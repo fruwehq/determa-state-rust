@@ -40,6 +40,9 @@ enum Tok {
     Dot,
     LBrack,
     RBrack,
+    LBrace,
+    RBrace,
+    Colon,
     LParen,
     RParen,
     Comma,
@@ -78,6 +81,18 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, CelError> {
             }
             ']' => {
                 out.push(Tok::RBrack);
+                i += 1;
+            }
+            '{' => {
+                out.push(Tok::LBrace);
+                i += 1;
+            }
+            '}' => {
+                out.push(Tok::RBrace);
+                i += 1;
+            }
+            ':' => {
+                out.push(Tok::Colon);
                 i += 1;
             }
             '(' => {
@@ -447,6 +462,36 @@ impl Parser {
                     }
                 }
                 Ok(Value::List(items))
+            }
+            Some(Tok::LBrace) => {
+                let mut map = std::collections::BTreeMap::new();
+                if !self.eat(&Tok::RBrace) {
+                    loop {
+                        // key: string literal or bare identifier (used as a string key)
+                        let key = match self.bump() {
+                            Some(Tok::Str(s)) => s,
+                            Some(Tok::Ident(s)) => s,
+                            other => {
+                                return Err(CelError::Other(format!(
+                                    "expected map key, got {other:?}"
+                                )))
+                            }
+                        };
+                        if !self.eat(&Tok::Colon) {
+                            return Err(CelError::Other("expected ':' in map literal".into()));
+                        }
+                        let v = self.parse_or(env)?;
+                        map.insert(key, v);
+                        if self.eat(&Tok::Comma) {
+                            continue;
+                        }
+                        break;
+                    }
+                    if !self.eat(&Tok::RBrace) {
+                        return Err(CelError::Other("expected '}'".into()));
+                    }
+                }
+                Ok(Value::Map(map))
             }
             other => Err(CelError::Other(format!("unexpected token {other:?}"))),
         }

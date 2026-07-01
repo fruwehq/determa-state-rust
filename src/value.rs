@@ -6,7 +6,12 @@
 use std::collections::BTreeMap;
 
 /// A harel runtime value. Mirrors the esv/payload `type` set (§4.4) plus `null`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// `Value` serializes as its **canonical JSON/native form** (an `Int(3)` is `3`, a
+/// `Bool(true)` is `true`, …), never as a tagged enum — so no engine-internal wrapper
+/// type leaks across any boundary (library, snapshot §8, CLI `--json` §13.4, observer
+/// §8) per SPEC §5.1.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -87,6 +92,20 @@ impl Value {
             // numeric strings are NOT coerced (only CLI --payload k=v does string coercion)
             _ => None,
         }
+    }
+}
+
+// Canonical JSON/native (de)serialization (SPEC §5.1): a Value is its underlying
+// JSON value, never a tagged wrapper.
+impl serde::Serialize for Value {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.to_json().serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Value {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        serde_json::Value::deserialize(d).map(|j| Value::from_json(&j))
     }
 }
 
