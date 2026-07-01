@@ -164,6 +164,7 @@ fn dispatch(engine: &mut Engine, data: &mut StoreData, args: &[String]) -> CmdOu
         "inject" => cmd_send(engine, rest, true),
         "step" => cmd_step(engine, rest),
         "inspect" => cmd_inspect(engine, rest),
+        "enabled" => cmd_enabled(engine, rest),
         other => CmdOut::text(EXIT_USAGE, format!("unknown command '{other}'")),
     }
 }
@@ -686,6 +687,10 @@ fn cmd_inspect(engine: &Engine, args: &[String]) -> CmdOut {
     m.insert("config".to_string(), Value::List(v.config.into_iter().map(Value::Str).collect()));
     m.insert("esvs".to_string(), Value::Map(v.esvs));
     m.insert(
+        "enabled".to_string(),
+        Value::List(v.enabled.into_iter().map(Value::Str).collect()),
+    );
+    m.insert(
         "queue".to_string(),
         Value::List(v.queue.into_iter().map(event_obj).collect()),
     );
@@ -717,6 +722,25 @@ fn cmd_inspect(engine: &Engine, args: &[String]) -> CmdOut {
         Value::List(v.dead_letter.into_iter().map(|d| Value::Str(d.event.etype)).collect()),
     );
     CmdOut::json(EXIT_OK, Value::Map(m))
+}
+
+fn cmd_enabled(engine: &Engine, args: &[String]) -> CmdOut {
+    let id = match args.first() {
+        Some(i) => i,
+        None => return CmdOut::text(EXIT_USAGE, "enabled <instance>".into()),
+    };
+    match engine.enabled_events(id) {
+        Ok(enabled) => {
+            let mut m = BTreeMap::new();
+            m.insert("instance".to_string(), Value::Str(id.to_string()));
+            m.insert(
+                "enabled".to_string(),
+                Value::List(enabled.into_iter().map(Value::Str).collect()),
+            );
+            CmdOut::json(EXIT_OK, Value::Map(m))
+        }
+        Err(e) => CmdOut::text(EXIT_NOT_FOUND, format!("{e:?}")),
+    }
 }
 
 fn event_obj(e: crate::runtime::QueuedEvent) -> Value {

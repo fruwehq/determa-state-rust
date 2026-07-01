@@ -279,6 +279,7 @@ pub struct InspectView {
     pub status: Status,
     pub config: Vec<String>,
     pub esvs: BTreeMap<String, Value>,
+    pub enabled: Vec<String>,
     pub queue: Vec<QueuedEvent>,
     pub deferred: Vec<QueuedEvent>,
     pub timers: Vec<ArmedTimer>,
@@ -1042,6 +1043,7 @@ impl Engine {
             status: inst.status,
             config: config_of(inst, m),
             esvs: reported_esvs(inst, m),
+            enabled: enabled_events(inst, m),
             queue: inst.queue.iter().filter_map(|q| match q {
                 QItem::Event(e) => Some(e.clone()),
                 _ => None,
@@ -1054,6 +1056,14 @@ impl Engine {
             history,
             dead_letter: inst.dead_letter.clone(),
         })
+    }
+
+    /// `enabled_events(instance)` — sorted declared event types the current active
+    /// configuration can handle (SPEC §14).
+    pub fn enabled_events(&self, inst_id: &str) -> Result<Vec<String>, EngineError> {
+        let inst = self.instance(inst_id)?;
+        let m = self.def_ref(&inst.def_id, inst.def_version);
+        Ok(enabled_events(inst, m))
     }
 
     pub fn snapshot(&self, inst_id: &str) -> Result<Snapshot, EngineError> {
@@ -2140,6 +2150,28 @@ fn reported_esvs(inst: &Instance, m: &Machine) -> BTreeMap<String, Value> {
         }
     }
     out
+}
+
+/// Reserved lifecycle event names never reported as enabled (SPEC §14).
+const RESERVED_LIFECYCLE_EVENTS: &[&str] = &["initial", "entry", "exit", "env", "error", "done"];
+
+/// `enabled_events(instance)` — the sorted declared event types the current active
+/// configuration can handle (SPEC §14). An event type is enabled iff some active
+/// state declares an `on_events` handler for it, considering each active leaf and its
+/// ancestor chain and all orthogonal regions. Structural and guard-agnostic;
+/// reserved lifecycle events are excluded.
+fn enabled_events(inst: &Instance, m: &Machine) -> Vec<String> {
+    let mut set = BTreeSet::new();
+    for leaf in active_leaves(inst, m) {
+        for s in ancestors_inclusive(m, leaf) {
+            for ev in m.get(s).on_events.keys() {
+                if !RESERVED_LIFECYCLE_EVENTS.contains(&ev.as_str()) {
+                    set.insert(ev.clone());
+                }
+            }
+        }
+    }
+    set.into_iter().collect()
 }
 
 // ===================== views helpers =====================

@@ -257,6 +257,17 @@ fn check_expect(engine: &Engine, _step: &serde_yaml::Value, expect: &serde_yaml:
             return Err("expected dead_letter".into());
         }
     }
+    // enabled (SPEC §14/§9): the addressed instance's enabled_events, sorted.
+    if let Some(en) = expect.get("enabled").and_then(|v| v.as_sequence()) {
+        let actual = engine
+            .enabled_events(&addr)
+            .map_err(|e| format!("enabled_events: {e:?}"))?;
+        let mut want: Vec<String> = en.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
+        want.sort();
+        if actual != want {
+            return Err(format!("enabled {:?} != {:?}", actual, want));
+        }
+    }
     // published
     if let Some(publ) = expect.get("published").and_then(|v| v.as_sequence()) {
         // not tracked across step boundary here; checked via instances instead.
