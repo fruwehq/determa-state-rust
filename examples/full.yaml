@@ -1,0 +1,127 @@
+# full.yaml — exercises every harel feature (SPEC.md §4-§10) on an intuitive domain:
+# a download manager. The `downloads` machine (top) spawns a `download` active object
+# per file. Demonstrates: esvs (state- and top-scoped), an external esv + `env`/refresh,
+# guards (CEL), structured actions, spawn + directed publish, defer, an orthogonal state
+# with deep history, a timer, faults, contracts, and a version migration.
+
+format: 1
+id: downloads
+version: 2
+contracts: [download_manager]
+
+events:
+  go_online: {}
+  go_offline: {}
+  add:           { payload: { url: { type: string, required: true } } }
+  download_done: { payload: { id:  { type: string } }, scope: local }
+
+top:
+  esvs:
+    max_active: { type: int, init: 3, external: true }   # host setting; may change at runtime
+    active:     { type: int, init: 0 }
+  on_events:
+    env:                                                 # host posts this when externals change
+      action: [ { refresh: { only: [max_active] } } ]    #   adopt the new host setting
+    download_done:
+      action: [ { assign: { active: "active - 1" } } ]
+  initial: { transition_to: offline }
+  states:
+
+    offline:
+      defer: [add]                      # queue add-requests until online (deferred-set)
+      on_events:
+        go_online: { transition_to: online }
+
+    online:
+      on_events:
+        go_offline: { transition_to: offline }
+        add:                            # internal (no transition_to): stay in online
+          guard: "active < max_active"
+          action:
+            - spawn: { def: download, payload: { url: "event.payload.url" } }
+            - assign: { active: "active + 1" }
+
+# v1 named these states up/down; v2 renamed them. Migrate pinned v1 instances forward,
+# but only when quiescent in one of those states (SPEC §10.2).
+migrations:
+  - from: 1
+    to: 2
+    when: "state in ['up','down']"
+    state_map: { up: online, down: offline }
+
+---
+
+# The spawned per-file machine. `url` is seeded from the spawn payload.
+format: 1
+id: download
+version: 1
+contracts: [download]
+
+events:
+  connected: {}
+  chunk: { payload: { bytes: { type: int, required: true } }, scope: internal }
+  eof: {}
+  hash_ok: {}
+  hash_mismatch: {}
+  pause: {}
+  resume: {}
+  download_done: { payload: { id: { type: string } }, scope: local }
+
+top:
+  esvs:
+    bytes_done: { type: int, init: 0 }   # persists across pause/resume
+  on_events:
+    error: { transition_to: failed }     # fault handling is just a listener (§5.10)
+  initial: { transition_to: active }
+  states:
+
+    # Transfer and integrity-check run concurrently. Deep history lets a paused
+    # download resume both regions where they left off.
+    active:
+      type: orthogonal
+      history: deep
+      on_events:
+        pause: { transition_to: paused }
+        done:  { transition_to: complete }   # generated when both regions reach final
+      regions:
+
+        # Region 1 — the byte transfer.
+        - initial: { transition_to: connecting }
+          states:
+            connecting:
+              after: [ { duration: 10s, transition_to: connecting } ]   # retry: re-arm timer
+              on_events:
+                connected: { transition_to: receiving }
+            receiving:
+              esvs:
+                session_bytes: { type: int, init: 0 }   # state-scoped: resets each entry
+              on_events:
+                chunk:
+                  action:
+                    - assign: { session_bytes: "session_bytes + event.payload.bytes" }
+                    - assign: { bytes_done:    "bytes_done + event.payload.bytes" }
+                eof: { transition_to: stored }
+            stored: { type: final }
+
+        # Region 2 — integrity check, concurrent with the transfer.
+        - initial: { transition_to: hashing }
+          states:
+            hashing:
+              on_events:
+                hash_ok:       { transition_to: verified }
+                hash_mismatch: { transition_to: failed }   # exits the orthogonal state
+            verified: { type: final }
+
+    paused:
+      on_events:
+        resume: { transition_to: active }    # deep history restores both regions
+
+    complete:
+      type: final
+      entry:
+        - publish: { event: download_done, to: parent, payload: { id: "id" } }
+
+    failed:
+      entry:
+        - publish: { event: download_done, to: parent, payload: { id: "id" } }
+        - stop: {}

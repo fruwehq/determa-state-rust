@@ -1,0 +1,17 @@
+# The smallest useful harel machine: one guarded transition.
+# A turnstile unlocks only when the inserted coin covers the fare.
+id: turnstile
+events:
+  coin: { payload: { amount: { type: int, required: true } } }
+  push: {}
+top:                                   # the outermost state (PSiCC "top")
+  esvs:
+    fare: { type: int, init: 50 }      # extended-state variable, declared in the state
+  initial: { transition_to: locked }   # the initial transition
+  states:
+    locked:
+      on_events:
+        coin: { transition_to: unlocked, guard: "event.payload.amount >= fare" }
+    unlocked:
+      on_events:
+        push: { transition_to: locked }

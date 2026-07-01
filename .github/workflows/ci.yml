@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: build + engine conformance + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Guarantee the conformance suite is pinned at spec tag v0.0.2, regardless
+      # of the recorded submodule commit (SPEC §2: the suite is the arbiter).
+      - name: Pin conformance suite at v0.0.2
+        run: |
+          (cd conformance-suite && git fetch --tags && git checkout v0.0.2)
+          echo "conformance suite:" && (cd conformance-suite && git describe --tags)
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Unit + doc tests
+        run: cargo test --lib
+
+      - name: Engine conformance (SPEC §9)
+        run: cargo test --test conformance -- --nocapture
+
+  cli-conformance:
+    name: black-box CLI conformance (SPEC §13.6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Pin conformance suite at v0.0.2
+        run: (cd conformance-suite && git fetch --tags && git checkout v0.0.2)
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run CLI conformance
+        run: |
+          python3 conformance-suite/conformance/run_cli.py \
+            --cmd "$(pwd)/target/release/harel"

@@ -1,0 +1,3 @@
+[submodule "conformance-suite"]
+	path = conformance-suite
+	url = https://github.com/fruwehq/harel-conformance.git
