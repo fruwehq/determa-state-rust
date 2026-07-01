@@ -31,6 +31,6 @@ pub mod value;
 pub use loader::{load_contract, load_machines, LoadError};
 pub use validate::{validate, Contract};
 
-pub use machine::{build as build_machine, Machine, NodeId, Scope};
+pub use machine::{build as build_machine, resolve_definitions, Machine, NodeId, Scope};
 pub use runtime::{Engine, Mode, RunResult, Snapshot, Status, StepRecord};
 pub use value::Value;

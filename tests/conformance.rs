@@ -71,11 +71,12 @@ fn run_case(dir: &Path) -> Check {
     if docs.is_empty() {
         return Check { ok: false, msg: "no machine docs".into() };
     }
-    for raw in &docs {
-        match build_machine(raw) {
-            Ok(m) => engine.register(m),
-            Err(e) => return Check { ok: false, msg: format!("build: {e:?}") },
-        }
+    let machines = match harel::resolve_definitions(&docs) {
+        Ok(ms) => ms,
+        Err(e) => return Check { ok: false, msg: format!("build: {e:?}") },
+    };
+    for m in machines {
+        engine.register(m);
     }
     let root_def = docs[0].id.clone();
     let external = test

@@ -264,6 +264,90 @@ pub struct StateNode {
     pub history: Option<String>,
     #[serde(default)]
     pub choice: Option<Vec<ChoiceBranch>>,
+    /// `submachine: <id>` inlines another definition synchronously (SPEC §5.6.1).
+    #[serde(default)]
+    pub submachine: Option<String>,
+    /// `with: { <externalEsv>: <CEL> }` seeds the submachine's external esvs.
+    #[serde(default)]
+    pub with: Option<BTreeMap<String, String>>,
+    /// Engine-set: this node is the inlined `top` of a submachine (esv-scope
+    /// boundary). Never appears in YAML.
+    #[serde(skip)]
+    pub is_sm_boundary: bool,
+    #[serde(skip)]
+    pub sm_with: BTreeMap<String, String>,
+}
+
+/// Inline `submachine:` references into a nested state tree (SPEC §5.6.1).
+///
+/// A state with `submachine: <id>` becomes a composite whose single child (named
+/// `<id>`) is the referenced definition's `top` (recursively inlined), marked as an
+/// esv-scope boundary and carrying the `with:` seeding. `registry` maps definition
+/// id -> its raw `top`. Returns errors for unknown or cyclic references.
+pub fn inline_submachines(
+    node: &StateNode,
+    registry: &std::collections::HashMap<String, StateNode>,
+    stack: &std::collections::HashSet<String>,
+) -> Result<StateNode, Vec<crate::loader::LoadError>> {
+    use crate::loader::LoadError;
+    if let Some(sub_id) = &node.submachine {
+        let reg_top = match registry.get(sub_id) {
+            Some(t) => t,
+            None => {
+                return Err(vec![LoadError {
+                    path: "/submachine".into(),
+                    message: format!("unknown submachine '{sub_id}'"),
+                }]);
+            }
+        };
+        if stack.contains(sub_id) {
+            return Err(vec![LoadError {
+                path: "/submachine".into(),
+                message: format!("cyclic submachine '{sub_id}'"),
+            }]);
+        }
+        let mut new_stack = stack.clone();
+        new_stack.insert(sub_id.clone());
+        let mut child = inline_submachines(reg_top, registry, &new_stack)?;
+        child.is_sm_boundary = true;
+        child.sm_with = node.with.clone().unwrap_or_default();
+        let mut out = node.clone();
+        out.submachine = None;
+        out.with = None;
+        out.is_sm_boundary = false;
+        out.sm_with = BTreeMap::new();
+        let mut states = BTreeMap::new();
+        states.insert(sub_id.clone(), child);
+        out.states = Some(states);
+        out.initial = Some(InitialTransition {
+            transition_to: sub_id.clone(),
+            guard: None,
+            action: None,
+        });
+        return Ok(out);
+    }
+    let mut out = node.clone();
+    if let Some(states) = &node.states {
+        let mut new_states = BTreeMap::new();
+        for (k, v) in states {
+            new_states.insert(k.clone(), inline_submachines(v, registry, stack)?);
+        }
+        out.states = Some(new_states);
+    }
+    if let Some(regions) = &node.regions {
+        let mut new_regions = Vec::new();
+        for r in regions {
+            let mut nr = r.clone();
+            let mut ns = BTreeMap::new();
+            for (k, v) in &r.states {
+                ns.insert(k.clone(), inline_submachines(v, registry, stack)?);
+            }
+            nr.states = ns;
+            new_regions.push(nr);
+        }
+        out.regions = Some(new_regions);
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Deserialize)]

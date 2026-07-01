@@ -6,7 +6,7 @@
 use crate::cel::{self, CelError, Env};
 use crate::machine::{HistoryKind, Machine, NodeId, StateDef, StateKind};
 use crate::model::Action;
-use crate::value::Value;
+use crate::value::{map1, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +156,7 @@ fn esv_key(state: &StateDef, name: &str) -> String {
 }
 
 fn nearest_declaring(inst: &Instance, m: &Machine, scope: NodeId, name: &str) -> Option<NodeId> {
-    for s in ancestors_inclusive(m, scope) {
+    for s in scope_chain(m, scope) {
         if inst.active.contains(&s) && m.get(s).esvs.iter().any(|(n, _)| n == name) {
             return Some(s);
         }
@@ -166,7 +166,7 @@ fn nearest_declaring(inst: &Instance, m: &Machine, scope: NodeId, name: &str) ->
 
 fn resolve_visible(inst: &Instance, m: &Machine, scope: NodeId) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
-    for s in ancestors_inclusive(m, scope) {
+    for s in scope_chain(m, scope) {
         if !inst.active.contains(&s) {
             continue;
         }
@@ -181,6 +181,30 @@ fn resolve_visible(inst: &Instance, m: &Machine, scope: NodeId) -> BTreeMap<Stri
         }
     }
     out
+}
+
+/// Esv-scope chain: walk up from `scope`, stopping AT a submachine boundary
+/// (inclusive) — the parent's esvs are not visible inside an inlined submachine
+/// (SPEC §5.6.1).
+fn scope_chain(m: &Machine, scope: NodeId) -> Vec<NodeId> {
+    let mut chain = vec![scope];
+    let mut cur = scope;
+    loop {
+        if m.get(cur).is_sm_boundary {
+            break;
+        }
+        match m.get(cur).parent {
+            Some(p) => {
+                chain.push(p);
+                cur = p;
+                if m.get(cur).is_sm_boundary {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    chain
 }
 
 // ===================== step buffer =====================
@@ -746,28 +770,34 @@ impl Engine {
     }
 
     fn post_step(&mut self, inst_id: &str, m: &Machine) {
-        // orthogonal completion -> done
-        let orthos: Vec<NodeId> = self
+        // Completion (SPEC §5.6 / §5.6.1): any active composite whose active leaf is
+        // final, or orthogonal whose regions are all final, generates a `done` event
+        // for its parent. `top` completion terminates a spawned instance instead.
+        let complete: Vec<NodeId> = self
             .instances
             .get(inst_id)
-            .map(|i| i.active.iter().copied().filter(|&n| m.get(n).is_orthogonal()).collect())
+            .map(|i| complete_states(i, m))
             .unwrap_or_default();
-        for o in orthos {
-            let all_final = self
+        for s in complete {
+            if s == m.top {
+                continue;
+            }
+            let already = self.instances.get(inst_id).unwrap().done_emitted.contains(&s);
+            if already {
+                continue;
+            }
+            let leaf_name = self
                 .instances
                 .get(inst_id)
-                .map(|i| regions_all_final(i, m, o))
-                .unwrap_or(false);
-            let emitted = self.instances.get(inst_id).unwrap().done_emitted.contains(&o);
-            if all_final && !emitted {
-                let inst = self.instances.get_mut(inst_id).unwrap();
-                inst.done_emitted.insert(o);
-                inst.queue.push_back(QItem::Event(QueuedEvent {
-                    etype: "done".into(),
-                    payload: Value::Null,
-                    origin: None,
-                }));
-            }
+                .map(|i| composite_leaf_name(i, m, s))
+                .unwrap_or_default();
+            let inst = self.instances.get_mut(inst_id).unwrap();
+            inst.done_emitted.insert(s);
+            inst.queue.push_back(QItem::Event(QueuedEvent {
+                etype: "done".into(),
+                payload: map1("state", Value::Str(leaf_name)),
+                origin: None,
+            }));
         }
         // termination via top-level final (spawned instances only) or stop
         self.handle_termination(inst_id, m);
@@ -1601,6 +1631,18 @@ fn enter(
 ) {
     inst.active.insert(n);
     let sd = m.get(n);
+    // A submachine root seeds its `external` esvs from `with:` (CEL over the parent
+    // scope) before its esvs initialize (SPEC §5.6.1).
+    if sd.is_sm_boundary && !sd.sm_with.is_empty() {
+        if let Some(parent) = sd.parent {
+            let env = build_env(inst, m, parent, event_value);
+            for (name, expr) in &sd.sm_with {
+                if let Ok(v) = crate::cel::eval(expr, &env) {
+                    inst.external_source.insert(name.clone(), v);
+                }
+            }
+        }
+    }
     for (name, decl) in sd.esvs.clone() {
         let val = if decl.external {
             inst.external_source.get(&name).cloned().unwrap_or(Value::Null)
@@ -1932,7 +1974,44 @@ fn replay_deferred(inst: &mut Instance, m: &Machine) {
     inst.queue = new_q;
 }
 
-// ===================== orthogonal done =====================
+// ===================== completion (orthogonal + submachine) =====================
+
+/// Active composite/orthogonal states that have reached completion: an orthogonal
+/// whose regions are all final, or a composite whose active leaf is final (incl. an
+/// inlined submachine root, SPEC §5.6.1).
+fn complete_states(inst: &Instance, m: &Machine) -> Vec<NodeId> {
+    let leaves = active_leaves(inst, m);
+    let mut out = Vec::new();
+    for &s in &inst.active {
+        let sd = m.get(s);
+        match sd.kind {
+            StateKind::Orthogonal => {
+                if regions_all_final(inst, m, s) {
+                    out.push(s);
+                }
+            }
+            StateKind::Composite => {
+                if leaves.iter().any(|&l| {
+                    is_ancestor_or_equal(m, s, l) && m.get(l).kind == StateKind::Final
+                }) {
+                    out.push(s);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The active leaf name within a composite (for the `done` payload).
+fn composite_leaf_name(inst: &Instance, m: &Machine, composite: NodeId) -> String {
+    for l in active_leaves(inst, m) {
+        if is_ancestor_or_equal(m, composite, l) && m.get(l).kind == StateKind::Final {
+            return m.get(l).id.clone();
+        }
+    }
+    String::new()
+}
 
 fn regions_all_final(inst: &Instance, m: &Machine, ortho: NodeId) -> bool {
     let regions = m.get(ortho).regions.clone();

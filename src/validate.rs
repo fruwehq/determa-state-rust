@@ -7,7 +7,7 @@ use crate::loader::LoadError;
 use crate::machine::{Machine, NodeId, StateDef, StateKind};
 use crate::model::{Action, RawMachine};
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const RESERVED_EVENTS: &[&str] = &["initial", "entry", "exit", "env", "error", "done"];
 const RESERVED_NAMES: &[&str] = &["top", "id", "parent", "event"];
@@ -49,7 +49,27 @@ pub fn validate(
 
     for raw in machines {
         validate_identifiers(raw, &mut errors);
-        let built = match crate::machine::build(raw) {
+    }
+    // inline submachines + build (so semantic checks run on the fully-resolved tree)
+    let registry: HashMap<String, crate::model::StateNode> = machines
+        .iter()
+        .map(|d| (d.id.clone(), d.top.clone()))
+        .collect();
+    for raw in machines {
+        let inlined_top = match crate::model::inline_submachines(
+            &raw.top,
+            &registry,
+            &HashSet::new(),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                errors.extend(e);
+                continue;
+            }
+        };
+        let mut inlined = raw.clone();
+        inlined.top = inlined_top;
+        let built = match crate::machine::build(&inlined) {
             Ok(m) => m,
             Err(es) => {
                 for e in es {
@@ -183,7 +203,7 @@ fn validate_dead_branches(m: &Machine, errors: &mut Vec<LoadError>) {
 
 /// All `transition_to` / initial targets of a state (resolved NodeIds). Conservative
 /// and guard-agnostic — every target is followed regardless of guards.
-fn state_targets(m: &Machine, s: &StateDef) -> Vec<NodeId> {
+fn state_targets(s: &StateDef) -> Vec<NodeId> {
     let mut out = Vec::new();
     if let Some(init) = &s.initial {
         out.push(init.target);
@@ -226,7 +246,7 @@ fn validate_reachability(m: &Machine, errors: &mut Vec<LoadError>) {
                 stack.push(par);
             }
         }
-        for t in state_targets(m, m.get(s)) {
+        for t in state_targets(m.get(s)) {
             if !reachable.contains(&t) {
                 stack.push(t);
             }

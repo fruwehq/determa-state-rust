@@ -122,6 +122,9 @@ pub struct StateDef {
     pub history: HistoryKind,
     pub choice: Option<Vec<ChoiceBranchDef>>,
     pub region_of: Option<(NodeId, usize)>,
+    /// Inlined submachine root (esv-scope boundary, SPEC §5.6.1).
+    pub is_sm_boundary: bool,
+    pub sm_with: Vec<(String, String)>,
 }
 
 impl StateDef {
@@ -295,6 +298,8 @@ fn register(
         history,
         choice: None,
         region_of: None,
+        is_sm_boundary: node.is_sm_boundary,
+        sm_with: node.sm_with.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
     });
 
     if by_name.contains_key(&id) {
@@ -606,4 +611,47 @@ pub fn build(raw: &RawMachine) -> Result<Machine, Vec<String>> {
         by_path,
         top: 0,
     })
+}
+
+/// Build a set of definitions, inlining `submachine:` references (SPEC §5.6.1)
+/// using a registry of all docs (def id -> raw machine). Returns one resolved
+/// [`Machine`] per input doc, in order, or the collected errors.
+pub fn resolve_definitions(
+    docs: &[RawMachine],
+) -> Result<Vec<Machine>, Vec<crate::loader::LoadError>> {
+    use crate::loader::LoadError;
+    use std::collections::{HashMap, HashSet};
+
+    let registry: HashMap<String, crate::model::StateNode> = docs
+        .iter()
+        .map(|d| (d.id.clone(), d.top.clone()))
+        .collect();
+    let mut out = Vec::new();
+    let mut errs: Vec<LoadError> = Vec::new();
+    for d in docs {
+        let inlined_top = match crate::model::inline_submachines(&d.top, &registry, &HashSet::new()) {
+            Ok(t) => t,
+            Err(e) => {
+                errs.extend(e);
+                continue;
+            }
+        };
+        let mut inlined = d.clone();
+        inlined.top = inlined_top;
+        match build(&inlined) {
+            Ok(m) => out.push(m),
+            Err(es) => {
+                for e in es {
+                    errs.push(LoadError {
+                        path: format!("machine '{}'", d.id),
+                        message: e,
+                    });
+                }
+            }
+        }
+    }
+    if !errs.is_empty() {
+        return Err(errs);
+    }
+    Ok(out)
 }
