@@ -4,12 +4,13 @@
 //! module adds the checks the JSON schema cannot express.
 
 use crate::loader::LoadError;
-use crate::machine::{Machine, NodeId, StateKind};
+use crate::machine::{Machine, NodeId, StateDef, StateKind};
 use crate::model::{Action, RawMachine};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
 
 const RESERVED_EVENTS: &[&str] = &["initial", "entry", "exit", "env", "error", "done"];
+const RESERVED_NAMES: &[&str] = &["top", "id", "parent", "event"];
 const IDENT: &str = "^[A-Za-z_][A-Za-z0-9_]*$";
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -61,6 +62,8 @@ pub fn validate(
             }
         };
         validate_choices(&built, &mut errors);
+        validate_dead_branches(&built, &mut errors);
+        validate_reachability(&built, &mut errors);
         validate_reserved_events(&built, &mut errors);
         validate_contracts(&built, &contract_map, &mut errors);
     }
@@ -101,39 +104,43 @@ fn check_state_identifiers(
 ) {
     if let Some(esvs) = &node.esvs {
         for name in esvs.keys() {
-            if !re.is_match(name) {
-                errors.push(LoadError {
-                    path: format!("{path}.esvs"),
-                    message: format!("'{name}' is not a valid identifier"),
-                });
-            }
+            check_name(name, &format!("{path}.esvs.{name}"), re, errors);
         }
     }
     if let Some(states) = &node.states {
         for (name, child) in states {
-            if !re.is_match(name) {
-                errors.push(LoadError {
-                    path: path.into(),
-                    message: format!("state '{name}' is not a valid identifier"),
-                });
-            }
+            check_name(name, &format!("{path}.states.{name}"), re, errors);
             check_state_identifiers(child, &format!("{path}.{name}"), re, errors);
         }
     }
     if let Some(regions) = &node.regions {
         for region in regions {
             for (name, child) in &region.states {
-                if !re.is_match(name) {
-                    errors.push(LoadError {
-                        path: path.into(),
-                        message: format!("state '{name}' is not a valid identifier"),
-                    });
-                }
+                check_name(name, &format!("{path}.states.{name}"), re, errors);
                 check_state_identifiers(child, &format!("{path}.{name}"), re, errors);
             }
         }
     }
 }
+
+/// Reject malformed identifiers and the structural/intrinsic reserved names
+/// `top`, `id`, `parent`, `event` (SPEC §2; reserved event names live in a
+/// different namespace and may be reused as state/esv names).
+fn check_name(name: &str, path: &str, re: &regex_lite::Regex, errors: &mut Vec<LoadError>) {
+    if !re.is_match(name) {
+        errors.push(LoadError {
+            path: path.into(),
+            message: format!("'{name}' is not a valid identifier"),
+        });
+    }
+    if RESERVED_NAMES.contains(&name) {
+        errors.push(LoadError {
+            path: path.into(),
+            message: format!("'{name}' is a reserved name"),
+        });
+    }
+}
+
 
 fn validate_reserved_events(m: &Machine, errors: &mut Vec<LoadError>) {
     for ev in m.events.keys() {
@@ -147,6 +154,93 @@ fn validate_reserved_events(m: &Machine, errors: &mut Vec<LoadError>) {
 }
 
 // --- choice pseudostates (§5.5.1) -----------------------------------------
+
+fn validate_dead_branches(m: &Machine, errors: &mut Vec<LoadError>) {
+    // In a guarded transition list (§4.5), an unguarded branch is the unconditional
+    // default and MUST be last (first passing guard wins); any branch after it is
+    // dead (SPEC §2).
+    for s in &m.states {
+        for (ev, list) in &s.on_events {
+            if list.len() < 2 {
+                continue;
+            }
+            for (i, t) in list.iter().enumerate() {
+                if i < list.len() - 1 && t.guard.is_none() {
+                    errors.push(LoadError {
+                        path: format!("{}.on_events.{}", s.path, ev),
+                        message:
+                            "an unguarded transition must be last; later branches are dead"
+                                .into(),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// --- reachability (SPEC §2) ------------------------------------------------
+
+/// All `transition_to` / initial targets of a state (resolved NodeIds). Conservative
+/// and guard-agnostic — every target is followed regardless of guards.
+fn state_targets(m: &Machine, s: &StateDef) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    if let Some(init) = &s.initial {
+        out.push(init.target);
+    }
+    for r in &s.regions {
+        out.push(r.initial.target);
+    }
+    for list in s.on_events.values() {
+        for t in list {
+            if let Some(tg) = t.target {
+                out.push(tg);
+            }
+        }
+    }
+    for a in &s.after {
+        if let Some(tg) = a.target {
+            out.push(tg);
+        }
+    }
+    if let Some(branches) = &s.choice {
+        for b in branches {
+            out.push(b.target);
+        }
+    }
+    out
+}
+
+fn validate_reachability(m: &Machine, errors: &mut Vec<LoadError>) {
+    use std::collections::HashSet;
+    let mut reachable: HashSet<NodeId> = HashSet::new();
+    let mut stack: Vec<NodeId> = vec![m.top];
+    while let Some(s) = stack.pop() {
+        if reachable.contains(&s) {
+            continue;
+        }
+        reachable.insert(s);
+        // entering a state implies its ancestors; follow their edges too
+        if let Some(par) = m.get(s).parent {
+            if !reachable.contains(&par) {
+                stack.push(par);
+            }
+        }
+        for t in state_targets(m, m.get(s)) {
+            if !reachable.contains(&t) {
+                stack.push(t);
+            }
+        }
+    }
+    for s in &m.states {
+        if s.path != "top" && !reachable.contains(&m.by_path[&s.path]) {
+            errors.push(LoadError {
+                path: "/".to_string() + &s.path.replace('.', "/"),
+                message: format!("unreachable state '{}'", s.id),
+            });
+        }
+    }
+}
 
 fn validate_choices(m: &Machine, errors: &mut Vec<LoadError>) {
     for (_idx, s) in m.states.iter().enumerate() {
