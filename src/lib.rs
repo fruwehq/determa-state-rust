@@ -1,18 +1,17 @@
-//! harel — a Rust implementation of the harel statechart engine.
+//! Determa State — a Rust implementation of the Determa State statechart engine.
 //!
-//! Implements harel spec **v0.0.4**. Correctness is defined by the language-agnostic
-//! conformance suite at <https://github.com/fruwehq/harel-conformance> (pinned at
-//! tag `v0.0.4`). See `SPEC.md` in the spec repository for the normative text.
+//! Implements Determa State spec **v0.0.5**. Correctness is defined by the language-agnostic
+//! conformance suite at <https://github.com/fruwehq/determa-state-conformance> (pinned at
+//! tag `v0.0.5`). See `SPEC.md` in the spec repository for the normative text.
 //!
-//! This crate exposes an embeddable library API (SPEC §2) and a standard `harel`
-//! CLI (`src/bin/harel.rs`, SPEC §13).
+//! This crate exposes an embeddable library API (SPEC §2) and a standard `determa-state` //! CLI (`src/bin/determa_state.rs`, SPEC §13).
 //!
 //! # Example
 //! ```
-//! use harel::{build_machine, load_machines};
+//! use determa_state::{build_machine, load_machines};
 //! let docs = load_machines(include_str!("../examples/minimal.yaml"))
 //!     .expect("minimal.yaml parses");
-//! let (valid, _errs) = harel::validate(&docs, &[]);
+//! let (valid, _errs) = determa_state::validate(&docs, &[]);
 //! assert!(valid);
 //! let _machine = build_machine(&docs[0]).expect("builds");
 //! ```

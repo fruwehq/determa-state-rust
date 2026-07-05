@@ -1,4 +1,4 @@
-//! The standard `harel` CLI (SPEC §13). A thin wrapper over the library [`Engine`]
+//! The standard `determa-state`  CLI (SPEC §13). A thin wrapper over the library [`Engine`]
 //! that persists state through a pluggable store (§13.1). Commands, exit codes, and
 //! the `--json` output shapes are normative.
 
@@ -36,7 +36,7 @@ impl CmdOut {
     }
 }
 
-/// Entry point used by the `harel` binary.
+/// Entry point used by the `determa-state` binary.
 pub fn run(args: Vec<String>) -> i32 {
     let mut store_spec = StoreSpec::File(default_store_dir());
     let mut json = false;
@@ -49,7 +49,7 @@ pub fn run(args: Vec<String>) -> i32 {
                 return EXIT_OK;
             }
             "--version" => {
-                println!("harel 0.0.4 (implements harel spec v0.0.4)");
+                println!("determa-state 0.0.5 (implements Determa State spec v0.0.5)");
                 return EXIT_OK;
             }
             "--json" => json = true,
@@ -84,10 +84,10 @@ pub fn run(args: Vec<String>) -> i32 {
 }
 
 fn default_store_dir() -> std::path::PathBuf {
-    if let Ok(s) = std::env::var("HAREL_STORE") {
+    if let Ok(s) = std::env::var("DETERMA_STORE") {
         return std::path::PathBuf::from(s);
     }
-    std::path::PathBuf::from("./.harel")
+    std::path::PathBuf::from("./.determa")
 }
 
 fn err_exit(code: i32, msg: &str) -> i32 {
@@ -97,8 +97,8 @@ fn err_exit(code: i32, msg: &str) -> i32 {
 
 fn print_help() {
     println!(
-        "harel — statechart engine CLI (spec v0.0.4)\n\
-         usage: harel [--store <spec>] [--json] <command> [args]\n\
+        "determa-state — statechart engine CLI (spec v0.0.5)\n\
+         usage: determa-state [--store <spec>] [--json] <command> [args]\n\
          commands: validate, export, new, send, advance, env, state, list, snapshot,\n\
                    restore, mode, inject, step, inspect, run"
     );

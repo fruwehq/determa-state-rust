@@ -141,7 +141,7 @@ impl SqliteStore {
         }
         let conn = rusqlite::Connection::open(&self.path)?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS harel_store (id INTEGER PRIMARY KEY, data TEXT NOT NULL);",
+            "CREATE TABLE IF NOT EXISTS determa_store (id INTEGER PRIMARY KEY, data TEXT NOT NULL);",
         )?;
         Ok(conn)
     }
@@ -155,7 +155,7 @@ impl Store for SqliteStore {
         };
         let row: Option<String> = conn
             .query_row(
-                "SELECT data FROM harel_store WHERE id = 0",
+                "SELECT data FROM determa_store WHERE id = 0",
                 [],
                 |r| r.get(0),
             )
@@ -169,7 +169,7 @@ impl Store for SqliteStore {
         if let Ok(conn) = self.conn() {
             let s = serde_json::to_string(data).unwrap_or_default();
             let _ = conn.execute(
-                "INSERT INTO harel_store (id, data) VALUES (0, ?1) \
+                "INSERT INTO determa_store (id, data) VALUES (0, ?1) \
                  ON CONFLICT(id) DO UPDATE SET data = excluded.data",
                 rusqlite::params![s],
             );

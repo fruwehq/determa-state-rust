@@ -1,4 +1,4 @@
-//! Loading harel YAML: multi-document machine files (§9: first doc is the root)
+//! Loading Determa State YAML: multi-document machine files (§9: first doc is the root)
 //! and contract files (§7).
 
 use crate::model::RawMachine;

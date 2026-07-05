@@ -5,8 +5,8 @@
 //! wrapper type may surface through resolved esvs, snapshots, or `--json`. This
 //! mirrors the reference `test_native_values` suite.
 
-use harel::value::Value;
-use harel::{load_machines, resolve_definitions, Engine};
+use determa_state::value::Value;
+use determa_state::{load_machines, resolve_definitions, Engine};
 use std::collections::BTreeMap;
 
 const TYPES: &str = "id: types

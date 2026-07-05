@@ -1,4 +1,4 @@
-//! The harel runtime engine (SPEC §5). Run-to-completion dispatch over a resolved
+//! The Determa State runtime engine (SPEC §5). Run-to-completion dispatch over a resolved
 //! [`Machine`]: hierarchical states with LCA exit/entry, esvs with scope, history,
 //! defer, timers over a virtual clock, orthogonal regions + `done`, choice
 //! pseudostates, active objects (spawn/publish/scope), faults, and snapshot/restore.

@@ -1,16 +1,16 @@
-# harel-rust
+# Determa State-rust
 
-A Rust implementation of the [harel](https://github.com/fruwehq/harel) statechart
+A Rust implementation of the [Determa State](https://github.com/fruwehq/determa-state-spec) statechart
 engine.
 
-**Implements harel spec v0.0.4.** Correctness is defined by the language-agnostic
-conformance suite at [`fruwehq/harel-conformance`](https://github.com/fruwehq/harel-conformance)
+**Implements Determa State spec v0.0.5.** Correctness is defined by the language-agnostic
+conformance suite at [`fruwehq/determa-state-conformance`](https://github.com/fruwehq/determa-state-conformance)
 (pinned at tag `v0.0.2` as a submodule under `conformance-suite/`); this engine is
 correct iff it passes every case.
 
-## What is harel?
+## What is Determa State?
 
-harel is a language-agnostic statechart format: a machine is declared once in YAML
+Determa State is a language-agnostic statechart format: a machine is declared once in YAML
 and run by an implementation in any language, with all implementations held
 accountable by a shared conformance suite. It follows the run-to-completion and
 hierarchical-state-machine semantics of Miro Samek's *Practical Statecharts in
@@ -38,7 +38,7 @@ This crate provides:
 - **Versioned definitions + safe-point migration** (§10).
 - **Snapshot/restore** and a passive per-step **Observer** (§8).
 - **Mermaid** export (§12).
-- An embeddable **library API** (§2) and the standard **`harel` CLI** (§13): all
+- An embeddable **library API** (§2) and the standard **`Determa State` CLI** (§13): all
   commands, exit codes, normative `--json` shapes, `--store file:`/`mem:`/`sqlite:`,
   batch/streaming `run`, and the §14 `mode`/`inject`/`step`/`inspect` verbs.
 
@@ -46,7 +46,7 @@ This crate provides:
 
 ```sh
 cargo build --release
-# the binary is target/release/harel
+# the binary is target/release/Determa State
 ```
 
 ## Run the conformance suite
@@ -58,30 +58,30 @@ git submodule update --init              # conformance-suite @ v0.0.2
 cargo test --test conformance -- --nocapture
 
 # black-box CLI cases (SPEC §13.6)
-python3 conformance-suite/conformance/run_cli.py --cmd "$(pwd)/target/release/harel"
+python3 conformance-suite/conformance/run_cli.py --cmd "$(pwd)/target/release/Determa State"
 ```
 
 Both are wired into CI (`.github/workflows/ci.yml`), which fetches the suite at tag
-`v0.0.4` and fails the build on any regression.
+`v0.0.5` and fails the build on any regression.
 
 ## CLI
 
 ```sh
-harel new t1 examples/minimal.yaml
-harel send t1 coin --payload amount=100 --json
-harel state t1 --json
-harel list --json
-harel validate examples/full.yaml
-harel export examples/full.yaml
+Determa State new t1 examples/minimal.yaml
+Determa State send t1 coin --payload amount=100 --json
+Determa State state t1 --json
+Determa State list --json
+Determa State validate examples/full.yaml
+Determa State export examples/full.yaml
 ```
 
 `--store <spec>` selects a backend: `file:<dir>` (default, portable snapshot files),
-`mem:` (ephemeral, in-process), or `sqlite:<path>`. See `harel --help`.
+`mem:` (ephemeral, in-process), or `sqlite:<path>`. See `Determa State --help`.
 
 ## Library
 
 ```rust,ignore
-use harel::{build_machine, load_machines, Engine, Value};
+use determa_state::{build_machine, load_machines, Engine, Value};
 use std::collections::BTreeMap;
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -100,7 +100,7 @@ assert_eq!(view.config, vec!["unlocked".to_string()]);
 
 ## Status
 
-Pre-1.0 (`0.0.x`), tracking the synchronized harel spec/conformance version.
+Pre-1.0 (`0.0.x`), tracking the synchronized Determa State spec/conformance version.
 
 ## License
 

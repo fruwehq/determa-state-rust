@@ -1,10 +1,10 @@
 //! Engine conformance harness (SPEC §9). Loads each `conformance/<case>/` from the
-//! pinned `harel-conformance` submodule, creates the root as id `root`, applies each
+//! pinned `determa-state-conformance` submodule, creates the root as id `root`, applies each
 //! `test.yaml` step to quiescence, and checks `expect`.
 
-use harel::machine::{parse_duration, Machine};
-use harel::value::Value;
-use harel::{build_machine, load_contract, load_machines, validate, Engine, Status};
+use determa_state::machine::{parse_duration, Machine};
+use determa_state::value::Value;
+use determa_state::{build_machine, load_contract, load_machines, validate, Engine, Status};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,7 +71,7 @@ fn run_case(dir: &Path) -> Check {
     if docs.is_empty() {
         return Check { ok: false, msg: "no machine docs".into() };
     }
-    let machines = match harel::resolve_definitions(&docs) {
+    let machines = match determa_state::resolve_definitions(&docs) {
         Ok(ms) => ms,
         Err(e) => return Check { ok: false, msg: format!("build: {e:?}") },
     };
@@ -138,7 +138,7 @@ fn map_of(v: &serde_yaml::Value) -> BTreeMap<String, Value> {
     }
 }
 
-fn load_contracts_from(dir: &Path) -> Vec<harel::validate::Contract> {
+fn load_contracts_from(dir: &Path) -> Vec<determa_state::validate::Contract> {
     let mut out = Vec::new();
     if let Ok(rd) = fs::read_dir(dir.join("contracts")) {
         for e in rd.flatten() {

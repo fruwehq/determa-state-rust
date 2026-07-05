@@ -1,4 +1,4 @@
-# The smallest useful harel machine: one guarded transition.
+# The smallest useful Determa State machine: one guarded transition.
 # A turnstile unlocks only when the inserted coin covers the fare.
 id: turnstile
 events:

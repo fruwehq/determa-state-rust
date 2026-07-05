@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-/// A harel runtime value. Mirrors the esv/payload `type` set (§4.4) plus `null`.
+/// A Determa State runtime value. Mirrors the esv/payload `type` set (§4.4) plus `null`.
 ///
 /// `Value` serializes as its **canonical JSON/native form** (an `Int(3)` is `3`, a
 /// `Bool(true)` is `true`, …), never as a tagged enum — so no engine-internal wrapper

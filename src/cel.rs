@@ -1,10 +1,10 @@
 //! Guard / action-value evaluation via the [Common Expression Language][cel]
 //! (SPEC §6), backed by the [`cel-interpreter`][crate] crate (cel-rust).
 //!
-//! harel mandates CEL so a guard means the same thing in every runtime. This module
-//! is a thin adapter: it builds a CEL context from the harel scope (in-scope `esvs`
+//! Determa State mandates CEL so a guard means the same thing in every runtime. This module
+//! is a thin adapter: it builds a CEL context from the Determa State scope (in-scope `esvs`
 //! + `event.payload.*` + the intrinsics `id`/`parent`/`state`), converts between
-//! harel's [`Value`] and CEL values, and maps CEL runtime errors onto [`CelError`]
+//! Determa State's [`Value`] and CEL values, and maps CEL runtime errors onto [`CelError`]
 //! (which the runtime treats as an action fault, SPEC §5.10). Boundary values stay
 //! canonical native/JSON (§5.1): every CEL result is normalized back to a [`Value`].
 //!
@@ -56,7 +56,7 @@ impl Env {
     }
 }
 
-/// Evaluate a CEL expression, returning its value as a canonical harel [`Value`].
+/// Evaluate a CEL expression, returning its value as a canonical Determa State [`Value`].
 pub fn eval(src: &str, env: &Env) -> Result<Value, CelError> {
     let program = Program::compile(src)
         .map_err(|e| CelError::Other(format!("CEL parse error: {e}")))?;
@@ -86,7 +86,7 @@ fn map_exec_error(e: ExecutionError) -> CelError {
 
 // --- value conversion ------------------------------------------------------
 
-/// Convert a harel [`Value`] into a CEL value for context binding.
+/// Convert a Determa State [`Value`] into a CEL value for context binding.
 fn to_cel(v: &Value) -> CelValue {
     match v {
         Value::Null => CelValue::Null,
@@ -107,7 +107,7 @@ fn to_cel(v: &Value) -> CelValue {
     }
 }
 
-/// Normalize a CEL result back into a canonical harel [`Value`] (§5.1).
+/// Normalize a CEL result back into a canonical Determa State [`Value`] (§5.1).
 fn from_cel(v: &CelValue) -> Value {
     match v {
         CelValue::Null => Value::Null,
@@ -124,7 +124,7 @@ fn from_cel(v: &CelValue) -> Value {
             }
             Value::Map(out)
         }
-        // Bytes/Duration/Timestamp/Function have no harel value type; surface as null.
+        // Bytes/Duration/Timestamp/Function have no Determa State value type; surface as null.
         CelValue::Bytes(_) | CelValue::Duration(_) | CelValue::Timestamp(_) | CelValue::Function(..) => {
             Value::Null
         }

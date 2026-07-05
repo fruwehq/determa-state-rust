@@ -2,8 +2,8 @@
 //! and exposed on the model but has no effect on dispatch, validation, or
 //! snapshots. A machine with `meta:` must load and run identically to one without.
 
-use harel::value::Value;
-use harel::{load_machines, resolve_definitions, Engine};
+use determa_state::value::Value;
+use determa_state::{load_machines, resolve_definitions, Engine};
 use std::collections::BTreeMap;
 
 const WITH_META: &str = "id: turnstile

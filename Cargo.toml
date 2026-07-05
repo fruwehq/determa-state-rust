@@ -1,21 +1,21 @@
 [package]
-name = "harel"
-version = "0.0.4"
+name = "determa-state"
+version = "0.0.5"
 edition = "2021"
 authors = ["fruwehq"]
 license = "MIT"
-description = "Rust implementation of the harel statechart engine (implements harel spec v0.0.4)"
-repository = "https://github.com/fruwehq/harel-rust"
+description = "Determa State — Rust implementation of the Determa statechart engine (implements Determa State spec v0.0.5)"
+repository = "https://github.com/fruwehq/determa-state-rust"
 readme = "README.md"
 exclude = ["conformance-suite/", ".github/"]
 
 [lib]
-name = "harel"
+name = "determa_state"
 path = "src/lib.rs"
 
 [[bin]]
-name = "harel"
-path = "src/bin/harel.rs"
+name = "determa-state"
+path = "src/bin/determa_state.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

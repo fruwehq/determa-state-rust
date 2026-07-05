@@ -1,4 +1,4 @@
-# full.yaml — exercises every harel feature (SPEC.md §4-§10) on an intuitive domain:
+# full.yaml — exercises every Determa State feature (SPEC.md §4-§10) on an intuitive domain:
 # a download manager. The `downloads` machine (top) spawns a `download` active object
 # per file. Demonstrates: esvs (state- and top-scoped), an external esv + `env`/refresh,
 # guards (CEL), structured actions, spawn + directed publish, defer, an orthogonal state
