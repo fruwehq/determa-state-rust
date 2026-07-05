@@ -17,11 +17,11 @@ jobs:
         with:
           submodules: recursive
 
-      # Guarantee the conformance suite is pinned at spec tag v0.0.4, regardless
+      # Guarantee the conformance suite is pinned at spec tag v0.0.5, regardless
       # of the recorded submodule commit (SPEC §2: the suite is the arbiter).
-      - name: Pin conformance suite at v0.0.4
+      - name: Pin conformance suite at v0.0.5
         run: |
-          (cd conformance-suite && git fetch --tags && git checkout v0.0.4)
+          (cd conformance-suite && git fetch --tags && git checkout v0.0.5)
           echo "conformance suite:" && (cd conformance-suite && git describe --tags)
 
       - uses: dtolnay/rust-toolchain@stable
@@ -45,8 +45,8 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Pin conformance suite at v0.0.4
-        run: (cd conformance-suite && git fetch --tags && git checkout v0.0.4)
+      - name: Pin conformance suite at v0.0.5
+        run: (cd conformance-suite && git fetch --tags && git checkout v0.0.5)
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -58,4 +58,4 @@ jobs:
       - name: Run CLI conformance
         run: |
           python3 conformance-suite/conformance/run_cli.py \
-            --cmd "$(pwd)/target/release/harel"
+            --cmd "$(pwd)/target/release/determa-state"
