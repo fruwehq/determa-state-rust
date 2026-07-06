@@ -49,7 +49,7 @@ pub fn run(args: Vec<String>) -> i32 {
                 return EXIT_OK;
             }
             "--version" => {
-                println!("determa-state 0.0.5 (implements Determa State spec v0.0.5)");
+                println!("determa-state 0.0.6 (implements Determa State spec v0.0.6)");
                 return EXIT_OK;
             }
             "--json" => json = true,
@@ -97,7 +97,7 @@ fn err_exit(code: i32, msg: &str) -> i32 {
 
 fn print_help() {
     println!(
-        "determa-state — statechart engine CLI (spec v0.0.5)\n\
+        "determa-state — statechart engine CLI (spec v0.0.6)\n\
          usage: determa-state [--store <spec>] [--json] <command> [args]\n\
          commands: validate, export, new, send, advance, env, state, list, snapshot,\n\
                    restore, mode, inject, step, inspect, run"
@@ -189,7 +189,7 @@ fn state_json(engine: &Engine, id: &str) -> Option<Value> {
 fn state_value(v: &crate::runtime::StateView) -> Value {
     let mut m = BTreeMap::new();
     m.insert("instance".to_string(), Value::Str(v.instance.clone()));
-    m.insert("def".to_string(), Value::Str(v.def.clone()));
+    m.insert("definition".to_string(), Value::Str(v.definition.clone()));
     m.insert("status".to_string(), Value::Str(status_str(v.status).to_string()));
     m.insert("config".to_string(), Value::List(v.config.iter().map(|s| Value::Str(s.clone())).collect()));
     m.insert("esvs".to_string(), Value::Map(v.esvs.clone()));
@@ -556,7 +556,7 @@ fn cmd_list(engine: &Engine) -> CmdOut {
         .map(|lv| {
             let mut m = BTreeMap::new();
             m.insert("id".to_string(), Value::Str(lv.id));
-            m.insert("def".to_string(), Value::Str(lv.def));
+            m.insert("definition".to_string(), Value::Str(lv.definition));
             m.insert("parent".to_string(), lv.parent.map(Value::Str).unwrap_or(Value::Null));
             m.insert("status".to_string(), Value::Str(status_str(lv.status).to_string()));
             m.insert("config".to_string(), Value::List(lv.config.into_iter().map(Value::Str).collect()));

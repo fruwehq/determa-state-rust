@@ -3,7 +3,7 @@
 A Rust implementation of the [Determa State](https://github.com/fruwehq/determa-state-spec) statechart
 engine.
 
-**Implements Determa State spec v0.0.5.** Correctness is defined by the language-agnostic
+**Implements Determa State spec v0.0.6.** Correctness is defined by the language-agnostic
 conformance suite at [`fruwehq/determa-state-conformance`](https://github.com/fruwehq/determa-state-conformance)
 (pinned at tag `v0.0.2` as a submodule under `conformance-suite/`); this engine is
 correct iff it passes every case.
@@ -62,7 +62,7 @@ python3 conformance-suite/conformance/run_cli.py --cmd "$(pwd)/target/release/De
 ```
 
 Both are wired into CI (`.github/workflows/ci.yml`), which fetches the suite at tag
-`v0.0.5` and fails the build on any regression.
+`v0.0.6` and fails the build on any regression.
 
 ## CLI
 
