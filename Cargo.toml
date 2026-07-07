@@ -1,10 +1,10 @@
 [package]
 name = "determa-state"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 authors = ["fruwehq"]
 license = "MIT"
-description = "Determa State — Rust implementation of the Determa statechart engine (implements Determa State spec v0.0.5)"
+description = "Determa State — Rust implementation of the Determa statechart engine (implements Determa State spec v0.0.6)"
 repository = "https://github.com/fruwehq/determa-state-rust"
 readme = "README.md"
 exclude = ["conformance-suite/", ".github/"]
@@ -15,6 +15,12 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "determa-state"
+path = "src/bin/determa_state.rs"
+
+# A language-suffixed alias so the launcher (and users) can pick a specific
+# implementation when both are installed (DETERMA_STATE_IMPL=rust). Same binary.
+[[bin]]
+name = "determa-state-rust"
 path = "src/bin/determa_state.rs"
 
 [dependencies]

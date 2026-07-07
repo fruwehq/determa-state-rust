@@ -258,7 +258,7 @@ pub enum EngineError {
 #[derive(Debug, Clone)]
 pub struct StateView {
     pub instance: InstanceId,
-    pub def: String,
+    pub definition: String,
     pub status: Status,
     pub config: Vec<String>,
     pub esvs: BTreeMap<String, Value>,
@@ -267,7 +267,7 @@ pub struct StateView {
 #[derive(Debug, Clone)]
 pub struct ListView {
     pub id: InstanceId,
-    pub def: String,
+    pub definition: String,
     pub parent: Option<InstanceId>,
     pub status: Status,
     pub config: Vec<String>,
@@ -1001,7 +1001,7 @@ impl Engine {
         let m = self.def_ref(&inst.def_id, inst.def_version);
         Ok(StateView {
             instance: inst_id.to_string(),
-            def: format!("{}@{}", inst.def_id, inst.def_version),
+            definition: format!("{}@{}", inst.def_id, inst.def_version),
             status: inst.status,
             config: config_of(inst, m),
             esvs: reported_esvs(inst, m),
@@ -1015,7 +1015,7 @@ impl Engine {
                 let m = self.def_ref(&inst.def_id, inst.def_version);
                 ListView {
                     id: id.clone(),
-                    def: format!("{}@{}", inst.def_id, inst.def_version),
+                    definition: format!("{}@{}", inst.def_id, inst.def_version),
                     parent: inst.parent.clone(),
                     status: inst.status,
                     config: config_of(inst, m),
