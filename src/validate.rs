@@ -263,7 +263,7 @@ fn validate_reachability(m: &Machine, errors: &mut Vec<LoadError>) {
 }
 
 fn validate_choices(m: &Machine, errors: &mut Vec<LoadError>) {
-    for (_idx, s) in m.states.iter().enumerate() {
+    for s in &m.states {
         if s.kind != StateKind::Choice {
             continue;
         }
@@ -298,13 +298,11 @@ fn validate_choices(m: &Machine, errors: &mut Vec<LoadError>) {
     let mut visited = HashSet::new();
     let mut stack = HashSet::new();
     for (idx, s) in m.states.iter().enumerate() {
-        if s.kind == StateKind::Choice {
-            if has_choice_cycle(m, idx, &mut visited, &mut stack) {
-                errors.push(LoadError {
-                    path: s.path.clone(),
-                    message: "choice graph contains a cycle".into(),
-                });
-            }
+        if s.kind == StateKind::Choice && has_choice_cycle(m, idx, &mut visited, &mut stack) {
+            errors.push(LoadError {
+                path: s.path.clone(),
+                message: "choice graph contains a cycle".into(),
+            });
         }
     }
 }
@@ -326,10 +324,8 @@ fn has_choice_cycle(
     let s = &m.states[start];
     if let Some(branches) = &s.choice {
         for b in branches {
-            if m.states[b.target].kind == StateKind::Choice {
-                if has_choice_cycle(m, b.target, visited, stack) {
-                    return true;
-                }
+            if m.states[b.target].kind == StateKind::Choice && has_choice_cycle(m, b.target, visited, stack) {
+                return true;
             }
         }
     }
@@ -434,4 +430,3 @@ mod regex_lite {
         }
     }
 }
-

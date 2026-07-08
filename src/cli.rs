@@ -584,9 +584,8 @@ fn cmd_advance(engine: &mut Engine, args: &[String]) -> CmdOut {
     }
     // print root state if present, else empty object
     if engine.instances.contains_key("root") {
-        match state_json(engine, "root") {
-            Some(v) => return CmdOut::json(EXIT_OK, v),
-            None => {}
+        if let Some(v) = state_json(engine, "root") {
+            return CmdOut::json(EXIT_OK, v);
         }
     }
     CmdOut::json(EXIT_OK, Value::Map(BTreeMap::new()))
@@ -913,19 +912,14 @@ fn write_line<W: Write>(w: &mut W, s: String) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 // emit
 
-fn emit(out: CmdOut, json: bool) -> i32 {
+fn emit(out: CmdOut, _json: bool) -> i32 {
     let exit = out.exit;
     match (out.json, out.text) {
         (Some(v), _) => {
             println!("{}", serde_json::to_string_pretty(&v.to_json()).unwrap_or_default());
         }
         (None, Some(t)) => {
-            // for validate (which has both json shape and text fallback) prefer json
-            if json {
-                println!("{t}");
-            } else {
-                println!("{t}");
-            }
+            println!("{t}");
         }
         (None, None) => {}
     }

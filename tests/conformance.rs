@@ -79,10 +79,7 @@ fn run_case(dir: &Path) -> Check {
         engine.register(m);
     }
     let root_def = docs[0].id.clone();
-    let external = test
-        .get("external")
-        .map(|m| map_of(m))
-        .unwrap_or_default();
+    let external = test.get("external").map(map_of).unwrap_or_default();
     let roundtrip = test.get("roundtrip").and_then(|v| v.as_bool()).unwrap_or(false);
 
     if let Err(e) = engine.create_root("root", &root_def, None, &external) {
@@ -175,7 +172,7 @@ fn apply_step(
     }
     if let Some(adv) = step.get("advance") {
         let dur = adv.as_str().ok_or("advance not str")?;
-        let ms = parse_duration(dur).map_err(|e| e)?;
+        let ms = parse_duration(dur)?;
         let _ = engine.advance(ms).map_err(|e| format!("advance: {e:?}"))?;
         return Ok(());
     }

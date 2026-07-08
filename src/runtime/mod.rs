@@ -156,12 +156,9 @@ fn esv_key(state: &StateDef, name: &str) -> String {
 }
 
 fn nearest_declaring(inst: &Instance, m: &Machine, scope: NodeId, name: &str) -> Option<NodeId> {
-    for s in scope_chain(m, scope) {
-        if inst.active.contains(&s) && m.get(s).esvs.iter().any(|(n, _)| n == name) {
-            return Some(s);
-        }
-    }
-    None
+    scope_chain(m, scope)
+        .into_iter()
+        .find(|&s| inst.active.contains(&s) && m.get(s).esvs.iter().any(|(n, _)| n == name))
 }
 
 fn resolve_visible(inst: &Instance, m: &Machine, scope: NodeId) -> BTreeMap<String, Value> {
@@ -230,13 +227,15 @@ struct StepBuf {
 
 // ===================== engine =====================
 
+type Observer = Box<dyn FnMut(&StepRecord) + Send>;
+
 pub struct Engine {
     pub defs: BTreeMap<(String, i64), Machine>,
     pub latest: BTreeMap<String, i64>,
     pub instances: BTreeMap<InstanceId, Instance>,
     pub clock: u64,
     pub mode: Mode,
-    pub observer: Option<Box<dyn FnMut(&StepRecord) + Send>>,
+    pub observer: Option<Observer>,
     run_published: Vec<String>,
     run_spawned: Vec<String>,
 }
@@ -680,7 +679,7 @@ impl Engine {
         };
 
         // snapshot for rollback
-        let backup = self.instances.get(inst_id).map(|i| Instance::snapshot_state(i));
+        let backup = self.instances.get(inst_id).map(Instance::snapshot_state);
 
         // env: update external source
         if etype.as_deref() == Some("env") {
@@ -1476,6 +1475,7 @@ fn execute_handler(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_choice(
     inst: &mut Instance,
     m: &Machine,
@@ -1512,6 +1512,7 @@ fn resolve_choice(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn external_transition(
     inst: &mut Instance,
     m: &Machine,
@@ -1532,7 +1533,7 @@ fn external_transition(
         .copied()
         .filter(|&x| is_strictly_below(m, lca, x) && is_ancestor_or_equal(m, anchor, x))
         .collect();
-    to_exit.sort_by(|a, b| m.get(*b).depth.cmp(&m.get(*a).depth));
+    to_exit.sort_by_key(|&n| std::cmp::Reverse(m.get(n).depth));
     // record history BEFORE descendants are removed (deepest composites first)
     for &x in &to_exit {
         if m.get(x).has_history() {
@@ -1555,6 +1556,7 @@ fn external_transition(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn local_transition(
     inst: &mut Instance,
     m: &Machine,
@@ -1571,7 +1573,7 @@ fn local_transition(
         .copied()
         .filter(|&x| is_strictly_below(m, source, x))
         .collect();
-    to_exit.sort_by(|a, b| m.get(*b).depth.cmp(&m.get(*a).depth));
+    to_exit.sort_by_key(|&n| std::cmp::Reverse(m.get(n).depth));
     for &x in &to_exit {
         if m.get(x).has_history() {
             record_history(inst, m, x);
@@ -1629,6 +1631,7 @@ fn entry_path_below(m: &Machine, lca: NodeId, target: NodeId) -> Vec<NodeId> {
 // ===================== entry / exit / descend =====================
 
 /// Activate, initialize esvs, run entry actions, arm timers.
+#[allow(clippy::too_many_arguments)]
 fn enter(
     inst: &mut Instance,
     m: &Machine,
@@ -1675,6 +1678,7 @@ fn enter(
 }
 
 /// Take initial transitions / restore history into substates (state `n` already entered).
+#[allow(clippy::too_many_arguments)]
 fn descend(
     inst: &mut Instance,
     m: &Machine,
@@ -1690,8 +1694,8 @@ fn descend(
         StateKind::Composite => {
             let has_hist = sd.has_history();
             let hist = inst.history.get(&n).cloned();
-            if has_hist && hist.is_some() {
-                restore_history(inst, m, n, clock, event_value, etype, hist.unwrap(), buf, rec);
+            if let (true, Some(hist)) = (has_hist, hist) {
+                restore_history(inst, m, n, clock, event_value, etype, hist, buf, rec);
             } else if let Some(init) = sd.initial.clone() {
                 for a in &init.action {
                     let _ = run_actions(inst, m, n, std::slice::from_ref(a), event_value, etype, buf, rec);
@@ -1703,8 +1707,8 @@ fn descend(
         StateKind::Orthogonal => {
             let has_hist = sd.has_history();
             let hist = inst.history.get(&n).cloned();
-            if has_hist && hist.is_some() {
-                restore_history(inst, m, n, clock, event_value, etype, hist.unwrap(), buf, rec);
+            if let (true, Some(hist)) = (has_hist, hist) {
+                restore_history(inst, m, n, clock, event_value, etype, hist, buf, rec);
             } else {
                 let regions = sd.regions.clone();
                 for r in &regions {
@@ -1720,6 +1724,7 @@ fn descend(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn restore_history(
     inst: &mut Instance,
     m: &Machine,
@@ -1813,6 +1818,7 @@ fn record_history(inst: &mut Instance, m: &Machine, state: NodeId) {
 
 // ===================== actions =====================
 
+#[allow(clippy::too_many_arguments)]
 fn run_actions(
     inst: &mut Instance,
     m: &Machine,
@@ -1829,6 +1835,7 @@ fn run_actions(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_one(
     inst: &mut Instance,
     m: &Machine,
@@ -1995,17 +2002,15 @@ fn complete_states(inst: &Instance, m: &Machine) -> Vec<NodeId> {
     for &s in &inst.active {
         let sd = m.get(s);
         match sd.kind {
-            StateKind::Orthogonal => {
-                if regions_all_final(inst, m, s) {
-                    out.push(s);
-                }
+            StateKind::Orthogonal if regions_all_final(inst, m, s) => {
+                out.push(s);
             }
-            StateKind::Composite => {
+            StateKind::Composite
                 if leaves.iter().any(|&l| {
                     is_ancestor_or_equal(m, s, l) && m.get(l).kind == StateKind::Final
-                }) {
-                    out.push(s);
-                }
+                }) =>
+            {
+                out.push(s);
             }
             _ => {}
         }

@@ -2,11 +2,11 @@
 //! (SPEC §6), backed by the [`cel-interpreter`][crate] crate (cel-rust).
 //!
 //! Determa State mandates CEL so a guard means the same thing in every runtime. This module
-//! is a thin adapter: it builds a CEL context from the Determa State scope (in-scope `esvs`
-//! + `event.payload.*` + the intrinsics `id`/`parent`/`state`), converts between
-//! Determa State's [`Value`] and CEL values, and maps CEL runtime errors onto [`CelError`]
-//! (which the runtime treats as an action fault, SPEC §5.10). Boundary values stay
-//! canonical native/JSON (§5.1): every CEL result is normalized back to a [`Value`].
+//! is a thin adapter: it builds a CEL context from the Determa State scope (in-scope `esvs`,
+//! `event.payload.*`, and the intrinsics `id`/`parent`/`state`), converts between Determa
+//! State's [`Value`] and CEL values, and maps CEL runtime errors onto [`CelError`]. The
+//! runtime treats those errors as action faults (SPEC §5.10). Boundary values stay canonical
+//! native/JSON (§5.1): every CEL result is normalized back to a [`Value`].
 //!
 //! [cel]: https://cel.dev/
 

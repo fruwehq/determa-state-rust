@@ -27,24 +27,18 @@ pub fn load_machines(src: &str) -> Result<Vec<RawMachine>, Vec<LoadError>> {
     let de = serde_yaml::Deserializer::from_str(src);
     let mut out = Vec::new();
     let mut errs = Vec::new();
-    let mut doc_index = 0;
-    for doc in de {
+    for (doc_index, doc) in de.enumerate() {
         match RawMachine::deserialize(doc) {
             Ok(m) => out.push(m),
             Err(e) => {
                 let pos = e.location().map(|l| l.line()).unwrap_or(0);
-                let path = if out.is_empty() {
-                    format!("doc[{}]", doc_index)
-                } else {
-                    format!("doc[{}]", doc_index)
-                };
+                let path = format!("doc[{}]", doc_index);
                 errs.push(LoadError {
                     path: format!("{path}:line {pos}"),
                     message: format!("{e}"),
                 });
             }
         }
-        doc_index += 1;
     }
     if !errs.is_empty() {
         return Err(errs);

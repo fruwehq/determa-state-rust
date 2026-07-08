@@ -38,16 +38,16 @@ impl Value {
     /// Is this value concretely of the declared esv/payload `type`?
     /// `null` satisfies any type (an unset variable / optional payload field).
     pub fn matches_type(&self, ty: &str) -> bool {
-        match (self, ty) {
-            (Value::Null, _) => true,
-            (Value::Bool(_), "bool") => true,
-            (Value::Int(_), "int") => true,
-            (Value::Float(_), "float") => true,
-            (Value::Str(_), "string") => true,
-            (Value::List(_), "list") => true,
-            (Value::Map(_), "map") => true,
-            _ => false,
-        }
+        matches!(
+            (self, ty),
+            (Value::Null, _)
+                | (Value::Bool(_), "bool")
+                | (Value::Int(_), "int")
+                | (Value::Float(_), "float")
+                | (Value::Str(_), "string")
+                | (Value::List(_), "list")
+                | (Value::Map(_), "map")
+        )
     }
 
     pub fn as_bool(&self) -> Option<bool> {
@@ -148,7 +148,7 @@ impl Value {
         match self {
             Value::Null => serde_json::Value::Null,
             Value::Bool(b) => serde_json::Value::Bool(*b),
-            Value::Int(i) => serde_json::Value::Number((*i as i64).into()),
+            Value::Int(i) => serde_json::Value::Number((*i).into()),
             Value::Float(f) => serde_json::Number::from_f64(*f)
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null),

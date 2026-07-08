@@ -202,9 +202,7 @@ fn resolve_ref(by_name: &HashMap<String, NodeId>, raw: &str) -> Option<NodeId> {
                 continue;
             }
             cur = by_name.get(seg).copied();
-            if cur.is_none() {
-                return None;
-            }
+            cur?;
         }
         cur
     } else {
@@ -307,7 +305,7 @@ fn register(
         meta: node
             .meta
             .as_ref()
-            .map(|v| Value::from_yaml(v))
+            .map(Value::from_yaml)
             .unwrap_or(Value::Map(BTreeMap::new())),
     });
 
@@ -622,7 +620,7 @@ pub fn build(raw: &RawMachine) -> Result<Machine, Vec<String>> {
         meta: raw
             .meta
             .as_ref()
-            .map(|v| Value::from_yaml(v))
+            .map(Value::from_yaml)
             .unwrap_or(Value::Map(BTreeMap::new())),
     })
 }
