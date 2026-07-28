@@ -7,7 +7,12 @@ license = "MIT"
 description = "Determa State — Rust implementation of the Determa statechart engine (implements Determa State spec v0.0.6)"
 repository = "https://github.com/fruwehq/determa-state-rust"
 readme = "README.md"
-exclude = ["conformance-suite/", ".github/"]
+exclude = [
+    "authoritative-spec/",
+    "conformance-suite/",
+    "tests/core_conformance.rs",
+    ".github/",
+]
 
 [lib]
 name = "determa_state"
@@ -21,17 +26,16 @@ path = "src/bin/determa_state.rs"
 # implementation when both are installed (DETERMA_STATE_IMPL=rust). Same binary.
 [[bin]]
 name = "determa-state-rust"
-path = "src/bin/determa_state.rs"
+path = "src/bin/determa_state_rust.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-rusqlite = { version = "0.31", features = ["bundled"] }
 cel-interpreter = "0.10"
-
-[dev-dependencies]
-tempfile = "3"
+jsonschema = { version = "0.33", default-features = false }
+regex = "1"
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 2

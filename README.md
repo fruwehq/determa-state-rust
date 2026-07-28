@@ -1,107 +1,103 @@
-# Determa State-rust
+# Determa State for Rust
 
-A Rust implementation of the [Determa State](https://github.com/fruwehq/determa-state-spec) statechart
-engine.
+Rust implementation of the portable [Determa State](https://github.com/fruwehq/determa-state-spec)
+`format: 1` core.
 
-**Implements Determa State spec v0.0.6.** Correctness is defined by the language-agnostic
-conformance suite at [`fruwehq/determa-state-conformance`](https://github.com/fruwehq/determa-state-conformance)
-(pinned at tag `v0.0.2` as a submodule under `conformance-suite/`); this engine is
-correct iff it passes every case.
+The crate remains version `0.0.6` while implementing the pre-release normative inputs:
 
-## What is Determa State?
+- specification commit `03771fac569a47b82f27891cd3700d4d1d876f8b`;
+- conformance commit `409bbdc6c2d4a4e9d50ddb1d994c5f5cd7d97762`.
 
-Determa State is a language-agnostic statechart format: a machine is declared once in YAML
-and run by an implementation in any language, with all implementations held
-accountable by a shared conformance suite. It follows the run-to-completion and
-hierarchical-state-machine semantics of Miro Samek's *Practical Statecharts in
-C/C++* (PSiCC) — the outermost state is `top` — and keeps the vocabulary of
-`cns_statemachine` (`top`, `esvs`, `on_events`, `transition_to`, `defer`, `publish`)
-while replacing raw guards/actions with [CEL](https://cel.dev/) and a small
-structured action set.
+Correctness is defined by the language-agnostic conformance suite. The Rust integration
+test runs every one of its 75 core cases.
 
-This crate provides:
+## Implemented core
 
-- **Full statechart semantics** (SPEC §5): hierarchy with LCA exit/entry, run-to-
-  completion, internal/local/external transitions, orthogonal regions + `done`,
-  shallow/deep history, choice pseudostates, `defer`red events, and timers over a
-  virtual clock.
-- **Extended state (`esvs`)** declared *inside* states, hierarchically scoped with
-  shadowing (§4.4), plus `external` esvs driven by the reserved `env` event and the
-  `refresh` action (§5.4).
-- **Guards in CEL** and a structured action set (`assign`/`publish`/`refresh`/
-  `spawn`/`stop`) whose computed values are CEL (§6).
-- **Active objects** — each instance owns an event queue; instances are spawned
-  dynamically with deterministic ids and communicate only by publishing events
-  (directed or by subscription/scope) over a pluggable bus (§5.7).
-- **Faults** via the reserved `error` event with atomic step rollback and a
-  dead-letter (§5.10).
-- **Versioned definitions + safe-point migration** (§10).
-- **Snapshot/restore** and a passive per-step **Observer** (§8).
-- **Mermaid** export (§12).
-- An embeddable **library API** (§2) and the standard **`Determa State` CLI** (§13): all
-  commands, exit codes, normative `--json` shapes, `--store file:`/`mem:`/`sqlite:`,
-  batch/streaming `run`, and the §14 `mode`/`inject`/`step`/`inspect` verbs.
+- Strict format-1 YAML 1.2 and JSON loading, schema validation, semantic validation,
+  portable scalar rules, and normalized bundle fingerprints.
+- Multiple machines per bundle, shared and private events, typed payloads and
+  variables, and the portable CEL profile.
+- Hierarchical dispatch, ordered guards, internal/local/unmarked transitions, choices,
+  history, entry/exit actions, final states, and `stop`.
+- Isolated synchronous components with explicit routing.
+- Owned spawned instances, nominal references, cancellation, completion, failure
+  propagation, and deterministic lifecycle cleanup.
+- Pure `create` and `dispatch` operations with deterministic runtime, cause, event, and
+  external-effect identities.
+- Inspection through the returned logical aggregate state, result disposition, fault,
+  rejection, configuration, variables, components, owned instances, and emissions.
 
-## Build
+The portable core does not own queues, persistence, broker acknowledgement, timers,
+snapshots, definition migration, package imports, or a background scheduler. A host may
+build those profiles around the pure state boundary. The command-line binary currently
+provides bundle validation only; it does not claim a portable CLI execution profile.
+
+## Build and test
 
 ```sh
+git submodule update --init
 cargo build --release
-# the binary is target/release/Determa State
+cargo test
+cargo clippy --all-targets -- -D warnings
 ```
 
-## Run the conformance suite
+The submodule must resolve to
+`409bbdc6c2d4a4e9d50ddb1d994c5f5cd7d97762`. CI also checks that the bundled schema is
+identical to the schema at specification commit
+`03771fac569a47b82f27891cd3700d4d1d876f8b`.
 
-```sh
-git submodule update --init              # conformance-suite @ v0.0.2
+## Library
 
-# engine cases (SPEC §9)
-cargo test --test conformance -- --nocapture
+```rust
+use determa_state::{
+    create, dispatch, load_bundle, Bindings, Delivery, Envelope, Target, Value,
+};
+use std::collections::BTreeMap;
 
-# black-box CLI cases (SPEC §13.6)
-python3 conformance-suite/conformance/run_cli.py --cmd "$(pwd)/target/release/Determa State"
+let source = std::fs::read_to_string("examples/minimal.yaml")?;
+let bundle = load_bundle(&source)?;
+let created = create(
+    &bundle,
+    "turnstile",
+    "turnstile-1",
+    "create-1",
+    &Bindings::default(),
+);
+let state = created.state.expect("creation succeeds");
+
+let result = dispatch(
+    &bundle,
+    &state,
+    Some(Delivery::Input(Envelope {
+        event: "coin".to_string(),
+        event_id: "input-1".to_string(),
+        target: Target::Root {
+            root_instance_id: state.root_instance_id.clone(),
+            root_runtime_id: state.root.runtime_id.clone(),
+        },
+        payload: BTreeMap::from([("amount".to_string(), Value::Int(100))]),
+        correlation_id: None,
+    })),
+);
+
+assert_eq!(
+    result.state.expect("dispatch succeeds").root.config(),
+    vec!["unlocked"]
+);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Both are wired into CI (`.github/workflows/ci.yml`), which fetches the suite at tag
-`v0.0.6` and fails the build on any regression.
+Input and internal envelopes are caller-owned. Internal emissions may be delivered back
+through `dispatch` explicitly. External emissions are deterministic output intents for
+the host to persist and deliver.
 
 ## CLI
 
 ```sh
-Determa State new t1 examples/minimal.yaml
-Determa State send t1 coin --payload amount=100 --json
-Determa State state t1 --json
-Determa State list --json
-Determa State validate examples/full.yaml
-Determa State export examples/full.yaml
+cargo run -- validate examples/minimal.yaml
+cargo run -- --version
 ```
-
-`--store <spec>` selects a backend: `file:<dir>` (default, portable snapshot files),
-`mem:` (ephemeral, in-process), or `sqlite:<path>`. See `Determa State --help`.
-
-## Library
-
-```rust,ignore
-use determa_state::{build_machine, load_machines, Engine, Value};
-use std::collections::BTreeMap;
-
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
-let docs = load_machines(include_str!("../examples/minimal.yaml"))?;
-let machine = build_machine(&docs[0]).map_err(|e| format!("{e:?}"))?;
-let mut engine = Engine::new();
-engine.register(machine);
-engine.create_root("t1", "turnstile", None, &BTreeMap::new())?;
-engine.send("t1", "coin", Value::Map(
-    [("amount".to_string(), Value::Int(100))].into_iter().collect()
-))?;
-let view = engine.state_view("t1")?;
-assert_eq!(view.config, vec!["unlocked".to_string()]);
-# Ok(()) }
-```
-
-## Status
-
-Pre-1.0 (`0.0.x`), tracking the synchronized Determa State spec/conformance version.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

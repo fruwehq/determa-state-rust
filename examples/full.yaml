@@ -1,127 +1,207 @@
-# full.yaml — exercises every Determa State feature (SPEC.md §4-§10) on an intuitive domain:
-# a download manager. The `downloads` machine (top) spawns a `download` active object
-# per file. Demonstrates: esvs (state- and top-scoped), an external esv + `env`/refresh,
-# guards (CEL), structured actions, spawn + directed publish, defer, an orthogonal state
-# with deep history, a timer, faults, contracts, and a version migration.
-
+# A self-contained format 1 bundle demonstrating:
+# - public input/output contracts and correlation;
+# - source-context transition actions;
+# - host-supplied input and external variables;
+# - explicit deep-history resume, self-history lifecycle replay, and plain-path restart;
+# - isolated lifecycle-bound components;
+# - owned spawn with a nominal instance reference; and
+# - an external scheduling request rather than a core timer.
 format: 1
-id: downloads
-version: 2
-contracts: [download_manager]
+namespace: example.orders
 
 events:
-  go_online: {}
-  go_offline: {}
-  add:           { payload: { url: { type: string, required: true } } }
-  download_done: { payload: { id:  { type: string } }, scope: local }
+  submit:
+    direction: input
+  finish_components:
+    direction: input
+  cancel_worker:
+    direction: input
+  begin:
+    direction: internal
+  finish_component:
+    direction: internal
+  payment_requested:
+    direction: output
+    payload:
+      order_id: { type: string, required: true }
+  payment_succeeded:
+    direction: input
+    correlates_to: payment_requested
+    payload:
+      provider_id: { type: string, required: true }
+  payment_rejected:
+    direction: input
+    correlates_to: payment_requested
+    payload:
+      reason: { type: string, required: true }
+  reminder_requested:
+    direction: output
+    payload:
+      order_id: { type: string, required: true }
+      delay_seconds: { type: int, required: true }
+  reminder_elapsed:
+    direction: input
+    correlates_to: reminder_requested
 
-top:
-  esvs:
-    max_active: { type: int, init: 3, external: true }   # host setting; may change at runtime
-    active:     { type: int, init: 0 }
-  on_events:
-    env:                                                 # host posts this when externals change
-      action: [ { refresh: { only: [max_active] } } ]    #   adopt the new host setting
-    download_done:
-      action: [ { assign: { active: "active - 1" } } ]
-  initial: { transition_to: offline }
-  states:
-
-    offline:
-      defer: [add]                      # queue add-requests until online (deferred-set)
+machines:
+  - machine_id: order
+    version: 1
+    root:
+      type: composite
+      variables:
+        order_id: { type: string, input: true }
+        provider_region: { type: string, external: true }
+        payment_status: { type: string, init: pending }
+        reminder_due: { type: bool, init: false }
+        payment_worker:
+          type: instance_reference
+          machine_id: payment_worker
+          nullable: true
+          init: null
+      initial: { transition_to: idle }
       on_events:
-        go_online: { transition_to: online }
-
-    online:
-      on_events:
-        go_offline: { transition_to: offline }
-        add:                            # internal (no transition_to): stay in online
-          guard: "active < max_active"
+        env:
           action:
-            - spawn: { def: download, payload: { url: "event.payload.url" } }
-            - assign: { active: "active + 1" }
+            - refresh: { only: [provider_region] }
+      states:
+        idle:
+          on_events:
+            submit:
+              transition_to: processing
+              action:
+                - spawn:
+                    machine_id: payment_worker
+                    bindings:
+                      input:
+                        order_id: "order_id"
+                      external:
+                        provider_region: "provider_region"
+                    bind_to: payment_worker
+                - send:
+                    event: payment_requested
+                    to: { external: true }
+                    correlation_id: "order_id"
+                    payload:
+                      order_id: "order_id"
+                - send:
+                    event: reminder_requested
+                    to: { external: true }
+                    correlation_id: "order_id"
+                    payload:
+                      order_id: "order_id"
+                      delay_seconds: "900"
 
-# v1 named these states up/down; v2 renamed them. Migrate pinned v1 instances forward,
-# but only when quiescent in one of those states (SPEC §10.2).
-migrations:
-  - from: 1
-    to: 2
-    when: "state in ['up','down']"
-    state_map: { up: online, down: offline }
+        processing:
+          type: parallel
+          entry:
+            - send:
+                event: begin
+                targets:
+                  - { component: fulfillment }
+                  - { component: accounting }
+          on_events:
+            finish_components:
+              action:
+                - send:
+                    event: finish_component
+                    targets:
+                      - { component: fulfillment }
+                      - { component: accounting }
+            payment_succeeded:
+              action:
+                - assign: { payment_status: "'succeeded'" }
+            payment_rejected:
+              action:
+                - assign: { payment_status: "'rejected'" }
+            reminder_elapsed:
+              action:
+                - assign: { reminder_due: "true" }
+            cancel_worker:
+              action:
+                - cancel: { instance: "payment_worker" }
+            done:
+              transition_to: complete
+          components:
+            - component_id: fulfillment
+              machine_id: fulfillment
+              with:
+                input:
+                  order_id: "owner.variables.order_id"
+            - component_id: accounting
+              root:
+                type: composite
+                variables:
+                  order_id: { type: string, input: true }
+                initial: { transition_to: waiting }
+                states:
+                  waiting:
+                    on_events:
+                      begin: { transition_to: active }
+                  active:
+                    on_events:
+                      finish_component: { transition_to: complete }
+                  complete: { type: final }
+              with:
+                input:
+                  order_id: "owner.variables.order_id"
 
----
+        complete:
+          type: final
 
-# The spawned per-file machine. `url` is seeded from the spawn payload.
-format: 1
-id: download
-version: 1
-contracts: [download]
-
-events:
-  connected: {}
-  chunk: { payload: { bytes: { type: int, required: true } }, scope: internal }
-  eof: {}
-  hash_ok: {}
-  hash_mismatch: {}
-  pause: {}
-  resume: {}
-  download_done: { payload: { id: { type: string } }, scope: local }
-
-top:
-  esvs:
-    bytes_done: { type: int, init: 0 }   # persists across pause/resume
-  on_events:
-    error: { transition_to: failed }     # fault handling is just a listener (§5.10)
-  initial: { transition_to: active }
-  states:
-
-    # Transfer and integrity-check run concurrently. Deep history lets a paused
-    # download resume both regions where they left off.
-    active:
-      type: orthogonal
-      history: deep
-      on_events:
-        pause: { transition_to: paused }
-        done:  { transition_to: complete }   # generated when both regions reach final
-      regions:
-
-        # Region 1 — the byte transfer.
-        - initial: { transition_to: connecting }
+  - machine_id: fulfillment
+    version: 1
+    events:
+      advance_fulfillment:
+        direction: internal
+      pause_fulfillment:
+        direction: internal
+      resume_fulfillment:
+        direction: internal
+      restart_fulfillment:
+        direction: internal
+      reenter_fulfillment:
+        direction: internal
+    root:
+      type: composite
+      variables:
+        order_id: { type: string, input: true }
+      initial: { transition_to: waiting }
+      states:
+        waiting:
+          on_events:
+            begin: { transition_to: active }
+        active:
+          type: composite
+          history: deep
+          initial: { transition_to: phase_one }
+          on_events:
+            pause_fulfillment: { transition_to: paused }
+            finish_component: { transition_to: complete }
+            reenter_fulfillment:
+              transition_to: { history: active }
           states:
-            connecting:
-              after: [ { duration: 10s, transition_to: connecting } ]   # retry: re-arm timer
+            phase_one:
               on_events:
-                connected: { transition_to: receiving }
-            receiving:
-              esvs:
-                session_bytes: { type: int, init: 0 }   # state-scoped: resets each entry
-              on_events:
-                chunk:
-                  action:
-                    - assign: { session_bytes: "session_bytes + event.payload.bytes" }
-                    - assign: { bytes_done:    "bytes_done + event.payload.bytes" }
-                eof: { transition_to: stored }
-            stored: { type: final }
+                advance_fulfillment: { transition_to: phase_two }
+            phase_two: {}
+        paused:
+          on_events:
+            resume_fulfillment:
+              transition_to: { history: active }
+            restart_fulfillment:
+              transition_to: active
+        complete: { type: final }
 
-        # Region 2 — integrity check, concurrent with the transfer.
-        - initial: { transition_to: hashing }
-          states:
-            hashing:
-              on_events:
-                hash_ok:       { transition_to: verified }
-                hash_mismatch: { transition_to: failed }   # exits the orthogonal state
-            verified: { type: final }
-
-    paused:
-      on_events:
-        resume: { transition_to: active }    # deep history restores both regions
-
-    complete:
-      type: final
-      entry:
-        - publish: { event: download_done, to: parent, payload: { id: "id" } }
-
-    failed:
-      entry:
-        - publish: { event: download_done, to: parent, payload: { id: "id" } }
-        - stop: {}
+  - machine_id: payment_worker
+    version: 1
+    events:
+      retry:
+        direction: internal
+    root:
+      type: composite
+      variables:
+        order_id: { type: string, input: true }
+        provider_region: { type: string, external: true }
+      initial: { transition_to: ready }
+      states:
+        ready: {}

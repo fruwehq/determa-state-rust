@@ -7,13 +7,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  SPECIFICATION_COMMIT: 03771fac569a47b82f27891cd3700d4d1d876f8b
+  CONFORMANCE_COMMIT: 409bbdc6c2d4a4e9d50ddb1d994c5f5cd7d97762
 
 jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -25,19 +27,26 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   build-test:
-    name: build + engine conformance + unit tests
+    name: build + format 1 core conformance + tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           submodules: recursive
 
-      # Guarantee the conformance suite is pinned at spec tag v0.0.6, regardless
-      # of the recorded submodule commit (SPEC §2: the suite is the arbiter).
-      - name: Pin conformance suite at v0.0.6
+      - name: Check out the normative specification
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: fruwehq/determa-state-spec
+          ref: ${{ env.SPECIFICATION_COMMIT }}
+          path: authoritative-spec
+          persist-credentials: false
+
+      - name: Verify immutable inputs
         run: |
-          (cd conformance-suite && git fetch --tags && git checkout v0.0.6)
-          echo "conformance suite:" && (cd conformance-suite && git describe --tags)
+          test "$(git -C conformance-suite rev-parse HEAD)" = "$CONFORMANCE_COMMIT"
+          test "$(git -C authoritative-spec rev-parse HEAD)" = "$SPECIFICATION_COMMIT"
+          cmp schema/machine.schema.json authoritative-spec/schema/machine.schema.json
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -46,31 +55,11 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Unit + doc tests
-        run: cargo test --lib
+      - name: Unit and public API tests
+        run: cargo test --lib --bins --test public_api
 
-      - name: Engine conformance (SPEC §9)
-        run: cargo test --test conformance -- --nocapture
+      - name: Documentation tests
+        run: cargo test --doc
 
-  cli-conformance:
-    name: black-box CLI conformance (SPEC §13.6)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Pin conformance suite at v0.0.6
-        run: (cd conformance-suite && git fetch --tags && git checkout v0.0.6)
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build release binary
-        run: cargo build --release
-
-      - name: Run CLI conformance
-        run: |
-          python3 conformance-suite/conformance/run_cli.py \
-            --cmd "$(pwd)/target/release/determa-state"
+      - name: All 75 format 1 core conformance cases
+        run: cargo test --test core_conformance -- --nocapture
