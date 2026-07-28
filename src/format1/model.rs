@@ -1,3 +1,4 @@
+use super::counter::Counter;
 use crate::value::Value;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -50,7 +51,7 @@ impl Default for Languages {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EventDeclaration {
     #[serde(default)]
@@ -70,7 +71,7 @@ pub enum EventDirection {
     Output,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PayloadField {
     #[serde(rename = "type")]
@@ -81,7 +82,7 @@ pub struct PayloadField {
     pub default: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct VariableDeclaration {
     #[serde(rename = "type")]
@@ -164,7 +165,7 @@ pub struct RawComponent {
     pub meta: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct BindingExpressions {
     pub input: BTreeMap<String, String>,
@@ -313,7 +314,7 @@ pub enum Target {
         owner_runtime_id: String,
         component_id: String,
         component_runtime_id: String,
-        activation_sequence: u64,
+        activation_sequence: Counter,
     },
     External,
 }

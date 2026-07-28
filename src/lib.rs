@@ -10,14 +10,14 @@ pub mod format1;
 pub mod value;
 
 /// Exact normative specification revision implemented by this crate.
-pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "03771fac569a47b82f27891cd3700d4d1d876f8b";
+pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "4bd4d9588d11b75d376380b6120676a056a4bc45";
 
 /// Exact core conformance revision exercised by this crate.
-pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "409bbdc6c2d4a4e9d50ddb1d994c5f5cd7d97762";
+pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "fc4842010ab8d83bf4c5c6280a5627ca86829f7f";
 
 pub use format1::{
     create, dispatch, load_bundle, load_bundle_from_json, AggregateState, Bindings, Bundle,
-    CoreResult, Delivery, Disposition, Emission, Envelope, FaultRecord, LoadError, LoadErrorCode,
-    Rejection, ResultStatus, RuntimeStatus, Target,
+    CoreResult, Counter, Delivery, Disposition, Emission, Envelope, FaultRecord, LoadError,
+    LoadErrorCode, Rejection, ResultStatus, RuntimeStatus, Target,
 };
-pub use value::{InstanceReference, Value};
+pub use value::{string_from_utf16, InstanceReference, InvalidUnicodeString, Value};

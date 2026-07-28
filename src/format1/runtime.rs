@@ -4,6 +4,7 @@ use super::compile::{
     CompiledActionKind, CompiledChoice, CompiledSendTarget, CompiledStateKind, CompiledTarget,
     CompiledTransition, Component, ComponentDefinition, Machine, State,
 };
+use super::counter::Counter;
 use super::model::{
     BindingExpressions, Bindings, Delivery, Envelope, EventDeclaration, EventDirection, Target,
     VariableDeclaration,
@@ -39,19 +40,21 @@ pub struct FaultRecord {
     pub runtime_id: String,
     pub cause_id: String,
     pub code: String,
-    pub step_sequence: u64,
+    pub step_sequence: Counter,
     pub source_locator: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Emission {
+    pub emitting_runtime_id: String,
+    pub emitting_owner_runtime_id: Option<String>,
     pub event: String,
     pub event_id: Option<String>,
     pub target: Target,
     pub payload: BTreeMap<String, Value>,
     pub correlation_id: Option<String>,
     pub effect_id: Option<String>,
-    pub sequence: Option<u64>,
+    pub sequence: Option<Counter>,
 }
 
 impl Emission {
@@ -84,17 +87,17 @@ pub enum ResultStatus {
     Rejected,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AggregateState {
     pub validated_bundle_fingerprint: String,
     pub namespace: String,
     pub root_instance_id: String,
     pub root: RuntimeState,
-    pub next_logical_step_sequence: u64,
-    pub next_output_sequence: u64,
+    pub next_logical_step_sequence: Counter,
+    pub next_output_sequence: Counter,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeState {
     pub runtime_id: String,
     pub machine_id: String,
@@ -106,61 +109,63 @@ pub struct RuntimeState {
     pub history: BTreeMap<String, Option<Vec<String>>>,
     pub components: Vec<ComponentRuntime>,
     pub owned_instances: Vec<OwnedRuntime>,
-    pub next_spawn_sequence: u64,
-    pub next_component_activation_sequence: BTreeMap<String, u64>,
-    pub next_state_activation_sequence: BTreeMap<String, u64>,
-    pub active_state_activation_sequence: BTreeMap<String, u64>,
+    pub next_spawn_sequence: Counter,
+    pub next_component_activation_sequence: BTreeMap<String, Counter>,
+    pub next_state_activation_sequence: BTreeMap<String, Counter>,
+    pub active_state_activation_sequence: BTreeMap<String, Counter>,
     pub fault: Option<FaultRecord>,
     pub relation: RuntimeRelation,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VariableSlot {
     pub name: String,
     pub declaration_path: String,
     pub declaration_pointer: String,
     pub declaration: VariableDeclaration,
     pub value: Value,
-    pub state_activation_sequence: u64,
+    pub state_activation_sequence: Counter,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeRelation {
     Root,
     Component {
         owner_runtime_id: String,
+        owner_target: Box<Target>,
         owner_state_path: String,
         component_id: String,
         component_pointer: String,
         declaration_index: usize,
-        activation_sequence: u64,
+        activation_sequence: Counter,
     },
     Spawned {
         owner_runtime_id: String,
-        spawn_sequence: u64,
+        owner_target: Box<Target>,
+        spawn_sequence: Counter,
         spawn_pointer: String,
         reference: InstanceReference,
         holder_path: Option<String>,
         holder_pointer: Option<String>,
-        holder_activation_sequence: u64,
+        holder_activation_sequence: Counter,
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ComponentRuntime {
     pub component_id: String,
     pub pointer: String,
     pub declaration_index: usize,
-    pub activation_sequence: u64,
+    pub activation_sequence: Counter,
     pub runtime: RuntimeState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OwnedRuntime {
-    pub spawn_sequence: u64,
+    pub spawn_sequence: Counter,
     pub holder_path: Option<String>,
     pub holder_pointer: Option<String>,
-    pub holder_activation_sequence: u64,
+    pub holder_activation_sequence: Counter,
     pub reference: InstanceReference,
     pub runtime: RuntimeState,
 }
@@ -174,9 +179,9 @@ struct StepFault {
 struct StepContext<'a> {
     bundle: &'a Bundle,
     root_instance_id: &'a str,
-    step_sequence: u64,
+    step_sequence: Counter,
     cause_id: String,
-    next_output_sequence: &'a mut u64,
+    next_output_sequence: &'a mut Counter,
     emissions: &'a mut Vec<Emission>,
 }
 
@@ -203,8 +208,8 @@ pub fn create(
             machine.clone(),
             RuntimeRelation::Root,
         ),
-        next_logical_step_sequence: 0,
-        next_output_sequence: 0,
+        next_logical_step_sequence: Counter::zero(),
+        next_output_sequence: Counter::zero(),
     };
     if initialize_root_variables(&mut aggregate.root, bindings).is_err() {
         return rejected_creation("invalid_binding");
@@ -216,21 +221,21 @@ pub fn create(
         &root_runtime_id,
         &root_runtime_id,
         creation_id,
-        0,
+        &Counter::zero(),
         &machine.root_pointer,
-        0,
+        &Counter::zero(),
     );
     let mut emissions = Vec::new();
     let mut context = StepContext {
         bundle,
         root_instance_id,
-        step_sequence: 0,
+        step_sequence: Counter::zero(),
         cause_id: cause_id.clone(),
         next_output_sequence: &mut aggregate.next_output_sequence,
         emissions: &mut emissions,
     };
     let initialization = initialize_runtime(&mut aggregate.root, bindings, &mut context, true);
-    aggregate.next_logical_step_sequence = 1;
+    aggregate.next_logical_step_sequence = Counter::from(1_u64);
     match initialization {
         Ok(()) => CoreResult {
             status: result_status(aggregate.root.status),
@@ -245,7 +250,7 @@ pub fn create(
                 runtime_id: root_runtime_id,
                 cause_id,
                 code: fault.code.to_string(),
-                step_sequence: 0,
+                step_sequence: Counter::zero(),
                 source_locator: fault.source_locator,
             };
             let mut diagnostic = RuntimeState::new(
@@ -253,10 +258,11 @@ pub fn create(
                 machine,
                 RuntimeRelation::Root,
             );
+            diagnostic.history.clear();
             diagnostic.status = RuntimeStatus::Faulted;
             diagnostic.fault = Some(record.clone());
             aggregate.root = diagnostic;
-            aggregate.next_output_sequence = 0;
+            aggregate.next_output_sequence = Counter::zero();
             CoreResult {
                 status: ResultStatus::Faulted,
                 disposition: None,
@@ -361,8 +367,7 @@ pub fn dispatch(
     };
 
     let mut aggregate = prior_state.clone();
-    let step_sequence = aggregate.next_logical_step_sequence;
-    aggregate.next_logical_step_sequence += 1;
+    let step_sequence = aggregate.next_logical_step_sequence.allocate();
     let mut emissions = Vec::new();
     let root_instance_id = aggregate.root_instance_id.clone();
     let cause_id = normalized_envelope.event_id.clone();
@@ -373,7 +378,7 @@ pub fn dispatch(
         let mut context = StepContext {
             bundle,
             root_instance_id: &root_instance_id,
-            step_sequence,
+            step_sequence: step_sequence.clone(),
             cause_id,
             next_output_sequence,
             emissions: &mut emissions,
@@ -392,7 +397,7 @@ pub fn dispatch(
                 &mut aggregate,
                 &address,
                 &normalized_envelope.event_id,
-                step_sequence,
+                step_sequence.clone(),
                 &mut emissions,
                 bundle,
             );
@@ -420,8 +425,8 @@ enum DeliveryMode {
 
 #[derive(Debug, Clone)]
 enum AddressSegment {
-    Component(String, u64),
-    Spawn(u64),
+    Component(String, Counter),
+    Spawn(Counter),
 }
 
 type RuntimeAddress = Vec<AddressSegment>;
@@ -445,7 +450,7 @@ impl RuntimeState {
             history,
             components: Vec::new(),
             owned_instances: Vec::new(),
-            next_spawn_sequence: 0,
+            next_spawn_sequence: Counter::zero(),
             next_component_activation_sequence: BTreeMap::new(),
             next_state_activation_sequence: BTreeMap::new(),
             active_state_activation_sequence: BTreeMap::new(),
@@ -523,14 +528,13 @@ fn fault_dispatch(
     fault: StepFault,
 ) -> CoreResult {
     let mut aggregate = prior_state.clone();
-    let step_sequence = aggregate.next_logical_step_sequence;
-    aggregate.next_logical_step_sequence += 1;
+    let step_sequence = aggregate.next_logical_step_sequence.allocate();
     let runtime = runtime_at_mut(&mut aggregate.root, address).expect("fault target was validated");
     let record = FaultRecord {
         runtime_id: runtime.runtime_id.clone(),
         cause_id: envelope.event_id.clone(),
         code: fault.code.to_string(),
-        step_sequence,
+        step_sequence: step_sequence.clone(),
         source_locator: fault.source_locator,
     };
     runtime.status = RuntimeStatus::Faulted;
@@ -563,53 +567,715 @@ fn fault_dispatch(
 }
 
 fn validate_prior_state(state: &AggregateState) -> bool {
-    !state.validated_bundle_fingerprint.is_empty()
-        && !state.namespace.is_empty()
-        && !state.root_instance_id.is_empty()
-        && !state.root.runtime_id.is_empty()
-        && !state.root.machine_id.is_empty()
-        && state.root.machine_version > 0
-        && matches!(state.root.relation, RuntimeRelation::Root)
-        && state
-            .root
-            .active
-            .iter()
-            .all(|path| state.root.definition.states.contains_key(path))
-        && state.root.variables.values().all(|slot| {
-            state
-                .root
-                .definition
-                .states
-                .get(&slot.declaration_path)
-                .and_then(|definition| definition.variables.get(&slot.name))
-                .is_some()
-                && (slot.declaration.value_type == "instance_reference"
-                    && matches!(slot.value, Value::Null | Value::InstanceReference(_))
-                    || slot
-                        .value
-                        .normalize_for_type(&slot.declaration.value_type)
-                        .is_some())
-        })
-        && matches!(
-            state.root.status,
-            RuntimeStatus::Running | RuntimeStatus::Completed | RuntimeStatus::Faulted
-        )
+    if state.validated_bundle_fingerprint.is_empty()
+        || state.namespace.is_empty()
+        || state.root_instance_id.is_empty()
+        || !matches!(state.root.relation, RuntimeRelation::Root)
+        || state.root.runtime_id
+            != root_runtime_identity_parts(
+                &state.validated_bundle_fingerprint,
+                &state.namespace,
+                &state.root.definition,
+                &state.root_instance_id,
+            )
+    {
+        return false;
+    }
+    validate_runtime_shape(state, &state.root, &state.root.definition)
 }
 
 fn validate_prior_state_bundle_binding(state: &AggregateState, bundle: &Bundle) -> bool {
-    state.namespace == bundle.namespace
-        && bundle
-            .machines
-            .get(&state.root.machine_id)
-            .is_some_and(|machine| {
-                machine.version == state.root.machine_version
-                    && machine.machine_index == state.root.definition.machine_index
-                    && machine.root_pointer == state.root.definition.root_pointer
-                    && machine
-                        .states
-                        .keys()
-                        .eq(state.root.definition.states.keys())
+    if state.namespace != bundle.namespace {
+        return false;
+    }
+    let Some(machine) = bundle.machines.get(&state.root.machine_id) else {
+        return false;
+    };
+    validate_runtime_bundle_binding(&state.root, machine, bundle)
+}
+
+fn validate_runtime_shape(
+    aggregate: &AggregateState,
+    runtime: &RuntimeState,
+    expected_definition: &Machine,
+) -> bool {
+    if runtime.runtime_id.is_empty()
+        || runtime.machine_id != expected_definition.machine_id
+        || runtime.machine_version != expected_definition.version
+        || runtime.definition != *expected_definition
+        || runtime.machine_version <= 0
+        || !validate_machine_shape(&runtime.definition)
+    {
+        return false;
+    }
+
+    let empty_diagnostic_shape = runtime.status == RuntimeStatus::Faulted
+        && runtime.active.is_empty()
+        && runtime.variables.is_empty()
+        && runtime.components.is_empty()
+        && runtime.owned_instances.is_empty()
+        && runtime.next_spawn_sequence == Counter::zero()
+        && runtime.next_component_activation_sequence.is_empty()
+        && runtime.next_state_activation_sequence.is_empty()
+        && runtime.active_state_activation_sequence.is_empty();
+    let creation_diagnostic = empty_diagnostic_shape
+        && matches!(runtime.relation, RuntimeRelation::Root)
+        && aggregate.next_logical_step_sequence == Counter::from(1_u64)
+        && runtime
+            .fault
+            .as_ref()
+            .is_some_and(|fault| fault.step_sequence == Counter::zero());
+    let contained_initialization_diagnostic =
+        empty_diagnostic_shape && !matches!(runtime.relation, RuntimeRelation::Root);
+    let empty_diagnostic_history = creation_diagnostic || contained_initialization_diagnostic;
+    let expected_history = runtime
+        .definition
+        .states
+        .values()
+        .filter(|state| !matches!(state.history, super::model::HistoryKind::None))
+        .map(|state| state.path.as_str())
+        .collect::<BTreeSet<_>>();
+    if (empty_diagnostic_history && !runtime.history.is_empty())
+        || (!empty_diagnostic_history
+            && runtime
+                .history
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+                != expected_history)
+        || !runtime.history.iter().all(|(slot, value)| {
+            value
+                .as_ref()
+                .is_none_or(|paths| validate_history_value(&runtime.definition, slot, paths))
+        })
+    {
+        return false;
+    }
+
+    if !validate_active_configuration(runtime)
+        || runtime
+            .active_state_activation_sequence
+            .keys()
+            .collect::<BTreeSet<_>>()
+            != runtime.active.iter().collect::<BTreeSet<_>>()
+        || runtime
+            .active_state_activation_sequence
+            .iter()
+            .any(|(path, sequence)| {
+                runtime
+                    .next_state_activation_sequence
+                    .get(path)
+                    .is_none_or(|next| next <= sequence)
             })
+        || runtime
+            .next_state_activation_sequence
+            .iter()
+            .any(|(path, next)| {
+                !runtime.definition.states.contains_key(path) || next == &Counter::zero()
+            })
+        || runtime
+            .next_component_activation_sequence
+            .iter()
+            .any(|(pointer, next)| {
+                !machine_has_component_pointer(&runtime.definition, pointer)
+                    || next == &Counter::zero()
+            })
+    {
+        return false;
+    }
+
+    for (key, slot) in &runtime.variables {
+        let Some(state) = runtime.definition.states.get(&slot.declaration_path) else {
+            return false;
+        };
+        let Some(declaration) = state.variables.get(&slot.name) else {
+            return false;
+        };
+        if key != &variable_key(&slot.declaration_path, &slot.name)
+            || declaration != &slot.declaration
+            || slot.declaration_pointer
+                != format!(
+                    "{}/variables/{}",
+                    state.pointer,
+                    super::source::escape_pointer(&slot.name)
+                )
+            || runtime
+                .active_state_activation_sequence
+                .get(&slot.declaration_path)
+                != Some(&slot.state_activation_sequence)
+            || !valid_slot_value(&slot.value, declaration)
+        {
+            return false;
+        }
+    }
+    if runtime.active.iter().any(|path| {
+        runtime.definition.states[path]
+            .variables
+            .keys()
+            .any(|name| !runtime.variables.contains_key(&variable_key(path, name)))
+    }) {
+        return false;
+    }
+
+    match runtime.status {
+        RuntimeStatus::Running if runtime.fault.is_some() => return false,
+        RuntimeStatus::Completed
+            if runtime.fault.is_some()
+                || !runtime.active.is_empty()
+                || !runtime.variables.is_empty()
+                || !runtime.components.is_empty()
+                || !runtime.owned_instances.is_empty() =>
+        {
+            return false;
+        }
+        RuntimeStatus::Faulted => {
+            let Some(fault) = &runtime.fault else {
+                return false;
+            };
+            if fault.runtime_id != runtime.runtime_id
+                || fault.cause_id.is_empty()
+                || fault.step_sequence >= aggregate.next_logical_step_sequence
+                || !validate_fault_locator(runtime, &fault.code, &fault.source_locator)
+            {
+                return false;
+            }
+        }
+        _ => {}
+    }
+
+    let mut component_keys = BTreeSet::new();
+    for component in &runtime.components {
+        let Some((owner_state, declaration)) =
+            find_component_declaration(&runtime.definition, component)
+        else {
+            return false;
+        };
+        if !component_keys.insert((
+            component.pointer.as_str(),
+            component.activation_sequence.clone(),
+        )) || !runtime.active.contains(&owner_state.path)
+            || runtime
+                .next_component_activation_sequence
+                .get(&component.pointer)
+                .is_none_or(|next| next <= &component.activation_sequence)
+        {
+            return false;
+        }
+        let expected_definition = match &declaration.definition {
+            ComponentDefinition::Machine(machine_id) => {
+                if component.runtime.machine_id != *machine_id {
+                    return false;
+                }
+                &component.runtime.definition
+            }
+            ComponentDefinition::Inline(machine) => machine.as_ref(),
+        };
+        let RuntimeRelation::Component {
+            owner_runtime_id,
+            owner_target,
+            owner_state_path,
+            component_id,
+            component_pointer,
+            declaration_index,
+            activation_sequence,
+        } = &component.runtime.relation
+        else {
+            return false;
+        };
+        if owner_runtime_id != &runtime.runtime_id
+            || owner_target.as_ref() != &runtime_target(runtime, &aggregate.root_instance_id)
+            || owner_state_path != &owner_state.path
+            || component_id != &component.component_id
+            || component_pointer != &component.pointer
+            || *declaration_index != component.declaration_index
+            || activation_sequence != &component.activation_sequence
+            || component.runtime.runtime_id
+                != component_runtime_identity_parts(
+                    &aggregate.namespace,
+                    &aggregate.root_instance_id,
+                    &runtime.runtime_id,
+                    declaration,
+                    &component.activation_sequence,
+                    expected_definition,
+                )
+            || !validate_runtime_shape(aggregate, &component.runtime, expected_definition)
+        {
+            return false;
+        }
+    }
+    let expected_components = runtime
+        .active
+        .iter()
+        .flat_map(|path| runtime.definition.states[path].components.iter())
+        .map(|component| component.pointer.as_str())
+        .collect::<BTreeSet<_>>();
+    if runtime
+        .components
+        .iter()
+        .map(|component| component.pointer.as_str())
+        .collect::<BTreeSet<_>>()
+        != expected_components
+    {
+        return false;
+    }
+
+    let mut spawn_sequences = BTreeSet::new();
+    for owned in &runtime.owned_instances {
+        if owned.runtime.status == RuntimeStatus::Completed
+            || !spawn_sequences.insert(owned.spawn_sequence.clone())
+            || runtime.next_spawn_sequence <= owned.spawn_sequence
+            || owned.reference.root_instance_id != aggregate.root_instance_id
+            || owned.reference.instance_id != owned.runtime.runtime_id
+            || owned.reference.machine_id != owned.runtime.machine_id
+            || owned.reference.machine_version != owned.runtime.machine_version
+        {
+            return false;
+        }
+        let RuntimeRelation::Spawned {
+            owner_runtime_id,
+            owner_target,
+            spawn_sequence,
+            spawn_pointer,
+            reference,
+            holder_path,
+            holder_pointer,
+            holder_activation_sequence,
+        } = &owned.runtime.relation
+        else {
+            return false;
+        };
+        if owner_runtime_id != &runtime.runtime_id
+            || owner_target.as_ref() != &runtime_target(runtime, &aggregate.root_instance_id)
+            || spawn_sequence != &owned.spawn_sequence
+            || reference != &owned.reference
+            || holder_path != &owned.holder_path
+            || holder_pointer != &owned.holder_pointer
+            || holder_activation_sequence != &owned.holder_activation_sequence
+            || find_spawn_declaration(&runtime.definition, spawn_pointer)
+                .is_none_or(|machine_id| machine_id != owned.runtime.machine_id)
+            || owned.runtime.runtime_id
+                != spawned_runtime_identity_parts(
+                    &aggregate.namespace,
+                    &aggregate.root_instance_id,
+                    &runtime.runtime_id,
+                    spawn_pointer,
+                    &owned.spawn_sequence,
+                    &owned.runtime.definition,
+                )
+            || !validate_holder(runtime, owned)
+            || !validate_runtime_shape(aggregate, &owned.runtime, &owned.runtime.definition)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_active_configuration(runtime: &RuntimeState) -> bool {
+    if runtime
+        .active
+        .iter()
+        .any(|path| !runtime.definition.states.contains_key(path))
+        || runtime.active.iter().any(|path| {
+            let mut parent = runtime.definition.states[path].parent.as_ref();
+            while let Some(path) = parent {
+                if !runtime.active.contains(path) {
+                    return true;
+                }
+                parent = runtime.definition.states[path].parent.as_ref();
+            }
+            false
+        })
+    {
+        return false;
+    }
+    if runtime.status == RuntimeStatus::Running && !runtime.active.contains("root") {
+        return false;
+    }
+    for path in &runtime.active {
+        let state = &runtime.definition.states[path];
+        if matches!(
+            state.kind,
+            CompiledStateKind::Choice | CompiledStateKind::Final
+        ) {
+            return false;
+        }
+        let active_children = state
+            .children
+            .iter()
+            .filter(|child| runtime.active.contains(*child))
+            .count();
+        match state.kind {
+            CompiledStateKind::Composite => {
+                let expected_children = usize::from(!state.children.is_empty());
+                if active_children != expected_children {
+                    return false;
+                }
+            }
+            _ if active_children != 0 => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn validate_history_value(machine: &Machine, slot: &str, paths: &[String]) -> bool {
+    let Some(declaration) = machine.states.get(slot) else {
+        return false;
+    };
+    if paths.is_empty()
+        || paths.iter().collect::<BTreeSet<_>>().len() != paths.len()
+        || paths.iter().any(|path| {
+            !machine.states.contains_key(path)
+                || !is_descendant(path, slot)
+                || matches!(
+                    machine.states[path].kind,
+                    CompiledStateKind::Choice | CompiledStateKind::Final
+                )
+        })
+    {
+        return false;
+    }
+    match declaration.history {
+        super::model::HistoryKind::None => false,
+        super::model::HistoryKind::Shallow => {
+            paths.len() == 1 && machine.states[&paths[0]].parent.as_deref() == Some(slot)
+        }
+        super::model::HistoryKind::Deep => paths.len() == 1,
+    }
+}
+
+fn machine_has_component_pointer(machine: &Machine, pointer: &str) -> bool {
+    machine
+        .states
+        .values()
+        .flat_map(|state| state.components.iter())
+        .any(|component| component.pointer == pointer)
+}
+
+fn validate_machine_shape(machine: &Machine) -> bool {
+    let Some(root) = machine.states.get("root") else {
+        return false;
+    };
+    if root.parent.is_some() || root.path != "root" || machine.root_pointer != root.pointer {
+        return false;
+    }
+    machine.states.iter().all(|(path, state)| {
+        path == &state.path
+            && !state.pointer.is_empty()
+            && state.parent.as_ref().is_none_or(|parent| {
+                machine
+                    .states
+                    .get(parent)
+                    .is_some_and(|state| state.children.iter().any(|child| child == path))
+            })
+            && state.children.iter().all(|child| {
+                machine
+                    .states
+                    .get(child)
+                    .is_some_and(|child| child.parent.as_deref() == Some(path.as_str()))
+            })
+    })
+}
+
+fn valid_slot_value(value: &Value, declaration: &VariableDeclaration) -> bool {
+    if declaration.value_type == "instance_reference" {
+        match value {
+            Value::Null => declaration.nullable == Some(true),
+            Value::InstanceReference(reference) => {
+                reference.machine_version > 0
+                    && !reference.root_instance_id.is_empty()
+                    && !reference.instance_id.is_empty()
+                    && !reference.machine_id.is_empty()
+                    && declaration
+                        .machine_id
+                        .as_ref()
+                        .is_none_or(|machine_id| machine_id == &reference.machine_id)
+            }
+            _ => false,
+        }
+    } else {
+        value.normalize_for_type(&declaration.value_type).is_some()
+    }
+}
+
+fn find_component_declaration<'a>(
+    machine: &'a Machine,
+    runtime: &ComponentRuntime,
+) -> Option<(&'a State, &'a Component)> {
+    machine.states.values().find_map(|state| {
+        state
+            .components
+            .iter()
+            .find(|component| {
+                component.pointer == runtime.pointer
+                    && component.component_id == runtime.component_id
+                    && component.declaration_index == runtime.declaration_index
+            })
+            .map(|component| (state, component))
+    })
+}
+
+fn find_spawn_declaration<'a>(machine: &'a Machine, pointer: &str) -> Option<&'a str> {
+    machine.states.values().find_map(|state| {
+        all_state_actions(state).find_map(|action| match &action.kind {
+            CompiledActionKind::Spawn { machine_id, .. } if action.pointer == pointer => {
+                Some(machine_id.as_str())
+            }
+            _ => None,
+        })
+    })
+}
+
+fn all_state_actions(state: &State) -> impl Iterator<Item = &CompiledAction> {
+    state
+        .entry
+        .iter()
+        .chain(state.exit.iter())
+        .chain(
+            state
+                .initial
+                .iter()
+                .flat_map(|initial| initial.action.iter()),
+        )
+        .chain(
+            state
+                .handlers
+                .values()
+                .flatten()
+                .flat_map(|transition| transition.action.iter()),
+        )
+        .chain(
+            state
+                .choice
+                .iter()
+                .flatten()
+                .flat_map(|choice| choice.action.iter()),
+        )
+}
+
+fn validate_fault_locator(runtime: &RuntimeState, code: &str, locator: &str) -> bool {
+    match code {
+        "contained_runtime_fault" => locator == "system:unhandled_contained_failure",
+        "cascade_fault" => locator == "system:cascade_cleanup",
+        "invariant_fault" => locator == "system:invariant",
+        "guard_fault" => runtime.definition.states.values().any(|state| {
+            state
+                .handlers
+                .values()
+                .flatten()
+                .any(|transition| transition.guard_pointer.as_deref() == Some(locator))
+                || state
+                    .choice
+                    .iter()
+                    .flatten()
+                    .any(|choice| choice.guard_pointer.as_deref() == Some(locator))
+        }),
+        "action_fault" => runtime.definition.states.values().any(|state| {
+            state.variables.iter().any(|(name, _)| {
+                let pointer = format!(
+                    "{}/variables/{}",
+                    state.pointer,
+                    super::source::escape_pointer(name)
+                );
+                locator == pointer || locator == format!("{pointer}/init")
+            }) || state
+                .components
+                .iter()
+                .any(|component| component_action_locator(component, locator))
+                || all_state_actions(state).any(|action| action_fault_locator(action, locator))
+        }),
+        "invalid_instance_target" | "inactive_component_target" => runtime
+            .definition
+            .states
+            .values()
+            .flat_map(all_state_actions)
+            .any(|action| send_target_locator(action, locator)),
+        "binding_not_empty" => runtime
+            .definition
+            .states
+            .values()
+            .flat_map(all_state_actions)
+            .any(|action| {
+                matches!(
+                    action.kind,
+                    CompiledActionKind::Spawn {
+                        bind_to: Some(_),
+                        ..
+                    }
+                ) && locator == format!("{}/spawn/bind_to", action.pointer)
+            }),
+        _ => false,
+    }
+}
+
+fn component_action_locator(component: &Component, locator: &str) -> bool {
+    if locator == format!("{}/with", component.pointer) {
+        return true;
+    }
+    for (kind, bindings) in [
+        ("input", &component.bindings.input),
+        ("external", &component.bindings.external),
+    ] {
+        if bindings.keys().any(|name| {
+            locator
+                == format!(
+                    "{}/with/{kind}/{}",
+                    component.pointer,
+                    super::source::escape_pointer(name)
+                )
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn action_fault_locator(action: &CompiledAction, locator: &str) -> bool {
+    match &action.kind {
+        CompiledActionKind::Assign { variable, .. } => {
+            locator
+                == format!(
+                    "{}/assign/{}",
+                    action.pointer,
+                    super::source::escape_pointer(variable)
+                )
+        }
+        CompiledActionKind::Send {
+            targets,
+            payload,
+            correlation_id,
+            ..
+        } => {
+            payload.keys().any(|name| {
+                locator
+                    == format!(
+                        "{}/send/payload/{}",
+                        action.pointer,
+                        super::source::escape_pointer(name)
+                    )
+            }) || locator == format!("{}/send/payload", action.pointer)
+                || correlation_id
+                    .as_ref()
+                    .is_some_and(|_| locator == format!("{}/send/correlation_id", action.pointer))
+                || targets.iter().enumerate().any(|(index, target)| {
+                    matches!(target, CompiledSendTarget::Instance(_))
+                        && locator == target_expression_pointer(action, targets, index)
+                })
+        }
+        CompiledActionKind::Refresh { only } => {
+            locator == format!("{}/refresh", action.pointer)
+                || only.as_ref().is_some_and(|only| {
+                    only.iter().enumerate().any(|(index, _)| {
+                        locator == format!("{}/refresh/only/{index}", action.pointer)
+                    })
+                })
+        }
+        CompiledActionKind::Spawn { bindings, .. } => {
+            if locator == format!("{}/spawn/bindings", action.pointer) {
+                return true;
+            }
+            for (kind, values) in [("input", &bindings.input), ("external", &bindings.external)] {
+                if values.keys().any(|name| {
+                    locator
+                        == format!(
+                            "{}/spawn/bindings/{kind}/{}",
+                            action.pointer,
+                            super::source::escape_pointer(name)
+                        )
+                }) {
+                    return true;
+                }
+            }
+            false
+        }
+        CompiledActionKind::Cancel { .. } => {
+            locator == format!("{}/cancel/instance", action.pointer)
+        }
+        CompiledActionKind::Stop => false,
+    }
+}
+
+fn send_target_locator(action: &CompiledAction, locator: &str) -> bool {
+    let CompiledActionKind::Send { targets, .. } = &action.kind else {
+        return false;
+    };
+    targets.iter().enumerate().any(|(index, target)| {
+        let base = if targets.len() == 1 {
+            format!("{}/send/to", action.pointer)
+        } else {
+            format!("{}/send/targets/{index}", action.pointer)
+        };
+        locator == base
+            || (matches!(target, CompiledSendTarget::Instance(_))
+                && locator == format!("{base}/instance"))
+    })
+}
+
+fn validate_holder(owner: &RuntimeState, owned: &OwnedRuntime) -> bool {
+    match (
+        &owned.holder_path,
+        &owned.holder_pointer,
+        &owned.runtime.relation,
+    ) {
+        (
+            Some(path),
+            Some(pointer),
+            RuntimeRelation::Spawned {
+                holder_activation_sequence,
+                ..
+            },
+        ) => owner.variables.values().any(|slot| {
+            &slot.declaration_path == path
+                && &slot.declaration_pointer == pointer
+                && &slot.state_activation_sequence == holder_activation_sequence
+                && slot.value == Value::InstanceReference(owned.reference.clone())
+        }),
+        (None, None, RuntimeRelation::Spawned { .. }) => true,
+        _ => false,
+    }
+}
+
+fn validate_runtime_bundle_binding(
+    runtime: &RuntimeState,
+    expected: &Machine,
+    bundle: &Bundle,
+) -> bool {
+    if runtime.definition != *expected {
+        return false;
+    }
+    for component in &runtime.components {
+        let Some((_, declaration)) = find_component_declaration(expected, component) else {
+            return false;
+        };
+        let target = match &declaration.definition {
+            ComponentDefinition::Machine(machine_id) => {
+                let Some(machine) = bundle.machines.get(machine_id) else {
+                    return false;
+                };
+                machine
+            }
+            ComponentDefinition::Inline(machine) => machine,
+        };
+        if !validate_runtime_bundle_binding(&component.runtime, target, bundle) {
+            return false;
+        }
+    }
+    for owned in &runtime.owned_instances {
+        let RuntimeRelation::Spawned { spawn_pointer, .. } = &owned.runtime.relation else {
+            return false;
+        };
+        let Some(machine_id) = find_spawn_declaration(expected, spawn_pointer) else {
+            return false;
+        };
+        let Some(target) = bundle.machines.get(machine_id) else {
+            return false;
+        };
+        if !validate_runtime_bundle_binding(&owned.runtime, target, bundle) {
+            return false;
+        }
+    }
+    true
 }
 
 fn initialize_root_variables(runtime: &mut RuntimeState, bindings: &Bindings) -> Result<(), ()> {
@@ -670,7 +1336,7 @@ fn resolve_delivery_target(
             owner_runtime_id,
             component_id,
             component_runtime_id,
-            *activation_sequence,
+            activation_sequence,
         )
         .ok_or("inactive_component_target"),
         Target::Component { .. } => Err("inactive_component_target"),
@@ -727,12 +1393,15 @@ fn runtime_at_mut<'a>(
 }
 
 fn find_spawn_address(runtime: &RuntimeState, instance_id: &str) -> Option<RuntimeAddress> {
+    if runtime.status != RuntimeStatus::Running {
+        return None;
+    }
     for owned in &runtime.owned_instances {
         if owned.reference.instance_id == instance_id {
-            return Some(vec![AddressSegment::Spawn(owned.spawn_sequence)]);
+            return Some(vec![AddressSegment::Spawn(owned.spawn_sequence.clone())]);
         }
         if let Some(mut nested) = find_spawn_address(&owned.runtime, instance_id) {
-            let mut address = vec![AddressSegment::Spawn(owned.spawn_sequence)];
+            let mut address = vec![AddressSegment::Spawn(owned.spawn_sequence.clone())];
             address.append(&mut nested);
             return Some(address);
         }
@@ -741,7 +1410,7 @@ fn find_spawn_address(runtime: &RuntimeState, instance_id: &str) -> Option<Runti
         if let Some(mut nested) = find_spawn_address(&component.runtime, instance_id) {
             let mut address = vec![AddressSegment::Component(
                 component.component_id.clone(),
-                component.activation_sequence,
+                component.activation_sequence.clone(),
             )];
             address.append(&mut nested);
             return Some(address);
@@ -755,17 +1424,20 @@ fn find_component_address(
     owner_runtime_id: &str,
     component_id: &str,
     component_runtime_id: &str,
-    activation_sequence: u64,
+    activation_sequence: &Counter,
 ) -> Option<RuntimeAddress> {
+    if runtime.status != RuntimeStatus::Running {
+        return None;
+    }
     if runtime.runtime_id == owner_runtime_id {
         let component = runtime.components.iter().find(|component| {
             component.component_id == component_id
-                && component.activation_sequence == activation_sequence
+                && &component.activation_sequence == activation_sequence
                 && component.runtime.runtime_id == component_runtime_id
         })?;
         return Some(vec![AddressSegment::Component(
             component.component_id.clone(),
-            component.activation_sequence,
+            component.activation_sequence.clone(),
         )]);
     }
     for component in &runtime.components {
@@ -778,7 +1450,7 @@ fn find_component_address(
         ) {
             let mut address = vec![AddressSegment::Component(
                 component.component_id.clone(),
-                component.activation_sequence,
+                component.activation_sequence.clone(),
             )];
             address.append(&mut nested);
             return Some(address);
@@ -792,7 +1464,7 @@ fn find_component_address(
             component_runtime_id,
             activation_sequence,
         ) {
-            let mut address = vec![AddressSegment::Spawn(owned.spawn_sequence)];
+            let mut address = vec![AddressSegment::Spawn(owned.spawn_sequence.clone())];
             address.append(&mut nested);
             return Some(address);
         }
@@ -801,11 +1473,25 @@ fn find_component_address(
 }
 
 fn root_runtime_identity(bundle: &Bundle, machine: &Machine, root_instance_id: &str) -> String {
+    root_runtime_identity_parts(
+        &bundle.fingerprint,
+        &bundle.namespace,
+        machine,
+        root_instance_id,
+    )
+}
+
+fn root_runtime_identity_parts(
+    fingerprint: &str,
+    namespace: &str,
+    machine: &Machine,
+    root_instance_id: &str,
+) -> String {
     hash_json(serde_json::json!([
         "determa-root-runtime-identity-2",
         "1",
-        bundle.fingerprint,
-        bundle.namespace,
+        fingerprint,
+        namespace,
         machine.machine_id,
         machine.version.to_string(),
         root_instance_id
@@ -819,9 +1505,9 @@ fn initialization_cause(
     source_runtime_id: &str,
     target_runtime_id: &str,
     parent_provenance: &str,
-    step_sequence: u64,
+    step_sequence: &Counter,
     source_locator: &str,
-    ordinal: u64,
+    ordinal: &Counter,
 ) -> String {
     hash_json(serde_json::json!([
         "determa-cause-identity-1",
@@ -842,7 +1528,7 @@ fn internal_event_identity(
     source_runtime_id: &str,
     target_runtime_id: &str,
     cause_id: &str,
-    step_sequence: u64,
+    step_sequence: &Counter,
     locator: &str,
     ordinal: usize,
 ) -> String {
@@ -864,7 +1550,7 @@ fn external_effect_identity(
     runtime: &RuntimeState,
     root_instance_id: &str,
     cause_id: &str,
-    step_sequence: u64,
+    step_sequence: &Counter,
     locator: &str,
     ordinal: usize,
 ) -> String {
@@ -890,7 +1576,25 @@ fn component_runtime_identity(
     root_instance_id: &str,
     owner_runtime_id: &str,
     component: &Component,
-    activation_sequence: u64,
+    activation_sequence: &Counter,
+    machine: &Machine,
+) -> String {
+    component_runtime_identity_parts(
+        &bundle.namespace,
+        root_instance_id,
+        owner_runtime_id,
+        component,
+        activation_sequence,
+        machine,
+    )
+}
+
+fn component_runtime_identity_parts(
+    namespace: &str,
+    root_instance_id: &str,
+    owner_runtime_id: &str,
+    component: &Component,
+    activation_sequence: &Counter,
     machine: &Machine,
 ) -> String {
     hash_json(serde_json::json!([
@@ -900,7 +1604,7 @@ fn component_runtime_identity(
         owner_runtime_id,
         component.pointer,
         activation_sequence.to_string(),
-        bundle.namespace,
+        namespace,
         machine.machine_id,
         machine.version.to_string()
     ]))
@@ -911,7 +1615,25 @@ fn spawned_runtime_identity(
     root_instance_id: &str,
     owner_runtime_id: &str,
     spawn_pointer: &str,
-    spawn_sequence: u64,
+    spawn_sequence: &Counter,
+    machine: &Machine,
+) -> String {
+    spawned_runtime_identity_parts(
+        &bundle.namespace,
+        root_instance_id,
+        owner_runtime_id,
+        spawn_pointer,
+        spawn_sequence,
+        machine,
+    )
+}
+
+fn spawned_runtime_identity_parts(
+    namespace: &str,
+    root_instance_id: &str,
+    owner_runtime_id: &str,
+    spawn_pointer: &str,
+    spawn_sequence: &Counter,
     machine: &Machine,
 ) -> String {
     hash_json(serde_json::json!([
@@ -921,7 +1643,7 @@ fn spawned_runtime_identity(
         owner_runtime_id,
         spawn_pointer,
         spawn_sequence.to_string(),
-        bundle.namespace,
+        namespace,
         machine.machine_id,
         machine.version.to_string()
     ]))
@@ -1285,12 +2007,11 @@ fn enter_state(
     let activation_sequence = runtime
         .next_state_activation_sequence
         .entry(path.to_string())
-        .or_insert(0);
-    let allocated_activation = *activation_sequence;
-    *activation_sequence += 1;
+        .or_default();
+    let allocated_activation = activation_sequence.allocate();
     runtime
         .active_state_activation_sequence
-        .insert(path.to_string(), allocated_activation);
+        .insert(path.to_string(), allocated_activation.clone());
     runtime.active.insert(path.to_string());
 
     if state.kind == CompiledStateKind::Parallel {
@@ -1300,7 +2021,7 @@ fn enter_state(
         runtime,
         &state,
         bindings,
-        allocated_activation,
+        allocated_activation.clone(),
         root_variables_prevalidated,
     )?;
     run_actions(runtime, path, &state.entry, None, context)?;
@@ -1317,7 +2038,7 @@ fn initialize_state_variables(
     runtime: &mut RuntimeState,
     state: &State,
     bindings: &Bindings,
-    state_activation_sequence: u64,
+    state_activation_sequence: Counter,
     root_variables_prevalidated: bool,
 ) -> Result<(), StepFault> {
     for (name, declaration) in &state.variables {
@@ -1371,7 +2092,7 @@ fn initialize_state_variables(
                 ),
                 declaration: declaration.clone(),
                 value,
-                state_activation_sequence,
+                state_activation_sequence: state_activation_sequence.clone(),
             },
         );
     }
@@ -1615,7 +2336,7 @@ fn run_actions(
                         source_locator: format!("{}/cancel/instance", action.pointer),
                     })?;
                 if let Value::InstanceReference(reference) = value {
-                    cancel_owned(runtime, &reference, context)?;
+                    let _ = cancel_owned(runtime, &reference, context)?;
                 }
             }
             CompiledActionKind::Stop => {
@@ -1710,9 +2431,10 @@ fn execute_send(
     }
     for (ordinal, target) in resolved.into_iter().enumerate() {
         if matches!(target, Target::External) {
-            let sequence = *context.next_output_sequence;
-            *context.next_output_sequence += 1;
+            let sequence = context.next_output_sequence.allocate();
             context.emissions.push(Emission {
+                emitting_runtime_id: runtime.runtime_id.clone(),
+                emitting_owner_runtime_id: runtime_owner_runtime_id(runtime),
                 event: event.to_string(),
                 event_id: None,
                 target,
@@ -1723,7 +2445,7 @@ fn execute_send(
                     runtime,
                     context.root_instance_id,
                     &context.cause_id,
-                    context.step_sequence,
+                    &context.step_sequence,
                     &action.pointer,
                     ordinal,
                 )),
@@ -1732,13 +2454,15 @@ fn execute_send(
         } else {
             let target_runtime_id = target_runtime_id(&target);
             context.emissions.push(Emission {
+                emitting_runtime_id: runtime.runtime_id.clone(),
+                emitting_owner_runtime_id: runtime_owner_runtime_id(runtime),
                 event: event.to_string(),
                 event_id: Some(internal_event_identity(
                     context.root_instance_id,
                     &runtime.runtime_id,
                     &target_runtime_id,
                     &context.cause_id,
-                    context.step_sequence,
+                    &context.step_sequence,
                     &action.pointer,
                     ordinal,
                 )),
@@ -1805,7 +2529,7 @@ fn resolve_author_target(
                 owner_runtime_id: runtime.runtime_id.clone(),
                 component_id: component.component_id.clone(),
                 component_runtime_id: component.runtime.runtime_id.clone(),
-                activation_sequence: component.activation_sequence,
+                activation_sequence: component.activation_sequence.clone(),
             })
         }
         CompiledSendTarget::Instance(_) => {
@@ -1843,13 +2567,13 @@ fn runtime_target(runtime: &RuntimeState, root_instance_id: &str) -> Target {
             owner_runtime_id: owner_runtime_id.clone(),
             component_id: component_id.clone(),
             component_runtime_id: runtime.runtime_id.clone(),
-            activation_sequence: *activation_sequence,
+            activation_sequence: activation_sequence.clone(),
         },
         RuntimeRelation::Spawned { reference, .. } => Target::SpawnedInstance(reference.clone()),
     }
 }
 
-fn owner_target(runtime: &RuntimeState, root_instance_id: &str) -> Option<Target> {
+fn runtime_owner_runtime_id(runtime: &RuntimeState) -> Option<String> {
     match &runtime.relation {
         RuntimeRelation::Root => None,
         RuntimeRelation::Component {
@@ -1857,10 +2581,15 @@ fn owner_target(runtime: &RuntimeState, root_instance_id: &str) -> Option<Target
         }
         | RuntimeRelation::Spawned {
             owner_runtime_id, ..
-        } => Some(Target::Root {
-            root_instance_id: root_instance_id.to_string(),
-            root_runtime_id: owner_runtime_id.clone(),
-        }),
+        } => Some(owner_runtime_id.clone()),
+    }
+}
+
+fn owner_target(runtime: &RuntimeState, _root_instance_id: &str) -> Option<Target> {
+    match &runtime.relation {
+        RuntimeRelation::Root => None,
+        RuntimeRelation::Component { owner_target, .. }
+        | RuntimeRelation::Spawned { owner_target, .. } => Some((**owner_target).clone()),
     }
 }
 
@@ -1906,14 +2635,13 @@ fn execute_spawn(
         code: "action_fault",
         source_locator: format!("{}/spawn/bindings", action.pointer),
     })?;
-    let spawn_sequence = runtime.next_spawn_sequence;
-    runtime.next_spawn_sequence += 1;
+    let spawn_sequence = runtime.next_spawn_sequence.allocate();
     let instance_id = spawned_runtime_identity(
         context.bundle,
         context.root_instance_id,
         &runtime.runtime_id,
         &action.pointer,
-        spawn_sequence,
+        &spawn_sequence,
         &machine,
     );
     let reference = InstanceReference {
@@ -1936,19 +2664,20 @@ fn execute_spawn(
         (
             Some(slot.declaration_path.clone()),
             Some(slot.declaration_pointer.clone()),
-            slot.state_activation_sequence,
+            slot.state_activation_sequence.clone(),
         )
     } else {
-        (None, None, 0)
+        (None, None, Counter::zero())
     };
     let relation = RuntimeRelation::Spawned {
         owner_runtime_id: runtime.runtime_id.clone(),
-        spawn_sequence,
+        owner_target: Box::new(runtime_target(runtime, context.root_instance_id)),
+        spawn_sequence: spawn_sequence.clone(),
         spawn_pointer: action.pointer.clone(),
         reference: reference.clone(),
         holder_path: holder_path.clone(),
         holder_pointer: holder_pointer.clone(),
-        holder_activation_sequence,
+        holder_activation_sequence: holder_activation_sequence.clone(),
     };
     let mut child = RuntimeState::new(instance_id.clone(), machine, relation);
     initialize_root_variables(&mut child, &bindings).map_err(|_| StepFault {
@@ -1961,9 +2690,9 @@ fn execute_spawn(
         &runtime.runtime_id,
         &instance_id,
         &context.cause_id,
-        context.step_sequence,
+        &context.step_sequence,
         &action.pointer,
-        spawn_sequence,
+        &spawn_sequence,
     );
     let parent_cause = std::mem::replace(&mut context.cause_id, child_cause.clone());
     let initialization = initialize_runtime(&mut child, &bindings, context, true);
@@ -1973,7 +2702,7 @@ fn execute_spawn(
             runtime_id: child.runtime_id.clone(),
             cause_id: child_cause,
             code: fault.code.to_string(),
-            step_sequence: context.step_sequence,
+            step_sequence: context.step_sequence.clone(),
             source_locator: fault.source_locator,
         };
         child = RuntimeState::new(
@@ -1981,6 +2710,7 @@ fn execute_spawn(
             child.definition.clone(),
             child.relation.clone(),
         );
+        child.history.clear();
         child.status = RuntimeStatus::Faulted;
         child.fault = Some(record.clone());
         emit_failure_notification(&child, &record, context);
@@ -2066,9 +2796,8 @@ fn allocate_components(
         let next = runtime
             .next_component_activation_sequence
             .entry(component.pointer.clone())
-            .or_insert(0);
-        let activation_sequence = *next;
-        *next += 1;
+            .or_default();
+        let activation_sequence = next.allocate();
         let machine = match &component.definition {
             ComponentDefinition::Machine(machine_id) => context.bundle.machines[machine_id].clone(),
             ComponentDefinition::Inline(machine) => machine.as_ref().clone(),
@@ -2078,16 +2807,17 @@ fn allocate_components(
             context.root_instance_id,
             &runtime.runtime_id,
             component,
-            activation_sequence,
+            &activation_sequence,
             &machine,
         );
         let relation = RuntimeRelation::Component {
             owner_runtime_id: runtime.runtime_id.clone(),
+            owner_target: Box::new(runtime_target(runtime, context.root_instance_id)),
             owner_state_path: state.path.clone(),
             component_id: component.component_id.clone(),
             component_pointer: component.pointer.clone(),
             declaration_index: component.declaration_index,
-            activation_sequence,
+            activation_sequence: activation_sequence.clone(),
         };
         runtime.components.push(ComponentRuntime {
             component_id: component.component_id.clone(),
@@ -2134,9 +2864,9 @@ fn initialize_components(
             &runtime.runtime_id,
             &child.runtime_id,
             &context.cause_id,
-            context.step_sequence,
+            &context.step_sequence,
             &component_definition.pointer,
-            component_definition.declaration_index as u64,
+            &Counter::from(component_definition.declaration_index),
         );
         let parent_cause = std::mem::replace(&mut context.cause_id, child_cause.clone());
         let initialization = initialize_runtime(child, &bindings, context, true);
@@ -2149,10 +2879,11 @@ fn initialize_components(
                 runtime_id: runtime_id.clone(),
                 cause_id: child_cause,
                 code: fault.code.to_string(),
-                step_sequence: context.step_sequence,
+                step_sequence: context.step_sequence.clone(),
                 source_locator: fault.source_locator,
             };
             *child = RuntimeState::new(runtime_id, definition, relation);
+            child.history.clear();
             child.status = RuntimeStatus::Faulted;
             child.fault = Some(record.clone());
             emit_failure_notification(child, &record, context);
@@ -2162,6 +2893,13 @@ fn initialize_components(
 }
 
 fn complete_runtime(
+    runtime: &mut RuntimeState,
+    context: &mut StepContext<'_>,
+) -> Result<(), StepFault> {
+    complete_runtime_inner(runtime, context).map_err(|_| cascade_step_fault())
+}
+
+fn complete_runtime_inner(
     runtime: &mut RuntimeState,
     context: &mut StepContext<'_>,
 ) -> Result<(), StepFault> {
@@ -2235,14 +2973,7 @@ fn cleanup_state_children(
             _ => None,
         })
         .collect::<Vec<_>>();
-    component_indices.sort_by_key(|index| {
-        let component = &runtime.components[*index];
-        std::cmp::Reverse((
-            component.pointer.clone(),
-            component.declaration_index,
-            component.activation_sequence,
-        ))
-    });
+    sort_component_cleanup_indices(runtime, &mut component_indices);
     for index in component_indices {
         cleanup_runtime(&mut runtime.components[index].runtime, context)?;
     }
@@ -2263,17 +2994,10 @@ fn cleanup_state_children(
         .filter(|(_, owned)| owned.holder_path.as_deref() == Some(path))
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    selected.sort_by_key(|index| {
-        let owned = &runtime.owned_instances[*index];
-        (
-            owned.holder_pointer.clone().unwrap_or_default(),
-            owned.holder_activation_sequence,
-            owned.spawn_sequence,
-        )
-    });
+    sort_owned_cleanup_indices(runtime, &mut selected);
     let selected_sequences = selected
         .iter()
-        .map(|index| runtime.owned_instances[*index].spawn_sequence)
+        .map(|index| runtime.owned_instances[*index].spawn_sequence.clone())
         .collect::<BTreeSet<_>>();
     for index in selected {
         cleanup_runtime(&mut runtime.owned_instances[index].runtime, context)?;
@@ -2289,28 +3013,13 @@ fn cleanup_all_descendants(
     context: &mut StepContext<'_>,
 ) -> Result<(), StepFault> {
     let mut component_indices = (0..runtime.components.len()).collect::<Vec<_>>();
-    component_indices.sort_by_key(|index| {
-        let component = &runtime.components[*index];
-        std::cmp::Reverse((
-            component.pointer.clone(),
-            component.declaration_index,
-            component.activation_sequence,
-        ))
-    });
+    sort_component_cleanup_indices(runtime, &mut component_indices);
     for index in component_indices {
         cleanup_runtime(&mut runtime.components[index].runtime, context)?;
     }
     runtime.components.clear();
     let mut owned_indices = (0..runtime.owned_instances.len()).collect::<Vec<_>>();
-    owned_indices.sort_by_key(|index| {
-        let owned = &runtime.owned_instances[*index];
-        (
-            usize::from(owned.holder_path.is_none()),
-            owned.holder_pointer.clone().unwrap_or_default(),
-            owned.holder_activation_sequence,
-            owned.spawn_sequence,
-        )
-    });
+    sort_owned_cleanup_indices(runtime, &mut owned_indices);
     for index in owned_indices {
         cleanup_runtime(&mut runtime.owned_instances[index].runtime, context)?;
     }
@@ -2318,7 +3027,52 @@ fn cleanup_all_descendants(
     Ok(())
 }
 
+fn sort_component_cleanup_indices(runtime: &RuntimeState, indices: &mut [usize]) {
+    indices.sort_by(|left, right| {
+        let left = component_cleanup_key(runtime, &runtime.components[*left]);
+        let right = component_cleanup_key(runtime, &runtime.components[*right]);
+        right.cmp(&left)
+    });
+}
+
+fn component_cleanup_key(
+    owner: &RuntimeState,
+    component: &ComponentRuntime,
+) -> (String, Counter, usize, Counter) {
+    let RuntimeRelation::Component {
+        owner_state_path, ..
+    } = &component.runtime.relation
+    else {
+        unreachable!("component collection contains a non-component runtime");
+    };
+    (
+        owner.definition.states[owner_state_path].pointer.clone(),
+        owner.active_state_activation_sequence[owner_state_path].clone(),
+        component.declaration_index,
+        component.activation_sequence.clone(),
+    )
+}
+
+fn sort_owned_cleanup_indices(runtime: &RuntimeState, indices: &mut [usize]) {
+    indices.sort_by_key(|index| {
+        let owned = &runtime.owned_instances[*index];
+        (
+            usize::from(owned.holder_path.is_none()),
+            owned.holder_pointer.clone().unwrap_or_default(),
+            owned.holder_activation_sequence.clone(),
+            owned.spawn_sequence.clone(),
+        )
+    });
+}
+
 fn cleanup_runtime(
+    runtime: &mut RuntimeState,
+    context: &mut StepContext<'_>,
+) -> Result<(), StepFault> {
+    cleanup_runtime_inner(runtime, context).map_err(|_| cascade_step_fault())
+}
+
+fn cleanup_runtime_inner(
     runtime: &mut RuntimeState,
     context: &mut StepContext<'_>,
 ) -> Result<(), StepFault> {
@@ -2339,11 +3093,18 @@ fn cleanup_runtime(
     Ok(())
 }
 
+fn cascade_step_fault() -> StepFault {
+    StepFault {
+        code: "cascade_fault",
+        source_locator: "system:cascade_cleanup".to_string(),
+    }
+}
+
 fn cancel_owned(
     runtime: &mut RuntimeState,
     reference: &InstanceReference,
     context: &mut StepContext<'_>,
-) -> Result<(), StepFault> {
+) -> Result<bool, StepFault> {
     if let Some(index) = runtime
         .owned_instances
         .iter()
@@ -2351,31 +3112,26 @@ fn cancel_owned(
     {
         cleanup_runtime(&mut runtime.owned_instances[index].runtime, context)?;
         runtime.owned_instances.remove(index);
-        return Ok(());
+        return Ok(true);
     }
     for owned in &mut runtime.owned_instances {
-        if cancel_owned(&mut owned.runtime, reference, context).is_ok()
-            && find_spawn_address(&owned.runtime, &reference.instance_id).is_none()
-        {
-            return Ok(());
+        if cancel_owned(&mut owned.runtime, reference, context)? {
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn emit_completion_notification(runtime: &RuntimeState, context: &mut StepContext<'_>) {
     match &runtime.relation {
         RuntimeRelation::Root => {}
         RuntimeRelation::Component {
-            owner_runtime_id,
+            owner_target,
             owner_state_path,
             component_id,
             ..
         } => {
-            let target = Target::Root {
-                root_instance_id: context.root_instance_id.to_string(),
-                root_runtime_id: owner_runtime_id.clone(),
-            };
+            let target = (**owner_target).clone();
             let payload = BTreeMap::from([
                 (
                     "component_id".to_string(),
@@ -2401,14 +3157,11 @@ fn emit_completion_notification(runtime: &RuntimeState, context: &mut StepContex
             let _ = owner_state_path;
         }
         RuntimeRelation::Spawned {
-            owner_runtime_id,
+            owner_target,
             reference,
             ..
         } => {
-            let target = Target::Root {
-                root_instance_id: context.root_instance_id.to_string(),
-                root_runtime_id: owner_runtime_id.clone(),
-            };
+            let target = (**owner_target).clone();
             let payload = BTreeMap::from([
                 (
                     "relationship".to_string(),
@@ -2470,7 +3223,7 @@ fn emit_failure_notification(
     ]));
     match &runtime.relation {
         RuntimeRelation::Component {
-            owner_runtime_id,
+            owner_target,
             component_id,
             ..
         } => {
@@ -2488,10 +3241,7 @@ fn emit_failure_notification(
             push_system_emission(
                 runtime,
                 "determa.component_failed",
-                Target::Root {
-                    root_instance_id: context.root_instance_id.to_string(),
-                    root_runtime_id: owner_runtime_id.clone(),
-                },
+                (**owner_target).clone(),
                 payload,
                 "system:component_failure",
                 0,
@@ -2499,7 +3249,7 @@ fn emit_failure_notification(
             );
         }
         RuntimeRelation::Spawned {
-            owner_runtime_id,
+            owner_target,
             reference,
             ..
         } => {
@@ -2525,10 +3275,7 @@ fn emit_failure_notification(
             push_system_emission(
                 runtime,
                 "determa.spawned_instance_failed",
-                Target::Root {
-                    root_instance_id: context.root_instance_id.to_string(),
-                    root_runtime_id: owner_runtime_id.clone(),
-                },
+                (**owner_target).clone(),
                 payload,
                 "system:spawned_failure",
                 0,
@@ -2550,13 +3297,15 @@ fn push_system_emission(
     context: &mut StepContext<'_>,
 ) {
     context.emissions.push(Emission {
+        emitting_runtime_id: runtime.runtime_id.clone(),
+        emitting_owner_runtime_id: runtime_owner_runtime_id(runtime),
         event: event.to_string(),
         event_id: Some(internal_event_identity(
             context.root_instance_id,
             &runtime.runtime_id,
             &target_runtime_id(&target),
             &context.cause_id,
-            context.step_sequence,
+            &context.step_sequence,
             locator,
             ordinal,
         )),
@@ -2603,7 +3352,7 @@ fn append_parallel_done_if_needed(
     aggregate: &mut AggregateState,
     address: &[AddressSegment],
     cause_id: &str,
-    step_sequence: u64,
+    step_sequence: Counter,
     emissions: &mut Vec<Emission>,
     bundle: &Bundle,
 ) {
@@ -2654,12 +3403,14 @@ fn append_parallel_done_if_needed(
         &owner.runtime_id,
         &owner.runtime_id,
         cause_id,
-        step_sequence,
+        &step_sequence,
         "system:component_completion",
         1,
     );
     let _ = bundle;
     emissions.push(Emission {
+        emitting_runtime_id: owner.runtime_id.clone(),
+        emitting_owner_runtime_id: runtime_owner_runtime_id(owner),
         event: "done".to_string(),
         event_id: Some(event_id),
         target,
@@ -2757,4 +3508,522 @@ fn direct_child_path(leaf: &str, parent: &str) -> Option<String> {
     let suffix = leaf.strip_prefix(parent)?.strip_prefix('.')?;
     let child = suffix.split('.').next()?;
     Some(format!("{parent}.{child}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format1::load_bundle;
+
+    const IDENTITY_VECTOR_BUNDLE: &str = r#"
+format: 1
+namespace: example.turnstile
+events:
+  tick:
+    payload:
+      amount: { type: float, default: 1 }
+meta:
+  large_integer: 9007199254740993
+  integer_one: 1
+  floating_one: 1.0
+machines:
+  - machine_id: turnstile
+    events:
+      local_notice:
+        payload:
+          value: { type: int, required: true }
+    root:
+      type: composite
+      variables:
+        attempts: { type: int, init: 0 }
+      initial: { transition_to: locked }
+      states:
+        locked:
+          type: parallel
+          components:
+            - component_id: left
+              root: {}
+            - component_id: right
+              root: {}
+          on_events:
+            tick:
+              transition_to: unlocked
+              action:
+                - send:
+                    event: local_notice
+                    payload: { value: "1" }
+        unlocked: {}
+"#;
+
+    fn cascade_fault_bundle(mode: &str) -> String {
+        let root = match mode {
+            "cancel" => {
+                r#"
+    root:
+      type: composite
+      variables:
+        child:
+          type: instance_reference
+          machine_id: faulty
+          nullable: true
+          init: null
+      entry:
+        - spawn: { machine_id: faulty, bind_to: child }
+      initial: { transition_to: active }
+      states:
+        active:
+          on_events:
+            trigger:
+              action:
+                - cancel: { instance: "child" }
+"#
+            }
+            "holder" => {
+                r#"
+    root:
+      type: composite
+      initial: { transition_to: active }
+      states:
+        active:
+          variables:
+            child:
+              type: instance_reference
+              machine_id: faulty
+              nullable: true
+              init: null
+          entry:
+            - spawn: { machine_id: faulty, bind_to: child }
+          on_events:
+            trigger: { transition_to: done }
+        done: {}
+"#
+            }
+            "stop" => {
+                r#"
+    root:
+      type: composite
+      variables:
+        child:
+          type: instance_reference
+          machine_id: faulty
+          nullable: true
+          init: null
+      entry:
+        - spawn: { machine_id: faulty, bind_to: child }
+      initial: { transition_to: active }
+      states:
+        active:
+          on_events:
+            trigger:
+              action:
+                - stop: {}
+"#
+            }
+            "completion" => {
+                r#"
+    root:
+      type: composite
+      variables:
+        child:
+          type: instance_reference
+          machine_id: faulty
+          nullable: true
+          init: null
+      entry:
+        - spawn: { machine_id: faulty, bind_to: child }
+      initial: { transition_to: active }
+      states:
+        active:
+          on_events:
+            trigger: { transition_to: finished }
+        finished: { type: final }
+"#
+            }
+            "parallel" => {
+                r#"
+    root:
+      type: composite
+      initial: { transition_to: active }
+      states:
+        active:
+          type: parallel
+          components:
+            - component_id: faulty
+              root:
+                type: composite
+                variables:
+                  value: { type: int, init: 1 }
+                exit:
+                  - send:
+                      event: cleanup_started
+                      to: { external: true }
+                      correlation_id: "'cleanup'"
+                  - assign: { value: "value / 0" }
+                initial: { transition_to: running }
+                states:
+                  running: {}
+            - component_id: healthy
+              root: {}
+          on_events:
+            trigger: { transition_to: done }
+        done: {}
+"#
+            }
+            _ => unreachable!(),
+        };
+        format!(
+            r#"
+format: 1
+namespace: test.cascade_{mode}
+events:
+  trigger: {{ direction: input }}
+  cleanup_started: {{ direction: output }}
+machines:
+  - machine_id: owner
+{root}
+  - machine_id: faulty
+    root:
+      type: composite
+      variables:
+        value: {{ type: int, init: 1 }}
+      exit:
+        - send:
+            event: cleanup_started
+            to: {{ external: true }}
+            correlation_id: "'cleanup'"
+        - assign: {{ value: "value / 0" }}
+      initial: {{ transition_to: running }}
+      states:
+        running: {{}}
+"#
+        )
+    }
+
+    #[test]
+    fn exact_normative_identity_vectors() {
+        let bundle = load_bundle(IDENTITY_VECTOR_BUNDLE).unwrap();
+        assert_eq!(
+            bundle.fingerprint,
+            "sha256:7e48ad82ea5305c24b7730f4fd24c36ec196a0875c982b85eba5b3a5ddcbb92f"
+        );
+        let result = create(
+            &bundle,
+            "turnstile",
+            "turnstile-42",
+            "create-7",
+            &Bindings::default(),
+        );
+        assert_eq!(result.status, ResultStatus::Running);
+        let aggregate = result.state.unwrap();
+        assert_eq!(
+            aggregate.root.runtime_id,
+            "sha256:72dca6d0b2b3690ae28bda2f17a461179b18fbf11daad7a12709d9384a500c64"
+        );
+        let left = &aggregate.root.components[0];
+        assert_eq!(left.component_id, "left");
+        assert_eq!(
+            left.runtime.runtime_id,
+            "sha256:43db74b6a8d6f31543f7d142fb5e25a49e33eb3bf548e7bfd20d59513778cbc3"
+        );
+        assert_eq!(
+            initialization_cause(
+                "root_initialization",
+                "turnstile-42",
+                &aggregate.root.runtime_id,
+                &aggregate.root.runtime_id,
+                "create-7",
+                &Counter::zero(),
+                "/machines/0/root",
+                &Counter::zero(),
+            ),
+            "sha256:c9e8e89a01362f40e9a74c01392d09abe2323f31c8f14f22e05bfcaf6dfac0ab"
+        );
+        assert_eq!(
+            runtime_target(&left.runtime, &aggregate.root_instance_id),
+            Target::Component {
+                root_instance_id: "turnstile-42".to_string(),
+                owner_runtime_id: aggregate.root.runtime_id.clone(),
+                component_id: "left".to_string(),
+                component_runtime_id: left.runtime.runtime_id.clone(),
+                activation_sequence: Counter::zero(),
+            }
+        );
+    }
+
+    #[test]
+    fn event_and_effect_hashes_preserve_large_counter_decimals() {
+        let bundle = load_bundle(IDENTITY_VECTOR_BUNDLE).unwrap();
+        let aggregate = create(
+            &bundle,
+            "turnstile",
+            "turnstile-42",
+            "create-7",
+            &Bindings::default(),
+        )
+        .state
+        .unwrap();
+        let root_id = &aggregate.root.runtime_id;
+        let component_id = &aggregate.root.components[0].runtime.runtime_id;
+        let cause_id = "sha256:c9e8e89a01362f40e9a74c01392d09abe2323f31c8f14f22e05bfcaf6dfac0ab";
+        let step = Counter::from_decimal("9007199254740993").unwrap();
+        let locator = "/machines/0/root/states/locked/on_events/tick/action/0";
+        assert_eq!(
+            internal_event_identity(
+                "turnstile-42",
+                root_id,
+                component_id,
+                cause_id,
+                &step,
+                locator,
+                0,
+            ),
+            "sha256:4546950b5141f5c27568f01832a44571dbb2f8b4b62f7ed0e1985f93a817bf12"
+        );
+        assert_eq!(
+            external_effect_identity(
+                &bundle,
+                &aggregate.root,
+                "turnstile-42",
+                cause_id,
+                &step,
+                locator,
+                0,
+            ),
+            "sha256:7386c6dfe80ee1019984b2b96d275d0ca90eddc9ba9075d57e120a3bd6b13386"
+        );
+    }
+
+    #[test]
+    fn every_root_completion_cascade_uses_canonical_component_and_holder_order() {
+        let mut source = r#"
+format: 1
+namespace: test.lifecycle_order
+events:
+  stop_all: { direction: input }
+  leave: { direction: input }
+  cleaned:
+    direction: output
+    payload:
+      label: { type: string, required: true }
+machines:
+  - machine_id: owner
+    root:
+      type: composite
+      initial: { transition_to: processing }
+      states:
+        processing:
+          type: parallel
+          variables:
+            a_holder:
+              type: instance_reference
+              machine_id: worker
+              nullable: true
+              init: null
+            z_holder:
+              type: instance_reference
+              machine_id: worker
+              nullable: true
+              init: null
+          entry:
+            - spawn:
+                machine_id: worker
+                bindings: { input: { label: "'spawn-z'" } }
+                bind_to: z_holder
+            - spawn:
+                machine_id: worker
+                bindings: { input: { label: "'spawn-a'" } }
+                bind_to: a_holder
+            - spawn:
+                machine_id: worker
+                bindings: { input: { label: "'spawn-unbound'" } }
+          components:
+"#
+        .to_string();
+        for index in 0..11 {
+            source.push_str(&format!(
+                r#"
+            - component_id: component_{index}
+              root:
+                type: composite
+                variables:
+                  label: {{ type: string, init: component-{index} }}
+                exit:
+                  - send:
+                      event: cleaned
+                      to: {{ external: true }}
+                      payload: {{ label: "label" }}
+                      correlation_id: "label"
+                initial: {{ transition_to: active }}
+                states:
+                  active: {{}}
+"#
+            ));
+        }
+        source.push_str(
+            r#"
+          on_events:
+            stop_all:
+              action:
+                - stop: {}
+            leave: { transition_to: finished }
+        finished: {}
+  - machine_id: worker
+    root:
+      type: composite
+      variables:
+        label: { type: string, input: true }
+      exit:
+        - send:
+            event: cleaned
+            to: { external: true }
+            payload: { label: "label" }
+            correlation_id: "label"
+      initial: { transition_to: active }
+      states:
+        active: {}
+"#,
+        );
+        let bundle = load_bundle(&source).unwrap();
+        let created = create(
+            &bundle,
+            "owner",
+            "lifecycle-order-1",
+            "create-lifecycle-order-1",
+            &Bindings::default(),
+        );
+        let prior = created.state.unwrap();
+        let result = dispatch(
+            &bundle,
+            &prior,
+            Some(Delivery::Input(Envelope {
+                event: "stop_all".to_string(),
+                event_id: "stop-all-1".to_string(),
+                target: runtime_target(&prior.root, &prior.root_instance_id),
+                payload: BTreeMap::new(),
+                correlation_id: None,
+            })),
+        );
+        assert_eq!(
+            result.status,
+            ResultStatus::Completed,
+            "unexpected stop result: {result:?}"
+        );
+        let labels = result
+            .emissions
+            .iter()
+            .map(|emission| match &emission.payload["label"] {
+                Value::String(value) => value.as_str(),
+                value => panic!("unexpected cleanup label {value:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "component-10",
+                "component-9",
+                "component-8",
+                "component-7",
+                "component-6",
+                "component-5",
+                "component-4",
+                "component-3",
+                "component-2",
+                "component-1",
+                "component-0",
+                "spawn-a",
+                "spawn-z",
+                "spawn-unbound",
+            ]
+        );
+
+        let transition_prior = create(
+            &bundle,
+            "owner",
+            "lifecycle-order-2",
+            "create-lifecycle-order-2",
+            &Bindings::default(),
+        )
+        .state
+        .unwrap();
+        let transitioned = dispatch(
+            &bundle,
+            &transition_prior,
+            Some(Delivery::Input(Envelope {
+                event: "leave".to_string(),
+                event_id: "leave-2".to_string(),
+                target: runtime_target(&transition_prior.root, &transition_prior.root_instance_id),
+                payload: BTreeMap::new(),
+                correlation_id: None,
+            })),
+        );
+        let transition_labels = transitioned
+            .emissions
+            .iter()
+            .map(|emission| match &emission.payload["label"] {
+                Value::String(value) => value.as_str(),
+                value => panic!("unexpected transition cleanup label {value:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(transition_labels, labels[..13]);
+        let state = transitioned.state.unwrap();
+        assert_eq!(state.root.config(), vec!["finished"]);
+        assert_eq!(state.root.owned_instances.len(), 1);
+        assert!(state.root.owned_instances[0].holder_path.is_none());
+    }
+
+    #[test]
+    fn every_cascade_entry_point_classifies_cleanup_failures_atomically() {
+        for mode in ["cancel", "holder", "stop", "completion", "parallel"] {
+            let bundle = load_bundle(&cascade_fault_bundle(mode))
+                .unwrap_or_else(|error| panic!("{mode}: {error}"));
+            let prior = create(
+                &bundle,
+                "owner",
+                &format!("cascade-{mode}"),
+                &format!("create-cascade-{mode}"),
+                &Bindings::default(),
+            )
+            .state
+            .unwrap();
+            let result = dispatch(
+                &bundle,
+                &prior,
+                Some(Delivery::Input(Envelope {
+                    event: "trigger".to_string(),
+                    event_id: format!("trigger-{mode}"),
+                    target: runtime_target(&prior.root, &prior.root_instance_id),
+                    payload: BTreeMap::new(),
+                    correlation_id: None,
+                })),
+            );
+            assert_eq!(result.status, ResultStatus::Faulted, "{mode}: {result:?}");
+            assert_eq!(result.disposition, Some(Disposition::Faulted), "{mode}");
+            let fault = result.fault.as_ref().unwrap();
+            assert_eq!(fault.code, "cascade_fault", "{mode}");
+            assert_eq!(fault.source_locator, "system:cascade_cleanup", "{mode}");
+            assert!(result.emissions.is_empty(), "{mode}");
+            let state = result.state.unwrap();
+            assert_eq!(state.root.status, RuntimeStatus::Faulted, "{mode}");
+            assert_eq!(
+                state.root.components.len(),
+                prior.root.components.len(),
+                "{mode}"
+            );
+            assert_eq!(
+                state.root.owned_instances.len(),
+                prior.root.owned_instances.len(),
+                "{mode}"
+            );
+            assert!(state
+                .root
+                .components
+                .iter()
+                .all(|component| component.runtime.status == RuntimeStatus::Running));
+            assert!(state
+                .root
+                .owned_instances
+                .iter()
+                .all(|owned| owned.runtime.status == RuntimeStatus::Running));
+        }
+    }
 }

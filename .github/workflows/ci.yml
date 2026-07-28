@@ -7,8 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  SPECIFICATION_COMMIT: 03771fac569a47b82f27891cd3700d4d1d876f8b
-  CONFORMANCE_COMMIT: 409bbdc6c2d4a4e9d50ddb1d994c5f5cd7d97762
+  SPECIFICATION_COMMIT: 4bd4d9588d11b75d376380b6120676a056a4bc45
+  CONFORMANCE_COMMIT: fc4842010ab8d83bf4c5c6280a5627ca86829f7f
 
 jobs:
   clippy:
@@ -54,6 +54,11 @@ jobs:
 
       - name: Build
         run: cargo build --release
+
+      - name: Validate authoritative specification examples
+        run: |
+          cargo run --release --bin determa-state -- validate authoritative-spec/examples/minimal.yaml
+          cargo run --release --bin determa-state -- validate authoritative-spec/examples/full.yaml
 
       - name: Unit and public API tests
         run: cargo test --lib --bins --test public_api

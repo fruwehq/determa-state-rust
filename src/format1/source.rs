@@ -1,6 +1,8 @@
 use super::compile::{compile_bundle, Bundle};
 use regex::Regex;
-use serde_yaml::Value as YamlValue;
+use yaml_rust2::parser::{MarkedEventReceiver, Parser};
+use yaml_rust2::scanner::{Marker, TScalarStyle};
+use yaml_rust2::{Event, Yaml, YamlLoader};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadErrorCode {
@@ -77,6 +79,7 @@ pub fn load_bundle(source: &str) -> Result<Bundle, LoadError> {
 
 pub fn load_bundle_from_json(value: serde_json::Value) -> Result<Bundle, LoadError> {
     validate_unicode(&value)?;
+    validate_numeric_domain(&value, "")?;
     validate_format(&value)?;
     validate_schema(&value)?;
     compile_bundle(value).map_err(|error| LoadError {
@@ -88,9 +91,12 @@ pub fn load_bundle_from_json(value: serde_json::Value) -> Result<Bundle, LoadErr
 
 pub fn parse_document(source: &str) -> Result<serde_json::Value, LoadError> {
     lexical_checks(source)?;
-    let yaml: YamlValue = serde_yaml::from_str(source).map_err(|error| {
+    let documents = YamlLoader::load_from_str(source).map_err(|error| {
         let message = error.to_string();
-        let code = if message.contains("duplicate key") || message.contains("duplicate entry") {
+        let code = if message.contains("duplicate key")
+            || message.contains("duplicated key")
+            || message.contains("duplicate entry")
+        {
             LoadErrorCode::DuplicateKey
         } else {
             LoadErrorCode::NonJsonValue
@@ -101,7 +107,13 @@ pub fn parse_document(source: &str) -> Result<serde_json::Value, LoadError> {
             message,
         }
     })?;
-    yaml_to_json(&yaml, "")
+    if documents.len() != 1 {
+        return source_error(
+            LoadErrorCode::NonJsonValue,
+            "a bundle source must contain exactly one YAML document",
+        );
+    }
+    yaml_to_json(&documents[0], "")
 }
 
 fn validate_format(value: &serde_json::Value) -> Result<(), LoadError> {
@@ -115,143 +127,137 @@ fn validate_format(value: &serde_json::Value) -> Result<(), LoadError> {
     })
 }
 
-fn source_location(error: &serde_yaml::Error) -> String {
-    error
-        .location()
-        .map(|location| format!("line {}, column {}", location.line(), location.column()))
-        .unwrap_or_else(|| "/".to_string())
+fn source_location(error: &yaml_rust2::ScanError) -> String {
+    format!(
+        "line {}, column {}",
+        error.marker().line(),
+        error.marker().col() + 1
+    )
 }
 
 fn lexical_checks(source: &str) -> Result<(), LoadError> {
-    if source.contains("\\uD800")
-        || source.contains("\\ud800")
-        || source.contains("\\uDFFF")
-        || source.contains("\\udfff")
-    {
-        return source_error(
-            LoadErrorCode::InvalidUnicode,
-            "source contains an unpaired Unicode surrogate escape",
-        );
+    let mut receiver = PortableScalarReceiver::default();
+    Parser::new_from_str(source)
+        .load(&mut receiver, true)
+        .map_err(|error| {
+            let message = error.to_string();
+            LoadError {
+                code: if message.contains("invalid Unicode character escape code") {
+                    LoadErrorCode::InvalidUnicode
+                } else {
+                    LoadErrorCode::NonJsonValue
+                },
+                path: source_location(&error),
+                message,
+            }
+        })?;
+    if let Some(error) = receiver.error {
+        Err(error)
+    } else if receiver.document_count != 1 {
+        source_error(
+            LoadErrorCode::NonJsonValue,
+            "a bundle source must contain exactly one YAML document",
+        )
+    } else {
+        Ok(())
     }
+}
 
+#[derive(Default)]
+struct PortableScalarReceiver {
+    document_count: usize,
+    error: Option<LoadError>,
+}
+
+impl MarkedEventReceiver for PortableScalarReceiver {
+    fn on_event(&mut self, event: Event, marker: Marker) {
+        if self.error.is_some() {
+            return;
+        }
+        match event {
+            Event::DocumentStart => self.document_count += 1,
+            Event::Alias(_) => self.reject(
+                LoadErrorCode::UnsupportedYamlFeature,
+                marker,
+                "YAML aliases are unsupported",
+            ),
+            Event::SequenceStart(anchor, tag) | Event::MappingStart(anchor, tag)
+                if anchor != 0 || tag.is_some() =>
+            {
+                self.reject(
+                    LoadErrorCode::UnsupportedYamlFeature,
+                    marker,
+                    "YAML anchors and explicit tags are unsupported",
+                );
+            }
+            Event::Scalar(value, style, anchor, tag) => {
+                if anchor != 0 || tag.is_some() {
+                    self.reject(
+                        LoadErrorCode::UnsupportedYamlFeature,
+                        marker,
+                        "YAML anchors and explicit tags are unsupported",
+                    );
+                } else if style == TScalarStyle::Plain {
+                    if let Err((code, message)) = classify_plain_scalar(&value) {
+                        self.reject(code, marker, &message);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl PortableScalarReceiver {
+    fn reject(&mut self, code: LoadErrorCode, marker: Marker, message: &str) {
+        self.error = Some(LoadError {
+            code,
+            path: format!("line {}, column {}", marker.line(), marker.col() + 1),
+            message: message.to_string(),
+        });
+    }
+}
+
+fn classify_plain_scalar(value: &str) -> Result<(), (LoadErrorCode, String)> {
+    if value.is_empty() || matches!(value, "Null" | "NULL" | "~") {
+        return Err((
+            LoadErrorCode::InvalidNullSyntax,
+            format!("noncanonical null scalar {value:?}"),
+        ));
+    }
+    if matches!(value, "True" | "TRUE" | "False" | "FALSE") {
+        return Err((
+            LoadErrorCode::InvalidBooleanSyntax,
+            format!("noncanonical Boolean scalar {value:?}"),
+        ));
+    }
     let json_number = Regex::new(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$")
         .expect("constant regex");
-    let numeric_candidate = Regex::new(r"^[+-]?(?:[0-9][0-9A-Za-z_.+-]*|\.[0-9][0-9A-Za-z_+-]*)$")
-        .expect("constant regex");
-
-    let lines = source.lines().collect::<Vec<_>>();
-    for (line_index, line) in lines.iter().enumerate() {
-        let mut token = String::new();
-        let mut quote = None;
-        let mut escaped = false;
-        let mut tokens = Vec::new();
-        for character in line.chars() {
-            if let Some(delimiter) = quote {
-                if delimiter == '"' && escaped {
-                    escaped = false;
-                    continue;
-                }
-                if delimiter == '"' && character == '\\' {
-                    escaped = true;
-                    continue;
-                }
-                if character == delimiter {
-                    quote = None;
-                }
-                continue;
-            }
-            match character {
-                '#' => break,
-                '\'' | '"' => {
-                    if !token.is_empty() {
-                        tokens.push(std::mem::take(&mut token));
-                    }
-                    quote = Some(character);
-                }
-                ':' | ',' | '[' | ']' | '{' | '}' | ' ' | '\t' => {
-                    if !token.is_empty() {
-                        tokens.push(std::mem::take(&mut token));
-                    }
-                }
-                _ => token.push(character),
-            }
+    if json_number.is_match(value) {
+        let valid = if value.contains('.') || value.contains('e') || value.contains('E') {
+            value.parse::<f64>().is_ok_and(f64::is_finite)
+        } else {
+            value.parse::<i64>().is_ok()
+        };
+        if valid {
+            return Ok(());
         }
-        if !token.is_empty() {
-            tokens.push(token);
-        }
-
-        for token in tokens {
-            if (token.starts_with('&') && token != "&&")
-                || token.starts_with('*')
-                || (token.starts_with('!') && token != "!=")
-            {
-                return Err(LoadError {
-                    code: LoadErrorCode::UnsupportedYamlFeature,
-                    path: format!("line {}", line_index + 1),
-                    message: format!("unsupported YAML token {token:?}"),
-                });
-            }
-            if matches!(token.as_str(), "True" | "TRUE" | "False" | "FALSE") {
-                return Err(LoadError {
-                    code: LoadErrorCode::InvalidBooleanSyntax,
-                    path: format!("line {}", line_index + 1),
-                    message: format!("noncanonical Boolean scalar {token:?}"),
-                });
-            }
-            if matches!(token.as_str(), "Null" | "NULL" | "~") {
-                return Err(LoadError {
-                    code: LoadErrorCode::InvalidNullSyntax,
-                    path: format!("line {}", line_index + 1),
-                    message: format!("noncanonical null scalar {token:?}"),
-                });
-            }
-            let lower = token.to_ascii_lowercase();
-            if (numeric_candidate.is_match(&token)
-                || matches!(
-                    lower.as_str(),
-                    ".inf" | "+.inf" | "-.inf" | ".nan" | "+.nan" | "-.nan"
-                ))
-                && token != "-"
-                && !json_number.is_match(&token)
-            {
-                return Err(LoadError {
-                    code: LoadErrorCode::InvalidNumericSyntax,
-                    path: format!("line {}", line_index + 1),
-                    message: format!("non-JSON numeric scalar {token:?}"),
-                });
-            }
-            if json_number.is_match(&token)
-                && (token.contains('.') || token.contains('e') || token.contains('E'))
-                && token.parse::<f64>().is_ok_and(|value| !value.is_finite())
-            {
-                return Err(LoadError {
-                    code: LoadErrorCode::NumericValueOutOfRange,
-                    path: format!("line {}", line_index + 1),
-                    message: format!("numeric scalar {token:?} is outside binary64 range"),
-                });
-            }
-        }
-
-        let content = line.split('#').next().unwrap_or_default();
-        let trimmed = content.trim_end();
-        if trimmed.ends_with(':') {
-            let indentation = content.len() - content.trim_start().len();
-            let has_nested_value = lines[line_index + 1..]
-                .iter()
-                .map(|line| line.split('#').next().unwrap_or_default())
-                .find(|line| !line.trim().is_empty())
-                .is_some_and(|next| {
-                    let next_indentation = next.len() - next.trim_start().len();
-                    next_indentation > indentation
-                });
-            if !has_nested_value {
-                return Err(LoadError {
-                    code: LoadErrorCode::InvalidNullSyntax,
-                    path: format!("line {}", line_index + 1),
-                    message: "empty YAML scalar is not portable null".to_string(),
-                });
-            }
-        }
+        return Err((
+            LoadErrorCode::NumericValueOutOfRange,
+            format!("numeric scalar {value:?} is outside the portable numeric domain"),
+        ));
+    }
+    let underscore_free = value.replace('_', "");
+    let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+    if matches!(Yaml::from_str(value), Yaml::Integer(_) | Yaml::Real(_))
+        || value.contains('_') && json_number.is_match(&underscore_free)
+        || unsigned.starts_with("0x")
+        || unsigned.starts_with("0o")
+    {
+        return Err((
+            LoadErrorCode::InvalidNumericSyntax,
+            format!("non-JSON numeric scalar {value:?}"),
+        ));
     }
     Ok(())
 }
@@ -264,63 +270,53 @@ fn source_error<T>(code: LoadErrorCode, message: &str) -> Result<T, LoadError> {
     })
 }
 
-fn yaml_to_json(value: &YamlValue, path: &str) -> Result<serde_json::Value, LoadError> {
+fn yaml_to_json(value: &Yaml, path: &str) -> Result<serde_json::Value, LoadError> {
     match value {
-        YamlValue::Null => Ok(serde_json::Value::Null),
-        YamlValue::Bool(value) => Ok(serde_json::Value::Bool(*value)),
-        YamlValue::Number(value) => {
-            if value.is_i64() {
-                let integer = value.as_i64().expect("i64 number");
-                Ok(serde_json::Value::Number(integer.into()))
-            } else if value.is_u64() {
-                let unsigned = value.as_u64().expect("u64 number");
-                let integer = i64::try_from(unsigned).map_err(|_| LoadError {
-                    code: LoadErrorCode::NumericValueOutOfRange,
-                    path: path.to_string(),
-                    message: "integer is outside signed 64-bit range".to_string(),
-                })?;
-                Ok(serde_json::Value::Number(integer.into()))
-            } else {
-                let float = value.as_f64().ok_or_else(|| LoadError {
-                    code: LoadErrorCode::NonJsonValue,
-                    path: path.to_string(),
-                    message: "numeric value is not representable".to_string(),
-                })?;
-                if !float.is_finite() {
-                    return source_error(
-                        LoadErrorCode::NumericValueOutOfRange,
-                        "floating-point value is not finite",
-                    );
-                }
-                Ok(serde_json::Value::Number(
-                    serde_json::Number::from_f64(if float == 0.0 { 0.0 } else { float })
-                        .expect("finite float"),
-                ))
+        Yaml::Null => Ok(serde_json::Value::Null),
+        Yaml::Boolean(value) => Ok(serde_json::Value::Bool(*value)),
+        Yaml::Integer(value) => Ok(serde_json::Value::Number((*value).into())),
+        Yaml::Real(value) => {
+            let float = value.parse::<f64>().map_err(|_| LoadError {
+                code: LoadErrorCode::NonJsonValue,
+                path: path.to_string(),
+                message: "numeric value is not representable".to_string(),
+            })?;
+            if !float.is_finite() {
+                return source_error(
+                    LoadErrorCode::NumericValueOutOfRange,
+                    "floating-point value is not finite",
+                );
             }
+            Ok(serde_json::Value::Number(
+                serde_json::Number::from_f64(if float == 0.0 { 0.0 } else { float })
+                    .expect("finite float"),
+            ))
         }
-        YamlValue::String(value) => Ok(serde_json::Value::String(value.clone())),
-        YamlValue::Sequence(values) => values
+        Yaml::String(value) => Ok(serde_json::Value::String(value.clone())),
+        Yaml::Array(values) => values
             .iter()
             .enumerate()
             .map(|(index, value)| yaml_to_json(value, &format!("{path}/{index}")))
             .collect::<Result<Vec<_>, _>>()
             .map(serde_json::Value::Array),
-        YamlValue::Mapping(values) => {
+        Yaml::Hash(values) => {
             let mut output = serde_json::Map::new();
             for (key, value) in values {
-                let key = key.as_str().ok_or_else(|| LoadError {
-                    code: LoadErrorCode::NonStringMapKey,
-                    path: path.to_string(),
-                    message: "mapping keys must be strings".to_string(),
-                })?;
+                let Yaml::String(key) = key else {
+                    return Err(LoadError {
+                        code: LoadErrorCode::NonStringMapKey,
+                        path: path.to_string(),
+                        message: "mapping keys must be strings".to_string(),
+                    });
+                };
                 let child_path = format!("{path}/{}", escape_pointer(key));
                 output.insert(key.to_string(), yaml_to_json(value, &child_path)?);
             }
             Ok(serde_json::Value::Object(output))
         }
-        YamlValue::Tagged(_) => source_error(
-            LoadErrorCode::UnsupportedYamlFeature,
-            "tagged YAML values are unsupported",
+        Yaml::Alias(_) | Yaml::BadValue => source_error(
+            LoadErrorCode::NonJsonValue,
+            "YAML value is outside the portable JSON-compatible tree",
         ),
     }
 }
@@ -351,6 +347,43 @@ fn validate_unicode(value: &serde_json::Value) -> Result<(), LoadError> {
     Ok(())
 }
 
+fn validate_numeric_domain(value: &serde_json::Value, path: &str) -> Result<(), LoadError> {
+    match value {
+        serde_json::Value::Number(number) => {
+            if number.as_i64().is_some() {
+                return Ok(());
+            }
+            if number.as_u64().is_some() {
+                return Err(LoadError {
+                    code: LoadErrorCode::NumericValueOutOfRange,
+                    path: path.to_string(),
+                    message: "integer is outside the signed 64-bit domain".to_string(),
+                });
+            }
+            if number.as_f64().is_some_and(f64::is_finite) {
+                return Ok(());
+            }
+            return Err(LoadError {
+                code: LoadErrorCode::NumericValueOutOfRange,
+                path: path.to_string(),
+                message: "number is outside the finite binary64 domain".to_string(),
+            });
+        }
+        serde_json::Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                validate_numeric_domain(value, &format!("{path}/{index}"))?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (name, value) in values {
+                validate_numeric_domain(value, &format!("{path}/{}", escape_pointer(name)))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn validate_schema(value: &serde_json::Value) -> Result<(), LoadError> {
     let schema: serde_json::Value =
         serde_json::from_str(include_str!("../../schema/machine.schema.json"))
@@ -368,4 +401,117 @@ fn validate_schema(value: &serde_json::Value) -> Result<(), LoadError> {
 
 pub(crate) fn escape_pointer(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bundle_with_meta(value: &str) -> String {
+        format!(
+            "format: 1\nnamespace: parser.test\nmeta:\n  value: {value}\nmachines:\n  - machine_id: probe\n    root: {{}}\n"
+        )
+    }
+
+    #[test]
+    fn plain_numeric_prefix_string_is_not_overclassified() {
+        let bundle = load_bundle(&bundle_with_meta("1alpha")).unwrap();
+        assert_eq!(bundle.normalized["meta"]["value"], "1alpha");
+    }
+
+    #[test]
+    fn empty_sequence_member_is_nonportable_null() {
+        let source = "format: 1\nnamespace: parser.empty\nmeta:\n  values:\n    -\nmachines:\n  - machine_id: probe\n    root: {}\n";
+        assert_eq!(
+            load_bundle(source).unwrap_err().code,
+            LoadErrorCode::InvalidNullSyntax
+        );
+    }
+
+    #[test]
+    fn every_unpaired_surrogate_range_is_rejected_but_quoted_text_is_not() {
+        for escape in ["D800", "DBFF", "DC00", "DFFF"] {
+            let source = bundle_with_meta(&format!("\"\\u{escape}\""));
+            assert_eq!(
+                load_bundle(&source).unwrap_err().code,
+                LoadErrorCode::InvalidUnicode
+            );
+        }
+        let source = bundle_with_meta("'\\uD800'");
+        assert_eq!(
+            load_bundle(&source).unwrap().normalized["meta"]["value"],
+            "\\uD800"
+        );
+        let source = bundle_with_meta("'\"\\uD800\"'");
+        assert_eq!(
+            load_bundle(&source).unwrap().normalized["meta"]["value"],
+            "\"\\uD800\""
+        );
+        let source = "format: 1\nnamespace: parser.literal\nmeta:\n  value: |\n    \"\\uD800\"\nmachines:\n  - machine_id: probe\n    root: {}\n";
+        assert_eq!(
+            load_bundle(source).unwrap().normalized["meta"]["value"],
+            "\"\\uD800\"\n"
+        );
+    }
+
+    #[test]
+    fn quoted_scalar_forms_remain_strings() {
+        for value in ["'True'", "'null'", "'0x10'", "'+1'", "'1.0'"] {
+            assert!(load_bundle(&bundle_with_meta(value)).is_ok(), "{value}");
+        }
+    }
+
+    #[test]
+    fn aliases_tags_and_duplicate_keys_are_rejected_before_normalization() {
+        let alias = "format: 1\nnamespace: parser.alias\nmeta: &meta { value: 1 }\nother: *meta\nmachines:\n  - machine_id: probe\n    root: {}\n";
+        assert_eq!(
+            load_bundle(alias).unwrap_err().code,
+            LoadErrorCode::UnsupportedYamlFeature
+        );
+        let tag = bundle_with_meta("!!str 1");
+        assert_eq!(
+            load_bundle(&tag).unwrap_err().code,
+            LoadErrorCode::UnsupportedYamlFeature
+        );
+        let duplicate = "format: 1\nnamespace: parser.duplicate\nmeta: one\nmeta: two\nmachines:\n  - machine_id: probe\n    root: {}\n";
+        assert_eq!(
+            load_bundle(duplicate).unwrap_err().code,
+            LoadErrorCode::DuplicateKey
+        );
+    }
+
+    #[test]
+    fn native_json_rejects_nested_unsigned_overflow() {
+        let mut value = serde_json::json!({
+            "format": 1,
+            "namespace": "native.overflow",
+            "meta": {"nested": {"value": 0}},
+            "machines": [{"machine_id": "probe", "root": {}}]
+        });
+        value["meta"]["nested"]["value"] =
+            serde_json::Value::Number(serde_json::Number::from(u64::MAX));
+        assert_eq!(
+            load_bundle_from_json(value).unwrap_err().code,
+            LoadErrorCode::NumericValueOutOfRange
+        );
+    }
+
+    #[test]
+    fn native_json_preserves_integer_and_double_fingerprint_types() {
+        let integer = load_bundle_from_json(serde_json::json!({
+            "format": 1,
+            "namespace": "native.types",
+            "meta": {"value": 1},
+            "machines": [{"machine_id": "probe", "root": {}}]
+        }))
+        .unwrap();
+        let floating = load_bundle_from_json(serde_json::json!({
+            "format": 1,
+            "namespace": "native.types",
+            "meta": {"value": 1.0},
+            "machines": [{"machine_id": "probe", "root": {}}]
+        }))
+        .unwrap();
+        assert_ne!(integer.fingerprint, floating.fingerprint);
+    }
 }

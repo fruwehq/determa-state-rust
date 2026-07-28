@@ -27,7 +27,7 @@ pub struct Bundle {
     pub normalized: JsonValue,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Machine {
     pub machine_id: String,
     pub version: i64,
@@ -38,7 +38,7 @@ pub struct Machine {
     pub meta: Option<JsonValue>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct State {
     pub path: String,
     pub pointer: String,
@@ -64,7 +64,7 @@ pub enum CompiledStateKind {
     Choice,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Component {
     pub component_id: String,
     pub declaration_index: usize,
@@ -73,20 +73,20 @@ pub struct Component {
     pub bindings: BindingExpressions,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ComponentDefinition {
     Machine(String),
     Inline(Box<Machine>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompiledInitial {
     pub target: String,
     pub action: Vec<CompiledAction>,
     pub pointer: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompiledChoice {
     pub target: CompiledTarget,
     pub guard: Option<String>,
@@ -95,7 +95,7 @@ pub struct CompiledChoice {
     pub pointer: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompiledTransition {
     pub target: Option<CompiledTarget>,
     pub guard: Option<String>,
@@ -105,19 +105,19 @@ pub struct CompiledTransition {
     pub pointer: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CompiledTarget {
     State(String),
     History(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompiledAction {
     pub kind: CompiledActionKind,
     pub pointer: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CompiledActionKind {
     Assign {
         variable: String,
@@ -143,7 +143,7 @@ pub enum CompiledActionKind {
     Stop,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CompiledSendTarget {
     SelfTarget,
     Owner,
@@ -196,6 +196,7 @@ pub fn compile_bundle(mut document: JsonValue) -> Result<Bundle, SemanticError> 
         machines.insert(machine.machine_id.clone(), machine);
     }
     validate_bindings_across_bundle(&machines)?;
+    validate_cel_across_bundle(&machines, &raw.events)?;
     validate_public_events(&raw.events)?;
     validate_initialization_cycles(&machines)?;
     Ok(Bundle {
@@ -587,9 +588,6 @@ fn compile_transition(
     transition: &Transition,
     pointer: &str,
 ) -> Result<CompiledTransition, SemanticError> {
-    if let Some(guard) = &transition.guard {
-        cel::validate_profile(guard, &format!("{pointer}/guard"))?;
-    }
     Ok(CompiledTransition {
         target: transition.transition_to.as_ref().map(compile_target),
         guard: transition.guard.clone(),
@@ -604,9 +602,6 @@ fn compile_transition(
 }
 
 fn compile_choice(branch: &ChoiceBranch, pointer: &str) -> Result<CompiledChoice, SemanticError> {
-    if let Some(guard) = &branch.guard {
-        cel::validate_profile(guard, &format!("{pointer}/guard"))?;
-    }
     Ok(CompiledChoice {
         target: compile_target(&branch.transition_to),
         guard: branch.guard.clone(),
@@ -638,28 +633,12 @@ fn compile_actions(
                         .iter()
                         .next()
                         .expect("schema requires one assignment");
-                    cel::validate_profile(
-                        expression,
-                        &format!("{action_pointer}/assign/{}", escape_pointer(variable)),
-                    )?;
                     CompiledActionKind::Assign {
                         variable: variable.clone(),
                         expression: expression.clone(),
                     }
                 }
                 Action::Send(send) => {
-                    for (name, expression) in &send.payload {
-                        cel::validate_profile(
-                            expression,
-                            &format!("{action_pointer}/send/payload/{}", escape_pointer(name)),
-                        )?;
-                    }
-                    if let Some(expression) = &send.correlation_id {
-                        cel::validate_profile(
-                            expression,
-                            &format!("{action_pointer}/send/correlation_id"),
-                        )?;
-                    }
                     let raw_targets = if let Some(targets) = &send.targets {
                         targets.clone()
                     } else if let Some(target) = &send.to {
@@ -700,15 +679,9 @@ fn compile_actions(
                         bind_to: spawn.bind_to.clone(),
                     }
                 }
-                Action::Cancel(cancel) => {
-                    cel::validate_profile(
-                        &cancel.instance,
-                        &format!("{action_pointer}/cancel/instance"),
-                    )?;
-                    CompiledActionKind::Cancel {
-                        instance: cancel.instance.clone(),
-                    }
-                }
+                Action::Cancel(cancel) => CompiledActionKind::Cancel {
+                    instance: cancel.instance.clone(),
+                },
                 Action::Stop(_) => CompiledActionKind::Stop,
             };
             Ok(CompiledAction {
@@ -732,12 +705,7 @@ fn compile_send_target(
             CompiledSendTarget::Component(component.clone())
         }
         TargetExpression::Instance { instance } => {
-            let pointer = if is_list {
-                format!("{action_pointer}/send/targets/{index}/instance")
-            } else {
-                format!("{action_pointer}/send/to/instance")
-            };
-            cel::validate_profile(instance, &pointer)?;
+            let _ = (action_pointer, is_list, index);
             CompiledSendTarget::Instance(instance.clone())
         }
         TargetExpression::External { .. } => CompiledSendTarget::External,
@@ -748,14 +716,7 @@ fn validate_binding_expressions(
     bindings: &BindingExpressions,
     pointer: &str,
 ) -> Result<(), SemanticError> {
-    for (kind, values) in [("input", &bindings.input), ("external", &bindings.external)] {
-        for (name, expression) in values {
-            cel::validate_profile(
-                expression,
-                &format!("{pointer}/{kind}/{}", escape_pointer(name)),
-            )?;
-        }
-    }
+    let _ = (bindings, pointer);
     Ok(())
 }
 
@@ -1209,6 +1170,436 @@ fn validate_bindings_across_bundle(
                         &format!("{}/spawn/bindings", action.pointer),
                     )?;
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_cel_across_bundle(
+    machines: &BTreeMap<String, Machine>,
+    bundle_events: &BTreeMap<String, EventDeclaration>,
+) -> Result<(), SemanticError> {
+    for machine in machines.values() {
+        validate_machine_cel(machine, machines, bundle_events)?;
+    }
+    Ok(())
+}
+
+fn validate_machine_cel(
+    machine: &Machine,
+    machines: &BTreeMap<String, Machine>,
+    bundle_events: &BTreeMap<String, EventDeclaration>,
+) -> Result<(), SemanticError> {
+    for state in machine.states.values() {
+        let lifecycle_environment = lexical_type_environment(machine, &state.path);
+        validate_typed_actions(
+            machine,
+            state,
+            &state.entry,
+            &lifecycle_environment,
+            machines,
+            bundle_events,
+        )?;
+        validate_typed_actions(
+            machine,
+            state,
+            &state.exit,
+            &lifecycle_environment,
+            machines,
+            bundle_events,
+        )?;
+        if let Some(initial) = &state.initial {
+            validate_typed_actions(
+                machine,
+                state,
+                &initial.action,
+                &lifecycle_environment,
+                machines,
+                bundle_events,
+            )?;
+        }
+        if let Some(branches) = &state.choice {
+            for branch in branches {
+                if let Some(guard) = &branch.guard {
+                    cel::check(
+                        guard,
+                        branch
+                            .guard_pointer
+                            .as_deref()
+                            .expect("guard pointer is retained"),
+                        &lifecycle_environment,
+                        &cel::CelType::Bool,
+                    )?;
+                }
+                validate_typed_actions(
+                    machine,
+                    state,
+                    &branch.action,
+                    &lifecycle_environment,
+                    machines,
+                    bundle_events,
+                )?;
+            }
+        }
+        for (event_name, transitions) in &state.handlers {
+            let event = event_declaration(machine, bundle_events, event_name);
+            let mut event_environment = lifecycle_environment.clone();
+            event_environment.values.insert(
+                "event".to_string(),
+                cel::CelType::Record(BTreeMap::from([(
+                    "payload".to_string(),
+                    cel::RecordField {
+                        value_type: event_payload_type(machine, event_name, event),
+                        optional: false,
+                    },
+                )])),
+            );
+            for transition in transitions {
+                if let Some(guard) = &transition.guard {
+                    cel::check(
+                        guard,
+                        transition
+                            .guard_pointer
+                            .as_deref()
+                            .expect("guard pointer is retained"),
+                        &event_environment,
+                        &cel::CelType::Bool,
+                    )?;
+                }
+                validate_typed_actions(
+                    machine,
+                    state,
+                    &transition.action,
+                    &event_environment,
+                    machines,
+                    bundle_events,
+                )?;
+            }
+        }
+        for component in &state.components {
+            let target = match &component.definition {
+                ComponentDefinition::Machine(machine_id) => &machines[machine_id],
+                ComponentDefinition::Inline(inline) => inline.as_ref(),
+            };
+            let owner_variables = visible_declaration_types(machine, &state.path);
+            let owner_environment = cel::TypeEnvironment {
+                values: BTreeMap::from([(
+                    "owner".to_string(),
+                    cel::CelType::Record(BTreeMap::from([(
+                        "variables".to_string(),
+                        cel::RecordField {
+                            value_type: cel::CelType::Record(owner_variables),
+                            optional: false,
+                        },
+                    )])),
+                )]),
+            };
+            validate_typed_bindings(
+                target,
+                &component.bindings,
+                &owner_environment,
+                &format!("{}/with", component.pointer),
+            )?;
+            if let ComponentDefinition::Inline(inline) = &component.definition {
+                validate_machine_cel(inline, machines, bundle_events)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn declaration_cel_type(declaration: &VariableDeclaration) -> cel::CelType {
+    match (
+        declaration.value_type.as_str(),
+        declaration.init.as_ref().and_then(|value| value.as_ref()),
+    ) {
+        ("list" | "map", Some(value)) => cel::value_type(value),
+        _ => cel::declared_type(&declaration.value_type, declaration.machine_id.as_deref()),
+    }
+}
+
+fn lexical_type_environment(machine: &Machine, scope: &str) -> cel::TypeEnvironment {
+    cel::TypeEnvironment {
+        values: visible_declaration_types(machine, scope)
+            .into_iter()
+            .map(|(name, field)| (name, field.value_type))
+            .collect(),
+    }
+}
+
+fn visible_declaration_types(machine: &Machine, scope: &str) -> BTreeMap<String, cel::RecordField> {
+    let mut output = BTreeMap::new();
+    let mut current = Some(scope.to_string());
+    while let Some(path) = current {
+        let state = &machine.states[&path];
+        for (name, declaration) in &state.variables {
+            output
+                .entry(name.clone())
+                .or_insert_with(|| cel::RecordField {
+                    value_type: declaration_cel_type(declaration),
+                    optional: false,
+                });
+        }
+        current = state.parent.clone();
+    }
+    output
+}
+
+fn event_declaration<'a>(
+    machine: &'a Machine,
+    bundle_events: &'a BTreeMap<String, EventDeclaration>,
+    event_name: &str,
+) -> Option<&'a EventDeclaration> {
+    machine
+        .events
+        .get(event_name)
+        .or_else(|| bundle_events.get(event_name))
+}
+
+fn payload_record(payload: &BTreeMap<String, super::model::PayloadField>) -> cel::CelType {
+    cel::CelType::Record(
+        payload
+            .iter()
+            .map(|(name, field)| {
+                (
+                    name.clone(),
+                    cel::RecordField {
+                        value_type: cel::declared_type(&field.value_type, None),
+                        optional: !field.required && field.default.is_none(),
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
+fn event_payload_type(
+    machine: &Machine,
+    event_name: &str,
+    declaration: Option<&EventDeclaration>,
+) -> cel::CelType {
+    if let Some(declaration) = declaration {
+        return payload_record(&declaration.payload);
+    }
+    let string = |optional| cel::RecordField {
+        value_type: cel::CelType::String,
+        optional,
+    };
+    let integer = |optional| cel::RecordField {
+        value_type: cel::CelType::Int,
+        optional,
+    };
+    let reference = |optional| cel::RecordField {
+        value_type: cel::CelType::InstanceReference(None),
+        optional,
+    };
+    let public_fault = cel::CelType::Record(BTreeMap::from([
+        ("runtime_id".to_string(), string(false)),
+        ("cause_id".to_string(), string(false)),
+        ("code".to_string(), string(false)),
+        ("step_sequence".to_string(), string(false)),
+        ("source_locator".to_string(), string(false)),
+    ]));
+    match event_name {
+        "env" => cel::CelType::Record(BTreeMap::from([(
+            "changed".to_string(),
+            cel::RecordField {
+                value_type: cel::CelType::Record(
+                    root_external_variables(machine)
+                        .into_iter()
+                        .map(|(name, declaration)| {
+                            (
+                                name,
+                                cel::RecordField {
+                                    value_type: declaration_cel_type(&declaration),
+                                    optional: true,
+                                },
+                            )
+                        })
+                        .collect(),
+                ),
+                optional: false,
+            },
+        )])),
+        "done" => cel::CelType::Record(BTreeMap::from([
+            ("relationship".to_string(), string(false)),
+            ("state_path".to_string(), string(true)),
+            ("owner_runtime_id".to_string(), string(true)),
+            ("instance".to_string(), reference(true)),
+            ("instance_id".to_string(), string(true)),
+            ("machine_id".to_string(), string(true)),
+            ("machine_version".to_string(), integer(true)),
+        ])),
+        "determa.component_completed" => cel::CelType::Record(BTreeMap::from([
+            ("component_id".to_string(), string(false)),
+            ("component_runtime_id".to_string(), string(false)),
+        ])),
+        "determa.component_failed" => cel::CelType::Record(BTreeMap::from([
+            ("component_id".to_string(), string(false)),
+            ("component_runtime_id".to_string(), string(false)),
+            (
+                "fault".to_string(),
+                cel::RecordField {
+                    value_type: public_fault,
+                    optional: false,
+                },
+            ),
+        ])),
+        "determa.spawned_instance_failed" => cel::CelType::Record(BTreeMap::from([
+            ("instance".to_string(), reference(false)),
+            ("instance_id".to_string(), string(false)),
+            ("machine_id".to_string(), string(false)),
+            ("machine_version".to_string(), integer(false)),
+            (
+                "fault".to_string(),
+                cel::RecordField {
+                    value_type: public_fault,
+                    optional: false,
+                },
+            ),
+        ])),
+        _ => cel::CelType::Record(BTreeMap::new()),
+    }
+}
+
+fn validate_typed_actions(
+    machine: &Machine,
+    source: &State,
+    actions: &[CompiledAction],
+    environment: &cel::TypeEnvironment,
+    machines: &BTreeMap<String, Machine>,
+    bundle_events: &BTreeMap<String, EventDeclaration>,
+) -> Result<(), SemanticError> {
+    for action in actions {
+        match &action.kind {
+            CompiledActionKind::Assign {
+                variable,
+                expression,
+            } => {
+                let (_, declaration) = find_variable_declaration(machine, &source.path, variable)
+                    .expect("unknown assignments were rejected");
+                cel::check(
+                    expression,
+                    &format!("{}/assign/{}", action.pointer, escape_pointer(variable)),
+                    environment,
+                    &cel::declared_type(&declaration.value_type, declaration.machine_id.as_deref()),
+                )?;
+            }
+            CompiledActionKind::Send {
+                event,
+                targets,
+                payload,
+                correlation_id,
+            } => {
+                if event == "env" {
+                    let expression = payload.get("changed").expect("the env shape was validated");
+                    let inferred = cel::infer_expression(
+                        expression,
+                        &format!("{}/send/payload/changed", action.pointer),
+                        environment,
+                    )?;
+                    if !matches!(inferred, cel::CelType::Map(_) | cel::CelType::Record(_)) {
+                        return semantic(
+                            &format!("{}/send/payload/changed", action.pointer),
+                            "env.changed must infer a map",
+                        );
+                    }
+                } else {
+                    let declaration = event_declaration(machine, bundle_events, event)
+                        .expect("send event was validated");
+                    if payload
+                        .keys()
+                        .any(|name| !declaration.payload.contains_key(name))
+                        || declaration
+                            .payload
+                            .iter()
+                            .any(|(name, field)| field.required && !payload.contains_key(name))
+                    {
+                        return semantic(
+                            &format!("{}/send/payload", action.pointer),
+                            "send payload does not cover the declared event schema",
+                        );
+                    }
+                    for (name, expression) in payload {
+                        let field = &declaration.payload[name];
+                        cel::check(
+                            expression,
+                            &format!("{}/send/payload/{}", action.pointer, escape_pointer(name)),
+                            environment,
+                            &cel::declared_type(&field.value_type, None),
+                        )?;
+                    }
+                }
+                if let Some(expression) = correlation_id {
+                    cel::check(
+                        expression,
+                        &format!("{}/send/correlation_id", action.pointer),
+                        environment,
+                        &cel::CelType::String,
+                    )?;
+                }
+                for (index, target) in targets.iter().enumerate() {
+                    if let CompiledSendTarget::Instance(expression) = target {
+                        cel::check(
+                            expression,
+                            &format!("{}/send/targets/{index}/instance", action.pointer),
+                            environment,
+                            &cel::CelType::InstanceReference(None),
+                        )?;
+                    }
+                }
+            }
+            CompiledActionKind::Spawn {
+                machine_id,
+                bindings,
+                ..
+            } => validate_typed_bindings(
+                &machines[machine_id],
+                bindings,
+                environment,
+                &format!("{}/spawn/bindings", action.pointer),
+            )?,
+            CompiledActionKind::Cancel { instance } => {
+                cel::check(
+                    instance,
+                    &format!("{}/cancel/instance", action.pointer),
+                    environment,
+                    &cel::CelType::InstanceReference(None),
+                )?;
+            }
+            CompiledActionKind::Refresh { .. } | CompiledActionKind::Stop => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_typed_bindings(
+    target: &Machine,
+    bindings: &BindingExpressions,
+    environment: &cel::TypeEnvironment,
+    pointer: &str,
+) -> Result<(), SemanticError> {
+    let input = root_input_variables(target);
+    let external = root_external_variables(target);
+    for (kind, expressions, declarations) in [
+        ("input", &bindings.input, &input),
+        ("external", &bindings.external, &external),
+    ] {
+        for (name, expression) in expressions {
+            let expression_pointer = format!("{pointer}/{kind}/{}", escape_pointer(name));
+            let inferred = cel::infer_expression(expression, &expression_pointer, environment)?;
+            let declaration = &declarations[name];
+            let expected =
+                cel::declared_type(&declaration.value_type, declaration.machine_id.as_deref());
+            if !cel::is_assignable(&inferred, &expected) {
+                return Err(SemanticError {
+                    code: LoadErrorCode::InvalidBinding,
+                    path: expression_pointer,
+                    message: format!(
+                        "binding expression type {inferred:?} is not assignable to {expected:?}"
+                    ),
+                });
             }
         }
     }

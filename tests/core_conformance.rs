@@ -1,6 +1,6 @@
 use determa_state::{
-    create, dispatch, load_bundle, AggregateState, Bindings, CoreResult, Delivery, Disposition,
-    Emission, Envelope, ResultStatus, RuntimeStatus, Target, Value,
+    create, dispatch, load_bundle, string_from_utf16, AggregateState, Bindings, CoreResult,
+    Counter, Delivery, Disposition, Emission, Envelope, ResultStatus, RuntimeStatus, Target, Value,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -83,6 +83,9 @@ fn run_case(case: &Path) -> Result<(), String> {
         .map(str::to_string)
         .unwrap_or_else(|| format!("conformance:{case_name}:create"));
     if contains_invalid_unicode(create_spec.and_then(|create| create.get("root_instance_id"))) {
+        assert_invalid_unicode_boundary(
+            create_spec.and_then(|create| create.get("root_instance_id")),
+        )?;
         let expected = create_spec
             .and_then(|create| create.get("expect"))
             .ok_or_else(|| "invalid-Unicode create lacks expectation".to_string())?;
@@ -113,7 +116,7 @@ fn run_case(case: &Path) -> Result<(), String> {
         &bindings,
     );
     if let Some(expect) = create_spec.and_then(|create| create.get("expect")) {
-        check_result(&result, expect, None)?;
+        check_result(&result, expect, None, None)?;
     }
     if result.status == ResultStatus::Rejected {
         return Ok(());
@@ -129,6 +132,7 @@ fn run_case(case: &Path) -> Result<(), String> {
         .cloned()
         .unwrap_or_default();
     for (step_index, step) in steps.iter().enumerate() {
+        let prior_state = state.clone();
         let step = step
             .as_object()
             .ok_or_else(|| format!("step {step_index} is not a map"))?;
@@ -137,6 +141,7 @@ fn run_case(case: &Path) -> Result<(), String> {
                 .as_object()
                 .ok_or_else(|| format!("step {step_index} send is not a map"))?;
             if contains_invalid_unicode(send.get("payload")) {
+                assert_invalid_unicode_boundary(send.get("payload"))?;
                 let expect = step
                     .get("expect")
                     .ok_or_else(|| "invalid-Unicode dispatch lacks expectation".to_string())?;
@@ -147,6 +152,16 @@ fn run_case(case: &Path) -> Result<(), String> {
                     != Some("invalid_payload")
                 {
                     return Err("invalid-Unicode dispatch expectation is inconsistent".to_string());
+                }
+                if expect
+                    .get("caller_still_owns_input")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                {
+                    return Err("invalid-Unicode dispatch must assert caller ownership".to_string());
+                }
+                if state != prior_state {
+                    return Err("invalid-Unicode boundary mutated prior state".to_string());
                 }
                 continue;
             }
@@ -237,9 +252,19 @@ fn run_case(case: &Path) -> Result<(), String> {
         } else {
             return Err(format!("step {step_index} has no send or deliver"));
         };
+        if state != prior_state {
+            return Err(format!(
+                "step {step_index}: dispatch mutated the caller's prior state"
+            ));
+        }
         if let Some(expect) = step.get("expect") {
-            check_result(&step_result, expect, supplied_envelope.as_ref())
-                .map_err(|error| format!("step {step_index}: {error}"))?;
+            check_result(
+                &step_result,
+                expect,
+                supplied_envelope.as_ref(),
+                Some(&prior_state),
+            )
+            .map_err(|error| format!("step {step_index}: {error}"))?;
         }
         if let Some(name) = step
             .get("capture_emissions_as")
@@ -292,7 +317,8 @@ fn run_static_documents(case: &Path, assertion: &serde_json::Value) -> Result<()
 fn check_result(
     result: &CoreResult,
     expected: &serde_json::Value,
-    _supplied_envelope: Option<&Envelope>,
+    supplied_envelope: Option<&Envelope>,
+    prior_state: Option<&AggregateState>,
 ) -> Result<(), String> {
     let expected = expected
         .as_object()
@@ -335,6 +361,15 @@ fn check_result(
     {
         return Err("expected null state".to_string());
     }
+    if expected
+        .get("caller_still_owns_input")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        supplied_envelope
+            .ok_or_else(|| "caller ownership asserted without a supplied envelope".to_string())?;
+        prior_state.ok_or_else(|| "caller ownership asserted without prior state".to_string())?;
+    }
     if let Some(rejection) = expected.get("rejection") {
         if rejection.is_null() {
             if result.rejection.is_some() {
@@ -347,6 +382,11 @@ fn check_result(
                 .ok_or_else(|| "expected rejection lacks code".to_string())?;
             if result.rejection.as_ref().map(|value| value.code.as_str()) != Some(code) {
                 return Err(format!("rejection {:?} != {code:?}", result.rejection));
+            }
+            if let (Some(actual), Some(prior)) = (result.state.as_ref(), prior_state) {
+                if actual != prior {
+                    return Err("rejection changed the prior aggregate state".to_string());
+                }
             }
         }
     }
@@ -473,7 +513,13 @@ fn check_emissions(
             compare_partial_map(&actual.payload, payload, None)?;
         }
         if let Some(target) = expected.get("target") {
-            compare_target(&actual.target, target, state)?;
+            compare_target(
+                &actual.target,
+                target,
+                state,
+                Some(&actual.emitting_runtime_id),
+                actual.emitting_owner_runtime_id.as_deref(),
+            )?;
         }
         if let Some(effect_id) = expected
             .get("effect_id")
@@ -483,8 +529,9 @@ fn check_emissions(
                 return Err(format!("emission {index} effect_id mismatch"));
             }
         }
-        if let Some(sequence) = expected.get("sequence").and_then(serde_json::Value::as_u64) {
-            if actual.sequence != Some(sequence) {
+        if let Some(sequence) = expected.get("sequence") {
+            let sequence = counter_from_json(sequence)?;
+            if actual.sequence.as_ref() != Some(&sequence) {
                 return Err(format!("emission {index} sequence mismatch"));
             }
         }
@@ -493,76 +540,42 @@ fn check_emissions(
 }
 
 fn compare_components(state: &AggregateState, expected: &serde_json::Value) -> Result<(), String> {
-    let expected = expected
-        .as_object()
-        .ok_or_else(|| "components expectation is not a map".to_string())?;
-    if state.root.components.len() != expected.len() {
-        return Err(format!(
-            "component ids {:?} != {:?}",
-            state
-                .root
-                .components
-                .iter()
-                .map(|component| &component.component_id)
-                .collect::<Vec<_>>(),
-            expected.keys().collect::<Vec<_>>()
-        ));
-    }
-    for (component_id, expected) in expected {
-        let component = state
-            .root
-            .components
-            .iter()
-            .find(|component| &component.component_id == component_id)
-            .ok_or_else(|| format!("missing component {component_id}"))?;
-        compare_runtime(&component.runtime, expected)?;
-    }
-    Ok(())
+    compare_runtime_components(&state.root, expected, state)
 }
 
 fn compare_owned(state: &AggregateState, expected: &serde_json::Value) -> Result<(), String> {
     let expected = expected
         .as_array()
         .ok_or_else(|| "owned_instances expectation is not a list".to_string())?;
-    if state.root.owned_instances.len() != expected.len() {
+    let mut actual = Vec::new();
+    collect_owned(&state.root, &mut actual);
+    actual.sort_by(|left, right| {
+        relation_owner_runtime_id(&left.runtime.relation)
+            .cmp(&relation_owner_runtime_id(&right.runtime.relation))
+            .then_with(|| left.spawn_sequence.cmp(&right.spawn_sequence))
+    });
+    if actual.len() != expected.len() {
         return Err(format!(
             "owned count {} != {}; root status={:?} fault={:?}",
-            state.root.owned_instances.len(),
+            actual.len(),
             expected.len(),
             state.root.status,
             state.root.fault
         ));
     }
-    for expected in expected {
+    for (index, expected) in expected.iter().enumerate() {
         let expected = expected
             .as_object()
             .ok_or_else(|| "owned member is not a map".to_string())?;
-        let sequence = expected
+        let key = expected
             .get("key")
-            .and_then(|key| key.get("spawn_sequence"))
-            .and_then(serde_json::Value::as_u64)
-            .or_else(|| {
-                expected
-                    .get("key")
-                    .and_then(|key| key.get("bound_instance"))
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|name| match state.root.visible_variables().get(name) {
-                        Some(Value::InstanceReference(reference)) => state
-                            .root
-                            .owned_instances
-                            .iter()
-                            .find(|owned| owned.reference == *reference)
-                            .map(|owned| owned.spawn_sequence),
-                        _ => None,
-                    })
-            })
-            .ok_or_else(|| "owned key does not resolve".to_string())?;
-        let owned = state
-            .root
-            .owned_instances
-            .iter()
-            .find(|owned| owned.spawn_sequence == sequence)
-            .ok_or_else(|| format!("missing owned sequence {sequence}"))?;
+            .ok_or_else(|| "owned member lacks key".to_string())?;
+        let owned = resolve_owned_key(state, &actual, key)?;
+        if !std::ptr::eq(owned, actual[index]) {
+            return Err(format!(
+                "owned member {index} is out of canonical owner/sequence order"
+            ));
+        }
         if let Some(machine_id) = expected
             .get("machine_id")
             .and_then(serde_json::Value::as_str)
@@ -574,7 +587,11 @@ fn compare_owned(state: &AggregateState, expected: &serde_json::Value) -> Result
                 ));
             }
         }
-        compare_runtime(&owned.runtime, &serde_json::Value::Object(expected.clone()))?;
+        compare_runtime(
+            &owned.runtime,
+            &serde_json::Value::Object(expected.clone()),
+            state,
+        )?;
     }
     Ok(())
 }
@@ -582,6 +599,7 @@ fn compare_owned(state: &AggregateState, expected: &serde_json::Value) -> Result
 fn compare_runtime(
     runtime: &determa_state::format1::RuntimeState,
     expected: &serde_json::Value,
+    aggregate: &AggregateState,
 ) -> Result<(), String> {
     let expected = expected
         .as_object()
@@ -608,23 +626,296 @@ fn compare_runtime(
     if let Some(variables) = expected.get("variables") {
         compare_variable_map(&runtime.visible_variables(), variables, runtime)?;
     }
+    if let Some(history) = expected.get("history") {
+        compare_history(runtime, history)?;
+    }
     if let Some(components) = expected.get("components") {
-        let expected = components
-            .as_object()
-            .ok_or_else(|| "nested components is not a map".to_string())?;
-        if runtime.components.len() != expected.len() {
-            return Err("nested component membership mismatch".to_string());
-        }
+        compare_runtime_components(runtime, components, aggregate)?;
     }
     if let Some(owned) = expected.get("owned_instances") {
-        let expected = owned
-            .as_array()
-            .ok_or_else(|| "nested owned is not a list".to_string())?;
-        if runtime.owned_instances.len() != expected.len() {
-            return Err("nested owned membership mismatch".to_string());
+        compare_runtime_owned(runtime, owned, aggregate)?;
+    }
+    Ok(())
+}
+
+fn compare_runtime_components(
+    runtime: &determa_state::format1::RuntimeState,
+    expected: &serde_json::Value,
+    aggregate: &AggregateState,
+) -> Result<(), String> {
+    let expected = expected
+        .as_object()
+        .ok_or_else(|| "components expectation is not a map".to_string())?;
+    if runtime.components.len() != expected.len() {
+        return Err(format!(
+            "component ids {:?} != {:?}",
+            runtime
+                .components
+                .iter()
+                .map(|component| &component.component_id)
+                .collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>()
+        ));
+    }
+    for (component_id, expected) in expected {
+        let component = runtime
+            .components
+            .iter()
+            .find(|component| &component.component_id == component_id)
+            .ok_or_else(|| format!("missing component {component_id}"))?;
+        compare_runtime(&component.runtime, expected, aggregate)?;
+    }
+    Ok(())
+}
+
+fn compare_runtime_owned(
+    runtime: &determa_state::format1::RuntimeState,
+    expected: &serde_json::Value,
+    aggregate: &AggregateState,
+) -> Result<(), String> {
+    let expected = expected
+        .as_array()
+        .ok_or_else(|| "nested owned_instances expectation is not a list".to_string())?;
+    if runtime.owned_instances.len() != expected.len() {
+        return Err(format!(
+            "owned sequences {:?} != {} expected member(s)",
+            runtime
+                .owned_instances
+                .iter()
+                .map(|owned| owned.spawn_sequence.to_string())
+                .collect::<Vec<_>>(),
+            expected.len()
+        ));
+    }
+    for expected in expected {
+        let expected_map = expected
+            .as_object()
+            .ok_or_else(|| "nested owned member is not a map".to_string())?;
+        let key = expected_map
+            .get("key")
+            .ok_or_else(|| "nested owned member lacks key".to_string())?;
+        let owned = resolve_direct_owned_key(aggregate, runtime, key)?;
+        if let Some(machine_id) = expected_map
+            .get("machine_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            if owned.runtime.machine_id != machine_id {
+                return Err(format!(
+                    "owned machine {:?} != {machine_id:?}",
+                    owned.runtime.machine_id
+                ));
+            }
+        }
+        compare_runtime(&owned.runtime, expected, aggregate)?;
+    }
+    Ok(())
+}
+
+fn compare_history(
+    runtime: &determa_state::format1::RuntimeState,
+    expected: &serde_json::Value,
+) -> Result<(), String> {
+    let actual = runtime
+        .history
+        .iter()
+        .map(|(key, value)| {
+            (
+                if key == "root" {
+                    "$root".to_string()
+                } else {
+                    key.clone()
+                },
+                value.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let expected = expected
+        .as_object()
+        .ok_or_else(|| "history expectation is not a map".to_string())?;
+    if actual.len() != expected.len() {
+        return Err(format!(
+            "history keys {:?} != {:?}",
+            actual.keys(),
+            expected.keys()
+        ));
+    }
+    for (key, expected) in expected {
+        let actual = actual
+            .get(key)
+            .ok_or_else(|| format!("missing history slot {key}"))?;
+        if expected.is_null() {
+            if actual.is_some() {
+                return Err(format!("history {key} is populated"));
+            }
+        } else if actual.as_ref() != Some(&string_list(expected)?) {
+            return Err(format!("history {key} {actual:?} != {expected:?}"));
         }
     }
     Ok(())
+}
+
+fn collect_owned<'a>(
+    runtime: &'a determa_state::format1::RuntimeState,
+    collected: &mut Vec<&'a determa_state::format1::OwnedRuntime>,
+) {
+    for component in &runtime.components {
+        collect_owned(&component.runtime, collected);
+    }
+    for owned in &runtime.owned_instances {
+        collected.push(owned);
+        collect_owned(&owned.runtime, collected);
+    }
+}
+
+fn resolve_owned_key<'a>(
+    state: &AggregateState,
+    actual: &[&'a determa_state::format1::OwnedRuntime],
+    key: &serde_json::Value,
+) -> Result<&'a determa_state::format1::OwnedRuntime, String> {
+    if let Some(variable) = key
+        .get("bound_instance")
+        .and_then(serde_json::Value::as_str)
+    {
+        let Value::InstanceReference(reference) = state
+            .root
+            .visible_variables()
+            .get(variable)
+            .cloned()
+            .ok_or_else(|| format!("missing bound variable {variable}"))?
+        else {
+            return Err(format!("{variable} is not an instance reference"));
+        };
+        let matches = actual
+            .iter()
+            .copied()
+            .filter(|owned| owned.reference == reference)
+            .collect::<Vec<_>>();
+        return match matches.as_slice() {
+            [owned] => Ok(*owned),
+            [] => Err(format!(
+                "bound variable {variable} resolves to no retained child"
+            )),
+            _ => Err(format!("bound variable {variable} resolves ambiguously")),
+        };
+    }
+    let owner = key
+        .get("owner")
+        .ok_or_else(|| "owned key lacks owner".to_string())?;
+    let owner_runtime_id = resolve_runtime_notation(state, owner)?;
+    let sequence = counter_from_json(
+        key.get("spawn_sequence")
+            .ok_or_else(|| "owned key lacks spawn_sequence".to_string())?,
+    )?;
+    actual
+        .iter()
+        .copied()
+        .find(|owned| {
+            relation_owner_runtime_id(&owned.runtime.relation) == Some(owner_runtime_id.as_str())
+                && owned.spawn_sequence == sequence
+        })
+        .ok_or_else(|| {
+            format!(
+                "missing owned key ({owner_runtime_id}, {})",
+                sequence.canonical_decimal()
+            )
+        })
+}
+
+fn resolve_direct_owned_key<'a>(
+    state: &AggregateState,
+    owner: &'a determa_state::format1::RuntimeState,
+    key: &serde_json::Value,
+) -> Result<&'a determa_state::format1::OwnedRuntime, String> {
+    let actual = owner.owned_instances.iter().collect::<Vec<_>>();
+    resolve_owned_key(state, &actual, key).and_then(|owned| {
+        (relation_owner_runtime_id(&owned.runtime.relation) == Some(owner.runtime_id.as_str()))
+            .then_some(owned)
+            .ok_or_else(|| "nested owned key names a different owner".to_string())
+    })
+}
+
+fn resolve_runtime_notation(
+    state: &AggregateState,
+    notation: &serde_json::Value,
+) -> Result<String, String> {
+    if notation.as_str() == Some("root") {
+        return Ok(state.root.runtime_id.clone());
+    }
+    if let Some(variable) = notation
+        .get("bound_instance")
+        .and_then(serde_json::Value::as_str)
+    {
+        let Value::InstanceReference(reference) = state
+            .root
+            .visible_variables()
+            .get(variable)
+            .cloned()
+            .ok_or_else(|| format!("missing bound variable {variable}"))?
+        else {
+            return Err(format!("{variable} is not an instance reference"));
+        };
+        return Ok(reference.instance_id);
+    }
+    Err(format!("unsupported runtime notation {notation:?}"))
+}
+
+fn find_runtime_by_id<'a>(
+    runtime: &'a determa_state::format1::RuntimeState,
+    runtime_id: &str,
+) -> Option<&'a determa_state::format1::RuntimeState> {
+    if runtime.runtime_id == runtime_id {
+        return Some(runtime);
+    }
+    for component in &runtime.components {
+        if let Some(found) = find_runtime_by_id(&component.runtime, runtime_id) {
+            return Some(found);
+        }
+    }
+    for owned in &runtime.owned_instances {
+        if let Some(found) = find_runtime_by_id(&owned.runtime, runtime_id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn relation_owner_runtime_id(relation: &determa_state::format1::RuntimeRelation) -> Option<&str> {
+    match relation {
+        determa_state::format1::RuntimeRelation::Root => None,
+        determa_state::format1::RuntimeRelation::Component {
+            owner_runtime_id, ..
+        }
+        | determa_state::format1::RuntimeRelation::Spawned {
+            owner_runtime_id, ..
+        } => Some(owner_runtime_id),
+    }
+}
+
+fn runtime_target(
+    state: &AggregateState,
+    runtime: &determa_state::format1::RuntimeState,
+) -> Target {
+    match &runtime.relation {
+        determa_state::format1::RuntimeRelation::Root => Target::Root {
+            root_instance_id: state.root_instance_id.clone(),
+            root_runtime_id: runtime.runtime_id.clone(),
+        },
+        determa_state::format1::RuntimeRelation::Spawned { reference, .. } => {
+            Target::SpawnedInstance(reference.clone())
+        }
+        determa_state::format1::RuntimeRelation::Component {
+            owner_runtime_id,
+            component_id,
+            activation_sequence,
+            ..
+        } => Target::Component {
+            root_instance_id: state.root_instance_id.clone(),
+            owner_runtime_id: owner_runtime_id.clone(),
+            component_id: component_id.clone(),
+            component_runtime_id: runtime.runtime_id.clone(),
+            activation_sequence: activation_sequence.clone(),
+        },
+    }
 }
 
 fn compare_variable_map(
@@ -736,34 +1027,76 @@ fn compare_target(
     actual: &Target,
     expected: &serde_json::Value,
     state: Option<&AggregateState>,
+    emitting_runtime_id: Option<&str>,
+    emitting_owner_runtime_id: Option<&str>,
 ) -> Result<(), String> {
     if expected.as_str() == Some("external") {
         return matches!(actual, Target::External)
             .then_some(())
             .ok_or_else(|| format!("target {actual:?} is not external"));
     }
-    if expected.as_str() == Some("owner") || expected.as_str() == Some("root") {
-        return matches!(actual, Target::Root { .. })
+    let state = state.ok_or_else(|| "target assertion requires aggregate state".to_string())?;
+    if expected.as_str() == Some("root") {
+        let expected = runtime_target(state, &state.root);
+        return (actual == &expected)
             .then_some(())
-            .ok_or_else(|| format!("target {actual:?} is not root/owner"));
+            .ok_or_else(|| format!("target {actual:?} != root {expected:?}"));
+    }
+    if expected.as_str() == Some("owner") {
+        let emitter_id = emitting_runtime_id
+            .ok_or_else(|| "owner target lacks emitting runtime identity".to_string())?;
+        let owner_id = find_runtime_by_id(&state.root, emitter_id)
+            .and_then(|emitter| {
+                relation_owner_runtime_id(&emitter.relation).or(Some(emitter.runtime_id.as_str()))
+            })
+            .or(emitting_owner_runtime_id)
+            .ok_or_else(|| "emission has no owner runtime identity".to_string())?;
+        let owner = find_runtime_by_id(&state.root, owner_id)
+            .ok_or_else(|| format!("owner runtime {owner_id} is absent"))?;
+        let expected = runtime_target(state, owner);
+        return (actual == &expected)
+            .then_some(())
+            .ok_or_else(|| format!("target {actual:?} != owner {expected:?}"));
     }
     if let Some(component_id) = expected
         .get("component")
         .and_then(serde_json::Value::as_str)
     {
-        return matches!(
-            actual,
-            Target::Component { component_id: actual, .. } if actual == component_id
+        let emitter = find_runtime_by_id(
+            &state.root,
+            emitting_runtime_id
+                .ok_or_else(|| "component target lacks emitting runtime identity".to_string())?,
         )
-        .then_some(())
-        .ok_or_else(|| format!("target {actual:?} is not component {component_id}"));
+        .ok_or_else(|| "emitting runtime is absent from aggregate".to_string())?;
+        let component = emitter
+            .components
+            .iter()
+            .find(|component| component.component_id == component_id)
+            .ok_or_else(|| {
+                format!(
+                    "component {component_id} is not owned by {}",
+                    emitter.runtime_id
+                )
+            })?;
+        let expanded = runtime_target(state, &component.runtime);
+        return (actual == &expanded)
+            .then_some(())
+            .ok_or_else(|| format!("target {actual:?} != component {expanded:?}"));
     }
     if let Some(variable) = expected
         .get("bound_instance")
         .and_then(serde_json::Value::as_str)
     {
-        let reference = state
-            .and_then(|state| state.root.visible_variables().get(variable).cloned())
+        let emitter = find_runtime_by_id(
+            &state.root,
+            emitting_runtime_id
+                .ok_or_else(|| "bound target lacks emitting runtime identity".to_string())?,
+        )
+        .ok_or_else(|| "emitting runtime is absent from aggregate".to_string())?;
+        let reference = emitter
+            .visible_variables()
+            .get(variable)
+            .cloned()
             .ok_or_else(|| format!("missing reference variable {variable}"))?;
         let Value::InstanceReference(reference) = reference else {
             return Err(format!("{variable} is not a reference"));
@@ -800,10 +1133,8 @@ fn compare_fault(
             return Err(format!("fault cause {:?} != {cause_id:?}", actual.cause_id));
         }
     }
-    if let Some(sequence) = expected
-        .get("step_sequence")
-        .and_then(serde_json::Value::as_u64)
-    {
+    if let Some(sequence) = expected.get("step_sequence") {
+        let sequence = counter_from_json(sequence)?;
         if actual.step_sequence != sequence {
             return Err(format!("fault step {} != {sequence}", actual.step_sequence));
         }
@@ -873,6 +1204,45 @@ fn string_list(value: &serde_json::Value) -> Result<Vec<String>, String> {
                 .ok_or_else(|| "expected string".to_string())
         })
         .collect()
+}
+
+fn counter_from_json(value: &serde_json::Value) -> Result<Counter, String> {
+    if let Some(value) = value.as_str() {
+        return Counter::from_decimal(value);
+    }
+    if let Some(value) = value.as_u64() {
+        return Counter::from_decimal(&value.to_string());
+    }
+    Err(format!(
+        "expected non-negative integer counter, got {value:?}"
+    ))
+}
+
+fn assert_invalid_unicode_boundary(value: Option<&serde_json::Value>) -> Result<(), String> {
+    fn marker(value: &serde_json::Value) -> Option<u16> {
+        match value {
+            serde_json::Value::Object(values) => {
+                if let Some(value) = values
+                    .get("invalid_unicode_scalar")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    return u16::from_str_radix(value, 16).ok();
+                }
+                values.values().find_map(marker)
+            }
+            serde_json::Value::Array(values) => values.iter().find_map(marker),
+            _ => None,
+        }
+    }
+    let scalar = value
+        .and_then(marker)
+        .ok_or_else(|| "invalid Unicode marker is absent or malformed".to_string())?;
+    if string_from_utf16(&[scalar]).is_ok() {
+        return Err(format!(
+            "Rust UTF-16 boundary accepted unpaired surrogate U+{scalar:04X}"
+        ));
+    }
+    Ok(())
 }
 
 fn contains_invalid_unicode(value: Option<&serde_json::Value>) -> bool {

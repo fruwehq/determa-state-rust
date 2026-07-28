@@ -1,6 +1,21 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidUnicodeString;
+
+impl std::fmt::Display for InvalidUnicodeString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("UTF-16 input contains an unpaired surrogate")
+    }
+}
+
+impl std::error::Error for InvalidUnicodeString {}
+
+pub fn string_from_utf16(units: &[u16]) -> Result<String, InvalidUnicodeString> {
+    String::from_utf16(units).map_err(|_| InvalidUnicodeString)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct InstanceReference {
     pub root_instance_id: String,
@@ -51,6 +66,10 @@ impl Value {
     pub fn normalize_for_type(&self, declared_type: &str) -> Option<Self> {
         match (self, declared_type) {
             (Self::Int(value), "float") => Some(Self::Float(*value as f64)),
+            (Self::Float(value), "float") if value.is_finite() => {
+                Some(Self::Float(if *value == 0.0 { 0.0 } else { *value }))
+            }
+            (Self::Float(_), "float") => None,
             _ if self.matches_type(declared_type) => Some(self.clone()),
             _ => None,
         }
@@ -63,6 +82,8 @@ impl Value {
             serde_json::Value::Number(value) => {
                 if let Some(integer) = value.as_i64() {
                     Ok(Self::Int(integer))
+                } else if value.as_u64().is_some() {
+                    Err("integer is outside the signed 64-bit domain".to_string())
                 } else {
                     let float = value
                         .as_f64()
@@ -150,5 +171,35 @@ impl<'de> Deserialize<'de> for Value {
     {
         let value = serde_json::Value::deserialize(deserializer)?;
         Self::from_json(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Value;
+
+    #[test]
+    fn native_values_reject_unsigned_overflow_and_preserve_numeric_types() {
+        let nested = serde_json::json!({
+            "items": [0]
+        });
+        let mut nested = nested;
+        nested["items"][0] = serde_json::Value::Number(serde_json::Number::from(u64::MAX));
+        assert!(Value::from_json(&nested).is_err());
+        assert_eq!(
+            Value::from_json(&serde_json::json!(1)).unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            Value::from_json(&serde_json::json!(1.0)).unwrap(),
+            Value::Float(1.0)
+        );
+        assert!(Value::Float(f64::INFINITY)
+            .normalize_for_type("float")
+            .is_none());
+        assert_eq!(
+            Value::Float(-0.0).normalize_for_type("float"),
+            Some(Value::Float(0.0))
+        );
     }
 }
