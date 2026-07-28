@@ -339,16 +339,22 @@ fn apply_envelope_replacement(
     let replacement = replacement
         .as_object()
         .ok_or_else(|| "deliver.replace is not a map".to_string())?;
-    if replacement.len() != 1 {
-        return Err("deliver.replace must contain exactly one field".to_string());
+    if replacement.is_empty() {
+        return Err("deliver.replace must not be empty".to_string());
+    }
+    if let Some(field) = replacement.keys().find(|field| {
+        !matches!(
+            field.as_str(),
+            "payload" | "target" | "spawned_instance_reference"
+        )
+    }) {
+        return Err(format!("unsupported deliver.replace field {field}"));
     }
     if let Some(payload) = replacement.get("payload") {
         envelope.payload = value_map(payload)?;
-        return Ok(());
     }
     if let Some(target) = replacement.get("target") {
         envelope.target = resolve_driver_target(state, target, false)?;
-        return Ok(());
     }
     if let Some(fields) = replacement.get("spawned_instance_reference") {
         let Target::SpawnedInstance(reference) = &mut envelope.target else {
@@ -377,12 +383,8 @@ fn apply_envelope_replacement(
                 _ => return Err(format!("unsupported spawned reference field {name}")),
             }
         }
-        return Ok(());
     }
-    Err(format!(
-        "unsupported deliver.replace field {:?}",
-        replacement.keys().collect::<Vec<_>>()
-    ))
+    Ok(())
 }
 
 fn required_string<'a>(value: &'a serde_json::Value, name: &str) -> Result<&'a str, String> {
@@ -1590,4 +1592,89 @@ fn contains_invalid_unicode(value: Option<&serde_json::Value>) -> bool {
 
 fn display(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+#[test]
+fn envelope_replacement_applies_all_fields_in_documented_order() {
+    let bundle = load_bundle(
+        r#"
+format: 1
+namespace: test.driver_replacement
+machines:
+  - machine_id: owner
+    root:
+      type: composite
+      variables:
+        child:
+          type: instance_reference
+          machine_id: worker
+          nullable: true
+          init: null
+      entry:
+        - spawn: { machine_id: worker, bind_to: child }
+      initial: { transition_to: active }
+      states:
+        active: {}
+  - machine_id: worker
+    root: {}
+"#,
+    )
+    .expect("focused driver bundle loads");
+    let state = create(
+        &bundle,
+        "owner",
+        "owner-1",
+        "create-1",
+        &Bindings::default(),
+    )
+    .state
+    .expect("focused driver aggregate is created");
+    let Value::InstanceReference(original_reference) = state
+        .root
+        .visible_variables()
+        .get("child")
+        .cloned()
+        .expect("spawn binds child")
+    else {
+        panic!("child binding is not an instance reference");
+    };
+    let mut envelope = Envelope {
+        event: "probe".to_string(),
+        event_id: "probe-1".to_string(),
+        target: runtime_target(&state, &state.root),
+        payload: BTreeMap::from([("old".to_string(), Value::Bool(true))]),
+        correlation_id: None,
+    };
+
+    apply_envelope_replacement(
+        &mut envelope,
+        &serde_json::json!({
+            "payload": { "replacement": "applied" },
+            "target": { "bound_instance": "child" },
+            "spawned_instance_reference": { "instance_id": "tampered-child" }
+        }),
+        &state,
+    )
+    .expect("multi-field replacement succeeds");
+
+    assert_eq!(
+        envelope.payload,
+        BTreeMap::from([(
+            "replacement".to_string(),
+            Value::String("applied".to_string())
+        )])
+    );
+    let Target::SpawnedInstance(reference) = envelope.target else {
+        panic!("target replacement did not select the spawned instance");
+    };
+    assert_eq!(
+        reference.root_instance_id,
+        original_reference.root_instance_id
+    );
+    assert_eq!(reference.machine_id, original_reference.machine_id);
+    assert_eq!(
+        reference.machine_version,
+        original_reference.machine_version
+    );
+    assert_eq!(reference.instance_id, "tampered-child");
 }
