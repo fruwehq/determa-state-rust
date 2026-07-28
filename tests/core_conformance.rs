@@ -21,7 +21,7 @@ fn all_format_1_core_cases() {
         .filter(|path| path.is_dir())
         .collect::<Vec<_>>();
     cases.sort();
-    assert_eq!(cases.len(), 75, "expected the complete merged core suite");
+    assert_eq!(cases.len(), 88, "expected the complete merged core suite");
     let mut failures = Vec::new();
     for case in cases {
         if let Err(error) = run_case(&case) {
@@ -132,11 +132,12 @@ fn run_case(case: &Path) -> Result<(), String> {
         .cloned()
         .unwrap_or_default();
     for (step_index, step) in steps.iter().enumerate() {
-        let prior_state = state.clone();
+        let caller_state = state.clone();
         let step = step
             .as_object()
             .ok_or_else(|| format!("step {step_index} is not a map"))?;
-        let (step_result, supplied_envelope) = if let Some(send) = step.get("send") {
+        let (step_result, supplied_envelope, supplied_state) = if let Some(send) = step.get("send")
+        {
             let send = send
                 .as_object()
                 .ok_or_else(|| format!("step {step_index} send is not a map"))?;
@@ -160,31 +161,13 @@ fn run_case(case: &Path) -> Result<(), String> {
                 {
                     return Err("invalid-Unicode dispatch must assert caller ownership".to_string());
                 }
-                if state != prior_state {
+                if !aggregate_exact_equal(&state, &caller_state) {
                     return Err("invalid-Unicode boundary mutated prior state".to_string());
                 }
                 continue;
             }
-            let target = if let Some(variable) = send
-                .get("bound_instance")
-                .and_then(serde_json::Value::as_str)
-            {
-                let value = state
-                    .root
-                    .visible_variables()
-                    .get(variable)
-                    .cloned()
-                    .ok_or_else(|| format!("missing bound variable {variable}"))?;
-                let Value::InstanceReference(reference) = value else {
-                    return Err(format!("{variable} is not an instance reference"));
-                };
-                Target::SpawnedInstance(reference)
-            } else {
-                Target::Root {
-                    root_instance_id: state.root_instance_id.clone(),
-                    root_runtime_id: state.root.runtime_id.clone(),
-                }
-            };
+            let target =
+                resolve_driver_target(&state, &serde_json::Value::Object(send.clone()), true)?;
             let event = send
                 .get("event")
                 .and_then(serde_json::Value::as_str)
@@ -224,6 +207,7 @@ fn run_case(case: &Path) -> Result<(), String> {
                     Some(Delivery::Input(envelope.clone())),
                 ),
                 Some(envelope),
+                state.clone(),
             )
         } else if let Some(deliver) = step.get("deliver") {
             let deliver = deliver
@@ -242,17 +226,27 @@ fn run_case(case: &Path) -> Result<(), String> {
                 .get(name)
                 .and_then(|emissions| emissions.get(index))
                 .ok_or_else(|| format!("capture {name}[{index}] is missing"))?;
-            let envelope = emission
+            let mut envelope = emission
                 .envelope()
                 .ok_or_else(|| "cannot deliver an external intent".to_string())?;
+            if let Some(replace) = deliver.get("replace") {
+                apply_envelope_replacement(&mut envelope, replace, &state)?;
+            }
             (
                 dispatch(&bundle, &state, Some(Delivery::Internal(envelope.clone()))),
                 Some(envelope),
+                state.clone(),
             )
+        } else if let Some(inspect) = step.get("inspect") {
+            let mut corrupted = state.clone();
+            apply_prior_state_corruption(&mut corrupted, inspect)?;
+            (dispatch(&bundle, &corrupted, None), None, corrupted)
         } else {
-            return Err(format!("step {step_index} has no send or deliver"));
+            return Err(format!(
+                "step {step_index} has no send, deliver, or inspect"
+            ));
         };
-        if state != prior_state {
+        if !aggregate_exact_equal(&state, &caller_state) {
             return Err(format!(
                 "step {step_index}: dispatch mutated the caller's prior state"
             ));
@@ -262,7 +256,7 @@ fn run_case(case: &Path) -> Result<(), String> {
                 &step_result,
                 expect,
                 supplied_envelope.as_ref(),
-                Some(&prior_state),
+                Some(&supplied_state),
             )
             .map_err(|error| format!("step {step_index}: {error}"))?;
         }
@@ -277,6 +271,196 @@ fn run_case(case: &Path) -> Result<(), String> {
             .ok_or_else(|| format!("step {step_index} returned no state"))?;
     }
     Ok(())
+}
+
+fn resolve_driver_target(
+    state: &AggregateState,
+    selector: &serde_json::Value,
+    default_root: bool,
+) -> Result<Target, String> {
+    if selector.as_str() == Some("root") {
+        return Ok(runtime_target(state, &state.root));
+    }
+    if let Some(variable) = selector
+        .get("bound_instance")
+        .and_then(serde_json::Value::as_str)
+    {
+        let value = state
+            .root
+            .visible_variables()
+            .get(variable)
+            .cloned()
+            .ok_or_else(|| format!("missing bound variable {variable}"))?;
+        let Value::InstanceReference(reference) = value else {
+            return Err(format!("{variable} is not an instance reference"));
+        };
+        return Ok(Target::SpawnedInstance(reference));
+    }
+    if let Some(component_id) = selector
+        .get("component")
+        .and_then(serde_json::Value::as_str)
+    {
+        let mut matches = Vec::new();
+        collect_components(&state.root, component_id, &mut matches);
+        return match matches.as_slice() {
+            [component] => Ok(runtime_target(state, &component.runtime)),
+            [] => Err(format!("component {component_id} is not retained")),
+            _ => Err(format!("component {component_id} is ambiguous")),
+        };
+    }
+    if default_root {
+        Ok(runtime_target(state, &state.root))
+    } else {
+        Err(format!("unsupported target selector {selector:?}"))
+    }
+}
+
+fn collect_components<'a>(
+    runtime: &'a determa_state::format1::RuntimeState,
+    component_id: &str,
+    matches: &mut Vec<&'a determa_state::format1::ComponentRuntime>,
+) {
+    for component in &runtime.components {
+        if component.component_id == component_id {
+            matches.push(component);
+        }
+        collect_components(&component.runtime, component_id, matches);
+    }
+    for owned in &runtime.owned_instances {
+        collect_components(&owned.runtime, component_id, matches);
+    }
+}
+
+fn apply_envelope_replacement(
+    envelope: &mut Envelope,
+    replacement: &serde_json::Value,
+    state: &AggregateState,
+) -> Result<(), String> {
+    let replacement = replacement
+        .as_object()
+        .ok_or_else(|| "deliver.replace is not a map".to_string())?;
+    if replacement.len() != 1 {
+        return Err("deliver.replace must contain exactly one field".to_string());
+    }
+    if let Some(payload) = replacement.get("payload") {
+        envelope.payload = value_map(payload)?;
+        return Ok(());
+    }
+    if let Some(target) = replacement.get("target") {
+        envelope.target = resolve_driver_target(state, target, false)?;
+        return Ok(());
+    }
+    if let Some(fields) = replacement.get("spawned_instance_reference") {
+        let Target::SpawnedInstance(reference) = &mut envelope.target else {
+            return Err(
+                "spawned_instance_reference replacement requires a spawned target".to_string(),
+            );
+        };
+        let fields = fields
+            .as_object()
+            .ok_or_else(|| "spawned_instance_reference is not a map".to_string())?;
+        if fields.is_empty() {
+            return Err("spawned_instance_reference replacement is empty".to_string());
+        }
+        for (name, value) in fields {
+            match name.as_str() {
+                "root_instance_id" => {
+                    reference.root_instance_id = required_string(value, name)?.to_string()
+                }
+                "instance_id" => reference.instance_id = required_string(value, name)?.to_string(),
+                "machine_id" => reference.machine_id = required_string(value, name)?.to_string(),
+                "machine_version" => {
+                    reference.machine_version = value
+                        .as_i64()
+                        .ok_or_else(|| "machine_version replacement is not an int".to_string())?
+                }
+                _ => return Err(format!("unsupported spawned reference field {name}")),
+            }
+        }
+        return Ok(());
+    }
+    Err(format!(
+        "unsupported deliver.replace field {:?}",
+        replacement.keys().collect::<Vec<_>>()
+    ))
+}
+
+fn required_string<'a>(value: &'a serde_json::Value, name: &str) -> Result<&'a str, String> {
+    value
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{name} replacement is not a non-empty string"))
+}
+
+fn apply_prior_state_corruption(
+    state: &mut AggregateState,
+    inspect: &serde_json::Value,
+) -> Result<(), String> {
+    let corruption = inspect
+        .get("corrupt_prior_state")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "unsupported inspect operation".to_string())?;
+    if corruption
+        .get("runtime")
+        .and_then(serde_json::Value::as_str)
+        != Some("root")
+    {
+        return Err("only root prior-state corruption is supported".to_string());
+    }
+    let variable = corruption
+        .get("variable")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "corrupt_prior_state.variable is missing".to_string())?;
+    let slot = state
+        .root
+        .variables
+        .values_mut()
+        .filter(|slot| slot.name == variable)
+        .max_by_key(|slot| slot.declaration_path.split('.').count())
+        .ok_or_else(|| format!("visible variable {variable} is missing"))?;
+    let path = corruption
+        .get("path")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "corrupt_prior_state.path is not a list".to_string())?;
+    if path.is_empty() {
+        return Err("corrupt_prior_state.path is empty".to_string());
+    }
+    let replacement = value_from_fixture(
+        corruption
+            .get("value")
+            .ok_or_else(|| "corrupt_prior_state.value is missing".to_string())?,
+    )?;
+    replace_nested_value(&mut slot.value, path, replacement)
+}
+
+fn replace_nested_value(
+    current: &mut Value,
+    path: &[serde_json::Value],
+    replacement: Value,
+) -> Result<(), String> {
+    let Some((head, tail)) = path.split_first() else {
+        *current = replacement;
+        return Ok(());
+    };
+    match (current, head) {
+        (Value::Map(values), serde_json::Value::String(key)) => {
+            let child = values
+                .get_mut(key)
+                .ok_or_else(|| format!("corrupt path map key {key} is missing"))?;
+            replace_nested_value(child, tail, replacement)
+        }
+        (Value::List(values), serde_json::Value::Number(index)) => {
+            let index = index
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| "corrupt path index is invalid".to_string())?;
+            let child = values
+                .get_mut(index)
+                .ok_or_else(|| format!("corrupt path list index {index} is missing"))?;
+            replace_nested_value(child, tail, replacement)
+        }
+        _ => Err("corrupt path cannot traverse the selected value".to_string()),
+    }
 }
 
 fn run_static_documents(case: &Path, assertion: &serde_json::Value) -> Result<(), String> {
@@ -369,6 +553,30 @@ fn check_result(
         supplied_envelope
             .ok_or_else(|| "caller ownership asserted without a supplied envelope".to_string())?;
         prior_state.ok_or_else(|| "caller ownership asserted without prior state".to_string())?;
+        if !matches!(
+            result.disposition,
+            Some(Disposition::Rejected | Disposition::Faulted)
+        ) {
+            return Err(
+                "caller input ownership asserted for a non-rejected, non-faulted dispatch"
+                    .to_string(),
+            );
+        }
+    }
+    if expected
+        .get("caller_still_owns_state")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        let prior = prior_state
+            .ok_or_else(|| "caller state ownership asserted without prior state".to_string())?;
+        if !result
+            .state
+            .as_ref()
+            .is_some_and(|state| aggregate_exact_equal(state, prior))
+        {
+            return Err("dispatch did not return the exact caller-owned prior state".to_string());
+        }
     }
     if let Some(rejection) = expected.get("rejection") {
         if rejection.is_null() {
@@ -384,7 +592,7 @@ fn check_result(
                 return Err(format!("rejection {:?} != {code:?}", result.rejection));
             }
             if let (Some(actual), Some(prior)) = (result.state.as_ref(), prior_state) {
-                if actual != prior {
+                if !aggregate_exact_equal(actual, prior) {
                     return Err("rejection changed the prior aggregate state".to_string());
                 }
             }
@@ -495,6 +703,14 @@ fn check_emissions(
                 return Err(format!(
                     "emission {index} event {:?} != {event:?}",
                     actual.event
+                ));
+            }
+        }
+        if let Some(event_id) = expected.get("event_id").and_then(serde_json::Value::as_str) {
+            if actual.event_id.as_deref() != Some(event_id) {
+                return Err(format!(
+                    "emission {index} event_id {:?} != {event_id:?}",
+                    actual.event_id
                 ));
             }
         }
@@ -959,6 +1175,16 @@ fn compare_value(
     expected: &serde_json::Value,
     runtime: Option<&determa_state::format1::RuntimeState>,
 ) -> Result<(), String> {
+    if expected
+        .get("normalized_double")
+        .and_then(serde_json::Value::as_str)
+        == Some("positive_zero")
+    {
+        return match actual {
+            Value::Float(value) if *value == 0.0 && value.is_sign_positive() => Ok(()),
+            _ => Err(format!("actual {actual:?} is not normalized positive zero")),
+        };
+    }
     if let Some(reference_expectation) = expected.get("instance_reference") {
         let Value::InstanceReference(reference) = actual else {
             return Err(format!("actual {actual:?} is not an instance reference"));
@@ -977,7 +1203,7 @@ fn compare_value(
         {
             let actual_targetable = runtime
                 .filter(|runtime| runtime.status == RuntimeStatus::Running)
-                .and_then(|runtime| find_reference(runtime, &reference.instance_id))
+                .and_then(|runtime| find_reference(runtime, reference))
                 .is_some_and(|runtime| runtime.status == RuntimeStatus::Running);
             if actual_targetable != targetable {
                 return Err(format!(
@@ -1144,18 +1370,18 @@ fn compare_fault(
 
 fn find_reference<'a>(
     runtime: &'a determa_state::format1::RuntimeState,
-    instance_id: &str,
+    reference: &determa_state::InstanceReference,
 ) -> Option<&'a determa_state::format1::RuntimeState> {
     for owned in &runtime.owned_instances {
-        if owned.reference.instance_id == instance_id {
+        if owned.reference == *reference {
             return Some(&owned.runtime);
         }
-        if let Some(found) = find_reference(&owned.runtime, instance_id) {
+        if let Some(found) = find_reference(&owned.runtime, reference) {
             return Some(found);
         }
     }
     for component in &runtime.components {
-        if let Some(found) = find_reference(&component.runtime, instance_id) {
+        if let Some(found) = find_reference(&component.runtime, reference) {
             return Some(found);
         }
     }
@@ -1188,8 +1414,107 @@ fn value_map(value: &serde_json::Value) -> Result<BTreeMap<String, Value>, Strin
         .ok_or_else(|| "value is not a map".to_string())?;
     object
         .iter()
-        .map(|(name, value)| Ok((name.clone(), Value::from_json(value)?)))
+        .map(|(name, value)| Ok((name.clone(), value_from_fixture(value)?)))
         .collect()
+}
+
+fn value_from_fixture(value: &serde_json::Value) -> Result<Value, String> {
+    if let Some(marker) = value
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .and_then(|object| object.get("non_finite_double"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return match marker {
+            "nan" => Ok(Value::Float(f64::NAN)),
+            "positive_infinity" => Ok(Value::Float(f64::INFINITY)),
+            "negative_infinity" => Ok(Value::Float(f64::NEG_INFINITY)),
+            _ => Err(format!("unsupported non_finite_double marker {marker:?}")),
+        };
+    }
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(value_from_fixture)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), value_from_fixture(value)?)))
+            .collect::<Result<BTreeMap<_, _>, String>>()
+            .map(Value::Map),
+        _ => Value::from_json(value),
+    }
+}
+
+fn aggregate_exact_equal(left: &AggregateState, right: &AggregateState) -> bool {
+    if !runtime_values_exact_equal(&left.root, &right.root) {
+        return false;
+    }
+    let mut left = left.clone();
+    let mut right = right.clone();
+    scrub_runtime_values(&mut left.root);
+    scrub_runtime_values(&mut right.root);
+    left == right
+}
+
+fn runtime_values_exact_equal(
+    left: &determa_state::format1::RuntimeState,
+    right: &determa_state::format1::RuntimeState,
+) -> bool {
+    left.variables.len() == right.variables.len()
+        && left.variables.iter().all(|(key, left)| {
+            right
+                .variables
+                .get(key)
+                .is_some_and(|right| value_exact_equal(&left.value, &right.value))
+        })
+        && left.components.len() == right.components.len()
+        && left
+            .components
+            .iter()
+            .zip(&right.components)
+            .all(|(left, right)| runtime_values_exact_equal(&left.runtime, &right.runtime))
+        && left.owned_instances.len() == right.owned_instances.len()
+        && left
+            .owned_instances
+            .iter()
+            .zip(&right.owned_instances)
+            .all(|(left, right)| runtime_values_exact_equal(&left.runtime, &right.runtime))
+}
+
+fn scrub_runtime_values(runtime: &mut determa_state::format1::RuntimeState) {
+    for slot in runtime.variables.values_mut() {
+        slot.value = Value::Null;
+    }
+    for component in &mut runtime.components {
+        scrub_runtime_values(&mut component.runtime);
+    }
+    for owned in &mut runtime.owned_instances {
+        scrub_runtime_values(&mut owned.runtime);
+    }
+}
+
+fn value_exact_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Float(left), Value::Float(right)) => left.to_bits() == right.to_bits(),
+        (Value::List(left), Value::List(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| value_exact_equal(left, right))
+        }
+        (Value::Map(left), Value::Map(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, left)| {
+                    right
+                        .get(key)
+                        .is_some_and(|right| value_exact_equal(left, right))
+                })
+        }
+        _ => left == right,
+    }
 }
 
 fn string_list(value: &serde_json::Value) -> Result<Vec<String>, String> {

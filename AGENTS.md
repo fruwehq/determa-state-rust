@@ -10,8 +10,8 @@ published as `determa-state` plus the `determa-state-rust` launcher-selection al
 
 The current implementation target is format 1 at these immutable inputs:
 
-- specification: `03771fac569a47b82f27891cd3700d4d1d876f8b`;
-- conformance: `409bbdc6c2d4a4e9d50ddb1d994c5f5cd7d97762`.
+- specification: `4bd4d9588d11b75d376380b6120676a056a4bc45`;
+- conformance: `ffbc65cbce49733803119a7dabf02a9727819ba8`.
 
 The conformance suite is the arbiter of behavior.
 
@@ -21,7 +21,7 @@ The conformance suite is the arbiter of behavior.
 - `src/format1/`: loader, semantic compiler, CEL profile, and pure runtime.
 - `src/value.rs`: portable values and nominal instance references.
 - `src/cli.rs`: nonportable validation utility only.
-- `tests/core_conformance.rs`: driver for all 75 `conformance/core` cases.
+- `tests/core_conformance.rs`: driver for all 88 `conformance/core` cases.
 - `conformance-suite/`: pinned `determa-state-conformance` submodule.
 
 ## Working rules
@@ -40,13 +40,13 @@ The conformance suite is the arbiter of behavior.
 ```sh
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
-  "409bbdc6c2d4a4e9d50ddb1d994c5f5cd7d97762"
+  "ffbc65cbce49733803119a7dabf02a9727819ba8"
 cargo build --release
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-`cargo test --test core_conformance -- --nocapture` runs the complete 75-case core suite.
+`cargo test --test core_conformance -- --nocapture` runs the complete 88-case core suite.
 CI additionally checks the local schema byte-for-byte against the exact specification
 commit.
 

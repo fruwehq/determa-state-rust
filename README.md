@@ -5,11 +5,11 @@ Rust implementation of the portable [Determa State](https://github.com/fruwehq/d
 
 The crate remains version `0.0.6` while implementing the pre-release normative inputs:
 
-- specification commit `03771fac569a47b82f27891cd3700d4d1d876f8b`;
-- conformance commit `409bbdc6c2d4a4e9d50ddb1d994c5f5cd7d97762`.
+- specification commit `4bd4d9588d11b75d376380b6120676a056a4bc45`;
+- conformance commit `ffbc65cbce49733803119a7dabf02a9727819ba8`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
-test runs every one of its 75 core cases.
+test runs every one of its 88 core cases.
 
 ## Implemented core
 
@@ -42,9 +42,9 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`409bbdc6c2d4a4e9d50ddb1d994c5f5cd7d97762`. CI also checks that the bundled schema is
+`ffbc65cbce49733803119a7dabf02a9727819ba8`. CI also checks that the bundled schema is
 identical to the schema at specification commit
-`03771fac569a47b82f27891cd3700d4d1d876f8b`.
+`4bd4d9588d11b75d376380b6120676a056a4bc45`.
 
 ## Library
 

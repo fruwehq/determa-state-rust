@@ -303,13 +303,16 @@ pub fn dispatch(
         Delivery::Input(envelope) => (DeliveryMode::Input, envelope),
         Delivery::Internal(envelope) => (DeliveryMode::Internal, envelope),
     };
+    if prior_state.root.status == RuntimeStatus::Faulted {
+        return rejected_dispatch(prior_state, "invalid_instance_target");
+    }
+    if matches!(mode, DeliveryMode::Input) && matches!(envelope.target, Target::Component { .. }) {
+        return rejected_dispatch(prior_state, "invalid_instance_target");
+    }
     let address = match resolve_delivery_target(prior_state, &envelope.target) {
         Ok(address) => address,
         Err(code) => return rejected_dispatch(prior_state, code),
     };
-    if prior_state.root.status == RuntimeStatus::Faulted {
-        return rejected_dispatch(prior_state, "invalid_instance_target");
-    }
     let Some(target_runtime) = runtime_at(&prior_state.root, &address) else {
         return rejected_dispatch(
             prior_state,
@@ -399,7 +402,6 @@ pub fn dispatch(
                 &normalized_envelope.event_id,
                 step_sequence.clone(),
                 &mut emissions,
-                bundle,
             );
             dispose_completed_spawned_at_path(&mut aggregate.root, &address);
             CoreResult {
@@ -995,7 +997,7 @@ fn valid_slot_value(value: &Value, declaration: &VariableDeclaration) -> bool {
             _ => false,
         }
     } else {
-        value.normalize_for_type(&declaration.value_type).is_some()
+        value.is_canonical_portable() && value.normalize_for_type(&declaration.value_type).is_some()
     }
 }
 
@@ -1229,7 +1231,6 @@ fn validate_holder(owner: &RuntimeState, owned: &OwnedRuntime) -> bool {
             &slot.declaration_path == path
                 && &slot.declaration_pointer == pointer
                 && &slot.state_activation_sequence == holder_activation_sequence
-                && slot.value == Value::InstanceReference(owned.reference.clone())
         }),
         (None, None, RuntimeRelation::Spawned { .. }) => true,
         _ => false,
@@ -1319,11 +1320,8 @@ fn resolve_delivery_target(
         {
             Ok(Vec::new())
         }
-        Target::SpawnedInstance(reference)
-            if reference.root_instance_id == aggregate.root_instance_id =>
-        {
-            find_spawn_address(&aggregate.root, &reference.instance_id)
-                .ok_or("invalid_instance_target")
+        Target::SpawnedInstance(reference) => {
+            find_spawn_address(&aggregate.root, reference).ok_or("invalid_instance_target")
         }
         Target::Component {
             root_instance_id,
@@ -1392,22 +1390,25 @@ fn runtime_at_mut<'a>(
     }
 }
 
-fn find_spawn_address(runtime: &RuntimeState, instance_id: &str) -> Option<RuntimeAddress> {
+fn find_spawn_address(
+    runtime: &RuntimeState,
+    reference: &InstanceReference,
+) -> Option<RuntimeAddress> {
     if runtime.status != RuntimeStatus::Running {
         return None;
     }
     for owned in &runtime.owned_instances {
-        if owned.reference.instance_id == instance_id {
+        if owned.reference == *reference {
             return Some(vec![AddressSegment::Spawn(owned.spawn_sequence.clone())]);
         }
-        if let Some(mut nested) = find_spawn_address(&owned.runtime, instance_id) {
+        if let Some(mut nested) = find_spawn_address(&owned.runtime, reference) {
             let mut address = vec![AddressSegment::Spawn(owned.spawn_sequence.clone())];
             address.append(&mut nested);
             return Some(address);
         }
     }
     for component in &runtime.components {
-        if let Some(mut nested) = find_spawn_address(&component.runtime, instance_id) {
+        if let Some(mut nested) = find_spawn_address(&component.runtime, reference) {
             let mut address = vec![AddressSegment::Component(
                 component.component_id.clone(),
                 component.activation_sequence.clone(),
@@ -1672,13 +1673,15 @@ fn validate_envelope(
         .or_else(|| bundle.events.get(&envelope.event));
     match envelope.event.as_str() {
         "env" => {
-            if matches!(mode, DeliveryMode::Input)
-                && !matches!(
-                    envelope.target,
-                    Target::Root { .. } | Target::SpawnedInstance(_)
-                )
-            {
-                return Err("invalid_instance_target");
+            match mode {
+                DeliveryMode::Input
+                    if matches!(
+                        envelope.target,
+                        Target::Root { .. } | Target::SpawnedInstance(_)
+                    ) => {}
+                DeliveryMode::Input => return Err("invalid_instance_target"),
+                DeliveryMode::Internal if matches!(envelope.target, Target::Component { .. }) => {}
+                DeliveryMode::Internal => return Err("invalid_event"),
             }
             if envelope.correlation_id.is_some() {
                 return Err("invalid_correlation");
@@ -1690,15 +1693,20 @@ fn validate_envelope(
                 return Err("invalid_payload");
             }
             let external = root_external_variables(&runtime.definition);
+            let mut normalized = BTreeMap::new();
             for (name, value) in changed {
                 let Some(declaration) = external.get(name) else {
                     return Err("invalid_payload");
                 };
-                if value.normalize_for_type(&declaration.value_type).is_none() {
-                    return Err("invalid_payload");
-                }
+                let value = value
+                    .normalize_for_type(&declaration.value_type)
+                    .ok_or("invalid_payload")?;
+                normalized.insert(name.clone(), value);
             }
-            return Ok(envelope.clone());
+            return Ok(Envelope {
+                payload: BTreeMap::from([("changed".to_string(), Value::Map(normalized))]),
+                ..envelope.clone()
+            });
         }
         "done"
         | "determa.component_completed"
@@ -1707,6 +1715,11 @@ fn validate_envelope(
             if matches!(mode, DeliveryMode::Input) {
                 return Err("invalid_event");
             }
+            if envelope.correlation_id.is_some() {
+                return Err("invalid_correlation");
+            }
+            validate_reserved_lifecycle_payload(&envelope.event, &envelope.payload)
+                .map_err(|_| "invalid_payload")?;
             return Ok(envelope.clone());
         }
         _ => {}
@@ -1725,15 +1738,12 @@ fn validate_envelope(
             return Err("invalid_event");
         }
     }
-    if declaration.correlates_to.is_some()
-        && envelope
-            .correlation_id
-            .as_ref()
-            .is_none_or(String::is_empty)
+    if envelope
+        .correlation_id
+        .as_ref()
+        .is_some_and(String::is_empty)
+        || declaration.correlates_to.is_some() && envelope.correlation_id.is_none()
     {
-        return Err("invalid_correlation");
-    }
-    if declaration.correlates_to.is_none() && envelope.correlation_id.is_some() {
         return Err("invalid_correlation");
     }
     let payload =
@@ -1769,6 +1779,158 @@ fn normalize_payload(
         }
     }
     Ok(normalized)
+}
+
+fn validate_reserved_lifecycle_payload(
+    event: &str,
+    payload: &BTreeMap<String, Value>,
+) -> Result<(), ()> {
+    match event {
+        "determa.component_completed" => {
+            require_exact_keys(payload, &["component_id", "component_runtime_id"])?;
+            require_identifier(payload.get("component_id"))?;
+            require_non_empty_string(payload.get("component_runtime_id"))?;
+        }
+        "determa.component_failed" => {
+            require_exact_keys(payload, &["component_id", "component_runtime_id", "fault"])?;
+            require_identifier(payload.get("component_id"))?;
+            require_non_empty_string(payload.get("component_runtime_id"))?;
+            validate_public_fault(payload.get("fault"))?;
+        }
+        "determa.spawned_instance_failed" => {
+            require_exact_keys(
+                payload,
+                &[
+                    "instance",
+                    "instance_id",
+                    "machine_id",
+                    "machine_version",
+                    "fault",
+                ],
+            )?;
+            let reference = require_instance_reference(payload.get("instance"))?;
+            if payload.get("instance_id") != Some(&Value::String(reference.instance_id.clone()))
+                || payload.get("machine_id") != Some(&Value::String(reference.machine_id.clone()))
+                || payload.get("machine_version") != Some(&Value::Int(reference.machine_version))
+            {
+                return Err(());
+            }
+            validate_public_fault(payload.get("fault"))?;
+        }
+        "done" => match payload.get("relationship") {
+            Some(Value::String(relationship)) if relationship == "parallel" => {
+                require_exact_keys(payload, &["relationship", "state_path", "owner_runtime_id"])?;
+                require_state_path(payload.get("state_path"))?;
+                require_non_empty_string(payload.get("owner_runtime_id"))?;
+            }
+            Some(Value::String(relationship)) if relationship == "spawned_instance" => {
+                require_exact_keys(
+                    payload,
+                    &[
+                        "relationship",
+                        "instance",
+                        "instance_id",
+                        "machine_id",
+                        "machine_version",
+                    ],
+                )?;
+                let reference = require_instance_reference(payload.get("instance"))?;
+                if payload.get("instance_id") != Some(&Value::String(reference.instance_id.clone()))
+                    || payload.get("machine_id")
+                        != Some(&Value::String(reference.machine_id.clone()))
+                    || payload.get("machine_version")
+                        != Some(&Value::Int(reference.machine_version))
+                {
+                    return Err(());
+                }
+            }
+            _ => return Err(()),
+        },
+        _ => return Err(()),
+    }
+    Ok(())
+}
+
+fn require_exact_keys(payload: &BTreeMap<String, Value>, keys: &[&str]) -> Result<(), ()> {
+    if payload.len() != keys.len() || keys.iter().any(|key| !payload.contains_key(*key)) {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn require_non_empty_string(value: Option<&Value>) -> Result<&str, ()> {
+    match value {
+        Some(Value::String(value)) if !value.is_empty() => Ok(value),
+        _ => Err(()),
+    }
+}
+
+fn require_identifier(value: Option<&Value>) -> Result<&str, ()> {
+    let value = require_non_empty_string(value)?;
+    if !is_identifier(value) {
+        return Err(());
+    }
+    Ok(value)
+}
+
+fn is_identifier(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn require_state_path(value: Option<&Value>) -> Result<(), ()> {
+    let value = require_non_empty_string(value)?;
+    if value.split('.').all(|part| {
+        let mut bytes = part.bytes();
+        bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }) {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+fn require_instance_reference(value: Option<&Value>) -> Result<&InstanceReference, ()> {
+    let Some(Value::InstanceReference(reference)) = value else {
+        return Err(());
+    };
+    if reference.root_instance_id.is_empty()
+        || reference.instance_id.is_empty()
+        || !is_identifier(&reference.machine_id)
+        || reference.machine_version <= 0
+    {
+        return Err(());
+    }
+    Ok(reference)
+}
+
+fn validate_public_fault(value: Option<&Value>) -> Result<(), ()> {
+    let Some(Value::Map(fault)) = value else {
+        return Err(());
+    };
+    require_exact_keys(
+        fault,
+        &[
+            "runtime_id",
+            "cause_id",
+            "code",
+            "step_sequence",
+            "source_locator",
+        ],
+    )?;
+    require_non_empty_string(fault.get("runtime_id"))?;
+    require_non_empty_string(fault.get("cause_id"))?;
+    require_non_empty_string(fault.get("code"))?;
+    require_non_empty_string(fault.get("source_locator"))?;
+    let step_sequence = require_non_empty_string(fault.get("step_sequence"))?;
+    Counter::from_decimal(step_sequence).map_err(|_| ())?;
+    Ok(())
 }
 
 fn select_handler(
@@ -1910,6 +2072,9 @@ fn resolve_choice_chain(
         }
         let branch = selected.expect("validated choice has a default");
         run_actions(runtime, &path, &branch.action, Some(envelope), context)?;
+        if runtime.status == RuntimeStatus::Completed {
+            return Ok((path, false));
+        }
         target = branch.target;
         history = matches!(target, CompiledTarget::History(_));
     }
@@ -2539,7 +2704,7 @@ fn resolve_author_target(
                     source_locator: target_expression_pointer(action, targets, index),
                 });
             };
-            if find_spawn_address(runtime, &reference.instance_id).is_none() {
+            if find_spawn_address(runtime, reference).is_none() {
                 return Err(StepFault {
                     code: "invalid_instance_target",
                     source_locator: target_expression_pointer(action, targets, index),
@@ -2694,10 +2859,14 @@ fn execute_spawn(
         &action.pointer,
         &spawn_sequence,
     );
+    let emission_checkpoint = context.emissions.len();
+    let output_sequence_checkpoint = context.next_output_sequence.clone();
     let parent_cause = std::mem::replace(&mut context.cause_id, child_cause.clone());
     let initialization = initialize_runtime(&mut child, &bindings, context, true);
     context.cause_id = parent_cause;
     if let Err(fault) = initialization {
+        context.emissions.truncate(emission_checkpoint);
+        *context.next_output_sequence = output_sequence_checkpoint;
         let record = FaultRecord {
             runtime_id: child.runtime_id.clone(),
             cause_id: child_cause,
@@ -2868,16 +3037,20 @@ fn initialize_components(
             &component_definition.pointer,
             &Counter::from(component_definition.declaration_index),
         );
+        let emission_checkpoint = context.emissions.len();
+        let output_sequence_checkpoint = context.next_output_sequence.clone();
         let parent_cause = std::mem::replace(&mut context.cause_id, child_cause.clone());
         let initialization = initialize_runtime(child, &bindings, context, true);
         context.cause_id = parent_cause;
         if let Err(fault) = initialization {
+            context.emissions.truncate(emission_checkpoint);
+            *context.next_output_sequence = output_sequence_checkpoint;
             let relation = child.relation.clone();
             let definition = child.definition.clone();
             let runtime_id = child.runtime_id.clone();
             let record = FaultRecord {
                 runtime_id: runtime_id.clone(),
-                cause_id: child_cause,
+                cause_id: child_cause.clone(),
                 code: fault.code.to_string(),
                 step_sequence: context.step_sequence.clone(),
                 source_locator: fault.source_locator,
@@ -2887,6 +3060,21 @@ fn initialize_components(
             child.status = RuntimeStatus::Faulted;
             child.fault = Some(record.clone());
             emit_failure_notification(child, &record, context);
+        }
+        if runtime.components[index].runtime.status == RuntimeStatus::Completed
+            && runtime
+                .components
+                .iter()
+                .all(|component| component.runtime.status == RuntimeStatus::Completed)
+        {
+            push_parallel_done(
+                runtime,
+                &state.path,
+                &child_cause,
+                &context.step_sequence,
+                context.root_instance_id,
+                context.emissions,
+            );
         }
     }
     Ok(())
@@ -3354,7 +3542,6 @@ fn append_parallel_done_if_needed(
     cause_id: &str,
     step_sequence: Counter,
     emissions: &mut Vec<Emission>,
-    bundle: &Bundle,
 ) {
     let Some(AddressSegment::Component(component_id, activation_sequence)) = address.last() else {
         return;
@@ -3383,7 +3570,25 @@ fn append_parallel_done_if_needed(
     else {
         return;
     };
-    let target = runtime_target(owner, &aggregate.root_instance_id);
+    push_parallel_done(
+        owner,
+        owner_state_path,
+        cause_id,
+        &step_sequence,
+        &aggregate.root_instance_id,
+        emissions,
+    );
+}
+
+fn push_parallel_done(
+    owner: &RuntimeState,
+    owner_state_path: &str,
+    cause_id: &str,
+    step_sequence: &Counter,
+    root_instance_id: &str,
+    emissions: &mut Vec<Emission>,
+) {
+    let target = runtime_target(owner, root_instance_id);
     let payload = BTreeMap::from([
         (
             "relationship".to_string(),
@@ -3391,7 +3596,7 @@ fn append_parallel_done_if_needed(
         ),
         (
             "state_path".to_string(),
-            Value::String(owner_state_path.clone()),
+            Value::String(owner_state_path.to_string()),
         ),
         (
             "owner_runtime_id".to_string(),
@@ -3399,15 +3604,14 @@ fn append_parallel_done_if_needed(
         ),
     ]);
     let event_id = internal_event_identity(
-        &aggregate.root_instance_id,
+        root_instance_id,
         &owner.runtime_id,
         &owner.runtime_id,
         cause_id,
-        &step_sequence,
+        step_sequence,
         "system:component_completion",
         1,
     );
-    let _ = bundle;
     emissions.push(Emission {
         emitting_runtime_id: owner.runtime_id.clone(),
         emitting_owner_runtime_id: runtime_owner_runtime_id(owner),
@@ -3697,6 +3901,111 @@ machines:
         running: {{}}
 "#
         )
+    }
+
+    #[test]
+    fn reserved_lifecycle_payloads_are_closed_and_coherent() {
+        let component_completed = BTreeMap::from([
+            (
+                "component_id".to_string(),
+                Value::String("worker".to_string()),
+            ),
+            (
+                "component_runtime_id".to_string(),
+                Value::String("component-runtime".to_string()),
+            ),
+        ]);
+        assert!(validate_reserved_lifecycle_payload(
+            "determa.component_completed",
+            &component_completed
+        )
+        .is_ok());
+        let mut extra_component_field = component_completed;
+        extra_component_field.insert("extra".to_string(), Value::Bool(true));
+        assert!(validate_reserved_lifecycle_payload(
+            "determa.component_completed",
+            &extra_component_field
+        )
+        .is_err());
+
+        let reference = InstanceReference {
+            root_instance_id: "root-1".to_string(),
+            instance_id: "child-1".to_string(),
+            machine_id: "worker".to_string(),
+            machine_version: 1,
+        };
+        let fault = Value::Map(BTreeMap::from([
+            (
+                "runtime_id".to_string(),
+                Value::String("child-1".to_string()),
+            ),
+            ("cause_id".to_string(), Value::String("cause-1".to_string())),
+            (
+                "code".to_string(),
+                Value::String("action_fault".to_string()),
+            ),
+            (
+                "step_sequence".to_string(),
+                Value::String("9007199254740993".to_string()),
+            ),
+            (
+                "source_locator".to_string(),
+                Value::String("/machines/0/root/entry/0/assign/value".to_string()),
+            ),
+        ]));
+        let spawned_failure = BTreeMap::from([
+            (
+                "instance".to_string(),
+                Value::InstanceReference(reference.clone()),
+            ),
+            (
+                "instance_id".to_string(),
+                Value::String(reference.instance_id.clone()),
+            ),
+            (
+                "machine_id".to_string(),
+                Value::String(reference.machine_id.clone()),
+            ),
+            (
+                "machine_version".to_string(),
+                Value::Int(reference.machine_version),
+            ),
+            ("fault".to_string(), fault),
+        ]);
+        assert!(validate_reserved_lifecycle_payload(
+            "determa.spawned_instance_failed",
+            &spawned_failure
+        )
+        .is_ok());
+        let mut mismatched_reference = spawned_failure;
+        mismatched_reference.insert(
+            "machine_id".to_string(),
+            Value::String("other_worker".to_string()),
+        );
+        assert!(validate_reserved_lifecycle_payload(
+            "determa.spawned_instance_failed",
+            &mismatched_reference
+        )
+        .is_err());
+
+        let parallel_done = BTreeMap::from([
+            (
+                "relationship".to_string(),
+                Value::String("parallel".to_string()),
+            ),
+            (
+                "state_path".to_string(),
+                Value::String("processing.work".to_string()),
+            ),
+            (
+                "owner_runtime_id".to_string(),
+                Value::String("owner-1".to_string()),
+            ),
+        ]);
+        assert!(validate_reserved_lifecycle_payload("done", &parallel_done).is_ok());
+        let mut incomplete_done = parallel_done;
+        incomplete_done.remove("owner_runtime_id");
+        assert!(validate_reserved_lifecycle_payload("done", &incomplete_done).is_err());
     }
 
     #[test]

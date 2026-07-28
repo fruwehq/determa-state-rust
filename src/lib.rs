@@ -13,7 +13,7 @@ pub mod value;
 pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "4bd4d9588d11b75d376380b6120676a056a4bc45";
 
 /// Exact core conformance revision exercised by this crate.
-pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "fc4842010ab8d83bf4c5c6280a5627ca86829f7f";
+pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "ffbc65cbce49733803119a7dabf02a9727819ba8";
 
 pub use format1::{
     create, dispatch, load_bundle, load_bundle_from_json, AggregateState, Bindings, Bundle,

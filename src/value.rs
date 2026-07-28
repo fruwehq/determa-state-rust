@@ -66,12 +66,37 @@ impl Value {
     pub fn normalize_for_type(&self, declared_type: &str) -> Option<Self> {
         match (self, declared_type) {
             (Self::Int(value), "float") => Some(Self::Float(*value as f64)),
-            (Self::Float(value), "float") if value.is_finite() => {
+            _ if self.matches_type(declared_type) => self.normalize_portable(),
+            _ => None,
+        }
+    }
+
+    pub fn normalize_portable(&self) -> Option<Self> {
+        match self {
+            Self::Float(value) if value.is_finite() => {
                 Some(Self::Float(if *value == 0.0 { 0.0 } else { *value }))
             }
-            (Self::Float(_), "float") => None,
-            _ if self.matches_type(declared_type) => Some(self.clone()),
-            _ => None,
+            Self::Float(_) => None,
+            Self::List(values) => values
+                .iter()
+                .map(Self::normalize_portable)
+                .collect::<Option<Vec<_>>>()
+                .map(Self::List),
+            Self::Map(values) => values
+                .iter()
+                .map(|(key, value)| Some((key.clone(), value.normalize_portable()?)))
+                .collect::<Option<BTreeMap<_, _>>>()
+                .map(Self::Map),
+            _ => Some(self.clone()),
+        }
+    }
+
+    pub fn is_canonical_portable(&self) -> bool {
+        match self {
+            Self::Float(value) => value.is_finite() && (*value != 0.0 || value.is_sign_positive()),
+            Self::List(values) => values.iter().all(Self::is_canonical_portable),
+            Self::Map(values) => values.values().all(Self::is_canonical_portable),
+            _ => true,
         }
     }
 
@@ -177,6 +202,7 @@ impl<'de> Deserialize<'de> for Value {
 #[cfg(test)]
 mod tests {
     use super::Value;
+    use std::collections::BTreeMap;
 
     #[test]
     fn native_values_reject_unsigned_overflow_and_preserve_numeric_types() {
@@ -201,5 +227,23 @@ mod tests {
             Value::Float(-0.0).normalize_for_type("float"),
             Some(Value::Float(0.0))
         );
+        let nested = Value::Map(BTreeMap::from([(
+            "values".to_string(),
+            Value::List(vec![Value::Float(-0.0), Value::Int(1)]),
+        )]));
+        let normalized = nested.normalize_for_type("map").unwrap();
+        let Value::Map(normalized) = normalized else {
+            panic!("expected normalized map");
+        };
+        let Value::List(values) = &normalized["values"] else {
+            panic!("expected normalized list");
+        };
+        assert!(
+            matches!(values[0], Value::Float(value) if value == 0.0 && value.is_sign_positive())
+        );
+        assert_eq!(values[1], Value::Int(1));
+        assert!(Value::List(vec![Value::Float(f64::NAN)])
+            .normalize_for_type("list")
+            .is_none());
     }
 }
