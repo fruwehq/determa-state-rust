@@ -1,200 +1,249 @@
-//! The dynamic value type used for esvs, event payloads, and CEL evaluation.
-//!
-//! Maps keep sorted keys for deterministic JSON serialization (conformance compares
-//! JSON structurally, so key order is irrelevant, but stable output helps humans).
-
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 
-/// A Determa State runtime value. Mirrors the esv/payload `type` set (§4.4) plus `null`.
-///
-/// `Value` serializes as its **canonical JSON/native form** (an `Int(3)` is `3`, a
-/// `Bool(true)` is `true`, …), never as a tagged enum — so no engine-internal wrapper
-/// type leaks across any boundary (library, snapshot §8, CLI `--json` §13.4, observer
-/// §8) per SPEC §5.1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidUnicodeString;
+
+impl std::fmt::Display for InvalidUnicodeString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("UTF-16 input contains an unpaired surrogate")
+    }
+}
+
+impl std::error::Error for InvalidUnicodeString {}
+
+pub fn string_from_utf16(units: &[u16]) -> Result<String, InvalidUnicodeString> {
+    String::from_utf16(units).map_err(|_| InvalidUnicodeString)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct InstanceReference {
+    pub root_instance_id: String,
+    pub instance_id: String,
+    pub machine_id: String,
+    pub machine_version: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
     Bool(bool),
     Int(i64),
     Float(f64),
-    Str(String),
+    String(String),
     List(Vec<Value>),
     Map(BTreeMap<String, Value>),
+    InstanceReference(InstanceReference),
 }
 
 impl Value {
     pub fn type_name(&self) -> &'static str {
         match self {
-            Value::Null => "null",
-            Value::Bool(_) => "bool",
-            Value::Int(_) => "int",
-            Value::Float(_) => "float",
-            Value::Str(_) => "string",
-            Value::List(_) => "list",
-            Value::Map(_) => "map",
+            Self::Null => "null",
+            Self::Bool(_) => "bool",
+            Self::Int(_) => "int",
+            Self::Float(_) => "float",
+            Self::String(_) => "string",
+            Self::List(_) => "list",
+            Self::Map(_) => "map",
+            Self::InstanceReference(_) => "instance_reference",
         }
     }
 
-    /// Is this value concretely of the declared esv/payload `type`?
-    /// `null` satisfies any type (an unset variable / optional payload field).
-    pub fn matches_type(&self, ty: &str) -> bool {
+    pub fn matches_type(&self, declared_type: &str) -> bool {
         matches!(
-            (self, ty),
-            (Value::Null, _)
-                | (Value::Bool(_), "bool")
-                | (Value::Int(_), "int")
-                | (Value::Float(_), "float")
-                | (Value::Str(_), "string")
-                | (Value::List(_), "list")
-                | (Value::Map(_), "map")
+            (self, declared_type),
+            (Self::Bool(_), "bool")
+                | (Self::Int(_), "int")
+                | (Self::Float(_), "float")
+                | (Self::String(_), "string")
+                | (Self::List(_), "list")
+                | (Self::Map(_), "map")
+                | (Self::InstanceReference(_), "instance_reference")
         )
     }
 
-    pub fn as_bool(&self) -> Option<bool> {
-        match self {
-            Value::Bool(b) => Some(*b),
+    pub fn normalize_for_type(&self, declared_type: &str) -> Option<Self> {
+        match (self, declared_type) {
+            (Self::Int(value), "float") => Some(Self::Float(*value as f64)),
+            _ if self.matches_type(declared_type) => self.normalize_portable(),
             _ => None,
         }
     }
 
-    pub fn truthy(&self) -> bool {
+    pub fn normalize_portable(&self) -> Option<Self> {
         match self {
-            Value::Bool(b) => *b,
-            Value::Null => false,
-            Value::Int(i) => *i != 0,
-            Value::Float(f) => *f != 0.0,
-            Value::Str(s) => !s.is_empty(),
-            Value::List(l) => !l.is_empty(),
-            Value::Map(m) => !m.is_empty(),
+            Self::Float(value) if value.is_finite() => {
+                Some(Self::Float(if *value == 0.0 { 0.0 } else { *value }))
+            }
+            Self::Float(_) => None,
+            Self::List(values) => values
+                .iter()
+                .map(Self::normalize_portable)
+                .collect::<Option<Vec<_>>>()
+                .map(Self::List),
+            Self::Map(values) => values
+                .iter()
+                .map(|(key, value)| Some((key.clone(), value.normalize_portable()?)))
+                .collect::<Option<BTreeMap<_, _>>>()
+                .map(Self::Map),
+            _ => Some(self.clone()),
         }
     }
 
-    pub fn as_str_value(&self) -> Option<&str> {
+    pub fn is_canonical_portable(&self) -> bool {
         match self {
-            Value::Str(s) => Some(s.as_str()),
-            _ => None,
+            Self::Float(value) => value.is_finite() && (*value != 0.0 || value.is_sign_positive()),
+            Self::List(values) => values.iter().all(Self::is_canonical_portable),
+            Self::Map(values) => values.values().all(Self::is_canonical_portable),
+            _ => true,
         }
     }
 
-    /// Coerce a value to a declared type for assignment / payload delivery.
-    /// Returns None if the value is not coercible (used to reject bad payloads).
-    pub fn coerce_to(&self, ty: &str) -> Option<Value> {
-        match (self, ty) {
-            (Value::Null, _) => Some(Value::Null),
-            (Value::Bool(b), "bool") => Some(Value::Bool(*b)),
-            (Value::Int(i), "int") => Some(Value::Int(*i)),
-            (Value::Float(f), "float") => Some(Value::Float(*f)),
-            (Value::Str(s), "string") => Some(Value::Str(s.clone())),
-            (Value::List(l), "list") => Some(Value::List(l.clone())),
-            (Value::Map(m), "map") => Some(Value::Map(m.clone())),
-            // int literal used where float is declared
-            (Value::Int(i), "float") => Some(Value::Float(*i as f64)),
-            // numeric strings are NOT coerced (only CLI --payload k=v does string coercion)
-            _ => None,
-        }
-    }
-}
-
-// Canonical JSON/native (de)serialization (SPEC §5.1): a Value is its underlying
-// JSON value, never a tagged wrapper.
-impl serde::Serialize for Value {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        self.to_json().serialize(s)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for Value {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        serde_json::Value::deserialize(d).map(|j| Value::from_json(&j))
-    }
-}
-
-impl Value {
-    pub fn from_yaml(v: &serde_yaml::Value) -> Value {
-        use serde_yaml::Value::*;
-        match v {
-            Null => Value::Null,
-            Bool(b) => Value::Bool(*b),
-            Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Value::Int(i)
-                } else if let Some(u) = n.as_u64() {
-                    Value::Int(u as i64)
+    pub fn from_json(value: &serde_json::Value) -> Result<Self, String> {
+        match value {
+            serde_json::Value::Null => Ok(Self::Null),
+            serde_json::Value::Bool(value) => Ok(Self::Bool(*value)),
+            serde_json::Value::Number(value) => {
+                if let Some(integer) = value.as_i64() {
+                    Ok(Self::Int(integer))
+                } else if value.as_u64().is_some() {
+                    Err("integer is outside the signed 64-bit domain".to_string())
                 } else {
-                    Value::Float(n.as_f64().unwrap_or(f64::NAN))
+                    let float = value
+                        .as_f64()
+                        .ok_or_else(|| "numeric value is not representable".to_string())?;
+                    if !float.is_finite() {
+                        return Err("numeric value is not finite".to_string());
+                    }
+                    Ok(Self::Float(if float == 0.0 { 0.0 } else { float }))
                 }
             }
-            String(s) => Value::Str(s.clone()),
-            Sequence(seq) => Value::List(seq.iter().map(Value::from_yaml).collect()),
-            Mapping(m) => {
-                let mut map = BTreeMap::new();
-                for (k, v) in m {
-                    let key = match k {
-                        String(s) => s.clone(),
-                        Bool(b) => b.to_string(),
-                        Number(n) => n.to_string(),
-                        Null => "null".to_string(),
-                        _ => continue,
-                    };
-                    map.insert(key, Value::from_yaml(v));
+            serde_json::Value::String(value) => {
+                if value
+                    .chars()
+                    .any(|character| (0xD800..=0xDFFF).contains(&(character as u32)))
+                {
+                    return Err("invalid Unicode scalar".to_string());
                 }
-                Value::Map(map)
+                Ok(Self::String(value.clone()))
             }
-            Tagged(t) => Value::from_yaml(&t.value),
+            serde_json::Value::Array(values) => values
+                .iter()
+                .map(Self::from_json)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Self::List),
+            serde_json::Value::Object(values) => values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), Self::from_json(value)?)))
+                .collect::<Result<BTreeMap<_, _>, String>>()
+                .map(Self::Map),
         }
     }
 
     pub fn to_json(&self) -> serde_json::Value {
         match self {
-            Value::Null => serde_json::Value::Null,
-            Value::Bool(b) => serde_json::Value::Bool(*b),
-            Value::Int(i) => serde_json::Value::Number((*i).into()),
-            Value::Float(f) => serde_json::Number::from_f64(*f)
+            Self::Null => serde_json::Value::Null,
+            Self::Bool(value) => serde_json::Value::Bool(*value),
+            Self::Int(value) => serde_json::Value::Number((*value).into()),
+            Self::Float(value) => serde_json::Number::from_f64(*value)
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null),
-            Value::Str(s) => serde_json::Value::String(s.clone()),
-            Value::List(l) => serde_json::Value::Array(l.iter().map(Value::to_json).collect()),
-            Value::Map(m) => {
-                let mut o = serde_json::Map::new();
-                for (k, v) in m {
-                    o.insert(k.clone(), v.to_json());
-                }
-                serde_json::Value::Object(o)
+            Self::String(value) => serde_json::Value::String(value.clone()),
+            Self::List(values) => {
+                serde_json::Value::Array(values.iter().map(Self::to_json).collect())
+            }
+            Self::Map(values) => serde_json::Value::Object(
+                values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.to_json()))
+                    .collect(),
+            ),
+            Self::InstanceReference(reference) => {
+                serde_json::to_value(reference).expect("instance references always serialize")
             }
         }
     }
 
-    pub fn from_json(v: &serde_json::Value) -> Value {
-        match v {
-            serde_json::Value::Null => Value::Null,
-            serde_json::Value::Bool(b) => Value::Bool(*b),
-            serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Value::Int(i)
-                } else if let Some(u) = n.as_u64() {
-                    Value::Int(u as i64)
-                } else {
-                    Value::Float(n.as_f64().unwrap_or(f64::NAN))
-                }
-            }
-            serde_json::Value::String(s) => Value::Str(s.clone()),
-            serde_json::Value::Array(a) => {
-                Value::List(a.iter().map(Value::from_json).collect())
-            }
-            serde_json::Value::Object(o) => {
-                let mut m = BTreeMap::new();
-                for (k, v) in o {
-                    m.insert(k.clone(), Value::from_json(v));
-                }
-                Value::Map(m)
-            }
+    pub fn as_map(&self) -> Option<&BTreeMap<String, Self>> {
+        match self {
+            Self::Map(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn as_string(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
         }
     }
 }
 
-/// Build a single-field map, common for payloads.
-pub fn map1(k: &str, v: Value) -> Value {
-    let mut m = BTreeMap::new();
-    m.insert(k.to_string(), v);
-    Value::Map(m)
+impl Serialize for Value {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.to_json().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Self::from_json(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Value;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn native_values_reject_unsigned_overflow_and_preserve_numeric_types() {
+        let nested = serde_json::json!({
+            "items": [0]
+        });
+        let mut nested = nested;
+        nested["items"][0] = serde_json::Value::Number(serde_json::Number::from(u64::MAX));
+        assert!(Value::from_json(&nested).is_err());
+        assert_eq!(
+            Value::from_json(&serde_json::json!(1)).unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            Value::from_json(&serde_json::json!(1.0)).unwrap(),
+            Value::Float(1.0)
+        );
+        assert!(Value::Float(f64::INFINITY)
+            .normalize_for_type("float")
+            .is_none());
+        assert_eq!(
+            Value::Float(-0.0).normalize_for_type("float"),
+            Some(Value::Float(0.0))
+        );
+        let nested = Value::Map(BTreeMap::from([(
+            "values".to_string(),
+            Value::List(vec![Value::Float(-0.0), Value::Int(1)]),
+        )]));
+        let normalized = nested.normalize_for_type("map").unwrap();
+        let Value::Map(normalized) = normalized else {
+            panic!("expected normalized map");
+        };
+        let Value::List(values) = &normalized["values"] else {
+            panic!("expected normalized list");
+        };
+        assert!(
+            matches!(values[0], Value::Float(value) if value == 0.0 && value.is_sign_positive())
+        );
+        assert_eq!(values[1], Value::Int(1));
+        assert!(Value::List(vec![Value::Float(f64::NAN)])
+            .normalize_for_type("list")
+            .is_none());
+    }
 }

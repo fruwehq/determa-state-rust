@@ -1,63 +1,64 @@
-# AGENTS.md — determa-state-rust
+# AGENTS.md - determa-state-rust
 
-Guidance for AI/coding agents working in this repository. (Tool-agnostic; not specific to any one assistant.)
+Guidance for coding agents working in this repository.
 
-## What this repo is
-The **Rust implementation** of Determa State. Crate **`determa-state`**, library module
-**`determa_state`**; the binary `src/bin/determa_state.rs` is published as **two** names —
-`determa-state` (canonical) and `determa-state-rust` (for explicit implementation
-selection). It is correct **iff** it passes the conformance suite.
+## Repository role
 
-Layout:
-- `src/` — library (`lib.rs`, `model.rs`, `validate.rs`, `runtime/`, `cel.rs`, `store.rs`, …) + the CLI (`cli.rs`, `bin/`).
-- `tests/` — Rust tests, incl. `conformance.rs` (drives the suite) plus `meta.rs`, `native_values.rs`.
-- `conformance-suite/` — a **git submodule** of `determa-state-conformance`.
-- `.github/workflows/` — `ci.yml` (gate) and `release.yml` (tag/dispatch → crates.io).
+This repository is the Rust implementation of the portable Determa State core. The
+crate is `determa-state`, the library module is `determa_state`, and the binary is
+published as `determa-state` plus the `determa-state-rust` launcher-selection alias.
 
-## Determa in one paragraph
-**Determa** is a family for defining/running well-specified, verifiable behavior. **Determa
-State** is a language-agnostic **statechart engine** (Harel/UML lineage, PSiCC RTC): one
-YAML/JSON machine runs identically under any implementation, validated against a shared
-conformance suite. Guards/action values are **CEL**, evaluated here via the
-**`cel-interpreter`** crate (cel-rust). An umbrella `determa` launcher dispatches
-`determa <product> …` → `determa-<product>` on PATH.
+The current implementation target is format 1 at these immutable inputs:
 
-## Repositories (org `fruwehq`, local folders `~/src/personal/`)
-| Repo | Role |
-|---|---|
-| determa-state-spec | normative prose spec + schema. No CI. |
-| determa-state-conformance | the conformance suite (arbiter). No CI. |
-| determa-state-python | Python impl — `determa-state` / `determa.state`. |
-| **determa-state-rust** (this) | Rust impl — crate `determa-state`. |
-| determa | umbrella launcher (`python/`, `rust/`, `node/`). |
+- specification: `4bd4d9588d11b75d376380b6120676a056a4bc45`;
+- conformance: `ffbc65cbce49733803119a7dabf02a9727819ba8`.
 
-## Working rules (every Determa repo)
-- **One issue → one PR**, branch → PR → **squash-merge**, linear history, resolve threads; `main` is protected and **requires branches be up-to-date** (serialize merges: update-branch re-runs CI).
-- **No AI/assistant attribution** anywhere (commits, PRs, comments, docs).
-- **Conformance-first:** spec text → conformance case → this impl. Stay in lockstep with the Python impl on all conformance-covered behavior (extensions beyond the suite are allowed, but must not change core semantics).
-- **Synchronized SemVer** with spec + python (currently **0.0.6**); bump `Cargo.toml`.
-- **No abbreviations** in JSON output / public identifiers (`definition` not `def`). Kept for now: `config`, machine-keywords (`esvs`, …), snapshot `def_id`/`def_version`, `spawn.def`.
+The conformance suite is the arbiter of behavior.
 
-## Gates (run before requesting review)
+## Layout
+
+- `schema/machine.schema.json`: exact normative format-1 schema.
+- `src/format1/`: loader, semantic compiler, CEL profile, and pure runtime.
+- `src/value.rs`: portable values and nominal instance references.
+- `src/cli.rs`: nonportable validation utility only.
+- `tests/core_conformance.rs`: driver for all 88 `conformance/core` cases.
+- `conformance-suite/`: pinned `determa-state-conformance` submodule.
+
+## Working rules
+
+- One issue to one branch to one pull request, squash-merged with linear history.
+- No assistant attribution in commits, pull requests, comments, or documentation.
+- Behavior changes start in the specification and conformance suite. Do not add engine
+  behavior that conflicts with either.
+- Keep synchronized State SemVer unchanged unless the coordinated release explicitly
+  changes it.
+- Do not restore aliases for unpublished grammar.
+- Do not expose host-profile assumptions as portable core behavior.
+
+## Gates
+
 ```sh
 git submodule update --init
+test "$(git -C conformance-suite rev-parse HEAD)" = \
+  "ffbc65cbce49733803119a7dabf02a9727819ba8"
 cargo build --release
-cargo test                # unit + doc + engine conformance
-# CLI conformance (black box), pinning the suite at the spec tag:
-(cd conformance-suite && git fetch --tags && git checkout v<VERSION>)
-python3 conformance-suite/conformance/run_cli.py --cmd "$(pwd)/target/release/determa-state"
+cargo test
+cargo clippy --all-targets -- -D warnings
 ```
-CI jobs: **"build + engine conformance + unit tests"** and **"black-box CLI conformance (SPEC §13.6)"**; both **force-pin** the submodule to `v<VERSION>`.
 
-**Gotchas specific to this repo:**
-- **CI does NOT run clippy**, and `main` currently carries ~37 pre-existing `clippy` warnings (rustc ≥ 1.95). Keep *new* code clippy-clean (`cargo clippy --all-targets -- -D warnings` on your diff), but expect the baseline to be noisy.
-- Serde structs use `#[serde(deny_unknown_fields)]` — a new machine key requires updating the corresponding struct(s) or loading fails.
-- The recorded `conformance-suite` submodule SHA may lag the spec tag; CI force-pins the tag and the published crate **excludes** the submodule, so it's cosmetic — but bump it to the tag when doing a release.
+`cargo test --test core_conformance -- --nocapture` runs the complete 88-case core suite.
+CI additionally checks the local schema byte-for-byte against the exact specification
+commit.
 
-## Releasing
-Tag `vX.Y.Z` (or `workflow_dispatch`) → `release.yml` runs `cargo publish` using the
-`CARGO_REGISTRY_TOKEN` org secret. After a spec release: bump `Cargo.toml`, re-pin the
-submodule + `ci.yml` to the new `v` tag.
+## Boundaries
 
-## Pointers
-- Library API (SPEC §2): `build_machine`, `load_machines`, `load_machine_from_value` (from a native `serde_json::Value`), `validate`, `Engine`. Spec: `determa-state-spec/SPEC.md`.
+The portable API is a pure foreground `create`/`dispatch` state transform. Queue
+ownership, persistence, timers, snapshots, definition migration/hot-swap, package
+imports, broker adapters, and scheduling are separate host or future profiles. The CLI
+currently validates bundles only.
+
+## Releases
+
+Do not tag casually. A synchronized State release coordinates the specification,
+conformance suite, Python engine, and Rust engine. crates.io publishing uses the
+repository release workflow and its configured trusted publishing path.
