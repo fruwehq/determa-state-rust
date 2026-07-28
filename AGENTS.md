@@ -8,10 +8,14 @@ This repository is the Rust implementation of the portable Determa State core. T
 crate is `determa-state`, the library module is `determa_state`, and the binary is
 published as `determa-state` plus the `determa-state-rust` launcher-selection alias.
 
+Repository metadata targets the synchronized State `0.0.7` release. The latest
+published crate remains `0.0.6` until the coordinated `v0.0.7` tag runs the release
+workflow.
+
 The current implementation target is format 1 at these immutable inputs:
 
-- specification: `4bd4d9588d11b75d376380b6120676a056a4bc45`;
-- conformance: `ffbc65cbce49733803119a7dabf02a9727819ba8`.
+- specification: `09c717a40c75b99612e54d764b5f1bdfa4b94f96`;
+- conformance: `74e477087fd31561600aacf652cccae571a5ea9a`.
 
 The conformance suite is the arbiter of behavior.
 
@@ -40,7 +44,7 @@ The conformance suite is the arbiter of behavior.
 ```sh
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
-  "ffbc65cbce49733803119a7dabf02a9727819ba8"
+  "74e477087fd31561600aacf652cccae571a5ea9a"
 cargo build --release
 cargo test
 cargo clippy --all-targets -- -D warnings
