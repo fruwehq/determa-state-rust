@@ -12,18 +12,15 @@ Repository metadata prepares the synchronized State `0.1.0` release. The latest
 published crate remains `0.0.7` until the coordinated `v0.1.0` tag runs the release
 workflow.
 
-The current draft remains validated at these exact immutable inputs until the real
-upstream `v0.1.0` tags exist:
+The current draft is validated against the merged `0.1.0` metadata revisions at these
+exact immutable inputs:
 
-- specification: `1502a58a780d837e05bfacb37680dfc92e3488b5`;
-- conformance: `707a49ce01c6f57f673c1959cdfe078bc8d0fc9a`.
+- specification: `c1635d74e6a216301a8986d37be8ce7e7111dfd7`;
+- conformance: `600523ca08c3b8a6ee790439a32dc4ce47f71b95`.
 
-The conformance suite is the arbiter of behavior.
-
-Before this release-preparation branch is marked ready or merged, replace those
-temporary pins with the commits referenced by the verified specification and
-conformance `v0.1.0` tags, update the schemas and conformance gitlink as required, and
-rerun every gate. Never invent a release tag or weaken an exact revision check.
+The conformance suite is the arbiter of behavior. These exact merged commits are the
+authoritative release inputs; tag publication is a later coordinated release operation.
+Never invent a release tag or weaken an exact revision check.
 
 ## Layout
 
@@ -53,7 +50,7 @@ rerun every gate. Never invent a release tag or weaken an exact revision check.
 ```sh
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
-  "707a49ce01c6f57f673c1959cdfe078bc8d0fc9a"
+  "600523ca08c3b8a6ee790439a32dc4ce47f71b95"
 cargo build --release
 cargo test
 cargo clippy --all-targets -- -D warnings

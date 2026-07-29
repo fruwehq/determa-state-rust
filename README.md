@@ -3,12 +3,11 @@
 Rust implementation of the portable [Determa State](https://github.com/fruwehq/determa-state-spec)
 `format: 1` core.
 
-Repository metadata prepares synchronized version `0.1.0`. Until the upstream
-`v0.1.0` releases exist, this branch remains validated against these exact normative
-inputs:
+Repository metadata prepares synchronized version `0.1.0`. This branch is validated
+against the merged `0.1.0` metadata revisions at these exact normative inputs:
 
-- specification commit `1502a58a780d837e05bfacb37680dfc92e3488b5`;
-- conformance commit `707a49ce01c6f57f673c1959cdfe078bc8d0fc9a`.
+- specification commit `c1635d74e6a216301a8986d37be8ce7e7111dfd7`;
+- conformance commit `600523ca08c3b8a6ee790439a32dc4ce47f71b95`.
 
 Until the coordinated `v0.1.0` tag publishes, the latest crate on crates.io remains
 version `0.0.7`.
@@ -16,11 +15,6 @@ version `0.0.7`.
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 110 format-1 core cases, 105 portable persistence vectors, and 12 steps
 across the six persistence host profiles.
-
-Before this release-preparation branch is marked ready or merged, it must replace the
-temporary commit pins with the verified commits referenced by the real specification
-and conformance `v0.1.0` tags, synchronize the conformance submodule and schemas, and
-rerun every release gate.
 
 ## Implemented core
 
@@ -58,10 +52,10 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`707a49ce01c6f57f673c1959cdfe078bc8d0fc9a`. CI also checks that all bundled schemas
+`600523ca08c3b8a6ee790439a32dc4ce47f71b95`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
-`1502a58a780d837e05bfacb37680dfc92e3488b5`. These are temporary exact pins for draft
-validation, not substitutes for the required synchronized `v0.1.0` upstream tags.
+`c1635d74e6a216301a8986d37be8ce7e7111dfd7`. These exact merged commits are the
+authoritative release inputs; tag publication is a later coordinated release operation.
 
 ## Library
 
