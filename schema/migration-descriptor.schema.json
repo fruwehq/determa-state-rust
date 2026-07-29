@@ -1,0 +1,588 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/migration-descriptor.schema.json",
+  "title": "Determa State aggregate migration descriptor",
+  "description": "Closed declarative migration schema for migration_descriptor_schema_version 1.",
+  "$ref": "#/$defs/migrationDescriptor",
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "canonicalDecimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "jsonPointer": {
+      "type": "string",
+      "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
+    },
+    "pointerMapping": {
+      "type": "object",
+      "required": [
+        "source_definition_pointer",
+        "target_definition_pointer"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_definition_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "target_definition_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        }
+      }
+    },
+    "activeStateMapping": {
+      "type": "object",
+      "required": [
+        "source_leaf_state_definition_pointer",
+        "target_leaf_state_definition_pointers"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_leaf_state_definition_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "target_leaf_state_definition_pointers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/jsonPointer"
+          }
+        }
+      }
+    },
+    "variableRule": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "operation",
+            "source_declaration_pointer",
+            "target_declaration_pointer"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "copy"
+            },
+            "source_declaration_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            },
+            "target_declaration_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "operation",
+            "source_declaration_pointers",
+            "target_declaration_pointer",
+            "expression"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "transform"
+            },
+            "source_declaration_pointers": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/jsonPointer"
+              }
+            },
+            "target_declaration_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            },
+            "expression": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "operation",
+            "source_declaration_pointer",
+            "reason"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "drop"
+            },
+            "source_declaration_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            },
+            "reason": {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "operation",
+            "target_declaration_pointer",
+            "expression"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "initialize"
+            },
+            "target_declaration_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            },
+            "expression": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "historyRule": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "operation",
+            "source_history_declaration_pointer",
+            "target_history_declaration_pointer",
+            "recorded_state_mappings"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "map"
+            },
+            "source_history_declaration_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            },
+            "target_history_declaration_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            },
+            "recorded_state_mappings": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/pointerMapping"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "operation",
+            "source_history_declaration_pointer",
+            "reason"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "drop"
+            },
+            "source_history_declaration_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            },
+            "reason": {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "operation",
+            "target_history_declaration_pointer"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "initialize_null"
+            },
+            "target_history_declaration_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            }
+          }
+        }
+      ]
+    },
+    "componentRule": {
+      "type": "object",
+      "required": [
+        "source_component_definition_pointer",
+        "target_component_definition_pointer",
+        "target_component_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_component_definition_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "target_component_definition_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "target_component_id": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "ownedRuntimeRule": {
+      "type": "object",
+      "required": [
+        "source_spawn_action_pointer",
+        "target_spawn_action_pointer",
+        "source_machine_id",
+        "target_machine_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_spawn_action_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "target_spawn_action_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "source_machine_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "target_machine_id": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "lifetimeHolderRule": {
+      "type": "object",
+      "required": [
+        "source_variable_declaration_pointer",
+        "target_variable_declaration_pointer"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_variable_declaration_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "target_variable_declaration_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        }
+      }
+    },
+    "counterRule": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "operation",
+            "source_definition_pointer",
+            "target_definition_pointer"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "map"
+            },
+            "source_definition_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            },
+            "target_definition_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "operation",
+            "target_definition_pointer"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "initialize_zero"
+            },
+            "target_definition_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "operation",
+            "source_definition_pointers",
+            "target_definition_pointer"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "merge_maximum"
+            },
+            "source_definition_pointers": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/jsonPointer"
+              }
+            },
+            "target_definition_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            }
+          }
+        }
+      ]
+    },
+    "terminalPolicy": {
+      "type": "object",
+      "required": [
+        "completed",
+        "faulted"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "completed": {
+          "enum": [
+            "preserve",
+            "reject"
+          ]
+        },
+        "faulted": {
+          "enum": [
+            "preserve",
+            "reject"
+          ]
+        }
+      }
+    },
+    "resourceRequirements": {
+      "type": "object",
+      "required": [
+        "maximum_transformed_output_bytes",
+        "maximum_cel_expression_length",
+        "maximum_cel_ast_nodes",
+        "maximum_cel_evaluation_steps"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "maximum_transformed_output_bytes": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "maximum_cel_expression_length": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "maximum_cel_ast_nodes": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "maximum_cel_evaluation_steps": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "mappings": {
+      "type": "object",
+      "required": [
+        "machines",
+        "active_states",
+        "variables",
+        "history",
+        "components",
+        "owned_runtimes",
+        "lifetime_holders",
+        "counters"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "machines": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pointerMapping"
+          }
+        },
+        "active_states": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/activeStateMapping"
+          }
+        },
+        "variables": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/variableRule"
+          }
+        },
+        "history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/historyRule"
+          }
+        },
+        "components": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/componentRule"
+          }
+        },
+        "owned_runtimes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ownedRuntimeRule"
+          }
+        },
+        "lifetime_holders": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/lifetimeHolderRule"
+          }
+        },
+        "counters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/counterRule"
+          }
+        }
+      }
+    },
+    "migrationDescriptor": {
+      "type": "object",
+      "required": [
+        "migration_descriptor_format",
+        "migration_descriptor_schema_version",
+        "source_machine_format",
+        "target_machine_format",
+        "source_validated_bundle_fingerprint",
+        "target_validated_bundle_fingerprint",
+        "source_aggregate_shape_fingerprint",
+        "target_aggregate_shape_fingerprint",
+        "mode",
+        "mappings",
+        "terminal_policy",
+        "resource_requirements",
+        "migration_descriptor_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "migration_descriptor_format": {
+          "const": "determa.aggregate_migration"
+        },
+        "migration_descriptor_schema_version": {
+          "const": 1
+        },
+        "source_machine_format": {
+          "const": 1
+        },
+        "target_machine_format": {
+          "const": 1
+        },
+        "source_validated_bundle_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "target_validated_bundle_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_aggregate_shape_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "target_aggregate_shape_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "mode": {
+          "enum": [
+            "compatible",
+            "transform"
+          ]
+        },
+        "mappings": {
+          "$ref": "#/$defs/mappings"
+        },
+        "terminal_policy": {
+          "$ref": "#/$defs/terminalPolicy"
+        },
+        "resource_requirements": {
+          "$ref": "#/$defs/resourceRequirements"
+        },
+        "migration_descriptor_digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "compatible"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "mappings": {
+                "properties": {
+                  "machines": {
+                    "maxItems": 0
+                  },
+                  "active_states": {
+                    "maxItems": 0
+                  },
+                  "variables": {
+                    "maxItems": 0
+                  },
+                  "history": {
+                    "maxItems": 0
+                  },
+                  "components": {
+                    "maxItems": 0
+                  },
+                  "owned_runtimes": {
+                    "maxItems": 0
+                  },
+                  "lifetime_holders": {
+                    "maxItems": 0
+                  },
+                  "counters": {
+                    "maxItems": 0
+                  }
+                }
+              },
+              "resource_requirements": {
+                "properties": {
+                  "maximum_transformed_output_bytes": {
+                    "const": "0"
+                  },
+                  "maximum_cel_expression_length": {
+                    "const": "0"
+                  },
+                  "maximum_cel_ast_nodes": {
+                    "const": "0"
+                  },
+                  "maximum_cel_evaluation_steps": {
+                    "const": "0"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

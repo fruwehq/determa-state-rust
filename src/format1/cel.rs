@@ -402,7 +402,91 @@ pub fn evaluate(expression: &str, environment: &Environment) -> Result<Value, Ev
     let expression = Parser::new()
         .parse(expression)
         .map_err(|error| EvaluationError(format!("CEL parse error: {error}")))?;
-    evaluate_ast(&expression, environment)
+    let mut meter = EvaluationMeter {
+        steps: 0,
+        maximum: usize::MAX,
+    };
+    evaluate_ast(&expression, environment, &mut meter)
+}
+
+pub(crate) fn migration_expression_info(expression: &str) -> Result<usize, EvaluationError> {
+    let expression = Parser::new()
+        .parse(expression)
+        .map_err(|error| EvaluationError(format!("CEL parse error: {error}")))?;
+    Ok(ast_nodes(&expression))
+}
+
+pub(crate) fn evaluate_migration(
+    expression: &str,
+    environment: &Environment,
+    maximum_steps: usize,
+) -> Result<(Value, usize), EvaluationError> {
+    let expression = Parser::new()
+        .parse(expression)
+        .map_err(|error| EvaluationError(format!("CEL parse error: {error}")))?;
+    let mut meter = EvaluationMeter {
+        steps: 0,
+        maximum: maximum_steps,
+    };
+    let value = evaluate_ast(&expression, environment, &mut meter)?;
+    Ok((value, meter.steps))
+}
+
+struct EvaluationMeter {
+    steps: usize,
+    maximum: usize,
+}
+
+impl EvaluationMeter {
+    fn enter(&mut self) -> Result<(), EvaluationError> {
+        self.steps = self.steps.saturating_add(1);
+        if self.steps > self.maximum {
+            Err(EvaluationError(
+                "migration CEL evaluation step limit exceeded".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn ast_nodes(expression: &IdedExpr) -> usize {
+    1 + match &expression.expr {
+        Expr::Call(call) => {
+            call.target.as_deref().map_or(0, ast_nodes)
+                + call.args.iter().map(ast_nodes).sum::<usize>()
+        }
+        Expr::Comprehension(comprehension) => {
+            ast_nodes(&comprehension.iter_range)
+                + ast_nodes(&comprehension.accu_init)
+                + ast_nodes(&comprehension.loop_cond)
+                + ast_nodes(&comprehension.loop_step)
+                + ast_nodes(&comprehension.result)
+        }
+        Expr::List(list) => list.elements.iter().map(ast_nodes).sum(),
+        Expr::Map(map) => map
+            .entries
+            .iter()
+            .map(|entry| {
+                1 + match &entry.expr {
+                    EntryExpr::MapEntry(entry) => ast_nodes(&entry.key) + ast_nodes(&entry.value),
+                    EntryExpr::StructField(entry) => ast_nodes(&entry.value),
+                }
+            })
+            .sum::<usize>(),
+        Expr::Select(select) => ast_nodes(&select.operand),
+        Expr::Struct(structure) => structure
+            .entries
+            .iter()
+            .map(|entry| {
+                1 + match &entry.expr {
+                    EntryExpr::MapEntry(entry) => ast_nodes(&entry.key) + ast_nodes(&entry.value),
+                    EntryExpr::StructField(entry) => ast_nodes(&entry.value),
+                }
+            })
+            .sum::<usize>(),
+        Expr::Unspecified | Expr::Ident(_) | Expr::Literal(_) => 0,
+    }
 }
 
 pub fn evaluate_boolean(
@@ -421,7 +505,9 @@ pub fn evaluate_boolean(
 fn evaluate_ast(
     expression: &IdedExpr,
     environment: &Environment,
+    meter: &mut EvaluationMeter,
 ) -> Result<Value, EvaluationError> {
+    meter.enter()?;
     match &expression.expr {
         Expr::Literal(value) => match value {
             Val::Null => Ok(Value::Null),
@@ -439,7 +525,7 @@ fn evaluate_ast(
         Expr::List(list) => list
             .elements
             .iter()
-            .map(|value| evaluate_ast(value, environment))
+            .map(|value| evaluate_ast(value, environment, meter))
             .collect::<Result<Vec<_>, _>>()
             .map(Value::List),
         Expr::Map(map) => {
@@ -451,12 +537,12 @@ fn evaluate_ast(
                 let Expr::Literal(Val::String(key)) = &entry.key.expr else {
                     return profile_runtime_error();
                 };
-                output.insert(key.clone(), evaluate_ast(&entry.value, environment)?);
+                output.insert(key.clone(), evaluate_ast(&entry.value, environment, meter)?);
             }
             Ok(Value::Map(output))
         }
         Expr::Select(select) => {
-            let operand = evaluate_ast(&select.operand, environment)?;
+            let operand = evaluate_ast(&select.operand, environment, meter)?;
             let Value::Map(values) = operand else {
                 return Err(EvaluationError(
                     "field selection requires a map or record".to_string(),
@@ -472,7 +558,7 @@ fn evaluate_ast(
             }
         }
         Expr::Call(call) if call.target.is_none() => {
-            evaluate_call(&call.func_name, &call.args, environment)
+            evaluate_call(&call.func_name, &call.args, environment, meter)
         }
         Expr::Unspecified | Expr::Call(_) | Expr::Comprehension(_) | Expr::Struct(_) => {
             profile_runtime_error()
@@ -484,20 +570,21 @@ fn evaluate_call(
     name: &str,
     arguments: &[IdedExpr],
     environment: &Environment,
+    meter: &mut EvaluationMeter,
 ) -> Result<Value, EvaluationError> {
     match (name, arguments) {
         (operators::CONDITIONAL, [condition, selected, unselected]) => {
-            match evaluate_ast(condition, environment)? {
-                Value::Bool(true) => evaluate_ast(selected, environment),
-                Value::Bool(false) => evaluate_ast(unselected, environment),
+            match evaluate_ast(condition, environment, meter)? {
+                Value::Bool(true) => evaluate_ast(selected, environment, meter),
+                Value::Bool(false) => evaluate_ast(unselected, environment, meter),
                 _ => Err(EvaluationError(
                     "conditional condition must be Boolean".to_string(),
                 )),
             }
         }
         (operators::LOGICAL_AND | operators::LOGICAL_OR, [left, right]) => {
-            let left = evaluate_ast(left, environment);
-            let right = evaluate_ast(right, environment);
+            let left = evaluate_ast(left, environment, meter);
+            let right = evaluate_ast(right, environment, meter);
             match (name, left, right) {
                 (operators::LOGICAL_AND, Ok(Value::Bool(false)), _)
                 | (operators::LOGICAL_AND, _, Ok(Value::Bool(false))) => Ok(Value::Bool(false)),
@@ -515,11 +602,11 @@ fn evaluate_call(
                 )),
             }
         }
-        (operators::LOGICAL_NOT, [value]) => match evaluate_ast(value, environment)? {
+        (operators::LOGICAL_NOT, [value]) => match evaluate_ast(value, environment, meter)? {
             Value::Bool(value) => Ok(Value::Bool(!value)),
             _ => Err(EvaluationError("! requires bool".to_string())),
         },
-        (operators::NEGATE, [value]) => match evaluate_ast(value, environment)? {
+        (operators::NEGATE, [value]) => match evaluate_ast(value, environment, meter)? {
             Value::Int(value) => value
                 .checked_neg()
                 .map(Value::Int)
@@ -536,11 +623,12 @@ fn evaluate_call(
             [left, right],
         ) => evaluate_arithmetic(
             name,
-            evaluate_ast(left, environment)?,
-            evaluate_ast(right, environment)?,
+            evaluate_ast(left, environment, meter)?,
+            evaluate_ast(right, environment, meter)?,
         ),
         (operators::EQUALS | operators::NOT_EQUALS, [left, right]) => {
-            let equal = evaluate_ast(left, environment)? == evaluate_ast(right, environment)?;
+            let equal =
+                evaluate_ast(left, environment, meter)? == evaluate_ast(right, environment, meter)?;
             Ok(Value::Bool(if name == operators::EQUALS {
                 equal
             } else {
@@ -555,8 +643,8 @@ fn evaluate_call(
             [left, right],
         ) => {
             let ordering = compare_values(
-                &evaluate_ast(left, environment)?,
-                &evaluate_ast(right, environment)?,
+                &evaluate_ast(left, environment, meter)?,
+                &evaluate_ast(right, environment, meter)?,
             )?;
             Ok(Value::Bool(match name {
                 operators::GREATER => ordering == Ordering::Greater,
@@ -567,8 +655,8 @@ fn evaluate_call(
             }))
         }
         (operators::IN, [needle, haystack]) => {
-            let needle = evaluate_ast(needle, environment)?;
-            match evaluate_ast(haystack, environment)? {
+            let needle = evaluate_ast(needle, environment, meter)?;
+            match evaluate_ast(haystack, environment, meter)? {
                 Value::List(values) => Ok(Value::Bool(values.contains(&needle))),
                 Value::Map(values) => match needle {
                     Value::String(value) => Ok(Value::Bool(values.contains_key(&value))),
@@ -580,8 +668,8 @@ fn evaluate_call(
             }
         }
         (operators::INDEX, [container, index]) => {
-            let container = evaluate_ast(container, environment)?;
-            let index = evaluate_ast(index, environment)?;
+            let container = evaluate_ast(container, environment, meter)?;
+            let index = evaluate_ast(index, environment, meter)?;
             match (container, index) {
                 (Value::List(values), Value::Int(index)) => usize::try_from(index)
                     .ok()
@@ -594,7 +682,7 @@ fn evaluate_call(
                 _ => Err(EvaluationError("invalid index operation".to_string())),
             }
         }
-        ("size", [value]) => match evaluate_ast(value, environment)? {
+        ("size", [value]) => match evaluate_ast(value, environment, meter)? {
             Value::String(value) => checked_size(value.chars().count()),
             Value::List(value) => checked_size(value.len()),
             Value::Map(value) => checked_size(value.len()),
@@ -602,11 +690,11 @@ fn evaluate_call(
                 "size requires a string, list, or map".to_string(),
             )),
         },
-        ("double", [value]) => match evaluate_ast(value, environment)? {
+        ("double", [value]) => match evaluate_ast(value, environment, meter)? {
             Value::Int(value) => finite_float(value as f64),
             _ => profile_runtime_error(),
         },
-        ("int", [value]) => match evaluate_ast(value, environment)? {
+        ("int", [value]) => match evaluate_ast(value, environment, meter)? {
             Value::Float(value)
                 if value.is_finite()
                     && value >= i64::MIN as f64
@@ -619,7 +707,7 @@ fn evaluate_call(
             )),
             _ => profile_runtime_error(),
         },
-        ("string", [value]) => match evaluate_ast(value, environment)? {
+        ("string", [value]) => match evaluate_ast(value, environment, meter)? {
             Value::Bool(value) => Ok(Value::String(value.to_string())),
             Value::Int(value) => Ok(Value::String(value.to_string())),
             Value::Float(value) => Ok(Value::String(canonical_double(value)?)),

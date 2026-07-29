@@ -7,8 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  SPECIFICATION_COMMIT: 09c717a40c75b99612e54d764b5f1bdfa4b94f96
-  CONFORMANCE_COMMIT: 74e477087fd31561600aacf652cccae571a5ea9a
+  SPECIFICATION_COMMIT: 1502a58a780d837e05bfacb37680dfc92e3488b5
+  CONFORMANCE_COMMIT: 707a49ce01c6f57f673c1959cdfe078bc8d0fc9a
 
 jobs:
   clippy:
@@ -47,6 +47,9 @@ jobs:
           test "$(git -C conformance-suite rev-parse HEAD)" = "$CONFORMANCE_COMMIT"
           test "$(git -C authoritative-spec rev-parse HEAD)" = "$SPECIFICATION_COMMIT"
           cmp schema/machine.schema.json authoritative-spec/schema/machine.schema.json
+          cmp schema/aggregate-state.schema.json authoritative-spec/schema/aggregate-state.schema.json
+          cmp schema/migration-descriptor.schema.json authoritative-spec/schema/migration-descriptor.schema.json
+          cmp schema/aggregate-state-package.schema.json authoritative-spec/schema/aggregate-state-package.schema.json
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -66,5 +69,8 @@ jobs:
       - name: Documentation tests
         run: cargo test --doc
 
-      - name: All 88 format 1 core conformance cases
-        run: cargo test --test core_conformance -- --nocapture
+      - name: All 110 format 1 core conformance cases
+        run: cargo test --test core_conformance --test persistence_conformance -- --nocapture
+
+      - name: Persistence host profiles
+        run: cargo test --test persistence_profiles -- --nocapture

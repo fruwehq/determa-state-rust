@@ -1,0 +1,769 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/aggregate-state.schema.json",
+  "title": "Determa State portable aggregate-state envelope",
+  "description": "Closed wire schema for aggregate_state_schema_version 1.",
+  "$ref": "#/$defs/aggregateState",
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "namespace": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"
+    },
+    "canonicalDecimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "positiveCanonicalDecimal": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "signedCanonicalDecimal": {
+      "type": "string",
+      "pattern": "^(0|-?[1-9][0-9]*)$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "jsonPointer": {
+      "type": "string",
+      "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
+    },
+    "sourceLocator": {
+      "type": "string",
+      "pattern": "^(?:(?:/(?:[^~/]|~[01])*)+|system:[A-Za-z_][A-Za-z0-9_]*)$"
+    },
+    "typedValue": {
+      "oneOf": [
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "null"
+            }
+          ],
+          "minItems": 1,
+          "maxItems": 1
+        },
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "boolean"
+            },
+            {
+              "type": "boolean"
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "string"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "integer"
+            },
+            {
+              "$ref": "#/$defs/signedCanonicalDecimal"
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "float"
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{16}$"
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "list"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/typedValue"
+              }
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "map"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/$defs/typedValue"
+                  }
+                ],
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        }
+      ]
+    },
+    "machineIdentity": {
+      "type": "object",
+      "required": [
+        "namespace",
+        "machine_id",
+        "machine_version",
+        "root_definition_pointer"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "namespace": {
+          "$ref": "#/$defs/namespace"
+        },
+        "machine_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "machine_version": {
+          "$ref": "#/$defs/positiveCanonicalDecimal"
+        },
+        "root_definition_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        }
+      }
+    },
+    "definitionBinding": {
+      "type": "object",
+      "required": [
+        "validated_bundle_fingerprint",
+        "machine"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "validated_bundle_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "machine": {
+          "$ref": "#/$defs/machineIdentity"
+        }
+      }
+    },
+    "rootIdentityOrigin": {
+      "type": "object",
+      "required": [
+        "kind",
+        "definition",
+        "root_instance_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "root"
+        },
+        "definition": {
+          "$ref": "#/$defs/definitionBinding"
+        },
+        "root_instance_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "componentIdentityOrigin": {
+      "type": "object",
+      "required": [
+        "kind",
+        "definition",
+        "owner_runtime_id",
+        "component_definition_pointer",
+        "activation_sequence",
+        "declaration_index"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "component"
+        },
+        "definition": {
+          "$ref": "#/$defs/definitionBinding"
+        },
+        "owner_runtime_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "component_definition_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "activation_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "declaration_index": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "spawnedIdentityOrigin": {
+      "type": "object",
+      "required": [
+        "kind",
+        "definition",
+        "owner_runtime_id",
+        "spawn_action_pointer",
+        "spawn_sequence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "owned_spawned_instance"
+        },
+        "definition": {
+          "$ref": "#/$defs/definitionBinding"
+        },
+        "owner_runtime_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "spawn_action_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "spawn_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "identityOrigin": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/rootIdentityOrigin"
+        },
+        {
+          "$ref": "#/$defs/componentIdentityOrigin"
+        },
+        {
+          "$ref": "#/$defs/spawnedIdentityOrigin"
+        }
+      ]
+    },
+    "instanceReference": {
+      "type": "object",
+      "required": [
+        "root_instance_id",
+        "instance_id",
+        "machine_id",
+        "machine_version"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "root_instance_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "instance_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "machine_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "machine_version": {
+          "$ref": "#/$defs/positiveCanonicalDecimal"
+        }
+      }
+    },
+    "targetIdentity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "root"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "object",
+              "required": [
+                "root_instance_id",
+                "root_runtime_id"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "root_instance_id": {
+                  "$ref": "#/$defs/nonEmptyString"
+                },
+                "root_runtime_id": {
+                  "$ref": "#/$defs/nonEmptyString"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "component"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "component": {
+              "type": "object",
+              "required": [
+                "root_instance_id",
+                "owner_runtime_id",
+                "component_id",
+                "component_runtime_id",
+                "activation_sequence"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "root_instance_id": {
+                  "$ref": "#/$defs/nonEmptyString"
+                },
+                "owner_runtime_id": {
+                  "$ref": "#/$defs/nonEmptyString"
+                },
+                "component_id": {
+                  "$ref": "#/$defs/identifier"
+                },
+                "component_runtime_id": {
+                  "$ref": "#/$defs/nonEmptyString"
+                },
+                "activation_sequence": {
+                  "$ref": "#/$defs/canonicalDecimal"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "spawned_instance"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "spawned_instance": {
+              "$ref": "#/$defs/instanceReference"
+            }
+          }
+        }
+      ]
+    },
+    "lifetimeHolder": {
+      "type": "object",
+      "required": [
+        "holder_runtime_id",
+        "variable_declaration_pointer",
+        "holder_state_activation_sequence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "holder_runtime_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "variable_declaration_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "holder_state_activation_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "relation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "root"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "owner_runtime_id",
+            "component_id",
+            "current_component_definition_pointer",
+            "activation_sequence",
+            "declaration_index"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "component"
+            },
+            "owner_runtime_id": {
+              "$ref": "#/$defs/sha256"
+            },
+            "component_id": {
+              "$ref": "#/$defs/identifier"
+            },
+            "current_component_definition_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            },
+            "activation_sequence": {
+              "$ref": "#/$defs/canonicalDecimal"
+            },
+            "declaration_index": {
+              "$ref": "#/$defs/canonicalDecimal"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "owner_runtime_id",
+            "current_spawn_action_pointer",
+            "spawn_sequence",
+            "lifetime_holder"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "owned_spawned_instance"
+            },
+            "owner_runtime_id": {
+              "$ref": "#/$defs/sha256"
+            },
+            "current_spawn_action_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            },
+            "spawn_sequence": {
+              "$ref": "#/$defs/canonicalDecimal"
+            },
+            "lifetime_holder": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/lifetimeHolder"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "stateActivation": {
+      "type": "object",
+      "required": [
+        "state_definition_pointer",
+        "activation_sequence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state_definition_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "activation_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "variable": {
+      "type": "object",
+      "required": [
+        "variable_declaration_pointer",
+        "declaring_state_activation_sequence",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "variable_declaration_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "declaring_state_activation_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "value": {
+          "$ref": "#/$defs/typedValue"
+        }
+      }
+    },
+    "history": {
+      "type": "object",
+      "required": [
+        "history_declaration_pointer",
+        "recorded_state_definition_pointers"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "history_declaration_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "recorded_state_definition_pointers": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/jsonPointer"
+              },
+              "uniqueItems": true
+            }
+          ]
+        }
+      }
+    },
+    "nextCounter": {
+      "type": "object",
+      "required": [
+        "definition_pointer",
+        "next_sequence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "definition_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "next_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "fault": {
+      "type": "object",
+      "required": [
+        "definition_fingerprint",
+        "runtime_id",
+        "cause_id",
+        "code",
+        "step_sequence",
+        "source_locator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "definition_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "runtime_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "cause_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "code": {
+          "$ref": "#/$defs/identifier"
+        },
+        "step_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "source_locator": {
+          "$ref": "#/$defs/sourceLocator"
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "required": [
+        "runtime_id",
+        "identity_origin",
+        "target_identity",
+        "current_definition",
+        "relation",
+        "status",
+        "active_leaf_state_definition_pointers",
+        "active_state_activations",
+        "variables",
+        "history",
+        "next_spawn_sequence",
+        "next_state_activation_sequences",
+        "next_component_activation_sequences",
+        "fault"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "runtime_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "identity_origin": {
+          "$ref": "#/$defs/identityOrigin"
+        },
+        "target_identity": {
+          "$ref": "#/$defs/targetIdentity"
+        },
+        "current_definition": {
+          "$ref": "#/$defs/definitionBinding"
+        },
+        "relation": {
+          "$ref": "#/$defs/relation"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "faulted"
+          ]
+        },
+        "active_leaf_state_definition_pointers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/jsonPointer"
+          },
+          "uniqueItems": true
+        },
+        "active_state_activations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stateActivation"
+          }
+        },
+        "variables": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/variable"
+          }
+        },
+        "history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/history"
+          }
+        },
+        "next_spawn_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "next_state_activation_sequences": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nextCounter"
+          }
+        },
+        "next_component_activation_sequences": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nextCounter"
+          }
+        },
+        "fault": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/fault"
+            }
+          ]
+        }
+      }
+    },
+    "aggregateState": {
+      "type": "object",
+      "required": [
+        "aggregate_state_format",
+        "aggregate_state_schema_version",
+        "machine_format",
+        "validated_bundle_fingerprint",
+        "namespace",
+        "root_machine_id",
+        "root_machine_version",
+        "root_instance_id",
+        "creation_id",
+        "root_runtime_id",
+        "migration_sequence",
+        "next_logical_step_sequence",
+        "next_output_sequence",
+        "runtimes",
+        "aggregate_state_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "aggregate_state_format": {
+          "const": "determa.aggregate_state"
+        },
+        "aggregate_state_schema_version": {
+          "const": 1
+        },
+        "machine_format": {
+          "const": 1
+        },
+        "validated_bundle_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "namespace": {
+          "$ref": "#/$defs/namespace"
+        },
+        "root_machine_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "root_machine_version": {
+          "$ref": "#/$defs/positiveCanonicalDecimal"
+        },
+        "root_instance_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "creation_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "root_runtime_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "migration_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "next_logical_step_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "next_output_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "runtimes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/runtime"
+          }
+        },
+        "aggregate_state_digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  }
+}

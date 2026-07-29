@@ -6,8 +6,8 @@ use super::compile::{
 };
 use super::counter::Counter;
 use super::model::{
-    BindingExpressions, Bindings, Delivery, Envelope, EventDeclaration, EventDirection, Target,
-    VariableDeclaration,
+    BindingExpressions, Bindings, DefinitionBinding, Delivery, Envelope, EventDeclaration,
+    EventDirection, IdentityOrigin, MachineIdentity, Target, VariableDeclaration,
 };
 use crate::value::{InstanceReference, Value};
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,7 @@ pub struct Rejection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaultRecord {
+    pub definition_fingerprint: String,
     pub runtime_id: String,
     pub cause_id: String,
     pub code: String,
@@ -92,6 +93,9 @@ pub struct AggregateState {
     pub validated_bundle_fingerprint: String,
     pub namespace: String,
     pub root_instance_id: String,
+    pub creation_id: String,
+    pub migration_sequence: Counter,
+    pub wire_runtime_order: Vec<String>,
     pub root: RuntimeState,
     pub next_logical_step_sequence: Counter,
     pub next_output_sequence: Counter,
@@ -100,6 +104,9 @@ pub struct AggregateState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeState {
     pub runtime_id: String,
+    pub identity_origin: IdentityOrigin,
+    pub target_identity: Target,
+    pub current_definition: DefinitionBinding,
     pub machine_id: String,
     pub machine_version: i64,
     pub definition: Machine,
@@ -199,14 +206,28 @@ pub fn create(
         return rejected_creation("invalid_machine_target");
     };
     let root_runtime_id = root_runtime_identity(bundle, &machine, root_instance_id);
+    let root_definition = definition_binding(bundle, &machine);
+    let root_target = Target::Root {
+        root_instance_id: root_instance_id.to_string(),
+        root_runtime_id: root_runtime_id.clone(),
+    };
     let mut aggregate = AggregateState {
         validated_bundle_fingerprint: bundle.fingerprint.clone(),
         namespace: bundle.namespace.clone(),
         root_instance_id: root_instance_id.to_string(),
+        creation_id: creation_id.to_string(),
+        migration_sequence: Counter::zero(),
+        wire_runtime_order: vec![root_runtime_id.clone()],
         root: RuntimeState::new(
             root_runtime_id.clone(),
             machine.clone(),
             RuntimeRelation::Root,
+            IdentityOrigin::Root {
+                definition: root_definition.clone(),
+                root_instance_id: root_instance_id.to_string(),
+            },
+            root_target,
+            root_definition,
         ),
         next_logical_step_sequence: Counter::zero(),
         next_output_sequence: Counter::zero(),
@@ -247,6 +268,7 @@ pub fn create(
         },
         Err(fault) => {
             let record = FaultRecord {
+                definition_fingerprint: bundle.fingerprint.clone(),
                 runtime_id: root_runtime_id,
                 cause_id,
                 code: fault.code.to_string(),
@@ -257,6 +279,9 @@ pub fn create(
                 aggregate.root.runtime_id.clone(),
                 machine,
                 RuntimeRelation::Root,
+                aggregate.root.identity_origin.clone(),
+                aggregate.root.target_identity.clone(),
+                aggregate.root.current_definition.clone(),
             );
             diagnostic.history.clear();
             diagnostic.status = RuntimeStatus::Faulted;
@@ -434,7 +459,14 @@ enum AddressSegment {
 type RuntimeAddress = Vec<AddressSegment>;
 
 impl RuntimeState {
-    fn new(runtime_id: String, definition: Machine, relation: RuntimeRelation) -> Self {
+    fn new(
+        runtime_id: String,
+        definition: Machine,
+        relation: RuntimeRelation,
+        identity_origin: IdentityOrigin,
+        target_identity: Target,
+        current_definition: DefinitionBinding,
+    ) -> Self {
         let history = definition
             .states
             .values()
@@ -443,6 +475,9 @@ impl RuntimeState {
             .collect();
         Self {
             runtime_id,
+            identity_origin,
+            target_identity,
+            current_definition,
             machine_id: definition.machine_id.clone(),
             machine_version: definition.version,
             definition,
@@ -533,6 +568,10 @@ fn fault_dispatch(
     let step_sequence = aggregate.next_logical_step_sequence.allocate();
     let runtime = runtime_at_mut(&mut aggregate.root, address).expect("fault target was validated");
     let record = FaultRecord {
+        definition_fingerprint: runtime
+            .current_definition
+            .validated_bundle_fingerprint
+            .clone(),
         runtime_id: runtime.runtime_id.clone(),
         cause_id: envelope.event_id.clone(),
         code: fault.code.to_string(),
@@ -572,18 +611,151 @@ fn validate_prior_state(state: &AggregateState) -> bool {
     if state.validated_bundle_fingerprint.is_empty()
         || state.namespace.is_empty()
         || state.root_instance_id.is_empty()
+        || state.creation_id.is_empty()
         || !matches!(state.root.relation, RuntimeRelation::Root)
-        || state.root.runtime_id
-            != root_runtime_identity_parts(
-                &state.validated_bundle_fingerprint,
-                &state.namespace,
-                &state.root.definition,
-                &state.root_instance_id,
-            )
+        || !validate_root_identity(state)
     {
         return false;
     }
     validate_runtime_shape(state, &state.root, &state.root.definition)
+}
+
+fn validate_root_identity(state: &AggregateState) -> bool {
+    let IdentityOrigin::Root {
+        definition,
+        root_instance_id,
+    } = &state.root.identity_origin
+    else {
+        return false;
+    };
+    if root_instance_id != &state.root_instance_id {
+        return false;
+    }
+    let expected = hash_json(serde_json::json!([
+        "determa-root-runtime-identity-2",
+        "1",
+        definition.validated_bundle_fingerprint,
+        definition.machine.namespace,
+        definition.machine.machine_id,
+        definition.machine.machine_version.to_string(),
+        state.root_instance_id
+    ]));
+    state.root.runtime_id == expected
+        && state.root.target_identity
+            == Target::Root {
+                root_instance_id: state.root_instance_id.clone(),
+                root_runtime_id: state.root.runtime_id.clone(),
+            }
+}
+
+fn validate_runtime_identity(aggregate: &AggregateState, runtime: &RuntimeState) -> bool {
+    match (
+        &runtime.identity_origin,
+        &runtime.target_identity,
+        &runtime.relation,
+    ) {
+        (
+            IdentityOrigin::Root {
+                definition,
+                root_instance_id,
+            },
+            Target::Root {
+                root_instance_id: target_root_instance_id,
+                root_runtime_id,
+            },
+            RuntimeRelation::Root,
+        ) => {
+            let expected = hash_json(serde_json::json!([
+                "determa-root-runtime-identity-2",
+                "1",
+                definition.validated_bundle_fingerprint,
+                definition.machine.namespace,
+                definition.machine.machine_id,
+                definition.machine.machine_version.to_string(),
+                root_instance_id
+            ]));
+            root_instance_id == &aggregate.root_instance_id
+                && target_root_instance_id == &aggregate.root_instance_id
+                && root_runtime_id == &runtime.runtime_id
+                && expected == runtime.runtime_id
+        }
+        (
+            IdentityOrigin::Component {
+                definition,
+                owner_runtime_id,
+                component_definition_pointer,
+                activation_sequence,
+                ..
+            },
+            Target::Component {
+                root_instance_id,
+                owner_runtime_id: target_owner_runtime_id,
+                component_runtime_id,
+                activation_sequence: target_activation_sequence,
+                ..
+            },
+            RuntimeRelation::Component {
+                owner_runtime_id: current_owner_runtime_id,
+                activation_sequence: current_activation_sequence,
+                ..
+            },
+        ) => {
+            let expected = hash_json(serde_json::json!([
+                "determa-component-runtime-identity-1",
+                "1",
+                aggregate.root_instance_id,
+                owner_runtime_id,
+                component_definition_pointer,
+                activation_sequence.to_string(),
+                definition.machine.namespace,
+                definition.machine.machine_id,
+                definition.machine.machine_version.to_string()
+            ]));
+            root_instance_id == &aggregate.root_instance_id
+                && owner_runtime_id == target_owner_runtime_id
+                && owner_runtime_id == current_owner_runtime_id
+                && component_runtime_id == &runtime.runtime_id
+                && activation_sequence == target_activation_sequence
+                && activation_sequence == current_activation_sequence
+                && expected == runtime.runtime_id
+        }
+        (
+            IdentityOrigin::OwnedSpawnedInstance {
+                definition,
+                owner_runtime_id,
+                spawn_action_pointer,
+                spawn_sequence,
+            },
+            Target::SpawnedInstance(reference),
+            RuntimeRelation::Spawned {
+                owner_runtime_id: current_owner_runtime_id,
+                spawn_sequence: current_spawn_sequence,
+                reference: current_reference,
+                ..
+            },
+        ) => {
+            let expected = hash_json(serde_json::json!([
+                "determa-spawned-runtime-identity-1",
+                "1",
+                aggregate.root_instance_id,
+                owner_runtime_id,
+                spawn_action_pointer,
+                spawn_sequence.to_string(),
+                definition.machine.namespace,
+                definition.machine.machine_id,
+                definition.machine.machine_version.to_string()
+            ]));
+            owner_runtime_id == current_owner_runtime_id
+                && spawn_sequence == current_spawn_sequence
+                && reference == current_reference
+                && reference.root_instance_id == aggregate.root_instance_id
+                && reference.instance_id == runtime.runtime_id
+                && reference.machine_id == definition.machine.machine_id
+                && reference.machine_version == definition.machine.machine_version
+                && expected == runtime.runtime_id
+        }
+        _ => false,
+    }
 }
 
 fn validate_prior_state_bundle_binding(state: &AggregateState, bundle: &Bundle) -> bool {
@@ -596,6 +768,12 @@ fn validate_prior_state_bundle_binding(state: &AggregateState, bundle: &Bundle) 
     validate_runtime_bundle_binding(&state.root, machine, bundle)
 }
 
+pub(crate) fn aggregate_is_valid_for_bundle(state: &AggregateState, bundle: &Bundle) -> bool {
+    validate_prior_state(state)
+        && state.validated_bundle_fingerprint == bundle.fingerprint
+        && validate_prior_state_bundle_binding(state, bundle)
+}
+
 fn validate_runtime_shape(
     aggregate: &AggregateState,
     runtime: &RuntimeState,
@@ -605,8 +783,16 @@ fn validate_runtime_shape(
         || runtime.machine_id != expected_definition.machine_id
         || runtime.machine_version != expected_definition.version
         || runtime.definition != *expected_definition
+        || runtime.current_definition.machine.namespace != aggregate.namespace
+        || runtime.current_definition.machine.machine_id != runtime.machine_id
+        || runtime.current_definition.machine.machine_version != runtime.machine_version
+        || runtime.current_definition.machine.root_definition_pointer
+            != runtime.definition.root_pointer
+        || runtime.current_definition.validated_bundle_fingerprint
+            != aggregate.validated_bundle_fingerprint
         || runtime.machine_version <= 0
         || !validate_machine_shape(&runtime.definition)
+        || !validate_runtime_identity(aggregate, runtime)
     {
         return false;
     }
@@ -737,7 +923,13 @@ fn validate_runtime_shape(
             if fault.runtime_id != runtime.runtime_id
                 || fault.cause_id.is_empty()
                 || fault.step_sequence >= aggregate.next_logical_step_sequence
-                || !validate_fault_locator(runtime, &fault.code, &fault.source_locator)
+                || !is_sha256(&fault.definition_fingerprint)
+                || (fault.definition_fingerprint
+                    == runtime.current_definition.validated_bundle_fingerprint
+                    && !validate_fault_locator(runtime, &fault.code, &fault.source_locator))
+                || (fault.definition_fingerprint
+                    != runtime.current_definition.validated_bundle_fingerprint
+                    && !validate_historical_fault(&fault.code, &fault.source_locator))
             {
                 return false;
             }
@@ -791,15 +983,6 @@ fn validate_runtime_shape(
             || component_pointer != &component.pointer
             || *declaration_index != component.declaration_index
             || activation_sequence != &component.activation_sequence
-            || component.runtime.runtime_id
-                != component_runtime_identity_parts(
-                    &aggregate.namespace,
-                    &aggregate.root_instance_id,
-                    &runtime.runtime_id,
-                    declaration,
-                    &component.activation_sequence,
-                    expected_definition,
-                )
             || !validate_runtime_shape(aggregate, &component.runtime, expected_definition)
         {
             return false;
@@ -828,8 +1011,6 @@ fn validate_runtime_shape(
             || runtime.next_spawn_sequence <= owned.spawn_sequence
             || owned.reference.root_instance_id != aggregate.root_instance_id
             || owned.reference.instance_id != owned.runtime.runtime_id
-            || owned.reference.machine_id != owned.runtime.machine_id
-            || owned.reference.machine_version != owned.runtime.machine_version
         {
             return false;
         }
@@ -855,15 +1036,6 @@ fn validate_runtime_shape(
             || holder_activation_sequence != &owned.holder_activation_sequence
             || find_spawn_declaration(&runtime.definition, spawn_pointer)
                 .is_none_or(|machine_id| machine_id != owned.runtime.machine_id)
-            || owned.runtime.runtime_id
-                != spawned_runtime_identity_parts(
-                    &aggregate.namespace,
-                    &aggregate.root_instance_id,
-                    &runtime.runtime_id,
-                    spawn_pointer,
-                    &owned.spawn_sequence,
-                    &owned.runtime.definition,
-                )
             || !validate_holder(runtime, owned)
             || !validate_runtime_shape(aggregate, &owned.runtime, &owned.runtime.definition)
         {
@@ -871,6 +1043,29 @@ fn validate_runtime_shape(
         }
     }
     true
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
+}
+
+fn validate_historical_fault(code: &str, locator: &str) -> bool {
+    matches!(
+        code,
+        "action_fault"
+            | "binding_not_empty"
+            | "cascade_fault"
+            | "contained_runtime_fault"
+            | "guard_fault"
+            | "inactive_component_target"
+            | "invalid_instance_target"
+            | "invariant_fault"
+    ) && (locator.starts_with('/') || locator.starts_with("system:"))
 }
 
 fn validate_active_configuration(runtime: &RuntimeState) -> bool {
@@ -1021,7 +1216,9 @@ fn find_component_declaration<'a>(
 fn find_spawn_declaration<'a>(machine: &'a Machine, pointer: &str) -> Option<&'a str> {
     machine.states.values().find_map(|state| {
         all_state_actions(state).find_map(|action| match &action.kind {
-            CompiledActionKind::Spawn { machine_id, .. } if action.pointer == pointer => {
+            CompiledActionKind::Spawn { machine_id, .. }
+                if format!("{}/spawn", action.pointer) == pointer =>
+            {
                 Some(machine_id.as_str())
             }
             _ => None,
@@ -1480,6 +1677,18 @@ fn root_runtime_identity(bundle: &Bundle, machine: &Machine, root_instance_id: &
         machine,
         root_instance_id,
     )
+}
+
+fn definition_binding(bundle: &Bundle, machine: &Machine) -> DefinitionBinding {
+    DefinitionBinding {
+        validated_bundle_fingerprint: bundle.fingerprint.clone(),
+        machine: MachineIdentity {
+            namespace: bundle.namespace.clone(),
+            machine_id: machine.machine_id.clone(),
+            machine_version: machine.version,
+            root_definition_pointer: machine.root_pointer.clone(),
+        },
+    }
 }
 
 fn root_runtime_identity_parts(
@@ -2611,7 +2820,7 @@ fn execute_send(
                     context.root_instance_id,
                     &context.cause_id,
                     &context.step_sequence,
-                    &action.pointer,
+                    &format!("{}/send", action.pointer),
                     ordinal,
                 )),
                 sequence: Some(sequence),
@@ -2628,7 +2837,7 @@ fn execute_send(
                     &target_runtime_id,
                     &context.cause_id,
                     &context.step_sequence,
-                    &action.pointer,
+                    &format!("{}/send", action.pointer),
                     ordinal,
                 )),
                 target,
@@ -2689,13 +2898,7 @@ fn resolve_author_target(
                     source_locator: pointer,
                 });
             }
-            Ok(Target::Component {
-                root_instance_id: root_instance_id.to_string(),
-                owner_runtime_id: runtime.runtime_id.clone(),
-                component_id: component.component_id.clone(),
-                component_runtime_id: component.runtime.runtime_id.clone(),
-                activation_sequence: component.activation_sequence.clone(),
-            })
+            Ok(component.runtime.target_identity.clone())
         }
         CompiledSendTarget::Instance(_) => {
             let Some(Value::InstanceReference(reference)) = dynamic else {
@@ -2717,25 +2920,8 @@ fn resolve_author_target(
 }
 
 fn runtime_target(runtime: &RuntimeState, root_instance_id: &str) -> Target {
-    match &runtime.relation {
-        RuntimeRelation::Root => Target::Root {
-            root_instance_id: root_instance_id.to_string(),
-            root_runtime_id: runtime.runtime_id.clone(),
-        },
-        RuntimeRelation::Component {
-            owner_runtime_id,
-            component_id,
-            activation_sequence,
-            ..
-        } => Target::Component {
-            root_instance_id: root_instance_id.to_string(),
-            owner_runtime_id: owner_runtime_id.clone(),
-            component_id: component_id.clone(),
-            component_runtime_id: runtime.runtime_id.clone(),
-            activation_sequence: activation_sequence.clone(),
-        },
-        RuntimeRelation::Spawned { reference, .. } => Target::SpawnedInstance(reference.clone()),
-    }
+    let _ = root_instance_id;
+    runtime.target_identity.clone()
 }
 
 fn runtime_owner_runtime_id(runtime: &RuntimeState) -> Option<String> {
@@ -2801,11 +2987,12 @@ fn execute_spawn(
         source_locator: format!("{}/spawn/bindings", action.pointer),
     })?;
     let spawn_sequence = runtime.next_spawn_sequence.allocate();
+    let spawn_action_pointer = format!("{}/spawn", action.pointer);
     let instance_id = spawned_runtime_identity(
         context.bundle,
         context.root_instance_id,
         &runtime.runtime_id,
-        &action.pointer,
+        &spawn_action_pointer,
         &spawn_sequence,
         &machine,
     );
@@ -2838,13 +3025,28 @@ fn execute_spawn(
         owner_runtime_id: runtime.runtime_id.clone(),
         owner_target: Box::new(runtime_target(runtime, context.root_instance_id)),
         spawn_sequence: spawn_sequence.clone(),
-        spawn_pointer: action.pointer.clone(),
+        spawn_pointer: spawn_action_pointer.clone(),
         reference: reference.clone(),
         holder_path: holder_path.clone(),
         holder_pointer: holder_pointer.clone(),
         holder_activation_sequence: holder_activation_sequence.clone(),
     };
-    let mut child = RuntimeState::new(instance_id.clone(), machine, relation);
+    let definition = definition_binding(context.bundle, &machine);
+    let target_identity = Target::SpawnedInstance(reference.clone());
+    let identity_origin = IdentityOrigin::OwnedSpawnedInstance {
+        definition: definition.clone(),
+        owner_runtime_id: runtime.runtime_id.clone(),
+        spawn_action_pointer: spawn_action_pointer.clone(),
+        spawn_sequence: spawn_sequence.clone(),
+    };
+    let mut child = RuntimeState::new(
+        instance_id.clone(),
+        machine,
+        relation,
+        identity_origin,
+        target_identity,
+        definition,
+    );
     initialize_root_variables(&mut child, &bindings).map_err(|_| StepFault {
         code: "action_fault",
         source_locator: format!("{}/spawn/bindings", action.pointer),
@@ -2856,7 +3058,7 @@ fn execute_spawn(
         &instance_id,
         &context.cause_id,
         &context.step_sequence,
-        &action.pointer,
+        &spawn_action_pointer,
         &spawn_sequence,
     );
     let emission_checkpoint = context.emissions.len();
@@ -2868,6 +3070,10 @@ fn execute_spawn(
         context.emissions.truncate(emission_checkpoint);
         *context.next_output_sequence = output_sequence_checkpoint;
         let record = FaultRecord {
+            definition_fingerprint: child
+                .current_definition
+                .validated_bundle_fingerprint
+                .clone(),
             runtime_id: child.runtime_id.clone(),
             cause_id: child_cause,
             code: fault.code.to_string(),
@@ -2878,6 +3084,9 @@ fn execute_spawn(
             child.runtime_id.clone(),
             child.definition.clone(),
             child.relation.clone(),
+            child.identity_origin.clone(),
+            child.target_identity.clone(),
+            child.current_definition.clone(),
         );
         child.history.clear();
         child.status = RuntimeStatus::Faulted;
@@ -2988,12 +3197,34 @@ fn allocate_components(
             declaration_index: component.declaration_index,
             activation_sequence: activation_sequence.clone(),
         };
+        let definition = definition_binding(context.bundle, &machine);
+        let target_identity = Target::Component {
+            root_instance_id: context.root_instance_id.to_string(),
+            owner_runtime_id: runtime.runtime_id.clone(),
+            component_id: component.component_id.clone(),
+            component_runtime_id: runtime_id.clone(),
+            activation_sequence: activation_sequence.clone(),
+        };
+        let identity_origin = IdentityOrigin::Component {
+            definition: definition.clone(),
+            owner_runtime_id: runtime.runtime_id.clone(),
+            component_definition_pointer: component.pointer.clone(),
+            activation_sequence: activation_sequence.clone(),
+            declaration_index: Counter::from(component.declaration_index),
+        };
         runtime.components.push(ComponentRuntime {
             component_id: component.component_id.clone(),
             pointer: component.pointer.clone(),
             declaration_index: component.declaration_index,
             activation_sequence,
-            runtime: RuntimeState::new(runtime_id, machine, relation),
+            runtime: RuntimeState::new(
+                runtime_id,
+                machine,
+                relation,
+                identity_origin,
+                target_identity,
+                definition,
+            ),
         });
     }
     Ok(())
@@ -3048,14 +3279,25 @@ fn initialize_components(
             let relation = child.relation.clone();
             let definition = child.definition.clone();
             let runtime_id = child.runtime_id.clone();
+            let identity_origin = child.identity_origin.clone();
+            let target_identity = child.target_identity.clone();
+            let current_definition = child.current_definition.clone();
             let record = FaultRecord {
+                definition_fingerprint: current_definition.validated_bundle_fingerprint.clone(),
                 runtime_id: runtime_id.clone(),
                 cause_id: child_cause.clone(),
                 code: fault.code.to_string(),
                 step_sequence: context.step_sequence.clone(),
                 source_locator: fault.source_locator,
             };
-            *child = RuntimeState::new(runtime_id, definition, relation);
+            *child = RuntimeState::new(
+                runtime_id,
+                definition,
+                relation,
+                identity_origin,
+                target_identity,
+                current_definition,
+            );
             child.history.clear();
             child.status = RuntimeStatus::Faulted;
             child.fault = Some(record.clone());
