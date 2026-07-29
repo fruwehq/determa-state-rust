@@ -732,7 +732,7 @@ fn command_line_surface_is_validation_only_and_aliases_match() {
         assert!(version.status.success());
         assert_eq!(
             String::from_utf8(version.stdout).expect("UTF-8 output"),
-            "determa-state 0.0.7\n"
+            "determa-state 0.1.0\n"
         );
 
         let validation = Command::new(binary)

@@ -3,16 +3,24 @@
 Rust implementation of the portable [Determa State](https://github.com/fruwehq/determa-state-spec)
 `format: 1` core.
 
-Repository metadata targets synchronized version `0.0.7` using these normative inputs:
+Repository metadata prepares synchronized version `0.1.0`. Until the upstream
+`v0.1.0` releases exist, this branch remains validated against these exact normative
+inputs:
 
-- specification commit `09c717a40c75b99612e54d764b5f1bdfa4b94f96`;
-- conformance commit `74e477087fd31561600aacf652cccae571a5ea9a`.
+- specification commit `1502a58a780d837e05bfacb37680dfc92e3488b5`;
+- conformance commit `707a49ce01c6f57f673c1959cdfe078bc8d0fc9a`.
 
-Until the coordinated `v0.0.7` tag publishes, the latest crate on crates.io remains
-version `0.0.6`.
+Until the coordinated `v0.1.0` tag publishes, the latest crate on crates.io remains
+version `0.0.7`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
-test runs every one of its 88 core cases.
+tests run all 110 format-1 core cases, 105 portable persistence vectors, and 12 steps
+across the six persistence host profiles.
+
+Before this release-preparation branch is marked ready or merged, it must replace the
+temporary commit pins with the verified commits referenced by the real specification
+and conformance `v0.1.0` tags, synchronize the conformance submodule and schemas, and
+rerun every release gate.
 
 ## Implemented core
 
@@ -27,13 +35,18 @@ test runs every one of its 88 core cases.
   propagation, and deterministic lifecycle cleanup.
 - Pure `create` and `dispatch` operations with deterministic runtime, cause, event, and
   external-effect identities.
+- Portable aggregate serialization and restoration with strict typed values, canonical
+  JSON, content-addressed definitions, and self-contained aggregate packages.
+- Resolver-backed compatible and transforming definition migration, exact route
+  execution, resource limits, audit records, and atomic migration-and-dispatch.
 - Inspection through the returned logical aggregate state, result disposition, fault,
   rejection, configuration, variables, components, owned instances, and emissions.
 
-The portable core does not own queues, persistence, broker acknowledgement, timers,
-snapshots, definition migration, package imports, or a background scheduler. A host may
-build those profiles around the pure state boundary. The command-line binary currently
-provides bundle validation only; it does not claim a portable CLI execution profile.
+The portable core does not own queues, broker acknowledgement, timers, package imports,
+or a background scheduler. Hosts provide artifact storage, resolver trust policy,
+transaction boundaries, and transport integration around the pure state and migration
+operations. The command-line binary currently provides bundle validation only; it does
+not claim a portable CLI execution profile.
 
 ## Build and test
 
@@ -45,9 +58,10 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`74e477087fd31561600aacf652cccae571a5ea9a`. CI also checks that the bundled schema is
-identical to the schema at specification commit
-`09c717a40c75b99612e54d764b5f1bdfa4b94f96`.
+`707a49ce01c6f57f673c1959cdfe078bc8d0fc9a`. CI also checks that all bundled schemas
+are identical to the schemas at specification commit
+`1502a58a780d837e05bfacb37680dfc92e3488b5`. These are temporary exact pins for draft
+validation, not substitutes for the required synchronized `v0.1.0` upstream tags.
 
 ## Library
 
