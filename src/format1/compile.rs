@@ -2060,7 +2060,7 @@ fn normalize_typed_literal(
     Ok(())
 }
 
-fn typed_projection(value: &JsonValue) -> JsonValue {
+pub(crate) fn typed_projection(value: &JsonValue) -> JsonValue {
     match value {
         JsonValue::Null => serde_json::json!(["null"]),
         JsonValue::Bool(value) => serde_json::json!(["boolean", value]),

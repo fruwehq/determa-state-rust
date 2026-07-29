@@ -1,16 +1,36 @@
 mod cel;
 mod compile;
 mod counter;
+mod migration;
 mod model;
+mod package;
+mod persistence;
 mod runtime;
 mod source;
+mod strict_json;
+mod wire;
 
 pub use compile::{Bundle, SemanticError};
 pub use counter::Counter;
-pub use model::{Bindings, Delivery, Envelope, Target};
+pub use migration::{
+    aggregate_shape_fingerprint, migrate_aggregate, migrate_and_dispatch, MigrationAuditRecord,
+    MigrationDispatchOutcome, MigrationOutcome, MigrationRequest, ResourceLimits,
+};
+pub use model::{
+    Bindings, DefinitionBinding, Delivery, Envelope, IdentityOrigin, MachineIdentity, Target,
+};
+pub use package::{restore_package, restore_package_and_migrate, RestoredPackage};
+pub use persistence::{
+    DefinitionResolver, InMemoryDefinitionResolver, MigrationArtifactResolver, ResolvedDefinition,
+    ResolvedMigrationDescriptor,
+};
 pub use runtime::{
     create, dispatch, AggregateState, ComponentRuntime, CoreResult, Disposition, Emission,
     FaultRecord, OwnedRuntime, Rejection, ResultStatus, RuntimeRelation, RuntimeState,
     RuntimeStatus, VariableSlot,
 };
 pub use source::{load_bundle, load_bundle_from_json, parse_document, LoadError, LoadErrorCode};
+pub use wire::{
+    encode_aggregate, restore_aggregate, AggregateEnvelope, PersistenceError, PersistenceErrorCode,
+    TypedValue,
+};

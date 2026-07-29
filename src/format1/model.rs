@@ -178,6 +178,41 @@ pub struct Bindings {
     pub external: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineIdentity {
+    pub namespace: String,
+    pub machine_id: String,
+    pub machine_version: i64,
+    pub root_definition_pointer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionBinding {
+    pub validated_bundle_fingerprint: String,
+    pub machine: MachineIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityOrigin {
+    Root {
+        definition: DefinitionBinding,
+        root_instance_id: String,
+    },
+    Component {
+        definition: DefinitionBinding,
+        owner_runtime_id: String,
+        component_definition_pointer: String,
+        activation_sequence: Counter,
+        declaration_index: Counter,
+    },
+    OwnedSpawnedInstance {
+        definition: DefinitionBinding,
+        owner_runtime_id: String,
+        spawn_action_pointer: String,
+        spawn_sequence: Counter,
+    },
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InitialTransition {
