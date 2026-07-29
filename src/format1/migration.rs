@@ -1417,8 +1417,9 @@ fn enforce_definition_limits(
     bundle: &Bundle,
     limits: &ResourceLimits,
 ) -> Result<(), PersistenceError> {
+    let typed_normalized = super::compile::typed_projection(&bundle.normalized);
     let bytes =
-        canonical_bytes(&bundle.normalized).map_err(|failure| totality(failure.to_string()))?;
+        canonical_bytes(&typed_normalized).map_err(|failure| totality(failure.to_string()))?;
     require_within(bytes.len(), &limits.maximum_definition_bytes)?;
     let statistics = super::strict_json::statistics(&bundle.normalized);
     require_within(statistics.depth, &limits.maximum_json_nesting_depth)?;
@@ -1669,7 +1670,9 @@ fn route_mismatch(message: impl Into<String>) -> PersistenceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format1::{load_bundle, InMemoryDefinitionResolver};
+    use crate::format1::{
+        create, encode_aggregate, load_bundle, Bindings, InMemoryDefinitionResolver,
+    };
 
     #[test]
     fn applies_normative_compatible_migration() {
@@ -1781,6 +1784,87 @@ mod tests {
             "shallow-expected-migration-audit.json",
             "shallow-migration-descriptor.json",
         );
+    }
+
+    #[test]
+    fn definition_byte_limits_use_exact_typed_large_integer_projection() {
+        let source_bundle = large_version_bundle("9007199254740992", "");
+        let target_bundle = large_version_bundle("9007199254740992", "meta:\n  release: next\n");
+        let adjacent_bundle = large_version_bundle("9007199254740993", "");
+        let source_typed = super::super::compile::typed_projection(&source_bundle.normalized);
+        let target_typed = super::super::compile::typed_projection(&target_bundle.normalized);
+        let adjacent_typed = super::super::compile::typed_projection(&adjacent_bundle.normalized);
+        let source_bytes = canonical_bytes(&source_typed).unwrap();
+        let target_bytes = canonical_bytes(&target_typed).unwrap();
+        let adjacent_bytes = canonical_bytes(&adjacent_typed).unwrap();
+        assert_ne!(source_bundle.fingerprint, adjacent_bundle.fingerprint);
+        assert_ne!(source_bytes, adjacent_bytes);
+
+        let shape = aggregate_shape_fingerprint(&source_bundle).unwrap();
+        assert_eq!(shape, aggregate_shape_fingerprint(&target_bundle).unwrap());
+        let mut descriptor: JsonValue = serde_json::from_slice(
+            &std::fs::read(
+                "conformance-suite/conformance/core/99-compatible-definition-upgrade/migration-descriptor.json",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        descriptor["source_validated_bundle_fingerprint"] =
+            JsonValue::String(source_bundle.fingerprint.clone());
+        descriptor["target_validated_bundle_fingerprint"] =
+            JsonValue::String(target_bundle.fingerprint.clone());
+        descriptor["source_aggregate_shape_fingerprint"] = JsonValue::String(shape.clone());
+        descriptor["target_aggregate_shape_fingerprint"] = JsonValue::String(shape);
+        let mut digest_input = descriptor.clone();
+        digest_input
+            .as_object_mut()
+            .unwrap()
+            .remove("migration_descriptor_digest");
+        let digest = jcs_hash(&json!(["determa-migration-descriptor-1", digest_input])).unwrap();
+        descriptor["migration_descriptor_digest"] = JsonValue::String(digest.clone());
+        let descriptor_bytes = canonical_bytes(&descriptor).unwrap();
+
+        let created = create(
+            &source_bundle,
+            "job",
+            "large-version-root",
+            "large-version-create",
+            &Bindings::default(),
+        );
+        let source_state = created.state.unwrap();
+        let (_, aggregate_bytes) = encode_aggregate(&source_bundle, &source_state).unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        assert!(resolver.insert(source_bundle, true));
+        assert!(resolver.insert(target_bundle.clone(), true));
+        assert!(resolver.insert_descriptor(digest.clone(), descriptor_bytes, true));
+        let request = MigrationRequest {
+            migration_route: vec![digest],
+            target_validated_bundle_fingerprint: target_bundle.fingerprint,
+            maintenance_mode: false,
+        };
+        let exact_limit = source_bytes.len().max(target_bytes.len());
+        let insufficient = ResourceLimits {
+            maximum_definition_bytes: Counter::from(exact_limit - 1),
+            ..ResourceLimits::default()
+        };
+        assert_eq!(
+            migrate_aggregate(&aggregate_bytes, &request, &resolver, &insufficient)
+                .unwrap_err()
+                .code,
+            PersistenceErrorCode::MigrationResourceLimitExceeded
+        );
+        let exact = ResourceLimits {
+            maximum_definition_bytes: Counter::from(exact_limit),
+            ..ResourceLimits::default()
+        };
+        migrate_aggregate(&aggregate_bytes, &request, &resolver, &exact).unwrap();
+    }
+
+    fn large_version_bundle(version: &str, extra: &str) -> Bundle {
+        load_bundle(&format!(
+            "format: 1\nnamespace: example.large_version\n{extra}machines:\n  - machine_id: job\n    version: {version}\n    root: {{}}\n"
+        ))
+        .unwrap()
     }
 
     fn assert_single_hop_case(

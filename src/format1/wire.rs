@@ -602,6 +602,7 @@ pub(crate) fn restore_envelope(
     if !records.is_empty() {
         return Err(invalid_state("runtime ownership graph is disconnected"));
     }
+    validate_root_header(envelope, &root)?;
     let aggregate = AggregateState {
         validated_bundle_fingerprint: envelope.validated_bundle_fingerprint.clone(),
         namespace: envelope.namespace.clone(),
@@ -634,6 +635,37 @@ pub(crate) fn restore_envelope(
         ));
     }
     Ok(aggregate)
+}
+
+fn validate_root_header(
+    envelope: &AggregateEnvelope,
+    root: &RuntimeState,
+) -> Result<(), PersistenceError> {
+    let Target::Root {
+        root_instance_id,
+        root_runtime_id,
+    } = &root.target_identity
+    else {
+        return Err(invalid_state("root runtime target is not root"));
+    };
+    if envelope.root_runtime_id != root.runtime_id
+        || root_runtime_id != &root.runtime_id
+        || envelope.root_instance_id != *root_instance_id
+        || envelope.namespace != root.current_definition.machine.namespace
+        || envelope.root_machine_id != root.current_definition.machine.machine_id
+        || envelope.root_machine_version
+            != root.current_definition.machine.machine_version.to_string()
+        || envelope.validated_bundle_fingerprint
+            != root.current_definition.validated_bundle_fingerprint
+        || root.machine_id != root.current_definition.machine.machine_id
+        || root.machine_version != root.current_definition.machine.machine_version
+        || root.definition.root_pointer != root.current_definition.machine.root_definition_pointer
+    {
+        return Err(invalid_state(
+            "aggregate header does not match the restored root runtime",
+        ));
+    }
+    Ok(())
 }
 
 fn collect_definition(
@@ -845,7 +877,7 @@ fn restore_runtime(
     if target_root_instance_id(&target) != envelope.root_instance_id {
         return Err(invalid_state("runtime target has the wrong root instance"));
     }
-    let origin = origin_from_wire(&wire.identity_origin)?;
+    let (origin, origin_component_id) = origin_from_wire(&wire.identity_origin, definitions)?;
     let relation = relation_from_wire(&wire.relation, targets, &target)?;
     let pointer_states = machine
         .states
@@ -971,6 +1003,7 @@ fn restore_runtime(
         identity_origin: origin,
         target_identity: target,
         current_definition: definition_from_wire(&wire.current_definition)?,
+        origin_component_id,
         machine_id: machine.machine_id.clone(),
         machine_version: machine.version,
         definition: machine,
@@ -1097,39 +1130,66 @@ fn definition_from_wire(
     })
 }
 
-fn origin_from_wire(origin: &WireIdentityOrigin) -> Result<IdentityOrigin, PersistenceError> {
+fn origin_from_wire(
+    origin: &WireIdentityOrigin,
+    definitions: &BTreeMap<String, Bundle>,
+) -> Result<(IdentityOrigin, Option<String>), PersistenceError> {
     Ok(match origin {
         WireIdentityOrigin::Root {
             definition,
             root_instance_id,
-        } => IdentityOrigin::Root {
-            definition: definition_from_wire(definition)?,
-            root_instance_id: root_instance_id.clone(),
-        },
+        } => (
+            IdentityOrigin::Root {
+                definition: definition_from_wire(definition)?,
+                root_instance_id: root_instance_id.clone(),
+            },
+            None,
+        ),
         WireIdentityOrigin::Component {
             definition,
             owner_runtime_id,
             component_definition_pointer,
             activation_sequence,
             declaration_index,
-        } => IdentityOrigin::Component {
-            definition: definition_from_wire(definition)?,
-            owner_runtime_id: owner_runtime_id.clone(),
-            component_definition_pointer: component_definition_pointer.clone(),
-            activation_sequence: parse_counter(activation_sequence)?,
-            declaration_index: parse_counter(declaration_index)?,
-        },
+        } => {
+            let bundle = definitions
+                .get(&definition.validated_bundle_fingerprint)
+                .ok_or_else(|| invalid_state("component origin definition is unavailable"))?;
+            let component =
+                find_component_in_bundle_by_pointer(bundle, component_definition_pointer)
+                    .ok_or_else(|| {
+                        invalid_state("component origin pointer does not resolve in its definition")
+                    })?;
+            if component.declaration_index != parse_usize(declaration_index)? {
+                return Err(invalid_state(
+                    "component origin declaration index does not match its definition",
+                ));
+            }
+            (
+                IdentityOrigin::Component {
+                    definition: definition_from_wire(definition)?,
+                    owner_runtime_id: owner_runtime_id.clone(),
+                    component_definition_pointer: component_definition_pointer.clone(),
+                    activation_sequence: parse_counter(activation_sequence)?,
+                    declaration_index: parse_counter(declaration_index)?,
+                },
+                Some(component.component_id.clone()),
+            )
+        }
         WireIdentityOrigin::OwnedSpawnedInstance {
             definition,
             owner_runtime_id,
             spawn_action_pointer,
             spawn_sequence,
-        } => IdentityOrigin::OwnedSpawnedInstance {
-            definition: definition_from_wire(definition)?,
-            owner_runtime_id: owner_runtime_id.clone(),
-            spawn_action_pointer: spawn_action_pointer.clone(),
-            spawn_sequence: parse_counter(spawn_sequence)?,
-        },
+        } => (
+            IdentityOrigin::OwnedSpawnedInstance {
+                definition: definition_from_wire(definition)?,
+                owner_runtime_id: owner_runtime_id.clone(),
+                spawn_action_pointer: spawn_action_pointer.clone(),
+                spawn_sequence: parse_counter(spawn_sequence)?,
+            },
+            None,
+        ),
     })
 }
 
@@ -1246,6 +1306,32 @@ pub(crate) fn find_machine_by_root_pointer<'a>(
     for machine in bundle.machines.values() {
         if let Some(found) = find_machine_recursive(machine, pointer) {
             return Some(found);
+        }
+    }
+    None
+}
+
+fn find_component_in_bundle_by_pointer<'a>(
+    bundle: &'a Bundle,
+    pointer: &str,
+) -> Option<&'a Component> {
+    bundle
+        .machines
+        .values()
+        .find_map(|machine| find_component_recursive(machine, pointer))
+}
+
+fn find_component_recursive<'a>(machine: &'a Machine, pointer: &str) -> Option<&'a Component> {
+    for state in machine.states.values() {
+        for component in &state.components {
+            if component.pointer == pointer {
+                return Some(component);
+            }
+            if let ComponentDefinition::Inline(inline) = &component.definition {
+                if let Some(found) = find_component_recursive(inline, pointer) {
+                    return Some(found);
+                }
+            }
         }
     }
     None
@@ -1849,5 +1935,69 @@ mod tests {
             bytes,
             std::fs::read(format!("{directory}/source-aggregate-state.canonical.json")).unwrap()
         );
+    }
+
+    #[test]
+    fn rejects_digest_consistent_root_header_forgery() {
+        let directory = "conformance-suite/conformance/core/94-aggregate-wire-round-trip";
+        let bundle =
+            load_bundle(&std::fs::read_to_string(format!("{directory}/machine.yaml")).unwrap())
+                .unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        assert!(resolver.insert(bundle, true));
+        let source = std::fs::read(format!("{directory}/source-aggregate-state.json")).unwrap();
+
+        for (member, forged) in [("root_machine_id", "forged"), ("root_machine_version", "2")] {
+            let mut value: JsonValue = serde_json::from_slice(&source).unwrap();
+            value[member] = JsonValue::String(forged.to_string());
+            let digest = aggregate_digest(&value).unwrap();
+            value["aggregate_state_digest"] = JsonValue::String(digest);
+            let bytes = canonical_bytes(&value).unwrap();
+            let failure = restore_aggregate(&bytes, &resolver).unwrap_err();
+            assert_eq!(
+                failure.code,
+                PersistenceErrorCode::InvalidAggregateState,
+                "{member}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_forged_immutable_component_target_name() {
+        let directory = "conformance-suite/conformance/core/104-component-migration";
+        let bundle =
+            load_bundle(&std::fs::read_to_string(format!("{directory}/machine.yaml")).unwrap())
+                .unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        assert!(resolver.insert(bundle.clone(), true));
+        let source = std::fs::read(format!("{directory}/source-aggregate-state.json")).unwrap();
+        let mut restored = restore_aggregate(&source, &resolver).unwrap();
+        let Target::Component { component_id, .. } =
+            &mut restored.root.components[0].runtime.target_identity
+        else {
+            panic!("fixture component target changed kind");
+        };
+        *component_id = "forged".to_string();
+        let dispatch = super::super::runtime::dispatch(&bundle, &restored, None);
+        assert_eq!(
+            dispatch.rejection.as_ref().map(|value| value.code.as_str()),
+            Some("invalid_prior_state")
+        );
+
+        let mut value: JsonValue = serde_json::from_slice(&source).unwrap();
+        let component = value["runtimes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|runtime| runtime["identity_origin"]["kind"] == "component")
+            .unwrap();
+        component["target_identity"]["component"]["component_id"] =
+            JsonValue::String("forged".to_string());
+        let digest = aggregate_digest(&value).unwrap();
+        value["aggregate_state_digest"] = JsonValue::String(digest);
+        let bytes = canonical_bytes(&value).unwrap();
+
+        let failure = restore_aggregate(&bytes, &resolver).unwrap_err();
+        assert_eq!(failure.code, PersistenceErrorCode::InvalidAggregateState);
     }
 }

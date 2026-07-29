@@ -107,6 +107,7 @@ pub struct RuntimeState {
     pub identity_origin: IdentityOrigin,
     pub target_identity: Target,
     pub current_definition: DefinitionBinding,
+    pub(crate) origin_component_id: Option<String>,
     pub machine_id: String,
     pub machine_version: i64,
     pub definition: Machine,
@@ -228,6 +229,7 @@ pub fn create(
             },
             root_target,
             root_definition,
+            None,
         ),
         next_logical_step_sequence: Counter::zero(),
         next_output_sequence: Counter::zero(),
@@ -282,6 +284,7 @@ pub fn create(
                 aggregate.root.identity_origin.clone(),
                 aggregate.root.target_identity.clone(),
                 aggregate.root.current_definition.clone(),
+                aggregate.root.origin_component_id.clone(),
             );
             diagnostic.history.clear();
             diagnostic.status = RuntimeStatus::Faulted;
@@ -466,6 +469,7 @@ impl RuntimeState {
         identity_origin: IdentityOrigin,
         target_identity: Target,
         current_definition: DefinitionBinding,
+        origin_component_id: Option<String>,
     ) -> Self {
         let history = definition
             .states
@@ -478,6 +482,7 @@ impl RuntimeState {
             identity_origin,
             target_identity,
             current_definition,
+            origin_component_id,
             machine_id: definition.machine_id.clone(),
             machine_version: definition.version,
             definition,
@@ -690,9 +695,9 @@ fn validate_runtime_identity(aggregate: &AggregateState, runtime: &RuntimeState)
             Target::Component {
                 root_instance_id,
                 owner_runtime_id: target_owner_runtime_id,
+                component_id: target_component_id,
                 component_runtime_id,
                 activation_sequence: target_activation_sequence,
-                ..
             },
             RuntimeRelation::Component {
                 owner_runtime_id: current_owner_runtime_id,
@@ -714,6 +719,7 @@ fn validate_runtime_identity(aggregate: &AggregateState, runtime: &RuntimeState)
             root_instance_id == &aggregate.root_instance_id
                 && owner_runtime_id == target_owner_runtime_id
                 && owner_runtime_id == current_owner_runtime_id
+                && runtime.origin_component_id.as_ref() == Some(target_component_id)
                 && component_runtime_id == &runtime.runtime_id
                 && activation_sequence == target_activation_sequence
                 && activation_sequence == current_activation_sequence
@@ -3046,6 +3052,7 @@ fn execute_spawn(
         identity_origin,
         target_identity,
         definition,
+        None,
     );
     initialize_root_variables(&mut child, &bindings).map_err(|_| StepFault {
         code: "action_fault",
@@ -3087,6 +3094,7 @@ fn execute_spawn(
             child.identity_origin.clone(),
             child.target_identity.clone(),
             child.current_definition.clone(),
+            child.origin_component_id.clone(),
         );
         child.history.clear();
         child.status = RuntimeStatus::Faulted;
@@ -3224,6 +3232,7 @@ fn allocate_components(
                 identity_origin,
                 target_identity,
                 definition,
+                Some(component.component_id.clone()),
             ),
         });
     }
@@ -3282,6 +3291,7 @@ fn initialize_components(
             let identity_origin = child.identity_origin.clone();
             let target_identity = child.target_identity.clone();
             let current_definition = child.current_definition.clone();
+            let origin_component_id = child.origin_component_id.clone();
             let record = FaultRecord {
                 definition_fingerprint: current_definition.validated_bundle_fingerprint.clone(),
                 runtime_id: runtime_id.clone(),
@@ -3297,6 +3307,7 @@ fn initialize_components(
                 identity_origin,
                 target_identity,
                 current_definition,
+                origin_component_id,
             );
             child.history.clear();
             child.status = RuntimeStatus::Faulted;
