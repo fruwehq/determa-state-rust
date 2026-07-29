@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "determa-state"
-version = "0.0.7"
+version = "0.1.0"
 dependencies = [
  "cel-parser",
  "jsonschema",
