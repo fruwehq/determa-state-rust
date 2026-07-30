@@ -1,20 +1,21 @@
 # Determa State for Rust
 
 Rust implementation of the portable [Determa State](https://github.com/fruwehq/determa-state-spec)
-`format: 1` core.
+`format: 1` core with an optional synchronous portable execution-checkpoint host.
 
 Repository metadata prepares synchronized version `0.1.0`. This branch is validated
 against the merged `0.1.0` metadata revisions at these exact normative inputs:
 
-- specification commit `c1635d74e6a216301a8986d37be8ce7e7111dfd7`;
-- conformance commit `600523ca08c3b8a6ee790439a32dc4ce47f71b95`.
+- specification commit `318ef1f16ae024770090bd338c8b70056df2855b`;
+- conformance commit `86cb08a98267371b96b8f4908409aee022e4b4fe`.
 
 Until the coordinated `v0.1.0` tag publishes, the latest crate on crates.io remains
 version `0.0.7`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 110 format-1 core cases, 105 portable persistence vectors, and 12 steps
-across the six persistence host profiles.
+across the six persistence host profiles. The execution-checkpoint integration test
+runs all 85 host vectors through actual Rust host operations.
 
 ## Implemented core
 
@@ -33,28 +34,36 @@ across the six persistence host profiles.
   JSON, content-addressed definitions, and self-contained aggregate packages.
 - Resolver-backed compatible and transforming definition migration, exact route
   execution, resource limits, audit records, and atomic migration-and-dispatch.
+- Strict execution-checkpoint Serde types, canonical digests, semantic restoration,
+  operation receipts, durable pending delivery, outbox lifecycle, bounded retention,
+  migration audit, root tombstones, and revision/digest compare-and-swap.
+- Direct execution-store trait-object injection and an initially empty public adapter
+  registry. Bundled adapters use only the same public registration route available to
+  third-party factories.
+- Default `memory`, `file`, and bundled-SQLite adapters plus optional PostgreSQL,
+  with explicit durable receipt/outbox modes and schema-contract health checks.
 - Inspection through the returned logical aggregate state, result disposition, fault,
   rejection, configuration, variables, components, owned instances, and emissions.
 
-The portable core does not own queues, broker acknowledgement, timers, package imports,
-or a background scheduler. Hosts provide artifact storage, resolver trust policy,
-transaction boundaries, and transport integration around the pure state and migration
-operations. The command-line binary currently provides bundle validation only; it does
-not claim a portable CLI execution profile.
+The portable core remains a pure foreground transform and does not own queues, broker
+acknowledgement, timers, package imports, or a background scheduler. The optional host
+persists SPEC section 17 state around those unchanged operations. Broker adapters,
+workers, transport integration, and application response data remain application
+concerns. The command-line binary still provides bundle validation only.
 
 ## Build and test
 
 ```sh
 git submodule update --init
-cargo build --release
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo build --release --all-features
+cargo test --all-features
+cargo clippy --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`600523ca08c3b8a6ee790439a32dc4ce47f71b95`. CI also checks that all bundled schemas
+`86cb08a98267371b96b8f4908409aee022e4b4fe`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
-`c1635d74e6a216301a8986d37be8ce7e7111dfd7`. These exact merged commits are the
+`318ef1f16ae024770090bd338c8b70056df2855b`. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
 
 ## Library
@@ -101,6 +110,71 @@ assert_eq!(
 Input and internal envelopes are caller-owned. Internal emissions may be delivered back
 through `dispatch` explicitly. External emissions are deterministic output intents for
 the host to persist and deliver.
+
+## Execution-checkpoint host
+
+The host accepts an `Arc<dyn ExecutionStore>` directly. No registry, URI, or discovery
+is required:
+
+```rust
+use determa_state::checkpoint::{CheckpointHost, ExecutionStore, MemoryExecutionStore};
+use determa_state::InMemoryDefinitionResolver;
+use std::sync::Arc;
+
+let store: Arc<dyn ExecutionStore> = Arc::new(MemoryExecutionStore::new());
+store.initialize_schema()?;
+let resolver = Arc::new(InMemoryDefinitionResolver::default());
+let host = CheckpointHost::new(store, resolver);
+# let _ = host;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+URI resolution is opt-in and generic. A new `AdapterRegistry` is empty;
+`register_bundled_adapters` registers compiled built-ins through its public `register`
+method. Generic resolution extracts only the lowercase URI scheme. Each factory owns
+configuration validation and capability evaluation.
+
+Storage setup is explicit:
+
+- `memory:` is ephemeral and advertises only `ephemeral`;
+- `file:/absolute/directory` uses locking and atomic replacement and advertises only
+  `restart_persistent`;
+- `sqlite:/absolute/database.sqlite3#receipt_retention=permanent&outbox_retention=strict`
+  uses bundled SQLite, WAL, `synchronous=FULL`, immediate write transactions, and
+  derives retention capabilities from the configured mode;
+- `postgresql://...#receipt_retention=permanent&outbox_retention=strict&tls=no_tls`
+  is the explicit local no-TLS bundled PostgreSQL route available with
+  `--features postgresql`.
+
+Durable factories reject configurations without
+`receipt_retention=bounded|permanent` and
+`outbox_retention=bounded|strict|compact`. The chosen mode is persisted in schema
+metadata, checked by `health`, advertised as store capabilities, and enforced on each
+insert or replacement. `PostgresqlExecutionStore::connect_with_tls` and
+`PostgresqlExecutionStoreFactory::with_tls` accept a caller-provided
+`postgres::tls::MakeTlsConnect` implementation; a secure connector configuration uses
+`tls=provided`. `connect_no_tls` and the bundled `tls=no_tls` factory remain explicit
+local/testing choices.
+
+For shared application and checkpoint atomicity, use
+`CheckpointHost::with_postgresql_transaction`. Its callback receives the native
+transaction for application SQL and accepts exactly one root-bound checkpoint mutation
+through `CheckpointHost::stage_postgresql_mutation`. The host uses `SERIALIZABLE`,
+rejects cross-store/cross-root handles, rolls both parts back on failure, and returns
+the committed host result only after commit succeeds. The store's lower-level native
+transaction callback does not run host operations.
+
+Call `initialize_schema` deliberately before file or database use. Adapters never
+silently migrate schema. The execution-store trait has no checkpoint deletion method;
+SQLite and PostgreSQL schemas also reject direct row deletion.
+
+PostgreSQL integration tests use `DETERMA_TEST_POSTGRES_URL`; retention and TLS
+factory fragments are appended by the tests:
+
+```sh
+DETERMA_TEST_POSTGRES_URL=postgresql://postgres:postgres@localhost/determa \
+  cargo test --features postgresql --test checkpoint_postgresql
+```
 
 ## CLI
 

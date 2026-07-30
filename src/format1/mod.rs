@@ -7,7 +7,7 @@ mod package;
 mod persistence;
 mod runtime;
 mod source;
-mod strict_json;
+pub(crate) mod strict_json;
 mod wire;
 
 pub use compile::{Bundle, SemanticError};

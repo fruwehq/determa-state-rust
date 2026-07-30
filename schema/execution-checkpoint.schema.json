@@ -1,0 +1,1330 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/execution-checkpoint.schema.json",
+  "title": "Determa State portable execution checkpoint",
+  "description": "Closed durable-host checkpoint for one root ownership aggregate.",
+  "$ref": "#/$defs/executionCheckpoint",
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "eventName": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "enum": [
+            "determa.component_completed",
+            "determa.component_failed",
+            "determa.spawned_instance_failed"
+          ]
+        }
+      ]
+    },
+    "canonicalDecimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "positiveCanonicalDecimal": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "typedMap": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "const": "map"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "aggregate-state.schema.json#/$defs/typedValue"
+              }
+            ],
+            "minItems": 2,
+            "maxItems": 2
+          }
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "envelope": {
+      "type": "object",
+      "required": [
+        "event",
+        "event_id",
+        "target",
+        "payload"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/eventName"
+        },
+        "event_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "target": {
+          "$ref": "aggregate-state.schema.json#/$defs/targetIdentity"
+        },
+        "payload": {
+          "$ref": "#/$defs/typedMap"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "hostInputOrigin": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "host_input"
+        }
+      }
+    },
+    "internalEmissionOrigin": {
+      "type": "object",
+      "required": [
+        "kind",
+        "producing_receipt_sequence",
+        "emission_index"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "internal_emission"
+        },
+        "producing_receipt_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "emission_index": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "deliveryOrigin": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/hostInputOrigin"
+        },
+        {
+          "$ref": "#/$defs/internalEmissionOrigin"
+        }
+      ]
+    },
+    "preAcceptanceFailure": {
+      "type": "object",
+      "required": [
+        "code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "malformed_delivery",
+            "wrong_root",
+            "invalid_delivery_mode",
+            "invalid_delivery_origin",
+            "delivery_digest_mismatch",
+            "event_id_conflict",
+            "tombstoned_root"
+          ]
+        }
+      }
+    },
+    "notAcceptedResult": {
+      "type": "object",
+      "required": [
+        "result",
+        "failure"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "result": {
+          "const": "not_accepted"
+        },
+        "failure": {
+          "$ref": "#/$defs/preAcceptanceFailure"
+        }
+      }
+    },
+    "pendingAcceptanceResult": {
+      "type": "object",
+      "required": [
+        "result",
+        "event_id",
+        "delivery_sequence",
+        "accepted_revision"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "result": {
+          "const": "pending"
+        },
+        "event_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "delivery_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "accepted_revision": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "committedDeliveryResult": {
+      "type": "object",
+      "required": [
+        "result",
+        "receipt"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "result": {
+          "const": "committed"
+        },
+        "receipt": {
+          "$ref": "#/$defs/deliveryReceipt"
+        }
+      }
+    },
+    "acceptanceResult": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/pendingAcceptanceResult"
+        },
+        {
+          "$ref": "#/$defs/committedDeliveryResult"
+        },
+        {
+          "$ref": "#/$defs/notAcceptedResult"
+        }
+      ]
+    },
+    "pendingDelivery": {
+      "type": "object",
+      "required": [
+        "delivery_sequence",
+        "accepted_revision",
+        "delivery_mode",
+        "origin",
+        "envelope",
+        "envelope_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "delivery_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "accepted_revision": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "delivery_mode": {
+          "enum": [
+            "input",
+            "internal"
+          ]
+        },
+        "origin": {
+          "$ref": "#/$defs/deliveryOrigin"
+        },
+        "envelope": {
+          "$ref": "#/$defs/envelope"
+        },
+        "envelope_digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "delivery_mode": {
+                "const": "input"
+              }
+            },
+            "required": [
+              "delivery_mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "origin": {
+                "$ref": "#/$defs/hostInputOrigin"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "delivery_mode": {
+                "const": "internal"
+              }
+            },
+            "required": [
+              "delivery_mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "origin": {
+                "$ref": "#/$defs/internalEmissionOrigin"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "internalDeliveryEmissionReference": {
+      "type": "object",
+      "required": [
+        "kind",
+        "emission_index",
+        "event_id",
+        "delivery_sequence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "internal_delivery"
+        },
+        "emission_index": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "event_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "delivery_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "externalOutboxEmissionReference": {
+      "type": "object",
+      "required": [
+        "kind",
+        "emission_index",
+        "effect_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "external_outbox"
+        },
+        "emission_index": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "effect_id": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "emissionReference": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/internalDeliveryEmissionReference"
+        },
+        {
+          "$ref": "#/$defs/externalOutboxEmissionReference"
+        }
+      ]
+    },
+    "rejection": {
+      "type": "object",
+      "required": [
+        "code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_event",
+            "invalid_payload",
+            "invalid_correlation",
+            "invalid_instance_target",
+            "inactive_component_target",
+            "invalid_prior_state",
+            "incompatible_bundle"
+          ]
+        }
+      }
+    },
+    "handledOutcome": {
+      "type": "object",
+      "required": [
+        "status",
+        "disposition",
+        "fault",
+        "rejection"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "running",
+            "completed"
+          ]
+        },
+        "disposition": {
+          "const": "handled"
+        },
+        "fault": {
+          "type": "null"
+        },
+        "rejection": {
+          "type": "null"
+        }
+      }
+    },
+    "unhandledOutcome": {
+      "type": "object",
+      "required": [
+        "status",
+        "disposition",
+        "fault",
+        "rejection"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "running"
+        },
+        "disposition": {
+          "const": "unhandled"
+        },
+        "fault": {
+          "type": "null"
+        },
+        "rejection": {
+          "type": "null"
+        }
+      }
+    },
+    "rejectedOutcome": {
+      "type": "object",
+      "required": [
+        "status",
+        "disposition",
+        "fault",
+        "rejection"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "faulted"
+          ]
+        },
+        "disposition": {
+          "const": "rejected"
+        },
+        "fault": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "aggregate-state.schema.json#/$defs/fault"
+            }
+          ]
+        },
+        "rejection": {
+          "$ref": "#/$defs/rejection"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "faulted"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "fault": {
+                "$ref": "aggregate-state.schema.json#/$defs/fault"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "fault": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "faultedOutcome": {
+      "type": "object",
+      "required": [
+        "status",
+        "disposition",
+        "fault",
+        "rejection"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "running",
+            "faulted"
+          ]
+        },
+        "disposition": {
+          "const": "faulted"
+        },
+        "fault": {
+          "$ref": "aggregate-state.schema.json#/$defs/fault"
+        },
+        "rejection": {
+          "type": "null"
+        }
+      }
+    },
+    "deliveryOutcome": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/handledOutcome"
+        },
+        {
+          "$ref": "#/$defs/unhandledOutcome"
+        },
+        {
+          "$ref": "#/$defs/rejectedOutcome"
+        },
+        {
+          "$ref": "#/$defs/faultedOutcome"
+        }
+      ]
+    },
+    "creationReceipt": {
+      "type": "object",
+      "required": [
+        "operation_kind",
+        "receipt_sequence",
+        "creation_id",
+        "request_digest",
+        "committed_revision",
+        "resulting_aggregate_state_digest",
+        "status",
+        "fault",
+        "emission_references"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation_kind": {
+          "const": "creation"
+        },
+        "receipt_sequence": {
+          "const": "0"
+        },
+        "creation_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "committed_revision": {
+          "const": "0"
+        },
+        "resulting_aggregate_state_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "faulted"
+          ]
+        },
+        "fault": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "aggregate-state.schema.json#/$defs/fault"
+            }
+          ]
+        },
+        "emission_references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/emissionReference"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "faulted"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "fault": {
+                "$ref": "aggregate-state.schema.json#/$defs/fault"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "fault": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "deliveryReceipt": {
+      "type": "object",
+      "required": [
+        "operation_kind",
+        "receipt_sequence",
+        "event_id",
+        "request_digest",
+        "accepted_delivery_sequence",
+        "accepted_revision",
+        "delivery_mode",
+        "origin",
+        "committed_revision",
+        "resulting_aggregate_state_digest",
+        "outcome",
+        "emission_references"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation_kind": {
+          "const": "delivery"
+        },
+        "receipt_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "event_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "accepted_delivery_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "accepted_revision": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "delivery_mode": {
+          "enum": [
+            "input",
+            "internal"
+          ]
+        },
+        "origin": {
+          "$ref": "#/$defs/deliveryOrigin"
+        },
+        "committed_revision": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "resulting_aggregate_state_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "outcome": {
+          "$ref": "#/$defs/deliveryOutcome"
+        },
+        "emission_references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/emissionReference"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "delivery_mode": {
+                "const": "input"
+              }
+            },
+            "required": [
+              "delivery_mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "origin": {
+                "$ref": "#/$defs/hostInputOrigin"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "delivery_mode": {
+                "const": "internal"
+              }
+            },
+            "required": [
+              "delivery_mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "origin": {
+                "$ref": "#/$defs/internalEmissionOrigin"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "maintenanceMigrationReceipt": {
+      "type": "object",
+      "required": [
+        "operation_kind",
+        "receipt_sequence",
+        "operation_id",
+        "request_digest",
+        "committed_revision",
+        "source_aggregate_state_digest",
+        "resulting_aggregate_state_digest",
+        "migration_sequences",
+        "result_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation_kind": {
+          "const": "maintenance_migration"
+        },
+        "receipt_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "committed_revision": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "source_aggregate_state_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "resulting_aggregate_state_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "migration_sequences": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/positiveCanonicalDecimal"
+          }
+        },
+        "result_code": {
+          "enum": [
+            "migration_applied",
+            "migration_no_operation"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "result_code": {
+                "const": "migration_applied"
+              }
+            },
+            "required": [
+              "result_code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "migration_sequences": {
+                "minItems": 1
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "migration_sequences": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "operationReceipt": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/creationReceipt"
+        },
+        {
+          "$ref": "#/$defs/deliveryReceipt"
+        },
+        {
+          "$ref": "#/$defs/maintenanceMigrationReceipt"
+        }
+      ]
+    },
+    "outboxIntent": {
+      "type": "object",
+      "required": [
+        "effect_id",
+        "sequence",
+        "event",
+        "payload",
+        "correlation_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "effect_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "event": {
+          "$ref": "#/$defs/identifier"
+        },
+        "payload": {
+          "$ref": "#/$defs/typedMap"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "notAttemptedOutboxState": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "not_attempted"
+        }
+      }
+    },
+    "retryableFailureOutboxState": {
+      "type": "object",
+      "required": [
+        "status",
+        "reason_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "retryable_failure"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "ambiguousOutboxState": {
+      "type": "object",
+      "required": [
+        "status",
+        "reason_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "ambiguous"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "pendingOutboxState": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/notAttemptedOutboxState"
+        },
+        {
+          "$ref": "#/$defs/retryableFailureOutboxState"
+        },
+        {
+          "$ref": "#/$defs/ambiguousOutboxState"
+        }
+      ]
+    },
+    "pendingOutboxIntent": {
+      "type": "object",
+      "required": [
+        "intent",
+        "state_revision",
+        "delivery_state"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "intent": {
+          "$ref": "#/$defs/outboxIntent"
+        },
+        "state_revision": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "delivery_state": {
+          "$ref": "#/$defs/pendingOutboxState"
+        }
+      }
+    },
+    "pendingOutboxUpdateResult": {
+      "type": "object",
+      "required": [
+        "result",
+        "record"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "result": {
+          "const": "committed"
+        },
+        "record": {
+          "$ref": "#/$defs/pendingOutboxIntent"
+        }
+      }
+    },
+    "confirmedOutboxOutcome": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "confirmed"
+        }
+      }
+    },
+    "reasonedTerminalOutboxOutcome": {
+      "type": "object",
+      "required": [
+        "status",
+        "reason_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "permanently_rejected",
+            "operator_cancelled",
+            "discarded",
+            "dead_lettered"
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "terminalOutboxOutcome": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/confirmedOutboxOutcome"
+        },
+        {
+          "$ref": "#/$defs/reasonedTerminalOutboxOutcome"
+        }
+      ]
+    },
+    "terminalOutboxRecord": {
+      "type": "object",
+      "required": [
+        "terminal_sequence",
+        "intent",
+        "committed_revision",
+        "outcome"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "terminal_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "intent": {
+          "$ref": "#/$defs/outboxIntent"
+        },
+        "committed_revision": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "outcome": {
+          "$ref": "#/$defs/terminalOutboxOutcome"
+        }
+      }
+    },
+    "outboxEffectTombstone": {
+      "type": "object",
+      "required": [
+        "terminal_sequence",
+        "effect_id",
+        "intent_digest",
+        "committed_revision",
+        "outcome"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "terminal_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "effect_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "intent_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "committed_revision": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "outcome": {
+          "$ref": "#/$defs/terminalOutboxOutcome"
+        }
+      }
+    },
+    "migrationAuditRecord": {
+      "type": "object",
+      "required": [
+        "migration_audit_record_schema_version",
+        "root_instance_id",
+        "root_runtime_id",
+        "migration_sequence",
+        "source_validated_bundle_fingerprint",
+        "target_validated_bundle_fingerprint",
+        "migration_descriptor_digest",
+        "source_aggregate_state_digest",
+        "target_aggregate_state_digest",
+        "result_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "migration_audit_record_schema_version": {
+          "const": 1
+        },
+        "root_instance_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "root_runtime_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "migration_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "source_validated_bundle_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "target_validated_bundle_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "migration_descriptor_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_aggregate_state_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "target_aggregate_state_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "result_code": {
+          "const": "migration_applied"
+        }
+      }
+    },
+    "retainedRootRecord": {
+      "type": "object",
+      "required": [
+        "status",
+        "aggregate_state"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "retained"
+        },
+        "aggregate_state": {
+          "$ref": "aggregate-state.schema.json"
+        }
+      }
+    },
+    "rootTombstone": {
+      "type": "object",
+      "required": [
+        "status",
+        "root_runtime_id",
+        "creation_id",
+        "terminal_status",
+        "final_aggregate_state_digest",
+        "tombstone_operation_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "tombstone"
+        },
+        "root_runtime_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "creation_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "terminal_status": {
+          "enum": [
+            "completed",
+            "faulted"
+          ]
+        },
+        "final_aggregate_state_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "tombstone_operation_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "rootRecord": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/retainedRootRecord"
+        },
+        {
+          "$ref": "#/$defs/rootTombstone"
+        }
+      ]
+    },
+    "permanentReplayRetention": {
+      "type": "object",
+      "required": [
+        "mode",
+        "permanent_replay_eligible",
+        "pruned_through_receipt_sequence",
+        "policy_identifier"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "const": "permanent"
+        },
+        "permanent_replay_eligible": {
+          "const": true
+        },
+        "pruned_through_receipt_sequence": {
+          "type": "null"
+        },
+        "policy_identifier": {
+          "type": "null"
+        }
+      }
+    },
+    "boundedReplayRetention": {
+      "type": "object",
+      "required": [
+        "mode",
+        "permanent_replay_eligible",
+        "pruned_through_receipt_sequence",
+        "policy_identifier"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "const": "bounded"
+        },
+        "permanent_replay_eligible": {
+          "const": false
+        },
+        "pruned_through_receipt_sequence": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/positiveCanonicalDecimal"
+            }
+          ]
+        },
+        "policy_identifier": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "replayRetention": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/permanentReplayRetention"
+        },
+        {
+          "$ref": "#/$defs/boundedReplayRetention"
+        }
+      ]
+    },
+    "executionCheckpoint": {
+      "type": "object",
+      "required": [
+        "execution_checkpoint_format",
+        "execution_checkpoint_schema_version",
+        "root_instance_id",
+        "revision",
+        "root_record",
+        "replay_retention",
+        "next_delivery_sequence",
+        "pending_deliveries",
+        "next_operation_receipt_sequence",
+        "operation_receipts",
+        "pending_outbox_intents",
+        "next_outbox_terminal_sequence",
+        "terminal_outbox_records",
+        "outbox_effect_tombstones",
+        "migration_audit_records",
+        "execution_checkpoint_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "execution_checkpoint_format": {
+          "const": "determa.execution_checkpoint"
+        },
+        "execution_checkpoint_schema_version": {
+          "const": 1
+        },
+        "root_instance_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "revision": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "root_record": {
+          "$ref": "#/$defs/rootRecord"
+        },
+        "replay_retention": {
+          "$ref": "#/$defs/replayRetention"
+        },
+        "next_delivery_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "pending_deliveries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pendingDelivery"
+          }
+        },
+        "next_operation_receipt_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "operation_receipts": {
+          "type": "array",
+          "minItems": 1,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/creationReceipt"
+            }
+          ],
+          "items": {
+            "$ref": "#/$defs/operationReceipt"
+          }
+        },
+        "pending_outbox_intents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pendingOutboxIntent"
+          }
+        },
+        "next_outbox_terminal_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "terminal_outbox_records": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/terminalOutboxRecord"
+          }
+        },
+        "outbox_effect_tombstones": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/outboxEffectTombstone"
+          }
+        },
+        "migration_audit_records": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/migrationAuditRecord"
+          }
+        },
+        "execution_checkpoint_digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "root_record": {
+                "properties": {
+                  "status": {
+                    "const": "tombstone"
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              }
+            },
+            "required": [
+              "root_record"
+            ]
+          },
+          "then": {
+            "properties": {
+              "pending_deliveries": {
+                "maxItems": 0
+              },
+              "pending_outbox_intents": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

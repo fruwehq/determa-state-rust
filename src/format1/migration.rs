@@ -159,7 +159,7 @@ pub struct MigrationDispatchOutcome {
 pub fn migrate_and_dispatch(
     source: &[u8],
     request: &MigrationRequest,
-    resolver: &impl MigrationArtifactResolver,
+    resolver: &(impl MigrationArtifactResolver + ?Sized),
     limits: &ResourceLimits,
     delivery: Option<super::model::Delivery>,
 ) -> Result<MigrationDispatchOutcome, PersistenceError> {
@@ -189,7 +189,7 @@ pub fn migrate_and_dispatch(
 pub fn migrate_aggregate(
     source: &[u8],
     request: &MigrationRequest,
-    resolver: &impl MigrationArtifactResolver,
+    resolver: &(impl MigrationArtifactResolver + ?Sized),
     limits: &ResourceLimits,
 ) -> Result<MigrationOutcome, PersistenceError> {
     require_within(source.len(), &limits.maximum_aggregate_bytes)?;
@@ -310,7 +310,7 @@ enum DefinitionRole {
 }
 
 fn resolve_definition(
-    resolver: &impl MigrationArtifactResolver,
+    resolver: &(impl MigrationArtifactResolver + ?Sized),
     fingerprint: &str,
     role: DefinitionRole,
 ) -> Result<Bundle, PersistenceError> {
@@ -339,7 +339,7 @@ fn resolve_definition(
 }
 
 fn resolve_descriptor(
-    resolver: &impl MigrationArtifactResolver,
+    resolver: &(impl MigrationArtifactResolver + ?Sized),
     digest: &str,
     limits: &ResourceLimits,
 ) -> Result<JsonValue, PersistenceError> {
