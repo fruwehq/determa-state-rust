@@ -1,0 +1,521 @@
+#[cfg(feature = "sqlite")]
+use determa_state::checkpoint::SqliteExecutionStore;
+use determa_state::checkpoint::{
+    register_bundled_adapters, AdapterRegistry, ExecutionStore, ExecutionStoreCapability,
+    FileExecutionStore, MemoryExecutionStore, StoreRecord, StoreWriteResult,
+};
+#[cfg(feature = "sqlite")]
+use determa_state::checkpoint::{
+    CheckpointHost, DurableStoreMode, ExecutionCheckpoint, HostFeature, HostProfile,
+    OutboxRetentionMode, ReceiptRetentionMode,
+};
+#[cfg(feature = "sqlite")]
+use determa_state::InMemoryDefinitionResolver;
+#[cfg(feature = "sqlite")]
+use rusqlite::Connection;
+use serde_json::json;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(feature = "sqlite")]
+const CHECKPOINT_PROFILE: &str = "conformance-suite/conformance/profiles/execution-checkpoint";
+
+#[test]
+fn memory_store_satisfies_the_shared_cas_contract() {
+    let store = MemoryExecutionStore::new();
+    store.initialize_schema().expect("memory initialization");
+    shared_store_contract(&store, "memory-root");
+    assert_eq!(
+        store.capabilities(),
+        BTreeSet::from([ExecutionStoreCapability::Ephemeral])
+    );
+}
+
+#[test]
+fn file_store_requires_explicit_setup_and_survives_restart() {
+    let directory = temporary_path("file-store");
+    let store = FileExecutionStore::new(&directory).expect("file store");
+    assert!(store.health().is_err());
+    store.initialize_schema().expect("file schema");
+    shared_store_contract(&store, "file-root");
+    drop(store);
+
+    let reopened = FileExecutionStore::new(&directory).expect("reopened file store");
+    assert_eq!(
+        reopened
+            .load("file-root")
+            .expect("restart load")
+            .expect("persisted record")
+            .revision,
+        "1"
+    );
+    assert_eq!(
+        reopened.capabilities(),
+        BTreeSet::from([ExecutionStoreCapability::RestartPersistent])
+    );
+    fs::remove_dir_all(directory).expect("remove temporary file store");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_store_requires_explicit_setup_and_satisfies_the_shared_contract() {
+    let directory = temporary_path("sqlite-store");
+    fs::create_dir_all(&directory).expect("SQLite temporary directory");
+    let path = directory.join("checkpoints.sqlite3");
+    let store =
+        SqliteExecutionStore::open(&path, DurableStoreMode::bounded()).expect("SQLite store");
+    assert!(store.health().is_err());
+    store.initialize_schema().expect("SQLite schema");
+    shared_store_contract(&store, "sqlite-root");
+    drop(store);
+
+    let reopened = SqliteExecutionStore::open(&path, DurableStoreMode::bounded())
+        .expect("reopened SQLite store");
+    assert_eq!(
+        reopened
+            .load("sqlite-root")
+            .expect("restart load")
+            .expect("persisted record")
+            .revision,
+        "1"
+    );
+    assert_eq!(
+        reopened.capabilities(),
+        BTreeSet::from([
+            ExecutionStoreCapability::DurableSingleWriter,
+            ExecutionStoreCapability::RootIdentityRetention,
+        ])
+    );
+    let raw = rusqlite::Connection::open(&path).expect("raw SQLite connection");
+    assert!(
+        raw.execute(
+            "DELETE FROM determa_execution_checkpoints WHERE root_instance_id = ?1",
+            ["sqlite-root"]
+        )
+        .is_err(),
+        "schema trigger must reject physical root deletion"
+    );
+    raw.execute_batch("DROP TRIGGER determa_execution_checkpoints_no_delete")
+        .expect("drop test trigger");
+    drop(raw);
+    assert!(
+        reopened.health().is_err(),
+        "health must reject a missing deletion guard"
+    );
+    drop(reopened);
+    fs::remove_dir_all(directory).expect("remove temporary SQLite store");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_factory_modes_derive_real_profile_capabilities() {
+    let directory = temporary_path("sqlite-policy-capabilities");
+    fs::create_dir_all(&directory).expect("SQLite temporary directory");
+    let strict_path = directory.join("strict.sqlite3");
+    let compact_path = directory.join("compact.sqlite3");
+    let registry = AdapterRegistry::new();
+    register_bundled_adapters(&registry).expect("register bundled adapters");
+
+    let strict_configuration = format!(
+        "sqlite:{}#receipt_retention=permanent&outbox_retention=strict",
+        strict_path.display()
+    );
+    let strict = registry
+        .resolve(
+            &strict_configuration,
+            &BTreeSet::from([
+                ExecutionStoreCapability::DurableSingleWriter,
+                ExecutionStoreCapability::RootIdentityRetention,
+                ExecutionStoreCapability::PermanentReceiptRetention,
+                ExecutionStoreCapability::PermanentOutboxTerminalRetention,
+            ]),
+        )
+        .expect("strict configured SQLite store");
+    strict.initialize_schema().expect("strict SQLite schema");
+    strict.health().expect("strict SQLite health");
+    let strict_host = CheckpointHost::new(strict, Arc::new(InMemoryDefinitionResolver::default()));
+    assert!(strict_host
+        .validate_profile(
+            HostProfile::ExactlyOnceCommittedProcessing,
+            &BTreeSet::from([HostFeature::AtomicCheckpointProcessing]),
+            true,
+        )
+        .is_ok());
+    assert!(strict_host
+        .validate_profile(
+            HostProfile::ExactlyOnceCommittedProcessing,
+            &BTreeSet::from([HostFeature::AtomicCheckpointProcessing]),
+            false,
+        )
+        .is_err());
+    assert!(strict_host
+        .validate_profile(
+            HostProfile::StrictDurableOutbox,
+            &BTreeSet::from([
+                HostFeature::AtomicCheckpointProcessing,
+                HostFeature::OutboxWorker,
+                HostFeature::TotalOutboxLifecycle,
+                HostFeature::RetainUnresolvedOutbox,
+            ]),
+            true,
+        )
+        .is_ok());
+
+    let compact_configuration = format!(
+        "sqlite:{}#receipt_retention=bounded&outbox_retention=compact",
+        compact_path.display()
+    );
+    let compact = registry
+        .resolve(
+            &compact_configuration,
+            &BTreeSet::from([
+                ExecutionStoreCapability::DurableSingleWriter,
+                ExecutionStoreCapability::RootIdentityRetention,
+                ExecutionStoreCapability::CompactEffectIdentityRetention,
+            ]),
+        )
+        .expect("compact configured SQLite store");
+    compact.initialize_schema().expect("compact SQLite schema");
+    let compact_host =
+        CheckpointHost::new(compact, Arc::new(InMemoryDefinitionResolver::default()));
+    assert!(compact_host
+        .validate_profile(
+            HostProfile::CompactDurableOutbox,
+            &BTreeSet::from([
+                HostFeature::AtomicCheckpointProcessing,
+                HostFeature::OutboxWorker,
+                HostFeature::TotalOutboxLifecycle,
+                HostFeature::RetainReferencedEffectTombstones,
+            ]),
+            false,
+        )
+        .is_ok());
+
+    assert!(registry
+        .resolve(
+            &format!("sqlite:{}", directory.join("missing.sqlite3").display()),
+            &BTreeSet::new(),
+        )
+        .is_err());
+    fs::remove_dir_all(directory).expect("remove temporary SQLite stores");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_schema_mode_and_policy_transitions_are_enforced() {
+    let directory = temporary_path("sqlite-policy-enforcement");
+    fs::create_dir_all(&directory).expect("SQLite temporary directory");
+    let strict_path = directory.join("strict.sqlite3");
+    let strict_mode =
+        DurableStoreMode::new(ReceiptRetentionMode::Permanent, OutboxRetentionMode::Strict);
+    let strict =
+        SqliteExecutionStore::open(&strict_path, strict_mode).expect("strict SQLite store");
+    strict.initialize_schema().expect("strict SQLite schema");
+    let before = fixture_record("checkpoint-02-outbox-lifecycle/outbox-total-checkpoint.json");
+    let compacted = fixture_record("checkpoint-02-outbox-lifecycle/outbox-compact-checkpoint.json");
+    assert_eq!(
+        strict
+            .insert_if_absent(before.clone())
+            .expect("strict seed"),
+        StoreWriteResult::Committed
+    );
+    assert!(strict
+        .compare_and_swap(
+            &before.root_instance_id,
+            &before.revision,
+            &before.execution_checkpoint_digest,
+            compacted.clone(),
+        )
+        .is_err());
+
+    let mut pruned_checkpoint: ExecutionCheckpoint =
+        serde_json::from_slice(&before.bytes).expect("checkpoint fixture");
+    pruned_checkpoint.operation_receipts.pop();
+    pruned_checkpoint.increment_revision();
+    pruned_checkpoint
+        .recompute_digest()
+        .expect("pruned checkpoint digest");
+    let pruned = StoreRecord::from_checkpoint(&pruned_checkpoint).expect("pruned record");
+    assert!(strict
+        .compare_and_swap(
+            &before.root_instance_id,
+            &before.revision,
+            &before.execution_checkpoint_digest,
+            pruned,
+        )
+        .is_err());
+
+    let mismatched = SqliteExecutionStore::open(
+        &strict_path,
+        DurableStoreMode::new(ReceiptRetentionMode::Bounded, OutboxRetentionMode::Compact),
+    )
+    .expect("mismatched SQLite store");
+    assert!(mismatched.health().is_err());
+    assert!(mismatched.initialize_schema().is_err());
+
+    let compact_path = directory.join("compact.sqlite3");
+    let compact_store = SqliteExecutionStore::open(
+        &compact_path,
+        DurableStoreMode::new(
+            ReceiptRetentionMode::Permanent,
+            OutboxRetentionMode::Compact,
+        ),
+    )
+    .expect("compact SQLite store");
+    compact_store
+        .initialize_schema()
+        .expect("compact SQLite schema");
+    assert_eq!(
+        compact_store
+            .insert_if_absent(before.clone())
+            .expect("compact seed"),
+        StoreWriteResult::Committed
+    );
+    assert_eq!(
+        compact_store
+            .compare_and_swap(
+                &before.root_instance_id,
+                &before.revision,
+                &before.execution_checkpoint_digest,
+                compacted.clone(),
+            )
+            .expect("valid compaction"),
+        StoreWriteResult::Committed
+    );
+    let mut deleted_checkpoint: ExecutionCheckpoint =
+        serde_json::from_slice(&compacted.bytes).expect("compacted checkpoint fixture");
+    deleted_checkpoint.outbox_effect_tombstones.clear();
+    deleted_checkpoint.increment_revision();
+    deleted_checkpoint
+        .recompute_digest()
+        .expect("deleted tombstone digest");
+    let deleted = StoreRecord::from_checkpoint(&deleted_checkpoint).expect("deleted record");
+    assert!(compact_store
+        .compare_and_swap(
+            &compacted.root_instance_id,
+            &compacted.revision,
+            &compacted.execution_checkpoint_digest,
+            deleted,
+        )
+        .is_err());
+
+    let malformed_path = directory.join("malformed.sqlite3");
+    let malformed_connection = Connection::open(&malformed_path).expect("malformed SQLite file");
+    malformed_connection
+        .execute_batch(
+            "
+            CREATE TABLE determa_execution_store_metadata (
+                singleton INTEGER,
+                schema_version INTEGER,
+                receipt_retention TEXT,
+                outbox_retention TEXT
+            );
+            INSERT INTO determa_execution_store_metadata
+                (singleton, schema_version, receipt_retention, outbox_retention)
+            VALUES (1, 1, 'permanent', 'strict');
+            CREATE TABLE determa_execution_checkpoints (
+                root_instance_id TEXT,
+                revision TEXT,
+                checkpoint_digest TEXT,
+                checkpoint_bytes BLOB
+            );
+            ",
+        )
+        .expect("lookalike SQLite schema");
+    drop(malformed_connection);
+    let malformed =
+        SqliteExecutionStore::open(&malformed_path, strict_mode).expect("malformed SQLite store");
+    assert!(malformed.initialize_schema().is_err());
+    assert!(malformed.health().is_err());
+
+    fs::remove_dir_all(directory).expect("remove temporary SQLite stores");
+}
+
+#[test]
+fn memory_compare_and_swap_has_one_concurrent_winner() {
+    let store: Arc<dyn ExecutionStore> = Arc::new(MemoryExecutionStore::new());
+    concurrent_cas_contract(store, "memory-concurrent");
+}
+
+#[test]
+fn file_compare_and_swap_has_one_concurrent_winner() {
+    let directory = temporary_path("file-concurrent");
+    let first = Arc::new(FileExecutionStore::new(&directory).expect("first file store"));
+    first.initialize_schema().expect("file schema");
+    let second = Arc::new(FileExecutionStore::new(&directory).expect("second file store"));
+    concurrent_cas_contract_with_stores(first, second, "file-concurrent");
+    fs::remove_dir_all(directory).expect("remove temporary file store");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_compare_and_swap_has_one_concurrent_winner() {
+    let directory = temporary_path("sqlite-concurrent");
+    fs::create_dir_all(&directory).expect("SQLite temporary directory");
+    let path = directory.join("checkpoints.sqlite3");
+    let first = Arc::new(
+        SqliteExecutionStore::open(&path, DurableStoreMode::bounded()).expect("first SQLite store"),
+    );
+    first.initialize_schema().expect("SQLite schema");
+    let second = Arc::new(
+        SqliteExecutionStore::open(&path, DurableStoreMode::bounded())
+            .expect("second SQLite store"),
+    );
+    concurrent_cas_contract_with_stores(first, second, "sqlite-concurrent");
+    fs::remove_dir_all(directory).expect("remove temporary SQLite store");
+}
+
+#[test]
+fn bundled_adapters_use_an_initially_empty_public_registry() {
+    let registry = AdapterRegistry::new();
+    assert!(registry.identifiers().expect("empty registry").is_empty());
+    register_bundled_adapters(&registry).expect("register bundled adapters");
+    let identifiers = registry.identifiers().expect("registered identifiers");
+    assert!(identifiers.contains(&"memory".to_string()));
+    assert!(identifiers.contains(&"file".to_string()));
+    #[cfg(feature = "sqlite")]
+    assert!(identifiers.contains(&"sqlite".to_string()));
+    #[cfg(feature = "postgresql")]
+    assert!(identifiers.contains(&"postgresql".to_string()));
+    assert!(register_bundled_adapters(&registry).is_err());
+}
+
+fn shared_store_contract(store: &dyn ExecutionStore, root_instance_id: &str) {
+    let initial = record(root_instance_id, "0", '0');
+    assert_eq!(
+        store
+            .insert_if_absent(initial.clone())
+            .expect("initial insert"),
+        StoreWriteResult::Committed
+    );
+    assert_eq!(
+        store
+            .insert_if_absent(initial.clone())
+            .expect("duplicate insert"),
+        StoreWriteResult::Conflict(Some(initial.clone()))
+    );
+    assert_eq!(
+        store.load(root_instance_id).expect("load initial"),
+        Some(initial.clone())
+    );
+    assert!(matches!(
+        store
+            .compare_and_swap(
+                root_instance_id,
+                "9",
+                &initial.execution_checkpoint_digest,
+                record(root_instance_id, "1", '1')
+            )
+            .expect("stale CAS"),
+        StoreWriteResult::Conflict(Some(_))
+    ));
+    let replacement = record(root_instance_id, "1", '1');
+    assert_eq!(
+        store
+            .compare_and_swap(
+                root_instance_id,
+                "0",
+                &initial.execution_checkpoint_digest,
+                replacement.clone()
+            )
+            .expect("successful CAS"),
+        StoreWriteResult::Committed
+    );
+    assert_eq!(
+        store.load(root_instance_id).expect("load replacement"),
+        Some(replacement)
+    );
+    assert!(store.health().expect("store health").healthy);
+}
+
+fn concurrent_cas_contract(store: Arc<dyn ExecutionStore>, root_instance_id: &str) {
+    concurrent_cas_contract_with_stores(store.clone(), store, root_instance_id);
+}
+
+fn concurrent_cas_contract_with_stores(
+    first: Arc<dyn ExecutionStore>,
+    second: Arc<dyn ExecutionStore>,
+    root_instance_id: &str,
+) {
+    first.initialize_schema().expect("store initialization");
+    let initial = record(root_instance_id, "0", '0');
+    assert_eq!(
+        first
+            .insert_if_absent(initial.clone())
+            .expect("concurrent seed"),
+        StoreWriteResult::Committed
+    );
+    let barrier = Arc::new(Barrier::new(3));
+    let root = root_instance_id.to_string();
+    let workers = [(first, '1'), (second, '2')]
+        .into_iter()
+        .map(|(store, marker)| {
+            let barrier = barrier.clone();
+            let root = root.clone();
+            let digest = initial.execution_checkpoint_digest.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                store
+                    .compare_and_swap(&root, "0", &digest, record(&root, "1", marker))
+                    .expect("concurrent CAS")
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("CAS worker"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == StoreWriteResult::Committed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, StoreWriteResult::Conflict(Some(_))))
+            .count(),
+        1
+    );
+}
+
+fn record(root_instance_id: &str, revision: &str, marker: char) -> StoreRecord {
+    let digest = format!("sha256:{}", marker.to_string().repeat(64));
+    let bytes = serde_json_canonicalizer::to_vec(&json!({
+        "root_instance_id": root_instance_id,
+        "revision": revision,
+        "execution_checkpoint_digest": digest
+    }))
+    .expect("record bytes");
+    StoreRecord {
+        root_instance_id: root_instance_id.to_string(),
+        revision: revision.to_string(),
+        execution_checkpoint_digest: digest,
+        bytes,
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[cfg(feature = "sqlite")]
+fn fixture_record(relative_path: &str) -> StoreRecord {
+    let bytes = fs::read(PathBuf::from(CHECKPOINT_PROFILE).join(relative_path))
+        .expect("checkpoint fixture");
+    let checkpoint: ExecutionCheckpoint =
+        serde_json::from_slice(&bytes).expect("typed checkpoint fixture");
+    StoreRecord::from_checkpoint(&checkpoint).expect("fixture store record")
+}
+
+fn temporary_path(label: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    std::env::temp_dir().join(format!("determa-{label}-{}-{nonce}", std::process::id()))
+}

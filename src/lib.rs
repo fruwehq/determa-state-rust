@@ -1,19 +1,21 @@
-//! Rust implementation of the portable Determa State `format: 1` core.
+//! Rust implementation of the portable Determa State `format: 1` core and
+//! optional synchronous execution-checkpoint host.
 //!
 //! The core is a pure foreground transform. [`format1::create`] creates one root
 //! ownership aggregate and [`format1::dispatch`] applies one caller-owned envelope.
 //! Queueing and timers remain host profiles. Portable aggregate persistence and
 //! definition migration are exposed as pure format-1 operations.
 
+pub mod checkpoint;
 pub mod cli;
 pub mod format1;
 pub mod value;
 
 /// Exact normative specification revision implemented by this crate.
-pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "c1635d74e6a216301a8986d37be8ce7e7111dfd7";
+pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "318ef1f16ae024770090bd338c8b70056df2855b";
 
 /// Exact core conformance revision exercised by this crate.
-pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "600523ca08c3b8a6ee790439a32dc4ce47f71b95";
+pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "86cb08a98267371b96b8f4908409aee022e4b4fe";
 
 pub use format1::{
     create, dispatch, encode_aggregate, load_bundle, load_bundle_from_json, migrate_aggregate,

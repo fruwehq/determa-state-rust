@@ -711,11 +711,11 @@ fn examples_and_revision_metadata_are_current() {
     load_bundle(include_str!("../examples/full.yaml")).expect("full example loads");
     assert_eq!(
         FORMAT_1_SPECIFICATION_COMMIT,
-        "c1635d74e6a216301a8986d37be8ce7e7111dfd7"
+        "318ef1f16ae024770090bd338c8b70056df2855b"
     );
     assert_eq!(
         FORMAT_1_CONFORMANCE_COMMIT,
-        "600523ca08c3b8a6ee790439a32dc4ce47f71b95"
+        "86cb08a98267371b96b8f4908409aee022e4b4fe"
     );
 }
 

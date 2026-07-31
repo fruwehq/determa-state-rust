@@ -7,8 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  SPECIFICATION_COMMIT: c1635d74e6a216301a8986d37be8ce7e7111dfd7
-  CONFORMANCE_COMMIT: 600523ca08c3b8a6ee790439a32dc4ce47f71b95
+  SPECIFICATION_COMMIT: 318ef1f16ae024770090bd338c8b70056df2855b
+  CONFORMANCE_COMMIT: 86cb08a98267371b96b8f4908409aee022e4b4fe
 
 jobs:
   clippy:
@@ -24,7 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
   build-test:
     name: build + format 1 core conformance + tests
@@ -50,6 +50,7 @@ jobs:
           cmp schema/aggregate-state.schema.json authoritative-spec/schema/aggregate-state.schema.json
           cmp schema/migration-descriptor.schema.json authoritative-spec/schema/migration-descriptor.schema.json
           cmp schema/aggregate-state-package.schema.json authoritative-spec/schema/aggregate-state-package.schema.json
+          cmp schema/execution-checkpoint.schema.json authoritative-spec/schema/execution-checkpoint.schema.json
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -64,7 +65,7 @@ jobs:
           cargo run --release --bin determa-state -- validate authoritative-spec/examples/full.yaml
 
       - name: Unit and public API tests
-        run: cargo test --lib --bins --test public_api
+        run: cargo test --lib --bins --test public_api --test checkpoint_adapters
 
       - name: Documentation tests
         run: cargo test --doc
@@ -74,3 +75,40 @@ jobs:
 
       - name: Persistence host profiles
         run: cargo test --test persistence_profiles -- --nocapture
+
+      - name: All 85 execution-checkpoint host vectors
+        run: cargo test --test checkpoint_conformance -- --nocapture
+
+  postgresql:
+    name: PostgreSQL execution-store integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: determa
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d determa"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build with PostgreSQL
+        run: cargo build --release --features postgresql
+
+      - name: PostgreSQL transaction and CAS contract
+        env:
+          DETERMA_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/determa
+        run: cargo test --features postgresql --test checkpoint_postgresql -- --nocapture

@@ -552,7 +552,7 @@ pub fn encode_aggregate(
 
 pub fn restore_aggregate(
     source: &[u8],
-    resolver: &impl DefinitionResolver,
+    resolver: &(impl DefinitionResolver + ?Sized),
 ) -> Result<AggregateState, PersistenceError> {
     let (envelope, _) = parse_aggregate_envelope(source)?;
     restore_envelope(&envelope, resolver)
@@ -560,7 +560,7 @@ pub fn restore_aggregate(
 
 pub(crate) fn restore_envelope(
     envelope: &AggregateEnvelope,
-    resolver: &impl DefinitionResolver,
+    resolver: &(impl DefinitionResolver + ?Sized),
 ) -> Result<AggregateState, PersistenceError> {
     let mut definitions = BTreeMap::new();
     for runtime in &envelope.runtimes {
@@ -670,7 +670,7 @@ fn validate_root_header(
 
 fn collect_definition(
     definition: &WireDefinitionBinding,
-    resolver: &impl DefinitionResolver,
+    resolver: &(impl DefinitionResolver + ?Sized),
     definitions: &mut BTreeMap<String, Bundle>,
 ) -> Result<(), PersistenceError> {
     collect_fingerprint(
@@ -700,7 +700,7 @@ fn collect_definition(
 
 fn collect_fingerprint(
     fingerprint: &str,
-    resolver: &impl DefinitionResolver,
+    resolver: &(impl DefinitionResolver + ?Sized),
     definitions: &mut BTreeMap<String, Bundle>,
 ) -> Result<(), PersistenceError> {
     if definitions.contains_key(fingerprint) {
