@@ -12,11 +12,15 @@ use postgres::{Client, NoTls};
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CHECKPOINT_PROFILE: &str = "conformance-suite/conformance/profiles/execution-checkpoint";
+fn checkpoint_profile_directory() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("conformance-suite/conformance/profiles/execution-checkpoint")
+}
 
 #[test]
 fn postgresql_cas_and_schema_contract() {
@@ -566,9 +570,10 @@ fn terminal_host(
     store: Arc<dyn ExecutionStore>,
 ) -> (CheckpointHost<InMemoryDefinitionResolver>, Bundle) {
     let bundle = load_bundle(
-        &fs::read_to_string(format!(
-            "{CHECKPOINT_PROFILE}/checkpoint-03-retention-and-root-lifecycle/terminal.yaml"
-        ))
+        &fs::read_to_string(
+            checkpoint_profile_directory()
+                .join("checkpoint-03-retention-and-root-lifecycle/terminal.yaml"),
+        )
         .expect("terminal bundle"),
     )
     .expect("load terminal bundle");
@@ -641,16 +646,15 @@ fn deferred_row_count(store: &PostgresqlExecutionStore, root_instance_id: &str) 
 }
 
 fn outbox_fixture_records() -> (StoreRecord, StoreRecord) {
-    let directory = format!("{CHECKPOINT_PROFILE}/checkpoint-02-outbox-lifecycle");
-    let bundle = load_bundle(
-        &fs::read_to_string(format!("{directory}/machine.yaml")).expect("outbox bundle"),
-    )
-    .expect("load outbox bundle");
+    let directory = checkpoint_profile_directory().join("checkpoint-02-outbox-lifecycle");
+    let bundle =
+        load_bundle(&fs::read_to_string(directory.join("machine.yaml")).expect("outbox bundle"))
+            .expect("load outbox bundle");
     let mut resolver = InMemoryDefinitionResolver::default();
     assert!(resolver.insert(bundle, true));
     let record = |name: &str| {
         let checkpoint = determa_state::checkpoint::restore_execution_checkpoint(
-            &fs::read(format!("{directory}/{name}")).expect("checkpoint fixture"),
+            &fs::read(directory.join(name)).expect("checkpoint fixture"),
             &resolver,
         )
         .expect("restore checkpoint fixture");
