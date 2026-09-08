@@ -6,14 +6,14 @@ Rust implementation of the portable [Determa State](https://github.com/fruwehq/d
 Repository metadata prepares synchronized version `0.1.0`. This branch is validated
 against the merged `0.1.0` metadata revisions at these exact normative inputs:
 
-- specification commit `318ef1f16ae024770090bd338c8b70056df2855b`;
-- conformance commit `86cb08a98267371b96b8f4908409aee022e4b4fe`.
+- specification commit `cc4b0d734aa1c5953de75fb53b63e390a3b72761`;
+- conformance commit `263644f951f342b0eeaa3aceef4877293d2d7c67`.
 
 Until the coordinated `v0.1.0` tag publishes, the latest crate on crates.io remains
 version `0.0.7`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
-tests run all 110 format-1 core cases, 105 portable persistence vectors, and 12 steps
+tests run all 111 format-1 core cases, 108 portable persistence vectors, and 12 steps
 across the six persistence host profiles. The execution-checkpoint integration test
 runs all 85 host vectors through actual Rust host operations.
 
@@ -61,9 +61,9 @@ cargo clippy --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`86cb08a98267371b96b8f4908409aee022e4b4fe`. CI also checks that all bundled schemas
+`263644f951f342b0eeaa3aceef4877293d2d7c67`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
-`318ef1f16ae024770090bd338c8b70056df2855b`. These exact merged commits are the
+`cc4b0d734aa1c5953de75fb53b63e390a3b72761`. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
 
 ## Library

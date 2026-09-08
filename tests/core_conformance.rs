@@ -21,7 +21,7 @@ fn all_format_1_core_cases() {
         .filter(|path| path.is_dir())
         .collect::<Vec<_>>();
     cases.sort();
-    assert_eq!(cases.len(), 110, "expected the complete merged core suite");
+    assert_eq!(cases.len(), 111, "expected the complete merged core suite");
     let mut failures = Vec::new();
     for case in cases {
         if let Err(error) = run_case(&case) {

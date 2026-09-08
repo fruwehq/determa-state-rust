@@ -16,8 +16,8 @@ workflow.
 The current draft is validated against the merged `0.1.0` metadata revisions at these
 exact immutable inputs:
 
-- specification: `318ef1f16ae024770090bd338c8b70056df2855b`;
-- conformance: `86cb08a98267371b96b8f4908409aee022e4b4fe`.
+- specification: `cc4b0d734aa1c5953de75fb53b63e390a3b72761`;
+- conformance: `263644f951f342b0eeaa3aceef4877293d2d7c67`.
 
 The conformance suite is the arbiter of behavior. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
@@ -33,8 +33,8 @@ Never invent a release tag or weaken an exact revision check.
   store registry, capability profiles, and bundled adapters.
 - `src/value.rs`: portable values and nominal instance references.
 - `src/cli.rs`: nonportable validation utility only.
-- `tests/core_conformance.rs`: driver for all 110 `conformance/core` cases.
-- `tests/persistence_conformance.rs`: driver for all 105 persistence vectors.
+- `tests/core_conformance.rs`: driver for all 111 `conformance/core` cases.
+- `tests/persistence_conformance.rs`: driver for all 108 persistence vectors.
 - `tests/persistence_profiles.rs`: driver for all six persistence host profiles.
 - `tests/checkpoint_conformance.rs`: driver for all 85 execution-checkpoint vectors.
 - `tests/checkpoint_adapters.rs`: shared memory/file/SQLite setup, restart, and CAS
@@ -59,13 +59,13 @@ Never invent a release tag or weaken an exact revision check.
 ```sh
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
-  "86cb08a98267371b96b8f4908409aee022e4b4fe"
+  "263644f951f342b0eeaa3aceef4877293d2d7c67"
 cargo build --release --all-features
 cargo test --all-features
 cargo clippy --all-features --all-targets -- -D warnings
 ```
 
-CI runs the complete 110-case core suite, all 105 persistence vectors, all 12
+CI runs the complete 111-case core suite, all 108 persistence vectors, all 12
 persistence-profile steps, and all 85 execution-checkpoint vectors. It also checks
 every local schema byte-for-byte against the exact specification commit and runs the
 optional PostgreSQL adapter against a service.

@@ -7,8 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  SPECIFICATION_COMMIT: 318ef1f16ae024770090bd338c8b70056df2855b
-  CONFORMANCE_COMMIT: 86cb08a98267371b96b8f4908409aee022e4b4fe
+  SPECIFICATION_COMMIT: cc4b0d734aa1c5953de75fb53b63e390a3b72761
+  CONFORMANCE_COMMIT: 263644f951f342b0eeaa3aceef4877293d2d7c67
 
 jobs:
   clippy:
@@ -70,7 +70,7 @@ jobs:
       - name: Documentation tests
         run: cargo test --doc
 
-      - name: All 110 format 1 core conformance cases
+      - name: All 111 format 1 core conformance cases
         run: cargo test --test core_conformance --test persistence_conformance -- --nocapture
 
       - name: Persistence host profiles

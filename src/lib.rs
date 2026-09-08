@@ -12,18 +12,19 @@ pub mod format1;
 pub mod value;
 
 /// Exact normative specification revision implemented by this crate.
-pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "318ef1f16ae024770090bd338c8b70056df2855b";
+pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "cc4b0d734aa1c5953de75fb53b63e390a3b72761";
 
 /// Exact core conformance revision exercised by this crate.
-pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "86cb08a98267371b96b8f4908409aee022e4b4fe";
+pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "263644f951f342b0eeaa3aceef4877293d2d7c67";
 
 pub use format1::{
-    create, dispatch, encode_aggregate, load_bundle, load_bundle_from_json, migrate_aggregate,
-    migrate_and_dispatch, restore_aggregate, restore_package, restore_package_and_migrate,
-    AggregateEnvelope, AggregateState, Bindings, Bundle, CoreResult, Counter, DefinitionResolver,
-    Delivery, Disposition, Emission, Envelope, FaultRecord, InMemoryDefinitionResolver, LoadError,
-    LoadErrorCode, MigrationArtifactResolver, MigrationAuditRecord, MigrationDispatchOutcome,
-    MigrationOutcome, MigrationRequest, PersistenceError, PersistenceErrorCode, Rejection,
-    ResourceLimits, RestoredPackage, ResultStatus, RuntimeStatus, Target, TypedValue,
+    create, decode_selected_migration_descriptor, dispatch, encode_aggregate, load_bundle,
+    load_bundle_from_json, migrate_aggregate, migrate_and_dispatch, restore_aggregate,
+    restore_package, restore_package_and_migrate, AggregateEnvelope, AggregateState, Bindings,
+    Bundle, CoreResult, Counter, DefinitionResolver, Delivery, Disposition, Emission, Envelope,
+    FaultRecord, InMemoryDefinitionResolver, LoadError, LoadErrorCode, MigrationArtifactResolver,
+    MigrationAuditRecord, MigrationDispatchOutcome, MigrationOutcome, MigrationRequest,
+    PersistenceError, PersistenceErrorCode, Rejection, ResourceLimits, RestoredPackage,
+    ResultStatus, RuntimeStatus, Target, TypedValue,
 };
 pub use value::{string_from_utf16, InstanceReference, InvalidUnicodeString, Value};
