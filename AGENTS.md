@@ -9,9 +9,8 @@ optional synchronous execution-checkpoint host. The crate is `determa-state`, th
 library module is `determa_state`, and the binary is published as `determa-state` plus
 the `determa-state-rust` launcher-selection alias.
 
-Repository metadata prepares the synchronized State `0.1.0` release. The latest
-published crate remains `0.0.7` until the coordinated `v0.1.0` tag runs the release
-workflow.
+State `0.1.0` is published on crates.io. Repository metadata remains at `0.1.0` until a
+later synchronized State release is explicitly authorized.
 
 The current draft is validated against the merged `0.1.0` metadata revisions at these
 exact immutable inputs:
@@ -60,10 +59,13 @@ Never invent a release tag or weaken an exact revision check.
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
   "263644f951f342b0eeaa3aceef4877293d2d7c67"
-cargo build --release --all-features
-cargo test --all-features
-cargo clippy --all-features --all-targets -- -D warnings
+cargo +1.86.0 build --release --locked --all-features
+cargo +1.86.0 test --locked --all-features
+cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
+
+The declared MSRV is Rust `1.86`. CI must keep the locked default and all-features graph,
+including PostgreSQL, buildable and testable with that toolchain.
 
 CI runs the complete 111-case core suite, all 108 persistence vectors, all 12
 persistence-profile steps, and all 85 execution-checkpoint vectors. It also checks
