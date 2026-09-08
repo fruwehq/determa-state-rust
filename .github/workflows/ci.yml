@@ -11,20 +11,53 @@ env:
   CONFORMANCE_COMMIT: 263644f951f342b0eeaa3aceef4877293d2d7c67
 
 jobs:
+  msrv:
+    name: Rust 1.86 MSRV + locked feature surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-03
+        with:
+          toolchain: 1.86.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: msrv-1.86
+
+      - name: Verify MSRV metadata and locked dependency graph
+        run: |
+          python3 scripts/verify_msrv.py --expected 1.86
+          python3 scripts/test_release_metadata.py
+          cargo metadata --locked --all-features --format-version 1 > /dev/null
+
+      - name: Build default features
+        run: cargo build --release --locked
+
+      - name: Test default features
+        run: cargo test --locked
+
+      - name: Build and test all features, including PostgreSQL
+        run: |
+          cargo build --release --locked --all-features
+          cargo test --locked --all-features
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-03
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Clippy
-        run: cargo clippy --all-features --all-targets -- -D warnings
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
   build-test:
     name: build + format 1 core conformance + tests
@@ -52,32 +85,32 @@ jobs:
           cmp schema/aggregate-state-package.schema.json authoritative-spec/schema/aggregate-state-package.schema.json
           cmp schema/execution-checkpoint.schema.json authoritative-spec/schema/execution-checkpoint.schema.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-03
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Validate authoritative specification examples
         run: |
-          cargo run --release --bin determa-state -- validate authoritative-spec/examples/minimal.yaml
-          cargo run --release --bin determa-state -- validate authoritative-spec/examples/full.yaml
+          cargo run --release --locked --bin determa-state -- validate authoritative-spec/examples/minimal.yaml
+          cargo run --release --locked --bin determa-state -- validate authoritative-spec/examples/full.yaml
 
       - name: Unit and public API tests
-        run: cargo test --lib --bins --test public_api --test checkpoint_adapters
+        run: cargo test --locked --lib --bins --test public_api --test checkpoint_adapters
 
       - name: Documentation tests
-        run: cargo test --doc
+        run: cargo test --locked --doc
 
       - name: All 111 format 1 core conformance cases
-        run: cargo test --test core_conformance --test persistence_conformance -- --nocapture
+        run: cargo test --locked --test core_conformance --test persistence_conformance -- --nocapture
 
       - name: Persistence host profiles
-        run: cargo test --test persistence_profiles -- --nocapture
+        run: cargo test --locked --test persistence_profiles -- --nocapture
 
       - name: All 85 execution-checkpoint host vectors
-        run: cargo test --test checkpoint_conformance -- --nocapture
+        run: cargo test --locked --test checkpoint_conformance -- --nocapture
 
   postgresql:
     name: PostgreSQL execution-store integration
@@ -101,14 +134,14 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-03
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build with PostgreSQL
-        run: cargo build --release --features postgresql
+        run: cargo build --release --locked --features postgresql
 
       - name: PostgreSQL transaction and CAS contract
         env:
           DETERMA_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/determa
-        run: cargo test --features postgresql --test checkpoint_postgresql -- --nocapture
+        run: cargo test --locked --features postgresql --test checkpoint_postgresql -- --nocapture

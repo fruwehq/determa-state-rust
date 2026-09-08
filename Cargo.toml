@@ -2,6 +2,7 @@
 name = "determa-state"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.86"
 authors = ["fruwehq"]
 license = "MIT"
 description = "Determa State — Rust implementation of the Determa statechart engine (implements Determa State spec v0.1.0)"

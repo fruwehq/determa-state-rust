@@ -3,14 +3,11 @@
 Rust implementation of the portable [Determa State](https://github.com/fruwehq/determa-state-spec)
 `format: 1` core with an optional synchronous portable execution-checkpoint host.
 
-Repository metadata prepares synchronized version `0.1.0`. This branch is validated
-against the merged `0.1.0` metadata revisions at these exact normative inputs:
+Version `0.1.0` is published on crates.io. This branch is validated against the merged
+`0.1.0` metadata revisions at these exact normative inputs:
 
 - specification commit `cc4b0d734aa1c5953de75fb53b63e390a3b72761`;
 - conformance commit `263644f951f342b0eeaa3aceef4877293d2d7c67`.
-
-Until the coordinated `v0.1.0` tag publishes, the latest crate on crates.io remains
-version `0.0.7`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 111 format-1 core cases, 108 portable persistence vectors, and 12 steps
@@ -53,11 +50,15 @@ concerns. The command-line binary still provides bundle validation only.
 
 ## Build and test
 
+The minimum supported Rust version (MSRV) is `1.86`. CI verifies the locked default and
+all-features dependency graph with that toolchain, including PostgreSQL compile and test
+coverage. Stable Rust remains the toolchain for formatting and clippy.
+
 ```sh
 git submodule update --init
-cargo build --release --all-features
-cargo test --all-features
-cargo clippy --all-features --all-targets -- -D warnings
+cargo +1.86.0 build --release --locked --all-features
+cargo +1.86.0 test --locked --all-features
+cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
