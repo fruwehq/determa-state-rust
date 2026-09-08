@@ -186,6 +186,14 @@ pub fn migrate_and_dispatch(
     })
 }
 
+/// Decode one selected migration-descriptor artifact without resolving a route.
+///
+/// This is the portable descriptor-decoder boundary used by conformance vectors for
+/// legacy bytes that have no modern routing digest.
+pub fn decode_selected_migration_descriptor(source: &[u8]) -> Result<(), PersistenceError> {
+    decode_descriptor(source, None, &ResourceLimits::default()).map(|_| ())
+}
+
 pub fn migrate_aggregate(
     source: &[u8],
     request: &MigrationRequest,
@@ -357,8 +365,16 @@ fn resolve_descriptor(
             "migration descriptor is not trusted",
         ));
     }
-    require_within(resolved.bytes.len(), &limits.maximum_descriptor_bytes)?;
-    let value = super::strict_json::parse(&resolved.bytes).map_err(|parse| {
+    decode_descriptor(&resolved.bytes, Some(digest), limits)
+}
+
+fn decode_descriptor(
+    source: &[u8],
+    expected_digest: Option<&str>,
+    limits: &ResourceLimits,
+) -> Result<JsonValue, PersistenceError> {
+    require_within(source.len(), &limits.maximum_descriptor_bytes)?;
+    let value = super::strict_json::parse(source).map_err(|parse| {
         error(
             PersistenceErrorCode::InvalidMigrationDescriptor,
             parse.to_string(),
@@ -399,7 +415,9 @@ fn resolve_descriptor(
         .expect("checked object")
         .remove("migration_descriptor_digest");
     let computed = jcs_hash(&json!(["determa-migration-descriptor-1", without_digest]))?;
-    if computed != digest || string(&value, "migration_descriptor_digest")? != digest {
+    let declared_digest = string(&value, "migration_descriptor_digest")?;
+    let expected_digest = expected_digest.unwrap_or(declared_digest);
+    if computed != expected_digest || declared_digest != expected_digest {
         return Err(error(
             PersistenceErrorCode::InvalidMigrationDescriptor,
             "migration descriptor digest mismatch",

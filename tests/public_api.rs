@@ -1,6 +1,7 @@
 use determa_state::{
-    create, dispatch, load_bundle, Bindings, Counter, Delivery, Disposition, Envelope,
-    ResultStatus, Target, Value, FORMAT_1_CONFORMANCE_COMMIT, FORMAT_1_SPECIFICATION_COMMIT,
+    create, decode_selected_migration_descriptor, dispatch, load_bundle, Bindings, Counter,
+    Delivery, Disposition, Envelope, PersistenceErrorCode, ResultStatus, Target, Value,
+    FORMAT_1_CONFORMANCE_COMMIT, FORMAT_1_SPECIFICATION_COMMIT,
 };
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -711,11 +712,25 @@ fn examples_and_revision_metadata_are_current() {
     load_bundle(include_str!("../examples/full.yaml")).expect("full example loads");
     assert_eq!(
         FORMAT_1_SPECIFICATION_COMMIT,
-        "318ef1f16ae024770090bd338c8b70056df2855b"
+        "cc4b0d734aa1c5953de75fb53b63e390a3b72761"
     );
     assert_eq!(
         FORMAT_1_CONFORMANCE_COMMIT,
-        "86cb08a98267371b96b8f4908409aee022e4b4fe"
+        "263644f951f342b0eeaa3aceef4877293d2d7c67"
+    );
+}
+
+#[test]
+fn selected_migration_descriptor_decoder_rejects_legacy_bytes() {
+    let source = std::fs::read(
+        "conformance-suite/conformance/core/113-migration-failure-completeness/legacy-0.0.6-snapshot.json",
+    )
+    .expect("legacy fixture is available");
+    assert_eq!(
+        decode_selected_migration_descriptor(&source)
+            .expect_err("legacy descriptor must be rejected")
+            .code,
+        PersistenceErrorCode::UnsupportedMigrationDescriptorFormat,
     );
 }
 

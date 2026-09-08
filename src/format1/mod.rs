@@ -13,8 +13,9 @@ mod wire;
 pub use compile::{Bundle, SemanticError};
 pub use counter::Counter;
 pub use migration::{
-    aggregate_shape_fingerprint, migrate_aggregate, migrate_and_dispatch, MigrationAuditRecord,
-    MigrationDispatchOutcome, MigrationOutcome, MigrationRequest, ResourceLimits,
+    aggregate_shape_fingerprint, decode_selected_migration_descriptor, migrate_aggregate,
+    migrate_and_dispatch, MigrationAuditRecord, MigrationDispatchOutcome, MigrationOutcome,
+    MigrationRequest, ResourceLimits,
 };
 pub use model::{
     Bindings, DefinitionBinding, Delivery, Envelope, IdentityOrigin, MachineIdentity, Target,

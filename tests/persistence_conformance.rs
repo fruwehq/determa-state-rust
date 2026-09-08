@@ -1,7 +1,8 @@
 use determa_state::{
-    create, dispatch, encode_aggregate, load_bundle, migrate_aggregate, migrate_and_dispatch,
-    restore_aggregate, restore_package, restore_package_and_migrate, Bindings, DefinitionResolver,
-    Delivery, Disposition, Envelope, InMemoryDefinitionResolver, MigrationRequest, ResourceLimits,
+    create, decode_selected_migration_descriptor, dispatch, encode_aggregate, load_bundle,
+    migrate_aggregate, migrate_and_dispatch, restore_aggregate, restore_package,
+    restore_package_and_migrate, Bindings, DefinitionResolver, Delivery, Disposition, Envelope,
+    InMemoryDefinitionResolver, MigrationRequest, ResourceLimits,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -158,6 +159,16 @@ fn run_vector(case: &Path, vector: &Value) -> Result<(), String> {
                 audit: Some(serde_json::to_value(outcome.migration.audit_records).unwrap()),
                 disposition: outcome.disposition,
                 emissions: Some(serde_json::to_value(outcome.emissions).unwrap()),
+                resolver: None,
+            })
+        }
+        "decode_selected_migration_descriptor" => {
+            let source = artifact(case, vector, "migration_descriptor")?;
+            decode_selected_migration_descriptor(&source).map(|_| Successful {
+                bytes: Vec::new(),
+                audit: None,
+                disposition: None,
+                emissions: Some(json!([])),
                 resolver: None,
             })
         }
