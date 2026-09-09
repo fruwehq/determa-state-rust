@@ -25,7 +25,7 @@ class MetadataChecksTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
-    def write_manifest(self, version: str = "0.1.0", msrv: str = "1.86") -> None:
+    def write_manifest(self, version: str = "0.2.0", msrv: str = "1.86") -> None:
         self.manifest.write_text(
             f'[package]\nname = "example"\nversion = "{version}"\n'
             f'edition = "2021"\nrust-version = "{msrv}"\n',
@@ -34,7 +34,7 @@ class MetadataChecksTest(unittest.TestCase):
 
     def test_exact_release_tag_is_accepted(self) -> None:
         self.write_manifest()
-        verify_release_tag(self.manifest, "v0.1.0")
+        verify_release_tag(self.manifest, "v0.2.0")
 
     def test_noncanonical_or_mismatched_release_tags_are_rejected(self) -> None:
         self.write_manifest()

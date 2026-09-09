@@ -7,7 +7,7 @@ pub fn run(args: Vec<String>) -> i32 {
     let mut arguments = args.into_iter().skip(1);
     match arguments.next().as_deref() {
         Some("--version") => {
-            println!("determa-state 0.1.0");
+            println!("determa-state 0.2.0");
             0
         }
         Some("validate") => {
@@ -35,7 +35,7 @@ pub fn run(args: Vec<String>) -> i32 {
         }
         Some("--help") | Some("-h") | None => {
             println!(
-                "determa-state 0.1.0\n\nusage:\n  determa-state validate <bundle.yaml>\n  determa-state --version"
+                "determa-state 0.2.0\n\nusage:\n  determa-state validate <bundle.yaml>\n  determa-state --version"
             );
             0
         }
