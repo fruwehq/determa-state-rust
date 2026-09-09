@@ -131,6 +131,41 @@ fn scope_state_comparison_rejects_digest_root_and_extra_sabotage() {
 }
 
 #[test]
+fn scope_state_comparison_rejects_semantically_equivalent_byte_changes() {
+    let case = PathBuf::from(PROFILE).join("checkpoint-02-outbox-lifecycle");
+    let inputs = read_json(&case.join("inputs.json"));
+    let (resolver, _) = resolver_for_case(&case, &inputs);
+    let states = read_json(&case.join("scope-states.json"));
+    let base = resolve_pointer(&states, "/snapshots/base");
+    let backend = ScopeBackend::from_state(&case, base, &resolver).expect("scope backend seed");
+    let observed_before = backend.observe().expect("scope state observation");
+
+    let store = backend
+        .stores
+        .get("physical-isolation-scope-a")
+        .expect("scope-a store");
+    store
+        .records
+        .lock()
+        .expect("scope-a records")
+        .get_mut("outbox-root")
+        .expect("outbox root")
+        .bytes
+        .push(b'\n');
+
+    let observed_after = backend.observe().expect("newline remains valid JSON");
+    assert_eq!(
+        observed_before.outbox_projection(),
+        observed_after.outbox_projection(),
+        "the byte sabotage must remain semantically equivalent for outbox projection"
+    );
+    assert!(
+        compare_scope_state(&case, &observed_after, base, &resolver).is_err(),
+        "semantically equivalent stored JSON bytes must not satisfy exact scope comparison"
+    );
+}
+
+#[test]
 fn rejected_scope_call_assertion_detects_real_store_access() {
     let case = PathBuf::from(PROFILE).join("checkpoint-02-outbox-lifecycle");
     let inputs = read_json(&case.join("inputs.json"));
@@ -889,12 +924,11 @@ impl ScopeBackend {
             for (root, record) in store.snapshot()? {
                 let value: JsonValue =
                     serde_json::from_slice(&record.bytes).map_err(error_string)?;
-                let canonical = serde_json_canonicalizer::to_vec(&value).map_err(error_string)?;
                 checkpoints.insert(
                     root,
                     ObservedCheckpoint {
-                        bytes: canonical.clone(),
-                        serialization_digest: sha256(&canonical),
+                        serialization_digest: sha256(&record.bytes),
+                        bytes: record.bytes,
                         execution_checkpoint_digest: record.execution_checkpoint_digest,
                     },
                 );
