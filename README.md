@@ -7,12 +7,12 @@ Version `0.1.0` is published on crates.io. This branch is validated against the 
 `0.1.0` metadata revisions at these exact normative inputs:
 
 - specification commit `cc4b0d734aa1c5953de75fb53b63e390a3b72761`;
-- conformance commit `263644f951f342b0eeaa3aceef4877293d2d7c67`.
+- conformance commit `5ba78c7ef90b8556e76de6481a18b23a3d0c2378`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 111 format-1 core cases, 108 portable persistence vectors, and 12 steps
 across the six persistence host profiles. The execution-checkpoint integration test
-runs all 85 host vectors through actual Rust host operations.
+runs all 91 host vectors through actual Rust host operations.
 
 ## Implemented core
 
@@ -41,6 +41,9 @@ runs all 85 host vectors through actual Rust host operations.
   with explicit durable receipt/outbox modes and schema-contract health checks.
 - Inspection through the returned logical aggregate state, result disposition, fault,
   rejection, configuration, variables, components, owned instances, and emissions.
+- Immutable `PORTABLE_CODES` slices on public closed-code enums, plus
+  `CREATION_REJECTION_CODES`, `DISPATCH_REJECTION_CODES`, and `ENGINE_FAULT_CODES` for
+  the portable categories represented as strings in runtime records.
 
 The portable core remains a pure foreground transform and does not own queues, broker
 acknowledgement, timers, package imports, or a background scheduler. The optional host
@@ -62,7 +65,7 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`263644f951f342b0eeaa3aceef4877293d2d7c67`. CI also checks that all bundled schemas
+`5ba78c7ef90b8556e76de6481a18b23a3d0c2378`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
 `cc4b0d734aa1c5953de75fb53b63e390a3b72761`. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.

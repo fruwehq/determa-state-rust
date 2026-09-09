@@ -27,6 +27,30 @@ pub enum LoadErrorCode {
 }
 
 impl LoadErrorCode {
+    /// Complete machine-load failure set defined by the portable registry.
+    ///
+    /// `StructuralValidation` remains available for harness classification but is
+    /// intentionally not a portable machine-load failure code.
+    pub const PORTABLE_CODES: &'static [Self] = &[
+        Self::DuplicateKey,
+        Self::NonStringMapKey,
+        Self::UnsupportedYamlFeature,
+        Self::UnsupportedFormat,
+        Self::NonJsonValue,
+        Self::InvalidUnicode,
+        Self::InvalidNumericSyntax,
+        Self::InvalidBooleanSyntax,
+        Self::InvalidNullSyntax,
+        Self::NumericValueOutOfRange,
+        Self::SemanticValidation,
+        Self::CelProfileError,
+        Self::InvalidBinding,
+        Self::DestroyedVariableWrite,
+        Self::DestroyedReferenceBinding,
+        Self::RootReentry,
+        Self::RootLocalTransition,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::DuplicateKey => "duplicate_key",

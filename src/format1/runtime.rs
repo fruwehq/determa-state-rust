@@ -30,6 +30,55 @@ pub enum Disposition {
     Faulted,
 }
 
+impl Disposition {
+    /// Complete result-disposition set defined by the portable registry.
+    pub const PORTABLE_CODES: &'static [Self] = &[
+        Self::Handled,
+        Self::Unhandled,
+        Self::Rejected,
+        Self::Faulted,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Handled => "handled",
+            Self::Unhandled => "unhandled",
+            Self::Rejected => "rejected",
+            Self::Faulted => "faulted",
+        }
+    }
+}
+
+/// Complete creation-rejection set defined by the portable registry.
+pub const CREATION_REJECTION_CODES: &[&str] = &[
+    "invalid_binding",
+    "invalid_creation_request",
+    "invalid_machine_target",
+];
+
+/// Complete dispatch-rejection set defined by the portable registry.
+pub const DISPATCH_REJECTION_CODES: &[&str] = &[
+    "inactive_component_target",
+    "incompatible_bundle",
+    "invalid_correlation",
+    "invalid_event",
+    "invalid_instance_target",
+    "invalid_payload",
+    "invalid_prior_state",
+];
+
+/// Complete engine-fault set defined by the portable registry.
+pub const ENGINE_FAULT_CODES: &[&str] = &[
+    "action_fault",
+    "binding_not_empty",
+    "cascade_fault",
+    "contained_runtime_fault",
+    "guard_fault",
+    "inactive_component_target",
+    "invalid_instance_target",
+    "invariant_fault",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rejection {
     pub code: String,

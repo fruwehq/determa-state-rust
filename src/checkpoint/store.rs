@@ -150,6 +150,25 @@ pub enum StoreErrorCode {
     ResponseLostAfterCommit,
 }
 
+impl StoreErrorCode {
+    /// Complete execution-store failure set defined by the portable registry.
+    ///
+    /// `ExecutionStoreFailure` remains available for implementation failures but
+    /// is intentionally not a portable execution-store failure code.
+    pub const PORTABLE_CODES: &'static [Self] = &[
+        Self::InjectedPreCommitFailure,
+        Self::ResponseLostAfterCommit,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecutionStoreFailure => "execution_store_failure",
+            Self::InjectedPreCommitFailure => "injected_pre_commit_failure",
+            Self::ResponseLostAfterCommit => "response_lost_after_commit",
+        }
+    }
+}
+
 impl std::fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
@@ -213,6 +232,14 @@ pub enum AdapterErrorCode {
 }
 
 impl AdapterErrorCode {
+    /// Complete execution-store adapter failure set defined by the portable registry.
+    pub const PORTABLE_CODES: &'static [Self] = &[
+        Self::DuplicateAdapterRegistration,
+        Self::UnknownAdapter,
+        Self::InvalidAdapterConfiguration,
+        Self::AdapterCapabilityMismatch,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::DuplicateAdapterRegistration => "duplicate_adapter_registration",

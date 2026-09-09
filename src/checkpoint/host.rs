@@ -147,6 +147,20 @@ pub enum HostFailureCode {
 }
 
 impl HostFailureCode {
+    /// Complete checkpoint-host failure set defined by the portable registry.
+    pub const PORTABLE_CODES: &'static [Self] = &[
+        Self::CreationRejected,
+        Self::EventIdConflict,
+        Self::CreationIdConflict,
+        Self::OperationIdConflict,
+        Self::EffectIdConflict,
+        Self::CheckpointRevisionConflict,
+        Self::InvalidExecutionCheckpoint,
+        Self::PhysicalDeletionUnsupported,
+        Self::InjectedPreCommitFailure,
+        Self::ResponseLostAfterCommit,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ExecutionStoreFailure => "execution_store_failure",

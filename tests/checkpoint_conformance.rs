@@ -68,7 +68,7 @@ fn all_checkpoint_artifacts_have_the_declared_classification() {
 }
 
 #[test]
-fn all_85_execution_checkpoint_vectors_run_through_the_host() {
+fn all_91_execution_checkpoint_vectors_run_through_the_host() {
     let mut count = 0;
     for case in case_directories() {
         let document = read_yaml(&case.join("test.yaml"));
@@ -82,7 +82,7 @@ fn all_85_execution_checkpoint_vectors_run_through_the_host() {
             run_vector(&case, &inputs, &resolver, &bundles, vector);
         }
     }
-    assert_eq!(count, 85);
+    assert_eq!(count, 91);
 }
 
 #[test]
@@ -404,6 +404,10 @@ fn run_vector(
     let name = vector["name"].as_str().expect("vector name");
     let operation = vector["operation"].as_str().expect("operation");
     let expect = &vector["expect"];
+    if vector.get("scope_state_before").is_some() {
+        run_scope_vector(case, resolver, vector);
+        return;
+    }
     if matches!(
         operation,
         "inject_execution_store" | "register_adapter" | "resolve_adapter" | "validate_host_profile"
@@ -495,6 +499,223 @@ fn run_vector(
             }
         }
     }
+}
+
+fn run_scope_vector(case: &Path, resolver: &InMemoryDefinitionResolver, vector: &JsonValue) {
+    let name = vector["name"].as_str().expect("scope vector name");
+    let states = read_json(
+        &case.join(
+            vector["scope_state_before"]["file"]
+                .as_str()
+                .expect("scope state file"),
+        ),
+    );
+    let before = resolve_pointer(
+        &states,
+        vector["scope_state_before"]["pointer"]
+            .as_str()
+            .expect("scope state pointer"),
+    );
+    let after = resolve_pointer(
+        &states,
+        vector["scope_state_after"]["pointer"]
+            .as_str()
+            .expect("scope state pointer"),
+    );
+
+    let mut stores = BTreeMap::new();
+    for scope in before["scopes"].as_array().expect("scope list") {
+        let physical_key = scope["physical_isolation_key"]
+            .as_str()
+            .expect("physical isolation key");
+        let store = Arc::new(MemoryExecutionStore::new());
+        store.initialize_schema().expect("scope store schema");
+        for checkpoint in scope["checkpoints"]
+            .as_object()
+            .expect("scope checkpoints")
+            .values()
+        {
+            let checkpoint = restore_fixture(
+                case,
+                checkpoint["file"].as_str().expect("scope checkpoint file"),
+                resolver,
+            );
+            store
+                .insert_if_absent(
+                    StoreRecord::from_checkpoint(&checkpoint).expect("scope checkpoint record"),
+                )
+                .expect("seed scope checkpoint");
+        }
+        stores.insert(physical_key.to_string(), store);
+    }
+
+    let selection = &vector["scope_selection"];
+    let requested = selection["requested_scope_id"].as_str();
+    let candidates = selection["candidates"]
+        .as_array()
+        .expect("scope candidates");
+    let selected = (candidates.len() == 1)
+        .then(|| &candidates[0])
+        .filter(|candidate| candidate["logical_scope_id"].as_str() == requested)
+        .filter(|candidate| candidate["authorized"].as_bool() == Some(true));
+
+    let (selection_result, selected_scope_id, execution_host_calls, store_calls) =
+        if let Some(selected) = selected {
+            let physical_key = selected["physical_isolation_key"]
+                .as_str()
+                .expect("selected physical isolation key");
+            let store = stores.get(physical_key).expect("selected scope store");
+            let record = store
+                .load("outbox-root")
+                .expect("selected scope load")
+                .expect("selected scope checkpoint");
+            let guard = MutationGuard::new(
+                record.revision.to_string(),
+                record.execution_checkpoint_digest.clone(),
+            );
+            let desired = serde_json::from_value(vector["desired_pending_state"].clone())
+                .expect("pending outbox state");
+            let host = CheckpointHost::new(store.clone(), Arc::new(resolver.clone()));
+            host.update_pending_outbox(
+                "outbox-root",
+                vector["effect_id"].as_str().expect("scope effect id"),
+                desired,
+                &guard,
+            )
+            .expect("selected scope update");
+            (
+                "selected",
+                selected["logical_scope_id"].as_str(),
+                vec!["update_pending_outbox"],
+                vec!["load_checkpoint", "compare_and_swap_checkpoint"],
+            )
+        } else {
+            ("rejected", None, Vec::new(), Vec::new())
+        };
+
+    let expect = &vector["expect"];
+    assert_eq!(
+        selection_result,
+        expect["selection_result"]
+            .as_str()
+            .expect("selection result"),
+        "{name} selection result"
+    );
+    assert_eq!(
+        selected_scope_id,
+        expect["selected_scope_id"].as_str(),
+        "{name} selected scope"
+    );
+    assert_eq!(
+        vec!["resolve_execution_store_scope"],
+        string_refs(&expect["calls"]["resolver"]),
+        "{name} resolver calls"
+    );
+    assert_eq!(
+        execution_host_calls,
+        string_refs(&expect["calls"]["execution_host"]),
+        "{name} execution host calls"
+    );
+    assert_eq!(
+        store_calls,
+        string_refs(&expect["calls"]["store"]),
+        "{name} store calls"
+    );
+    assert!(
+        string_refs(&expect["calls"]["core"]).is_empty(),
+        "{name} core calls"
+    );
+
+    let mut changed_scopes = 0;
+    for expected_scope in after["scopes"].as_array().expect("expected scope list") {
+        let physical_key = expected_scope["physical_isolation_key"]
+            .as_str()
+            .expect("expected physical isolation key");
+        let store = stores.get(physical_key).expect("expected scope store");
+        for (root, expected_checkpoint) in expected_scope["checkpoints"]
+            .as_object()
+            .expect("expected scope checkpoints")
+        {
+            let expected = restore_fixture(
+                case,
+                expected_checkpoint["file"]
+                    .as_str()
+                    .expect("expected scope checkpoint file"),
+                resolver,
+            )
+            .canonical_bytes()
+            .expect("expected scope checkpoint bytes");
+            let actual = store
+                .load(root)
+                .expect("expected scope load")
+                .expect("expected scope checkpoint")
+                .bytes;
+            if actual != restore_scope_checkpoint_bytes(case, before, physical_key, root, resolver)
+            {
+                changed_scopes += 1;
+            }
+            assert_eq!(actual, expected, "{name} scope {physical_key} checkpoint");
+        }
+    }
+    let expected_mutation = if changed_scopes == 0 {
+        "unchanged"
+    } else {
+        "changed"
+    };
+    assert_eq!(
+        expected_mutation,
+        expect["scope_state_mutation"]
+            .as_str()
+            .expect("scope state mutation"),
+        "{name} scope mutation"
+    );
+    assert_eq!(
+        expected_mutation,
+        expect["checkpoint_map_mutation"]
+            .as_str()
+            .expect("checkpoint map mutation"),
+        "{name} checkpoint map mutation"
+    );
+    assert_eq!(
+        expected_mutation,
+        expect["outbox_record_map_mutation"]
+            .as_str()
+            .expect("outbox record map mutation"),
+        "{name} outbox record map mutation"
+    );
+}
+
+fn restore_scope_checkpoint_bytes(
+    case: &Path,
+    state: &JsonValue,
+    physical_key: &str,
+    root: &str,
+    resolver: &InMemoryDefinitionResolver,
+) -> Vec<u8> {
+    let scope = state["scopes"]
+        .as_array()
+        .expect("scope list")
+        .iter()
+        .find(|scope| scope["physical_isolation_key"].as_str() == Some(physical_key))
+        .expect("scope by physical isolation key");
+    restore_fixture(
+        case,
+        scope["checkpoints"][root]["file"]
+            .as_str()
+            .expect("scope checkpoint file"),
+        resolver,
+    )
+    .canonical_bytes()
+    .expect("scope checkpoint bytes")
+}
+
+fn string_refs(value: &JsonValue) -> Vec<&str> {
+    value
+        .as_array()
+        .expect("string list")
+        .iter()
+        .map(|value| value.as_str().expect("string list member"))
+        .collect()
 }
 
 fn run_host_operation(

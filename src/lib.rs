@@ -15,7 +15,7 @@ pub mod value;
 pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "cc4b0d734aa1c5953de75fb53b63e390a3b72761";
 
 /// Exact core conformance revision exercised by this crate.
-pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "263644f951f342b0eeaa3aceef4877293d2d7c67";
+pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "5ba78c7ef90b8556e76de6481a18b23a3d0c2378";
 
 pub use format1::{
     create, decode_selected_migration_descriptor, dispatch, encode_aggregate, load_bundle,
@@ -25,6 +25,7 @@ pub use format1::{
     FaultRecord, InMemoryDefinitionResolver, LoadError, LoadErrorCode, MigrationArtifactResolver,
     MigrationAuditRecord, MigrationDispatchOutcome, MigrationOutcome, MigrationRequest,
     PersistenceError, PersistenceErrorCode, Rejection, ResourceLimits, RestoredPackage,
-    ResultStatus, RuntimeStatus, Target, TypedValue,
+    ResultStatus, RuntimeStatus, Target, TypedValue, CREATION_REJECTION_CODES,
+    DISPATCH_REJECTION_CODES, ENGINE_FAULT_CODES,
 };
 pub use value::{string_from_utf16, InstanceReference, InvalidUnicodeString, Value};

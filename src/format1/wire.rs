@@ -43,6 +43,33 @@ pub enum PersistenceErrorCode {
 }
 
 impl PersistenceErrorCode {
+    /// Complete failure set defined by the portable persistence registry.
+    pub const PORTABLE_CODES: &'static [Self] = &[
+        Self::UnsupportedAggregateStateFormat,
+        Self::UnsupportedAggregateStateSchemaVersion,
+        Self::UnsupportedMigrationDescriptorFormat,
+        Self::UnsupportedMigrationDescriptorSchemaVersion,
+        Self::UnsupportedAggregateStatePackageFormat,
+        Self::UnsupportedAggregateStatePackageSchemaVersion,
+        Self::InvalidAggregateState,
+        Self::InvalidAggregateStatePackage,
+        Self::AggregateStateDigestMismatch,
+        Self::SourceDefinitionUnavailable,
+        Self::DefinitionUntrusted,
+        Self::TargetDefinitionUnavailable,
+        Self::DefinitionFingerprintMismatch,
+        Self::MigrationDescriptorUntrusted,
+        Self::InvalidMigrationDescriptor,
+        Self::InvalidMigrationRequest,
+        Self::MigrationRouteMissing,
+        Self::MigrationRouteMismatch,
+        Self::MigrationTransformFault,
+        Self::MigrationTotalityFailure,
+        Self::MigrationResourceLimitExceeded,
+        Self::TerminalMigrationRequiresMaintenance,
+        Self::TerminalMigrationRejected,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::UnsupportedAggregateStateFormat => "unsupported_aggregate_state_format",
