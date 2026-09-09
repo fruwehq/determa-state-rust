@@ -714,11 +714,11 @@ fn examples_and_revision_metadata_are_current() {
     load_bundle(include_str!("../examples/full.yaml")).expect("full example loads");
     assert_eq!(
         FORMAT_1_SPECIFICATION_COMMIT,
-        "cc4b0d734aa1c5953de75fb53b63e390a3b72761"
+        "7782671b56165a59caa61a65c29fefc63105ebf8"
     );
     assert_eq!(
         FORMAT_1_CONFORMANCE_COMMIT,
-        "5ba78c7ef90b8556e76de6481a18b23a3d0c2378"
+        "d6a45d31614ee25de20476ed93f10e14997d882c"
     );
 }
 
@@ -774,7 +774,7 @@ fn command_line_surface_is_validation_only_and_aliases_match() {
         assert!(version.status.success());
         assert_eq!(
             String::from_utf8(version.stdout).expect("UTF-8 output"),
-            "determa-state 0.1.0\n"
+            "determa-state 0.2.0\n"
         );
 
         let validation = Command::new(binary)

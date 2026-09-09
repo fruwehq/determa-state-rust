@@ -9,14 +9,15 @@ optional synchronous execution-checkpoint host. The crate is `determa-state`, th
 library module is `determa_state`, and the binary is published as `determa-state` plus
 the `determa-state-rust` launcher-selection alias.
 
-State `0.1.0` is published on crates.io. Repository metadata remains at `0.1.0` until a
-later synchronized State release is explicitly authorized.
+Repository metadata prepares the synchronized State `0.2.0` release. The latest
+published crate remains `0.1.0` until the coordinated `v0.2.0` tag runs the release
+workflow.
 
-The current draft is validated against the merged `0.1.0` metadata revisions at these
+The current draft is validated against the merged `0.2.0` metadata revisions at these
 exact immutable inputs:
 
-- specification: `cc4b0d734aa1c5953de75fb53b63e390a3b72761`;
-- conformance: `5ba78c7ef90b8556e76de6481a18b23a3d0c2378`.
+- specification: `7782671b56165a59caa61a65c29fefc63105ebf8`;
+- conformance: `d6a45d31614ee25de20476ed93f10e14997d882c`.
 
 The conformance suite is the arbiter of behavior. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
@@ -58,7 +59,7 @@ Never invent a release tag or weaken an exact revision check.
 ```sh
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
-  "5ba78c7ef90b8556e76de6481a18b23a3d0c2378"
+  "d6a45d31614ee25de20476ed93f10e14997d882c"
 cargo +1.86.0 build --release --locked --all-features
 cargo +1.86.0 test --locked --all-features
 cargo clippy --locked --all-features --all-targets -- -D warnings

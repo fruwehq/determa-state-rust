@@ -1,11 +1,11 @@
 [package]
 name = "determa-state"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.86"
 authors = ["fruwehq"]
 license = "MIT"
-description = "Determa State — Rust implementation of the Determa statechart engine (implements Determa State spec v0.1.0)"
+description = "Determa State — Rust implementation of the Determa statechart engine (implements Determa State spec v0.2.0)"
 repository = "https://github.com/fruwehq/determa-state-rust"
 readme = "README.md"
 exclude = [
