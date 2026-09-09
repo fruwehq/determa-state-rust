@@ -3,8 +3,8 @@ use determa_state::checkpoint::{
     StoreErrorCode,
 };
 use determa_state::{
-    Disposition, LoadErrorCode, PersistenceErrorCode, CREATION_REJECTION_CODES,
-    DISPATCH_REJECTION_CODES, ENGINE_FAULT_CODES,
+    CreationRejectionCode, DispatchRejectionCode, Disposition, EngineFaultCode, LoadErrorCode,
+    PersistenceErrorCode, CREATION_REJECTION_CODES, DISPATCH_REJECTION_CODES, ENGINE_FAULT_CODES,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,10 +25,6 @@ fn projected<T>(values: &[T], as_str: impl Fn(&T) -> &'static str) -> BTreeSet<S
         .iter()
         .map(|value| as_str(value).to_string())
         .collect()
-}
-
-fn strings(values: &[&str]) -> BTreeSet<String> {
-    values.iter().map(|value| (*value).to_string()).collect()
 }
 
 #[test]
@@ -58,13 +54,22 @@ fn production_exports_match_the_authoritative_registry_exactly() {
                 code.as_str()
             }),
         ),
-        ("creation_rejection", strings(CREATION_REJECTION_CODES)),
-        ("dispatch_rejection", strings(DISPATCH_REJECTION_CODES)),
+        (
+            "creation_rejection",
+            projected(CreationRejectionCode::PORTABLE_CODES, |code| code.as_str()),
+        ),
+        (
+            "dispatch_rejection",
+            projected(DispatchRejectionCode::PORTABLE_CODES, |code| code.as_str()),
+        ),
         (
             "disposition",
             projected(Disposition::PORTABLE_CODES, |code| code.as_str()),
         ),
-        ("engine_fault", strings(ENGINE_FAULT_CODES)),
+        (
+            "engine_fault",
+            projected(EngineFaultCode::PORTABLE_CODES, |code| code.as_str()),
+        ),
         (
             "execution_store_adapter_failure",
             projected(AdapterErrorCode::PORTABLE_CODES, |code| code.as_str()),
@@ -104,6 +109,31 @@ fn production_exports_match_the_authoritative_registry_exactly() {
             "portable code mismatch for {category}: missing={missing:?}, extra={extra:?}"
         );
     }
+}
+
+#[test]
+fn compatibility_string_exports_are_exact_projections_of_emitter_codes() {
+    assert_eq!(
+        CREATION_REJECTION_CODES,
+        CreationRejectionCode::PORTABLE_CODES
+            .iter()
+            .map(|code| code.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        DISPATCH_REJECTION_CODES,
+        DispatchRejectionCode::PORTABLE_CODES
+            .iter()
+            .map(|code| code.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        ENGINE_FAULT_CODES,
+        EngineFaultCode::PORTABLE_CODES
+            .iter()
+            .map(|code| code.as_str())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

@@ -41,9 +41,10 @@ runs all 91 host vectors through actual Rust host operations.
   with explicit durable receipt/outbox modes and schema-contract health checks.
 - Inspection through the returned logical aggregate state, result disposition, fault,
   rejection, configuration, variables, components, owned instances, and emissions.
-- Immutable `PORTABLE_CODES` slices on public closed-code enums, plus
+- Immutable `PORTABLE_CODES` slices on public closed-code enums, including
+  `CreationRejectionCode`, `DispatchRejectionCode`, and `EngineFaultCode`, plus
   `CREATION_REJECTION_CODES`, `DISPATCH_REJECTION_CODES`, and `ENGINE_FAULT_CODES` for
-  the portable categories represented as strings in runtime records.
+  compatibility with the existing string-slice API.
 
 The portable core remains a pure foreground transform and does not own queues, broker
 acknowledgement, timers, package imports, or a background scheduler. The optional host

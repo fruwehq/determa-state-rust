@@ -26,10 +26,10 @@ pub use persistence::{
     ResolvedMigrationDescriptor,
 };
 pub use runtime::{
-    create, dispatch, AggregateState, ComponentRuntime, CoreResult, Disposition, Emission,
-    FaultRecord, OwnedRuntime, Rejection, ResultStatus, RuntimeRelation, RuntimeState,
-    RuntimeStatus, VariableSlot, CREATION_REJECTION_CODES, DISPATCH_REJECTION_CODES,
-    ENGINE_FAULT_CODES,
+    create, dispatch, AggregateState, ComponentRuntime, CoreResult, CreationRejectionCode,
+    DispatchRejectionCode, Disposition, Emission, EngineFaultCode, FaultRecord, OwnedRuntime,
+    Rejection, ResultStatus, RuntimeRelation, RuntimeState, RuntimeStatus, VariableSlot,
+    CREATION_REJECTION_CODES, DISPATCH_REJECTION_CODES, ENGINE_FAULT_CODES,
 };
 pub use source::{load_bundle, load_bundle_from_json, parse_document, LoadError, LoadErrorCode};
 pub use wire::{

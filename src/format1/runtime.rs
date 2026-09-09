@@ -49,34 +49,133 @@ impl Disposition {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Portable rejection codes emitted while creating an aggregate.
+pub enum CreationRejectionCode {
+    InvalidBinding,
+    InvalidCreationRequest,
+    InvalidMachineTarget,
+}
+
+impl CreationRejectionCode {
+    pub const PORTABLE_CODES: &'static [Self] = &[
+        Self::InvalidBinding,
+        Self::InvalidCreationRequest,
+        Self::InvalidMachineTarget,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidBinding => "invalid_binding",
+            Self::InvalidCreationRequest => "invalid_creation_request",
+            Self::InvalidMachineTarget => "invalid_machine_target",
+        }
+    }
+}
+
 /// Complete creation-rejection set defined by the portable registry.
 pub const CREATION_REJECTION_CODES: &[&str] = &[
-    "invalid_binding",
-    "invalid_creation_request",
-    "invalid_machine_target",
+    CreationRejectionCode::InvalidBinding.as_str(),
+    CreationRejectionCode::InvalidCreationRequest.as_str(),
+    CreationRejectionCode::InvalidMachineTarget.as_str(),
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Portable rejection codes emitted while dispatching a delivery.
+pub enum DispatchRejectionCode {
+    InactiveComponentTarget,
+    IncompatibleBundle,
+    InvalidCorrelation,
+    InvalidEvent,
+    InvalidInstanceTarget,
+    InvalidPayload,
+    InvalidPriorState,
+}
+
+impl DispatchRejectionCode {
+    pub const PORTABLE_CODES: &'static [Self] = &[
+        Self::InactiveComponentTarget,
+        Self::IncompatibleBundle,
+        Self::InvalidCorrelation,
+        Self::InvalidEvent,
+        Self::InvalidInstanceTarget,
+        Self::InvalidPayload,
+        Self::InvalidPriorState,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InactiveComponentTarget => "inactive_component_target",
+            Self::IncompatibleBundle => "incompatible_bundle",
+            Self::InvalidCorrelation => "invalid_correlation",
+            Self::InvalidEvent => "invalid_event",
+            Self::InvalidInstanceTarget => "invalid_instance_target",
+            Self::InvalidPayload => "invalid_payload",
+            Self::InvalidPriorState => "invalid_prior_state",
+        }
+    }
+}
 
 /// Complete dispatch-rejection set defined by the portable registry.
 pub const DISPATCH_REJECTION_CODES: &[&str] = &[
-    "inactive_component_target",
-    "incompatible_bundle",
-    "invalid_correlation",
-    "invalid_event",
-    "invalid_instance_target",
-    "invalid_payload",
-    "invalid_prior_state",
+    DispatchRejectionCode::InactiveComponentTarget.as_str(),
+    DispatchRejectionCode::IncompatibleBundle.as_str(),
+    DispatchRejectionCode::InvalidCorrelation.as_str(),
+    DispatchRejectionCode::InvalidEvent.as_str(),
+    DispatchRejectionCode::InvalidInstanceTarget.as_str(),
+    DispatchRejectionCode::InvalidPayload.as_str(),
+    DispatchRejectionCode::InvalidPriorState.as_str(),
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Portable fault codes recorded by format-1 engine execution.
+pub enum EngineFaultCode {
+    ActionFault,
+    BindingNotEmpty,
+    CascadeFault,
+    ContainedRuntimeFault,
+    GuardFault,
+    InactiveComponentTarget,
+    InvalidInstanceTarget,
+    InvariantFault,
+}
+
+impl EngineFaultCode {
+    pub const PORTABLE_CODES: &'static [Self] = &[
+        Self::ActionFault,
+        Self::BindingNotEmpty,
+        Self::CascadeFault,
+        Self::ContainedRuntimeFault,
+        Self::GuardFault,
+        Self::InactiveComponentTarget,
+        Self::InvalidInstanceTarget,
+        Self::InvariantFault,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ActionFault => "action_fault",
+            Self::BindingNotEmpty => "binding_not_empty",
+            Self::CascadeFault => "cascade_fault",
+            Self::ContainedRuntimeFault => "contained_runtime_fault",
+            Self::GuardFault => "guard_fault",
+            Self::InactiveComponentTarget => "inactive_component_target",
+            Self::InvalidInstanceTarget => "invalid_instance_target",
+            Self::InvariantFault => "invariant_fault",
+        }
+    }
+}
 
 /// Complete engine-fault set defined by the portable registry.
 pub const ENGINE_FAULT_CODES: &[&str] = &[
-    "action_fault",
-    "binding_not_empty",
-    "cascade_fault",
-    "contained_runtime_fault",
-    "guard_fault",
-    "inactive_component_target",
-    "invalid_instance_target",
-    "invariant_fault",
+    EngineFaultCode::ActionFault.as_str(),
+    EngineFaultCode::BindingNotEmpty.as_str(),
+    EngineFaultCode::CascadeFault.as_str(),
+    EngineFaultCode::ContainedRuntimeFault.as_str(),
+    EngineFaultCode::GuardFault.as_str(),
+    EngineFaultCode::InactiveComponentTarget.as_str(),
+    EngineFaultCode::InvalidInstanceTarget.as_str(),
+    EngineFaultCode::InvariantFault.as_str(),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,7 +328,7 @@ pub struct OwnedRuntime {
 
 #[derive(Debug, Clone)]
 struct StepFault {
-    code: &'static str,
+    code: EngineFaultCode,
     source_locator: String,
 }
 
@@ -250,10 +349,10 @@ pub fn create(
     bindings: &Bindings,
 ) -> CoreResult {
     if root_instance_id.is_empty() || creation_id.is_empty() {
-        return rejected_creation("invalid_creation_request");
+        return rejected_creation(CreationRejectionCode::InvalidCreationRequest);
     }
     let Some(machine) = bundle.machines.get(machine_id).cloned() else {
-        return rejected_creation("invalid_machine_target");
+        return rejected_creation(CreationRejectionCode::InvalidMachineTarget);
     };
     let root_runtime_id = root_runtime_identity(bundle, &machine, root_instance_id);
     let root_definition = definition_binding(bundle, &machine);
@@ -284,7 +383,7 @@ pub fn create(
         next_output_sequence: Counter::zero(),
     };
     if initialize_root_variables(&mut aggregate.root, bindings).is_err() {
-        return rejected_creation("invalid_binding");
+        return rejected_creation(CreationRejectionCode::InvalidBinding);
     }
 
     let cause_id = initialization_cause(
@@ -322,7 +421,7 @@ pub fn create(
                 definition_fingerprint: bundle.fingerprint.clone(),
                 runtime_id: root_runtime_id,
                 cause_id,
-                code: fault.code.to_string(),
+                code: fault.code.as_str().to_string(),
                 step_sequence: Counter::zero(),
                 source_locator: fault.source_locator,
             };
@@ -358,13 +457,13 @@ pub fn dispatch(
     delivery: Option<Delivery>,
 ) -> CoreResult {
     if !validate_prior_state(prior_state) {
-        return rejected_dispatch(prior_state, "invalid_prior_state");
+        return rejected_dispatch(prior_state, DispatchRejectionCode::InvalidPriorState);
     }
     if prior_state.validated_bundle_fingerprint != bundle.fingerprint {
-        return rejected_dispatch(prior_state, "incompatible_bundle");
+        return rejected_dispatch(prior_state, DispatchRejectionCode::IncompatibleBundle);
     }
     if !validate_prior_state_bundle_binding(prior_state, bundle) {
-        return rejected_dispatch(prior_state, "invalid_prior_state");
+        return rejected_dispatch(prior_state, DispatchRejectionCode::InvalidPriorState);
     }
     let Some(delivery) = delivery else {
         return CoreResult {
@@ -381,10 +480,10 @@ pub fn dispatch(
         Delivery::Internal(envelope) => (DeliveryMode::Internal, envelope),
     };
     if prior_state.root.status == RuntimeStatus::Faulted {
-        return rejected_dispatch(prior_state, "invalid_instance_target");
+        return rejected_dispatch(prior_state, DispatchRejectionCode::InvalidInstanceTarget);
     }
     if matches!(mode, DeliveryMode::Input) && matches!(envelope.target, Target::Component { .. }) {
-        return rejected_dispatch(prior_state, "invalid_instance_target");
+        return rejected_dispatch(prior_state, DispatchRejectionCode::InvalidInstanceTarget);
     }
     let address = match resolve_delivery_target(prior_state, &envelope.target) {
         Ok(address) => address,
@@ -394,9 +493,9 @@ pub fn dispatch(
         return rejected_dispatch(
             prior_state,
             if matches!(envelope.target, Target::Component { .. }) {
-                "inactive_component_target"
+                DispatchRejectionCode::InactiveComponentTarget
             } else {
-                "invalid_instance_target"
+                DispatchRejectionCode::InvalidInstanceTarget
             },
         );
     };
@@ -404,9 +503,9 @@ pub fn dispatch(
         return rejected_dispatch(
             prior_state,
             if matches!(envelope.target, Target::Component { .. }) {
-                "inactive_component_target"
+                DispatchRejectionCode::InactiveComponentTarget
             } else {
-                "invalid_instance_target"
+                DispatchRejectionCode::InvalidInstanceTarget
             },
         );
     }
@@ -431,7 +530,7 @@ pub fn dispatch(
                 &address,
                 &normalized_envelope,
                 StepFault {
-                    code: "contained_runtime_fault",
+                    code: EngineFaultCode::ContainedRuntimeFault,
                     source_locator: "system:unhandled_contained_failure".to_string(),
                 },
             );
@@ -585,7 +684,7 @@ fn result_status(status: RuntimeStatus) -> ResultStatus {
     }
 }
 
-fn rejected_creation(code: &str) -> CoreResult {
+fn rejected_creation(code: CreationRejectionCode) -> CoreResult {
     CoreResult {
         status: ResultStatus::Rejected,
         disposition: None,
@@ -593,12 +692,12 @@ fn rejected_creation(code: &str) -> CoreResult {
         emissions: Vec::new(),
         fault: None,
         rejection: Some(Rejection {
-            code: code.to_string(),
+            code: code.as_str().to_string(),
         }),
     }
 }
 
-fn rejected_dispatch(prior_state: &AggregateState, code: &str) -> CoreResult {
+fn rejected_dispatch(prior_state: &AggregateState, code: DispatchRejectionCode) -> CoreResult {
     CoreResult {
         status: result_status(prior_state.root.status),
         disposition: Some(Disposition::Rejected),
@@ -606,7 +705,7 @@ fn rejected_dispatch(prior_state: &AggregateState, code: &str) -> CoreResult {
         emissions: Vec::new(),
         fault: prior_state.root.fault.clone(),
         rejection: Some(Rejection {
-            code: code.to_string(),
+            code: code.as_str().to_string(),
         }),
     }
 }
@@ -628,7 +727,7 @@ fn fault_dispatch(
             .clone(),
         runtime_id: runtime.runtime_id.clone(),
         cause_id: envelope.event_id.clone(),
-        code: fault.code.to_string(),
+        code: fault.code.as_str().to_string(),
         step_sequence: step_sequence.clone(),
         source_locator: fault.source_locator,
     };
@@ -1562,7 +1661,7 @@ fn initialize_root_variables(runtime: &mut RuntimeState, bindings: &Bindings) ->
 fn resolve_delivery_target(
     aggregate: &AggregateState,
     target: &Target,
-) -> Result<RuntimeAddress, &'static str> {
+) -> Result<RuntimeAddress, DispatchRejectionCode> {
     match target {
         Target::Root {
             root_instance_id,
@@ -1572,9 +1671,8 @@ fn resolve_delivery_target(
         {
             Ok(Vec::new())
         }
-        Target::SpawnedInstance(reference) => {
-            find_spawn_address(&aggregate.root, reference).ok_or("invalid_instance_target")
-        }
+        Target::SpawnedInstance(reference) => find_spawn_address(&aggregate.root, reference)
+            .ok_or(DispatchRejectionCode::InvalidInstanceTarget),
         Target::Component {
             root_instance_id,
             owner_runtime_id,
@@ -1588,9 +1686,9 @@ fn resolve_delivery_target(
             component_runtime_id,
             activation_sequence,
         )
-        .ok_or("inactive_component_target"),
-        Target::Component { .. } => Err("inactive_component_target"),
-        _ => Err("invalid_instance_target"),
+        .ok_or(DispatchRejectionCode::InactiveComponentTarget),
+        Target::Component { .. } => Err(DispatchRejectionCode::InactiveComponentTarget),
+        _ => Err(DispatchRejectionCode::InvalidInstanceTarget),
     }
 }
 
@@ -1926,9 +2024,9 @@ fn validate_envelope(
     runtime: &RuntimeState,
     mode: DeliveryMode,
     envelope: &Envelope,
-) -> Result<Envelope, &'static str> {
+) -> Result<Envelope, DispatchRejectionCode> {
     if envelope.event_id.is_empty() {
-        return Err("invalid_event");
+        return Err(DispatchRejectionCode::InvalidEvent);
     }
     let declaration = runtime
         .definition
@@ -1943,28 +2041,28 @@ fn validate_envelope(
                         envelope.target,
                         Target::Root { .. } | Target::SpawnedInstance(_)
                     ) => {}
-                DeliveryMode::Input => return Err("invalid_instance_target"),
+                DeliveryMode::Input => return Err(DispatchRejectionCode::InvalidInstanceTarget),
                 DeliveryMode::Internal if matches!(envelope.target, Target::Component { .. }) => {}
-                DeliveryMode::Internal => return Err("invalid_event"),
+                DeliveryMode::Internal => return Err(DispatchRejectionCode::InvalidEvent),
             }
             if envelope.correlation_id.is_some() {
-                return Err("invalid_correlation");
+                return Err(DispatchRejectionCode::InvalidCorrelation);
             }
             let Some(Value::Map(changed)) = envelope.payload.get("changed") else {
-                return Err("invalid_payload");
+                return Err(DispatchRejectionCode::InvalidPayload);
             };
             if envelope.payload.len() != 1 || changed.is_empty() {
-                return Err("invalid_payload");
+                return Err(DispatchRejectionCode::InvalidPayload);
             }
             let external = root_external_variables(&runtime.definition);
             let mut normalized = BTreeMap::new();
             for (name, value) in changed {
                 let Some(declaration) = external.get(name) else {
-                    return Err("invalid_payload");
+                    return Err(DispatchRejectionCode::InvalidPayload);
                 };
                 let value = value
                     .normalize_for_type(&declaration.value_type)
-                    .ok_or("invalid_payload")?;
+                    .ok_or(DispatchRejectionCode::InvalidPayload)?;
                 normalized.insert(name.clone(), value);
             }
             return Ok(Envelope {
@@ -1977,19 +2075,19 @@ fn validate_envelope(
         | "determa.component_failed"
         | "determa.spawned_instance_failed" => {
             if matches!(mode, DeliveryMode::Input) {
-                return Err("invalid_event");
+                return Err(DispatchRejectionCode::InvalidEvent);
             }
             if envelope.correlation_id.is_some() {
-                return Err("invalid_correlation");
+                return Err(DispatchRejectionCode::InvalidCorrelation);
             }
             validate_reserved_lifecycle_payload(&envelope.event, &envelope.payload)
-                .map_err(|_| "invalid_payload")?;
+                .map_err(|_| DispatchRejectionCode::InvalidPayload)?;
             return Ok(envelope.clone());
         }
         _ => {}
     }
     let Some(declaration) = declaration else {
-        return Err("invalid_event");
+        return Err(DispatchRejectionCode::InvalidEvent);
     };
     match (mode, declaration.direction) {
         (DeliveryMode::Input, EventDirection::Input)
@@ -1999,7 +2097,7 @@ fn validate_envelope(
             ) => {}
         (DeliveryMode::Internal, EventDirection::Internal) => {}
         (DeliveryMode::Input, _) | (DeliveryMode::Internal, _) => {
-            return Err("invalid_event");
+            return Err(DispatchRejectionCode::InvalidEvent);
         }
     }
     if envelope
@@ -2008,10 +2106,10 @@ fn validate_envelope(
         .is_some_and(String::is_empty)
         || declaration.correlates_to.is_some() && envelope.correlation_id.is_none()
     {
-        return Err("invalid_correlation");
+        return Err(DispatchRejectionCode::InvalidCorrelation);
     }
-    let payload =
-        normalize_payload(declaration, &envelope.payload).map_err(|_| "invalid_payload")?;
+    let payload = normalize_payload(declaration, &envelope.payload)
+        .map_err(|_| DispatchRejectionCode::InvalidPayload)?;
     Ok(Envelope {
         payload,
         ..envelope.clone()
@@ -2224,7 +2322,7 @@ fn select_handler(
                             Ok(false) => continue,
                             Err(_) => {
                                 return Err(StepFault {
-                                    code: "guard_fault",
+                                    code: EngineFaultCode::GuardFault,
                                     source_locator: transition
                                         .guard_pointer
                                         .clone()
@@ -2355,7 +2453,7 @@ fn choice_enabled(
     };
     cel::evaluate_boolean(guard, &action_environment(runtime, scope, Some(envelope))).map_err(
         |_| StepFault {
-            code: "guard_fault",
+            code: EngineFaultCode::GuardFault,
             source_locator: branch.guard_pointer.clone().expect("guard pointer"),
         },
     )
@@ -2487,7 +2585,7 @@ fn initialize_state_variables(
                     .map(|value| value.unwrap_or(Value::Null))
             })
             .ok_or_else(|| StepFault {
-                code: "action_fault",
+                code: EngineFaultCode::ActionFault,
                 source_locator: format!(
                     "{}/variables/{}",
                     state.pointer,
@@ -2500,7 +2598,7 @@ fn initialize_state_variables(
             value
                 .normalize_for_type(&declaration.value_type)
                 .ok_or_else(|| StepFault {
-                    code: "action_fault",
+                    code: EngineFaultCode::ActionFault,
                     source_locator: format!(
                         "{}/variables/{}/init",
                         state.pointer,
@@ -2625,7 +2723,7 @@ fn run_actions(
             } => {
                 let environment = action_environment(runtime, scope, envelope);
                 let value = cel::evaluate(expression, &environment).map_err(|_| StepFault {
-                    code: "action_fault",
+                    code: EngineFaultCode::ActionFault,
                     source_locator: format!(
                         "{}/assign/{}",
                         action.pointer,
@@ -2634,7 +2732,7 @@ fn run_actions(
                 })?;
                 let key =
                     resolve_variable_key(runtime, scope, variable).ok_or_else(|| StepFault {
-                        code: "action_fault",
+                        code: EngineFaultCode::ActionFault,
                         source_locator: format!(
                             "{}/assign/{}",
                             action.pointer,
@@ -2644,7 +2742,7 @@ fn run_actions(
                 let slot = runtime.variables.get_mut(&key).expect("resolved variable");
                 if slot.declaration.external {
                     return Err(StepFault {
-                        code: "action_fault",
+                        code: EngineFaultCode::ActionFault,
                         source_locator: format!(
                             "{}/assign/{}",
                             action.pointer,
@@ -2657,7 +2755,7 @@ fn run_actions(
                         Value::Null | Value::InstanceReference(_) => value,
                         _ => {
                             return Err(StepFault {
-                                code: "action_fault",
+                                code: EngineFaultCode::ActionFault,
                                 source_locator: format!(
                                     "{}/assign/{}",
                                     action.pointer,
@@ -2670,7 +2768,7 @@ fn run_actions(
                     value
                         .normalize_for_type(&slot.declaration.value_type)
                         .ok_or_else(|| StepFault {
-                            code: "action_fault",
+                            code: EngineFaultCode::ActionFault,
                             source_locator: format!(
                                 "{}/assign/{}",
                                 action.pointer,
@@ -2699,13 +2797,13 @@ fn run_actions(
             CompiledActionKind::Refresh { only } => {
                 let Some(envelope) = envelope.filter(|envelope| envelope.event == "env") else {
                     return Err(StepFault {
-                        code: "action_fault",
+                        code: EngineFaultCode::ActionFault,
                         source_locator: format!("{}/refresh", action.pointer),
                     });
                 };
                 let Some(Value::Map(changed)) = envelope.payload.get("changed") else {
                     return Err(StepFault {
-                        code: "action_fault",
+                        code: EngineFaultCode::ActionFault,
                         source_locator: format!("{}/refresh", action.pointer),
                     });
                 };
@@ -2716,26 +2814,26 @@ fn run_actions(
                 for (index, name) in selected.iter().enumerate() {
                     let Some(value) = changed.get(name) else {
                         return Err(StepFault {
-                            code: "action_fault",
+                            code: EngineFaultCode::ActionFault,
                             source_locator: format!("{}/refresh/only/{index}", action.pointer),
                         });
                     };
                     let key =
                         resolve_variable_key(runtime, scope, name).ok_or_else(|| StepFault {
-                            code: "action_fault",
+                            code: EngineFaultCode::ActionFault,
                             source_locator: format!("{}/refresh/only/{index}", action.pointer),
                         })?;
                     let slot = &runtime.variables[&key];
                     if !slot.declaration.external {
                         return Err(StepFault {
-                            code: "action_fault",
+                            code: EngineFaultCode::ActionFault,
                             source_locator: format!("{}/refresh/only/{index}", action.pointer),
                         });
                     }
                     let normalized = value
                         .normalize_for_type(&slot.declaration.value_type)
                         .ok_or_else(|| StepFault {
-                            code: "action_fault",
+                            code: EngineFaultCode::ActionFault,
                             source_locator: format!("{}/refresh/only/{index}", action.pointer),
                         })?;
                     updates.push((key, normalized));
@@ -2761,7 +2859,7 @@ fn run_actions(
             CompiledActionKind::Cancel { instance } => {
                 let value = cel::evaluate(instance, &action_environment(runtime, scope, envelope))
                     .map_err(|_| StepFault {
-                        code: "action_fault",
+                        code: EngineFaultCode::ActionFault,
                         source_locator: format!("{}/cancel/instance", action.pointer),
                     })?;
                 if let Value::InstanceReference(reference) = value {
@@ -2793,7 +2891,7 @@ fn execute_send(
     let mut payload = BTreeMap::new();
     for (name, expression) in payload_expressions {
         let value = cel::evaluate(expression, &environment).map_err(|_| StepFault {
-            code: "action_fault",
+            code: EngineFaultCode::ActionFault,
             source_locator: format!(
                 "{}/send/payload/{}",
                 action.pointer,
@@ -2807,13 +2905,13 @@ fn execute_send(
         .map(|expression| {
             cel::evaluate(expression, &environment)
                 .map_err(|_| StepFault {
-                    code: "action_fault",
+                    code: EngineFaultCode::ActionFault,
                     source_locator: format!("{}/send/correlation_id", action.pointer),
                 })
                 .and_then(|value| match value {
                     Value::String(value) if !value.is_empty() => Ok(value),
                     _ => Err(StepFault {
-                        code: "action_fault",
+                        code: EngineFaultCode::ActionFault,
                         source_locator: format!("{}/send/correlation_id", action.pointer),
                     }),
                 })
@@ -2823,7 +2921,7 @@ fn execute_send(
     for (index, target) in targets.iter().enumerate() {
         if let CompiledSendTarget::Instance(expression) = target {
             let value = cel::evaluate(expression, &environment).map_err(|_| StepFault {
-                code: "action_fault",
+                code: EngineFaultCode::ActionFault,
                 source_locator: target_expression_pointer(action, targets, index),
             })?;
             dynamic_values.push(Some(value));
@@ -2842,7 +2940,7 @@ fn execute_send(
     };
     if let Some(declaration) = declaration {
         payload = normalize_payload(declaration, &payload).map_err(|_| StepFault {
-            code: "action_fault",
+            code: EngineFaultCode::ActionFault,
             source_locator: format!("{}/send/payload", action.pointer),
         })?;
     }
@@ -2935,7 +3033,7 @@ fn resolve_author_target(
     match target {
         CompiledSendTarget::SelfTarget => Ok(runtime_target(runtime, root_instance_id)),
         CompiledSendTarget::Owner => owner_target(runtime, root_instance_id).ok_or(StepFault {
-            code: "invalid_instance_target",
+            code: EngineFaultCode::InvalidInstanceTarget,
             source_locator: pointer,
         }),
         CompiledSendTarget::Component(component_id) => {
@@ -2944,12 +3042,12 @@ fn resolve_author_target(
                 .iter()
                 .find(|component| component.component_id == *component_id)
                 .ok_or_else(|| StepFault {
-                    code: "inactive_component_target",
+                    code: EngineFaultCode::InactiveComponentTarget,
                     source_locator: pointer.clone(),
                 })?;
             if component.runtime.status != RuntimeStatus::Running {
                 return Err(StepFault {
-                    code: "inactive_component_target",
+                    code: EngineFaultCode::InactiveComponentTarget,
                     source_locator: pointer,
                 });
             }
@@ -2958,13 +3056,13 @@ fn resolve_author_target(
         CompiledSendTarget::Instance(_) => {
             let Some(Value::InstanceReference(reference)) = dynamic else {
                 return Err(StepFault {
-                    code: "invalid_instance_target",
+                    code: EngineFaultCode::InvalidInstanceTarget,
                     source_locator: target_expression_pointer(action, targets, index),
                 });
             };
             if find_spawn_address(runtime, reference).is_none() {
                 return Err(StepFault {
-                    code: "invalid_instance_target",
+                    code: EngineFaultCode::InvalidInstanceTarget,
                     source_locator: target_expression_pointer(action, targets, index),
                 });
             }
@@ -3038,7 +3136,7 @@ fn execute_spawn(
         &format!("{}/spawn/bindings", action.pointer),
     )?;
     validate_runtime_bindings(&machine, &bindings).map_err(|_| StepFault {
-        code: "action_fault",
+        code: EngineFaultCode::ActionFault,
         source_locator: format!("{}/spawn/bindings", action.pointer),
     })?;
     let spawn_sequence = runtime.next_spawn_sequence.allocate();
@@ -3063,7 +3161,7 @@ fn execute_spawn(
         let slot = runtime.variables.get_mut(&key).expect("bind slot");
         if slot.value != Value::Null {
             return Err(StepFault {
-                code: "binding_not_empty",
+                code: EngineFaultCode::BindingNotEmpty,
                 source_locator: format!("{}/spawn/bind_to", action.pointer),
             });
         }
@@ -3104,7 +3202,7 @@ fn execute_spawn(
         None,
     );
     initialize_root_variables(&mut child, &bindings).map_err(|_| StepFault {
-        code: "action_fault",
+        code: EngineFaultCode::ActionFault,
         source_locator: format!("{}/spawn/bindings", action.pointer),
     })?;
     let child_cause = initialization_cause(
@@ -3132,7 +3230,7 @@ fn execute_spawn(
                 .clone(),
             runtime_id: child.runtime_id.clone(),
             cause_id: child_cause,
-            code: fault.code.to_string(),
+            code: fault.code.as_str().to_string(),
             step_sequence: context.step_sequence.clone(),
             source_locator: fault.source_locator,
         };
@@ -3185,7 +3283,7 @@ fn evaluate_bindings(
     ] {
         for (name, expression) in source {
             let value = cel::evaluate(expression, &environment).map_err(|_| StepFault {
-                code: "action_fault",
+                code: EngineFaultCode::ActionFault,
                 source_locator: format!("{pointer}/{kind}/{}", super::source::escape_pointer(name)),
             })?;
             output.insert(name.clone(), value);
@@ -3313,7 +3411,7 @@ fn initialize_components(
         )?;
         let child = &mut runtime.components[index].runtime;
         validate_runtime_bindings(&child.definition, &bindings).map_err(|_| StepFault {
-            code: "action_fault",
+            code: EngineFaultCode::ActionFault,
             source_locator: format!("{}/with", component_definition.pointer),
         })?;
         let child_cause = initialization_cause(
@@ -3345,7 +3443,7 @@ fn initialize_components(
                 definition_fingerprint: current_definition.validated_bundle_fingerprint.clone(),
                 runtime_id: runtime_id.clone(),
                 cause_id: child_cause.clone(),
-                code: fault.code.to_string(),
+                code: fault.code.as_str().to_string(),
                 step_sequence: context.step_sequence.clone(),
                 source_locator: fault.source_locator,
             };
@@ -3585,7 +3683,7 @@ fn cleanup_runtime_inner(
 
 fn cascade_step_fault() -> StepFault {
     StepFault {
-        code: "cascade_fault",
+        code: EngineFaultCode::CascadeFault,
         source_locator: "system:cascade_cleanup".to_string(),
     }
 }
@@ -4060,6 +4158,47 @@ machines:
                     payload: { value: "1" }
         unlocked: {}
 "#;
+
+    #[test]
+    fn closed_code_enums_drive_production_rejection_and_fault_strings() {
+        for code in CreationRejectionCode::PORTABLE_CODES {
+            assert_eq!(
+                rejected_creation(*code)
+                    .rejection
+                    .expect("creation rejection")
+                    .code,
+                code.as_str()
+            );
+        }
+
+        let bundle = load_bundle(IDENTITY_VECTOR_BUNDLE).expect("identity bundle");
+        let aggregate = create(
+            &bundle,
+            "turnstile",
+            "closed-code-root",
+            "closed-code-create",
+            &Bindings::default(),
+        )
+        .state
+        .expect("created aggregate");
+        for code in DispatchRejectionCode::PORTABLE_CODES {
+            assert_eq!(
+                rejected_dispatch(&aggregate, *code)
+                    .rejection
+                    .expect("dispatch rejection")
+                    .code,
+                code.as_str()
+            );
+        }
+
+        for code in EngineFaultCode::PORTABLE_CODES {
+            let fault = StepFault {
+                code: *code,
+                source_locator: "/closed-code-test".to_string(),
+            };
+            assert_eq!(fault.code.as_str(), code.as_str());
+        }
+    }
 
     fn cascade_fault_bundle(mode: &str) -> String {
         let root = match mode {
