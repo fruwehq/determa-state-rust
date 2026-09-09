@@ -2,7 +2,7 @@ use determa_state::checkpoint::{
     register_bundled_adapters, validate_outbox_compaction, AcceptanceResult, AdapterError,
     AdapterErrorCode, AdapterRegistry, CheckpointHost, CreationRequest, DeliveryRequest,
     EmissionReference, ExecutionCheckpoint, ExecutionStore, ExecutionStoreCapability,
-    ExecutionStoreFactory, HostFeature, HostProfile, MaintenanceMigrationRequest,
+    ExecutionStoreFactory, HealthStatus, HostFeature, HostProfile, MaintenanceMigrationRequest,
     MemoryExecutionStore, MutationGuard, OperationReceipt, OutboxRecord, PendingOutboxState,
     PreAcceptanceFailureCode, ProcessingMigration, ReplayRetention, RootRecord, StoreError,
     StoreRecord, StoreWriteResult, TerminalOutboxOutcome, TerminalRootStatus,
@@ -12,6 +12,7 @@ use determa_state::{
     RuntimeStatus, Value,
 };
 use serde_json::{json, Value as JsonValue};
+use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -68,7 +69,7 @@ fn all_checkpoint_artifacts_have_the_declared_classification() {
 }
 
 #[test]
-fn all_85_execution_checkpoint_vectors_run_through_the_host() {
+fn all_91_execution_checkpoint_vectors_run_through_the_host() {
     let mut count = 0;
     for case in case_directories() {
         let document = read_yaml(&case.join("test.yaml"));
@@ -82,7 +83,116 @@ fn all_85_execution_checkpoint_vectors_run_through_the_host() {
             run_vector(&case, &inputs, &resolver, &bundles, vector);
         }
     }
-    assert_eq!(count, 85);
+    assert_eq!(count, 91);
+}
+
+#[test]
+fn scope_state_comparison_rejects_digest_root_and_extra_sabotage() {
+    let case = PathBuf::from(PROFILE).join("checkpoint-02-outbox-lifecycle");
+    let inputs = read_json(&case.join("inputs.json"));
+    let (resolver, _) = resolver_for_case(&case, &inputs);
+    let states = read_json(&case.join("scope-states.json"));
+    let base = resolve_pointer(&states, "/snapshots/base");
+    let backend = ScopeBackend::from_state(&case, base, &resolver).expect("scope backend seed");
+    let observed = backend.observe().expect("scope state observation");
+    compare_scope_state(&case, &observed, base, &resolver).expect("unaltered scope fixture");
+
+    let mut corrupt_digest = base.clone();
+    corrupt_digest["scopes"][0]["outbox_records"][0]["source_digest"] =
+        json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    assert!(
+        compare_scope_state(&case, &observed, &corrupt_digest, &resolver).is_err(),
+        "corrupt expected outbox source digest must fail"
+    );
+
+    let mut omitted_unchanged_root = base.clone();
+    omitted_unchanged_root["scopes"][1]["checkpoints"]
+        .as_object_mut()
+        .expect("scope-b checkpoint map")
+        .remove("outbox-root");
+    assert!(
+        compare_scope_state(&case, &observed, &omitted_unchanged_root, &resolver).is_err(),
+        "omitting an unchanged checkpoint root must fail"
+    );
+
+    let store = backend
+        .stores
+        .get("physical-isolation-scope-a")
+        .expect("scope-a store");
+    let extra_checkpoint = restore_fixture(&case, "outbox-base-checkpoint.json", &resolver);
+    let mut extra = StoreRecord::from_checkpoint(&extra_checkpoint).expect("extra record");
+    extra.root_instance_id = "extra-root".to_string();
+    store.seed(extra).expect("seed extra root");
+    let observed_with_extra = backend.observe().expect("scope state with extra root");
+    assert!(
+        compare_scope_state(&case, &observed_with_extra, base, &resolver).is_err(),
+        "an extra actual checkpoint root must fail exact key comparison"
+    );
+}
+
+#[test]
+fn scope_state_comparison_rejects_semantically_equivalent_byte_changes() {
+    let case = PathBuf::from(PROFILE).join("checkpoint-02-outbox-lifecycle");
+    let inputs = read_json(&case.join("inputs.json"));
+    let (resolver, _) = resolver_for_case(&case, &inputs);
+    let states = read_json(&case.join("scope-states.json"));
+    let base = resolve_pointer(&states, "/snapshots/base");
+    let backend = ScopeBackend::from_state(&case, base, &resolver).expect("scope backend seed");
+    let observed_before = backend.observe().expect("scope state observation");
+
+    let store = backend
+        .stores
+        .get("physical-isolation-scope-a")
+        .expect("scope-a store");
+    store
+        .records
+        .lock()
+        .expect("scope-a records")
+        .get_mut("outbox-root")
+        .expect("outbox root")
+        .bytes
+        .push(b'\n');
+
+    let observed_after = backend.observe().expect("newline remains valid JSON");
+    assert_eq!(
+        observed_before.outbox_projection(),
+        observed_after.outbox_projection(),
+        "the byte sabotage must remain semantically equivalent for outbox projection"
+    );
+    assert!(
+        compare_scope_state(&case, &observed_after, base, &resolver).is_err(),
+        "semantically equivalent stored JSON bytes must not satisfy exact scope comparison"
+    );
+}
+
+#[test]
+fn rejected_scope_call_assertion_detects_real_store_access() {
+    let case = PathBuf::from(PROFILE).join("checkpoint-02-outbox-lifecycle");
+    let inputs = read_json(&case.join("inputs.json"));
+    let (resolver, _) = resolver_for_case(&case, &inputs);
+    let states = read_json(&case.join("scope-states.json"));
+    let base = resolve_pointer(&states, "/snapshots/base");
+    let document = read_yaml(&case.join("test.yaml"));
+    let vector = document["execution_checkpoint_profile"]["vectors"]
+        .as_array()
+        .expect("checkpoint vectors")
+        .iter()
+        .find(|vector| vector["name"].as_str() == Some("missing_scope_fails_before_host_operation"))
+        .expect("missing-scope vector");
+    let backend = ScopeBackend::from_state(&case, base, &resolver).expect("scope backend seed");
+    assert!(backend.resolve(&vector["scope_selection"]).is_none());
+    assert_scope_calls(&backend.calls(), &vector["expect"]["calls"])
+        .expect("rejected path makes no store call");
+
+    let store = backend
+        .stores
+        .get("physical-isolation-scope-a")
+        .expect("scope-a store");
+    ExecutionStore::load(store.as_ref(), "outbox-root").expect("deliberate real store load");
+    assert!(
+        assert_scope_calls(&backend.calls(), &vector["expect"]["calls"]).is_err(),
+        "instrumentation must expose a real rejected-path store load"
+    );
 }
 
 #[test]
@@ -404,6 +514,10 @@ fn run_vector(
     let name = vector["name"].as_str().expect("vector name");
     let operation = vector["operation"].as_str().expect("operation");
     let expect = &vector["expect"];
+    if vector.get("scope_state_before").is_some() {
+        run_scope_vector(case, resolver, vector);
+        return;
+    }
     if matches!(
         operation,
         "inject_execution_store" | "register_adapter" | "resolve_adapter" | "validate_host_profile"
@@ -494,6 +608,601 @@ fn run_vector(
                 );
             }
         }
+    }
+}
+
+fn run_scope_vector(case: &Path, resolver: &InMemoryDefinitionResolver, vector: &JsonValue) {
+    let name = vector["name"].as_str().expect("scope vector name");
+    let states = read_json(
+        &case.join(
+            vector["scope_state_before"]["file"]
+                .as_str()
+                .expect("scope state file"),
+        ),
+    );
+    let before = resolve_pointer(
+        &states,
+        vector["scope_state_before"]["pointer"]
+            .as_str()
+            .expect("scope state pointer"),
+    );
+    let after = resolve_pointer(
+        &states,
+        vector["scope_state_after"]["pointer"]
+            .as_str()
+            .expect("scope state pointer"),
+    );
+
+    let backend = ScopeBackend::from_state(case, before, resolver).expect("scope backend seed");
+    let observed_before = backend.observe().expect("scope state before");
+    let selected = backend.resolve(&vector["scope_selection"]);
+    let (selection_result, selected_scope_id) = if let Some(store) = selected {
+        let selected_scope_id = store.logical_scope_id.clone();
+        backend
+            .update_pending_outbox(store, vector, resolver)
+            .expect("selected scope update");
+        ("selected", Some(selected_scope_id))
+    } else {
+        ("rejected", None)
+    };
+    let observed_after = backend.observe().expect("scope state after");
+
+    let expect = &vector["expect"];
+    assert_eq!(
+        selection_result,
+        expect["selection_result"]
+            .as_str()
+            .expect("selection result"),
+        "{name} selection result"
+    );
+    assert_eq!(
+        selected_scope_id.as_deref(),
+        expect["selected_scope_id"].as_str(),
+        "{name} selected scope"
+    );
+    assert_scope_calls(&backend.calls(), &expect["calls"])
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+    compare_scope_state(case, &observed_after, after, resolver)
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+
+    let scope_mutation = mutation(&observed_before, &observed_after);
+    let checkpoint_mutation = mutation(
+        &observed_before.checkpoint_projection(),
+        &observed_after.checkpoint_projection(),
+    );
+    let outbox_mutation = mutation(
+        &observed_before.outbox_projection(),
+        &observed_after.outbox_projection(),
+    );
+    assert_eq!(
+        scope_mutation,
+        expect["scope_state_mutation"]
+            .as_str()
+            .expect("scope state mutation"),
+        "{name} scope mutation"
+    );
+    assert_eq!(
+        checkpoint_mutation,
+        expect["checkpoint_map_mutation"]
+            .as_str()
+            .expect("checkpoint map mutation"),
+        "{name} checkpoint map mutation"
+    );
+    assert_eq!(
+        outbox_mutation,
+        expect["outbox_record_map_mutation"]
+            .as_str()
+            .expect("outbox record map mutation"),
+        "{name} outbox record map mutation"
+    );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScopeCall {
+    Resolver(&'static str),
+    Host(&'static str),
+    Store(&'static str),
+}
+
+struct ScopeStore {
+    logical_scope_id: String,
+    physical_isolation_key: String,
+    records: Mutex<BTreeMap<String, StoreRecord>>,
+    calls: Arc<Mutex<Vec<ScopeCall>>>,
+}
+
+impl ScopeStore {
+    fn seed(&self, record: StoreRecord) -> Result<(), String> {
+        let mut records = self.records.lock().map_err(|_| "scope store lock")?;
+        if records
+            .insert(record.root_instance_id.clone(), record)
+            .is_some()
+        {
+            return Err("duplicate checkpoint root in scope fixture".to_string());
+        }
+        Ok(())
+    }
+
+    fn peek(&self, root: &str) -> Result<Option<StoreRecord>, String> {
+        Ok(self
+            .records
+            .lock()
+            .map_err(|_| "scope store lock")?
+            .get(root)
+            .cloned())
+    }
+
+    fn snapshot(&self) -> Result<BTreeMap<String, StoreRecord>, String> {
+        Ok(self.records.lock().map_err(|_| "scope store lock")?.clone())
+    }
+
+    fn record_call(&self, call: ScopeCall) -> Result<(), StoreError> {
+        self.calls
+            .lock()
+            .map_err(|_| StoreError::new("scope call log lock is poisoned"))?
+            .push(call);
+        Ok(())
+    }
+}
+
+impl ExecutionStore for ScopeStore {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn capabilities(&self) -> BTreeSet<ExecutionStoreCapability> {
+        BTreeSet::from([ExecutionStoreCapability::Ephemeral])
+    }
+
+    fn initialize_schema(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn health(&self) -> Result<HealthStatus, StoreError> {
+        Ok(HealthStatus::healthy("instrumented scope store"))
+    }
+
+    fn load(&self, root_instance_id: &str) -> Result<Option<StoreRecord>, StoreError> {
+        self.record_call(ScopeCall::Store("load_checkpoint"))?;
+        self.peek(root_instance_id).map_err(StoreError::new)
+    }
+
+    fn insert_if_absent(&self, record: StoreRecord) -> Result<StoreWriteResult, StoreError> {
+        self.record_call(ScopeCall::Store("insert_checkpoint"))?;
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| StoreError::new("scope store lock is poisoned"))?;
+        if let Some(current) = records.get(&record.root_instance_id) {
+            return Ok(StoreWriteResult::Conflict(Some(current.clone())));
+        }
+        records.insert(record.root_instance_id.clone(), record);
+        Ok(StoreWriteResult::Committed)
+    }
+
+    fn compare_and_swap(
+        &self,
+        root_instance_id: &str,
+        expected_revision: &str,
+        expected_checkpoint_digest: &str,
+        replacement: StoreRecord,
+    ) -> Result<StoreWriteResult, StoreError> {
+        self.record_call(ScopeCall::Store("compare_and_swap_checkpoint"))?;
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| StoreError::new("scope store lock is poisoned"))?;
+        let Some(current) = records.get(root_instance_id) else {
+            return Ok(StoreWriteResult::Conflict(None));
+        };
+        if current.revision != expected_revision
+            || current.execution_checkpoint_digest != expected_checkpoint_digest
+        {
+            return Ok(StoreWriteResult::Conflict(Some(current.clone())));
+        }
+        records.insert(root_instance_id.to_string(), replacement);
+        Ok(StoreWriteResult::Committed)
+    }
+}
+
+struct ScopeBackend {
+    physical_backend_id: String,
+    stores: BTreeMap<String, Arc<ScopeStore>>,
+    calls: Arc<Mutex<Vec<ScopeCall>>>,
+}
+
+impl ScopeBackend {
+    fn from_state(
+        case: &Path,
+        state: &JsonValue,
+        resolver: &InMemoryDefinitionResolver,
+    ) -> Result<Self, String> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut stores = BTreeMap::new();
+        for scope in state["scopes"]
+            .as_array()
+            .ok_or_else(|| "scope list is missing".to_string())?
+        {
+            let logical_scope_id = required_string(scope, "logical_scope_id")?;
+            let physical_isolation_key = required_string(scope, "physical_isolation_key")?;
+            let store = Arc::new(ScopeStore {
+                logical_scope_id: logical_scope_id.to_string(),
+                physical_isolation_key: physical_isolation_key.to_string(),
+                records: Mutex::new(BTreeMap::new()),
+                calls: calls.clone(),
+            });
+            let checkpoints = scope["checkpoints"]
+                .as_object()
+                .ok_or_else(|| "scope checkpoints are missing".to_string())?;
+            for (root, metadata) in checkpoints {
+                let checkpoint =
+                    restore_fixture(case, required_string(metadata, "file")?, resolver);
+                let record = StoreRecord::from_checkpoint(&checkpoint).map_err(error_string)?;
+                if record.root_instance_id != *root {
+                    return Err(format!(
+                        "checkpoint root {} does not match map key {root}",
+                        record.root_instance_id
+                    ));
+                }
+                store.seed(record)?;
+            }
+            if stores
+                .insert(physical_isolation_key.to_string(), store)
+                .is_some()
+            {
+                return Err("duplicate physical isolation key".to_string());
+            }
+        }
+        Ok(Self {
+            physical_backend_id: required_string(state, "physical_backend_id")?.to_string(),
+            stores,
+            calls,
+        })
+    }
+
+    fn resolve(&self, selection: &JsonValue) -> Option<Arc<ScopeStore>> {
+        self.calls
+            .lock()
+            .expect("scope call log")
+            .push(ScopeCall::Resolver("resolve_execution_store_scope"));
+        let candidates = selection["candidates"].as_array()?;
+        if candidates.len() != 1 {
+            return None;
+        }
+        let candidate = &candidates[0];
+        if candidate["authorized"].as_bool() != Some(true)
+            || selection["requested_scope_id"].as_str() != candidate["logical_scope_id"].as_str()
+        {
+            return None;
+        }
+        let physical_key = candidate["physical_isolation_key"].as_str()?;
+        let store = self.stores.get(physical_key)?.clone();
+        (store.logical_scope_id.as_str() == candidate["logical_scope_id"].as_str()?)
+            .then_some(store)
+    }
+
+    fn update_pending_outbox(
+        &self,
+        store: Arc<ScopeStore>,
+        vector: &JsonValue,
+        resolver: &InMemoryDefinitionResolver,
+    ) -> Result<(), String> {
+        self.calls
+            .lock()
+            .map_err(|_| "scope call log lock")?
+            .push(ScopeCall::Host("update_pending_outbox"));
+        let root = store
+            .snapshot()?
+            .keys()
+            .next()
+            .cloned()
+            .ok_or_else(|| "selected scope has no checkpoint".to_string())?;
+        let current = store
+            .peek(&root)?
+            .ok_or_else(|| "selected checkpoint disappeared".to_string())?;
+        let desired: PendingOutboxState =
+            serde_json::from_value(vector["desired_pending_state"].clone())
+                .map_err(error_string)?;
+        let guard = MutationGuard::new(current.revision, current.execution_checkpoint_digest);
+        let execution_store: Arc<dyn ExecutionStore> = store;
+        let host = CheckpointHost::new(execution_store, Arc::new(resolver.clone()));
+        host.update_pending_outbox(
+            &root,
+            required_string(vector, "effect_id")?,
+            desired,
+            &guard,
+        )
+        .map_err(error_string)?;
+        Ok(())
+    }
+
+    fn observe(&self) -> Result<ObservedScopeState, String> {
+        let mut scopes = BTreeMap::new();
+        for store in self.stores.values() {
+            let mut checkpoints = BTreeMap::new();
+            let mut outbox_records = BTreeMap::new();
+            for (root, record) in store.snapshot()? {
+                let value: JsonValue =
+                    serde_json::from_slice(&record.bytes).map_err(error_string)?;
+                checkpoints.insert(
+                    root,
+                    ObservedCheckpoint {
+                        serialization_digest: sha256(&record.bytes),
+                        bytes: record.bytes,
+                        execution_checkpoint_digest: record.execution_checkpoint_digest,
+                    },
+                );
+                collect_outbox_records(&value, &mut outbox_records)?;
+            }
+            if scopes
+                .insert(
+                    store.logical_scope_id.clone(),
+                    ObservedScope {
+                        physical_isolation_key: store.physical_isolation_key.clone(),
+                        checkpoints,
+                        outbox_records,
+                    },
+                )
+                .is_some()
+            {
+                return Err("duplicate logical scope id".to_string());
+            }
+        }
+        Ok(ObservedScopeState {
+            physical_backend_id: self.physical_backend_id.clone(),
+            scopes,
+        })
+    }
+
+    fn calls(&self) -> Vec<ScopeCall> {
+        self.calls.lock().expect("scope call log").clone()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedCheckpoint {
+    bytes: Vec<u8>,
+    serialization_digest: String,
+    execution_checkpoint_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedScope {
+    physical_isolation_key: String,
+    checkpoints: BTreeMap<String, ObservedCheckpoint>,
+    outbox_records: BTreeMap<(String, String), JsonValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedScopeState {
+    physical_backend_id: String,
+    scopes: BTreeMap<String, ObservedScope>,
+}
+
+impl ObservedScopeState {
+    fn checkpoint_projection(&self) -> BTreeMap<String, BTreeMap<String, ObservedCheckpoint>> {
+        self.scopes
+            .iter()
+            .map(|(id, scope)| (id.clone(), scope.checkpoints.clone()))
+            .collect()
+    }
+
+    fn outbox_projection(&self) -> BTreeMap<String, BTreeMap<(String, String), JsonValue>> {
+        self.scopes
+            .iter()
+            .map(|(id, scope)| (id.clone(), scope.outbox_records.clone()))
+            .collect()
+    }
+}
+
+fn collect_outbox_records(
+    checkpoint: &JsonValue,
+    records: &mut BTreeMap<(String, String), JsonValue>,
+) -> Result<(), String> {
+    for (field, kind, effect_pointer) in [
+        ("pending_outbox_intents", "pending", "/intent/effect_id"),
+        ("terminal_outbox_records", "terminal", "/intent/effect_id"),
+        ("outbox_effect_tombstones", "tombstone", "/effect_id"),
+    ] {
+        for record in checkpoint[field]
+            .as_array()
+            .ok_or_else(|| format!("{field} is missing"))?
+        {
+            let effect_id = record
+                .pointer(effect_pointer)
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| format!("{field} record has no effect id"))?;
+            let canonical = serde_json_canonicalizer::to_vec(record).map_err(error_string)?;
+            let value = json!({
+                "effect_id": effect_id,
+                "record_kind": kind,
+                "source_digest": sha256(&canonical),
+            });
+            if records
+                .insert((kind.to_string(), effect_id.to_string()), value)
+                .is_some()
+            {
+                return Err(format!("duplicate {kind} outbox record {effect_id}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compare_scope_state(
+    case: &Path,
+    observed: &ObservedScopeState,
+    expected: &JsonValue,
+    resolver: &InMemoryDefinitionResolver,
+) -> Result<(), String> {
+    require_object_keys(expected, &["physical_backend_id", "scopes"])?;
+    if observed.physical_backend_id != required_string(expected, "physical_backend_id")? {
+        return Err("physical backend id differs".to_string());
+    }
+    let expected_scopes = expected["scopes"]
+        .as_array()
+        .ok_or_else(|| "expected scope list is missing".to_string())?;
+    let mut expected_by_id = BTreeMap::new();
+    for scope in expected_scopes {
+        require_object_keys(
+            scope,
+            &[
+                "logical_scope_id",
+                "physical_isolation_key",
+                "checkpoints",
+                "outbox_records",
+            ],
+        )?;
+        let id = required_string(scope, "logical_scope_id")?;
+        if expected_by_id.insert(id.to_string(), scope).is_some() {
+            return Err(format!("duplicate expected scope {id}"));
+        }
+    }
+    if observed.scopes.keys().collect::<BTreeSet<_>>()
+        != expected_by_id.keys().collect::<BTreeSet<_>>()
+    {
+        return Err("logical scope key sets differ".to_string());
+    }
+    for (id, expected_scope) in expected_by_id {
+        let actual = &observed.scopes[&id];
+        if actual.physical_isolation_key
+            != required_string(expected_scope, "physical_isolation_key")?
+        {
+            return Err(format!("{id} physical isolation key differs"));
+        }
+        let expected_checkpoints = expected_scope["checkpoints"]
+            .as_object()
+            .ok_or_else(|| format!("{id} checkpoints are missing"))?;
+        if actual.checkpoints.keys().collect::<BTreeSet<_>>()
+            != expected_checkpoints.keys().collect::<BTreeSet<_>>()
+        {
+            return Err(format!("{id} checkpoint root key sets differ"));
+        }
+        for (root, metadata) in expected_checkpoints {
+            require_object_keys(
+                metadata,
+                &[
+                    "execution_checkpoint_digest",
+                    "file",
+                    "serialization_digest",
+                ],
+            )?;
+            let checkpoint = restore_fixture(case, required_string(metadata, "file")?, resolver);
+            let expected_bytes = checkpoint.canonical_bytes().map_err(error_string)?;
+            let expected_value = ObservedCheckpoint {
+                bytes: expected_bytes,
+                serialization_digest: required_string(metadata, "serialization_digest")?
+                    .to_string(),
+                execution_checkpoint_digest: required_string(
+                    metadata,
+                    "execution_checkpoint_digest",
+                )?
+                .to_string(),
+            };
+            if actual.checkpoints[root] != expected_value {
+                return Err(format!("{id} checkpoint {root} differs"));
+            }
+        }
+        let mut expected_outbox = BTreeMap::new();
+        for record in expected_scope["outbox_records"]
+            .as_array()
+            .ok_or_else(|| format!("{id} outbox records are missing"))?
+        {
+            require_object_keys(record, &["effect_id", "record_kind", "source_digest"])?;
+            let kind = required_string(record, "record_kind")?;
+            let effect_id = required_string(record, "effect_id")?;
+            if expected_outbox
+                .insert((kind.to_string(), effect_id.to_string()), record.clone())
+                .is_some()
+            {
+                return Err(format!("duplicate expected {kind} record {effect_id}"));
+            }
+        }
+        if actual.outbox_records != expected_outbox {
+            return Err(format!("{id} outbox record map differs"));
+        }
+    }
+    Ok(())
+}
+
+fn assert_scope_calls(actual: &[ScopeCall], expected: &JsonValue) -> Result<(), String> {
+    let layer = |wanted: fn(&ScopeCall) -> Option<&'static str>| {
+        actual.iter().filter_map(wanted).collect::<Vec<_>>()
+    };
+    let expected_layer = |name: &str| -> Result<Vec<&str>, String> {
+        expected[name]
+            .as_array()
+            .ok_or_else(|| format!("expected {name} call list is missing"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| format!("expected {name} call is not a string"))
+            })
+            .collect()
+    };
+    let resolver = layer(|call| match call {
+        ScopeCall::Resolver(name) => Some(*name),
+        _ => None,
+    });
+    let host = layer(|call| match call {
+        ScopeCall::Host(name) => Some(*name),
+        _ => None,
+    });
+    let store = layer(|call| match call {
+        ScopeCall::Store(name) => Some(*name),
+        _ => None,
+    });
+    if resolver != expected_layer("resolver")? {
+        return Err(format!("resolver calls differ: {resolver:?}"));
+    }
+    if host != expected_layer("execution_host")? {
+        return Err(format!("host calls differ: {host:?}"));
+    }
+    if store != expected_layer("store")? {
+        return Err(format!("store calls differ: {store:?}"));
+    }
+    if !expected_layer("core")?.is_empty() {
+        return Err("scope harness does not make core calls".to_string());
+    }
+    Ok(())
+}
+
+fn required_string<'a>(value: &'a JsonValue, field: &str) -> Result<&'a str, String> {
+    value[field]
+        .as_str()
+        .ok_or_else(|| format!("{field} is missing"))
+}
+
+fn require_object_keys(value: &JsonValue, expected: &[&str]) -> Result<(), String> {
+    let actual = value
+        .as_object()
+        .ok_or_else(|| "expected JSON object".to_string())?
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(format!(
+            "object key sets differ: actual={actual:?}, expected={expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn error_string(error: impl std::fmt::Display) -> String {
+    error.to_string()
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn mutation<T: PartialEq>(before: &T, after: &T) -> &'static str {
+    if before == after {
+        "unchanged"
+    } else {
+        "changed"
     }
 }
 

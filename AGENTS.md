@@ -16,7 +16,7 @@ The current draft is validated against the merged `0.1.0` metadata revisions at 
 exact immutable inputs:
 
 - specification: `cc4b0d734aa1c5953de75fb53b63e390a3b72761`;
-- conformance: `263644f951f342b0eeaa3aceef4877293d2d7c67`.
+- conformance: `5ba78c7ef90b8556e76de6481a18b23a3d0c2378`.
 
 The conformance suite is the arbiter of behavior. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
@@ -35,7 +35,7 @@ Never invent a release tag or weaken an exact revision check.
 - `tests/core_conformance.rs`: driver for all 111 `conformance/core` cases.
 - `tests/persistence_conformance.rs`: driver for all 108 persistence vectors.
 - `tests/persistence_profiles.rs`: driver for all six persistence host profiles.
-- `tests/checkpoint_conformance.rs`: driver for all 85 execution-checkpoint vectors.
+- `tests/checkpoint_conformance.rs`: driver for all 91 execution-checkpoint vectors.
 - `tests/checkpoint_adapters.rs`: shared memory/file/SQLite setup, restart, and CAS
   contracts.
 - `tests/checkpoint_postgresql.rs`: optional PostgreSQL exact-schema, retention-mode,
@@ -58,7 +58,7 @@ Never invent a release tag or weaken an exact revision check.
 ```sh
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
-  "263644f951f342b0eeaa3aceef4877293d2d7c67"
+  "5ba78c7ef90b8556e76de6481a18b23a3d0c2378"
 cargo +1.86.0 build --release --locked --all-features
 cargo +1.86.0 test --locked --all-features
 cargo clippy --locked --all-features --all-targets -- -D warnings
@@ -68,7 +68,7 @@ The declared MSRV is Rust `1.86`. CI must keep the locked default and all-featur
 including PostgreSQL, buildable and testable with that toolchain.
 
 CI runs the complete 111-case core suite, all 108 persistence vectors, all 12
-persistence-profile steps, and all 85 execution-checkpoint vectors. It also checks
+persistence-profile steps, and all 91 execution-checkpoint vectors. It also checks
 every local schema byte-for-byte against the exact specification commit and runs the
 optional PostgreSQL adapter against a service.
 

@@ -16,6 +16,14 @@ pub enum CheckpointErrorCode {
 }
 
 impl CheckpointErrorCode {
+    /// Complete checkpoint-artifact failure set defined by the portable registry.
+    pub const PORTABLE_CODES: &'static [Self] = &[
+        Self::UnsupportedExecutionCheckpointFormat,
+        Self::UnsupportedExecutionCheckpointSchemaVersion,
+        Self::InvalidExecutionCheckpoint,
+        Self::ExecutionCheckpointDigestMismatch,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::UnsupportedExecutionCheckpointFormat => "unsupported_execution_checkpoint_format",
@@ -1172,6 +1180,31 @@ pub enum PreAcceptanceFailureCode {
     DeliveryDigestMismatch,
     EventIdConflict,
     TombstonedRoot,
+}
+
+impl PreAcceptanceFailureCode {
+    /// Complete pre-acceptance failure set defined by the portable registry.
+    pub const PORTABLE_CODES: &'static [Self] = &[
+        Self::MalformedDelivery,
+        Self::WrongRoot,
+        Self::InvalidDeliveryMode,
+        Self::InvalidDeliveryOrigin,
+        Self::DeliveryDigestMismatch,
+        Self::EventIdConflict,
+        Self::TombstonedRoot,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MalformedDelivery => "malformed_delivery",
+            Self::WrongRoot => "wrong_root",
+            Self::InvalidDeliveryMode => "invalid_delivery_mode",
+            Self::InvalidDeliveryOrigin => "invalid_delivery_origin",
+            Self::DeliveryDigestMismatch => "delivery_digest_mismatch",
+            Self::EventIdConflict => "event_id_conflict",
+            Self::TombstonedRoot => "tombstoned_root",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

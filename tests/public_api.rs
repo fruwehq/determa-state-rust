@@ -1,7 +1,9 @@
 use determa_state::{
     create, decode_selected_migration_descriptor, dispatch, load_bundle, Bindings, Counter,
-    Delivery, Disposition, Envelope, PersistenceErrorCode, ResultStatus, Target, Value,
-    FORMAT_1_CONFORMANCE_COMMIT, FORMAT_1_SPECIFICATION_COMMIT,
+    CreationRejectionCode, Delivery, DispatchRejectionCode, Disposition, EngineFaultCode, Envelope,
+    PersistenceErrorCode, ResultStatus, Target, Value, CREATION_REJECTION_CODES,
+    DISPATCH_REJECTION_CODES, ENGINE_FAULT_CODES, FORMAT_1_CONFORMANCE_COMMIT,
+    FORMAT_1_SPECIFICATION_COMMIT,
 };
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -716,7 +718,32 @@ fn examples_and_revision_metadata_are_current() {
     );
     assert_eq!(
         FORMAT_1_CONFORMANCE_COMMIT,
-        "263644f951f342b0eeaa3aceef4877293d2d7c67"
+        "5ba78c7ef90b8556e76de6481a18b23a3d0c2378"
+    );
+}
+
+#[test]
+fn runtime_closed_code_exports_are_public_and_compatible() {
+    assert_eq!(
+        CreationRejectionCode::PORTABLE_CODES
+            .iter()
+            .map(|code| code.as_str())
+            .collect::<Vec<_>>(),
+        CREATION_REJECTION_CODES
+    );
+    assert_eq!(
+        DispatchRejectionCode::PORTABLE_CODES
+            .iter()
+            .map(|code| code.as_str())
+            .collect::<Vec<_>>(),
+        DISPATCH_REJECTION_CODES
+    );
+    assert_eq!(
+        EngineFaultCode::PORTABLE_CODES
+            .iter()
+            .map(|code| code.as_str())
+            .collect::<Vec<_>>(),
+        ENGINE_FAULT_CODES
     );
 }
 

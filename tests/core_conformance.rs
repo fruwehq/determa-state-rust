@@ -82,23 +82,6 @@ fn run_case(case: &Path) -> Result<(), String> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| format!("conformance:{case_name}:create"));
-    if contains_invalid_unicode(create_spec.and_then(|create| create.get("root_instance_id"))) {
-        assert_invalid_unicode_boundary(
-            create_spec.and_then(|create| create.get("root_instance_id")),
-        )?;
-        let expected = create_spec
-            .and_then(|create| create.get("expect"))
-            .ok_or_else(|| "invalid-Unicode create lacks expectation".to_string())?;
-        if expected
-            .get("rejection")
-            .and_then(|value| value.get("code"))
-            .and_then(serde_json::Value::as_str)
-            != Some("invalid_creation_request")
-        {
-            return Err("invalid-Unicode create expectation is inconsistent".to_string());
-        }
-        return Ok(());
-    }
     let bindings = create_spec
         .and_then(|create| create.get("bindings"))
         .map(bindings_from_json)
@@ -108,6 +91,17 @@ fn run_case(case: &Path) -> Result<(), String> {
         .machine_order
         .first()
         .ok_or_else(|| "bundle has no root machine".to_string())?;
+    if contains_invalid_unicode(create_spec.and_then(|create| create.get("root_instance_id"))) {
+        assert_invalid_unicode_boundary(
+            create_spec.and_then(|create| create.get("root_instance_id")),
+        )?;
+        let expected = create_spec
+            .and_then(|create| create.get("expect"))
+            .ok_or_else(|| "invalid-Unicode create lacks expectation".to_string())?;
+        let result = create(&bundle, machine_id, "", &creation_id, &bindings);
+        check_result(&result, expected, None, None)?;
+        return Ok(());
+    }
     let mut result = create(
         &bundle,
         machine_id,
@@ -141,30 +135,9 @@ fn run_case(case: &Path) -> Result<(), String> {
             let send = send
                 .as_object()
                 .ok_or_else(|| format!("step {step_index} send is not a map"))?;
-            if contains_invalid_unicode(send.get("payload")) {
+            let invalid_unicode_probe = contains_invalid_unicode(send.get("payload"));
+            if invalid_unicode_probe {
                 assert_invalid_unicode_boundary(send.get("payload"))?;
-                let expect = step
-                    .get("expect")
-                    .ok_or_else(|| "invalid-Unicode dispatch lacks expectation".to_string())?;
-                if expect
-                    .get("rejection")
-                    .and_then(|value| value.get("code"))
-                    .and_then(serde_json::Value::as_str)
-                    != Some("invalid_payload")
-                {
-                    return Err("invalid-Unicode dispatch expectation is inconsistent".to_string());
-                }
-                if expect
-                    .get("caller_still_owns_input")
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(true)
-                {
-                    return Err("invalid-Unicode dispatch must assert caller ownership".to_string());
-                }
-                if !aggregate_exact_equal(&state, &caller_state) {
-                    return Err("invalid-Unicode boundary mutated prior state".to_string());
-                }
-                continue;
             }
             let target =
                 resolve_driver_target(&state, &serde_json::Value::Object(send.clone()), true)?;
@@ -178,11 +151,14 @@ fn run_case(case: &Path) -> Result<(), String> {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("conformance:{case_name}:step:{step_index}:input"));
-            let payload = send
-                .get("payload")
-                .map(value_map)
-                .transpose()?
-                .unwrap_or_default();
+            let payload = if invalid_unicode_probe {
+                invalid_unicode_probe_map(send.get("payload"))?
+            } else {
+                send.get("payload")
+                    .map(value_map)
+                    .transpose()?
+                    .unwrap_or_default()
+            };
             let envelope = Envelope {
                 event,
                 event_id,
@@ -1418,6 +1394,41 @@ fn value_map(value: &serde_json::Value) -> Result<BTreeMap<String, Value>, Strin
         .iter()
         .map(|(name, value)| Ok((name.clone(), value_from_fixture(value)?)))
         .collect()
+}
+
+fn invalid_unicode_probe_map(
+    value: Option<&serde_json::Value>,
+) -> Result<BTreeMap<String, Value>, String> {
+    let object = value
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "invalid-Unicode payload is not a map".to_string())?;
+    object
+        .iter()
+        .map(|(name, value)| Ok((name.clone(), invalid_unicode_probe_value(value)?)))
+        .collect()
+}
+
+fn invalid_unicode_probe_value(value: &serde_json::Value) -> Result<Value, String> {
+    if value
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .is_some_and(|object| object.contains_key("invalid_unicode_scalar"))
+    {
+        return Ok(Value::Float(f64::NAN));
+    }
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(invalid_unicode_probe_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), invalid_unicode_probe_value(value)?)))
+            .collect::<Result<BTreeMap<_, _>, String>>()
+            .map(Value::Map),
+        _ => Value::from_json(value),
+    }
 }
 
 fn value_from_fixture(value: &serde_json::Value) -> Result<Value, String> {

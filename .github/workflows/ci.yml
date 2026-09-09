@@ -8,7 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   SPECIFICATION_COMMIT: cc4b0d734aa1c5953de75fb53b63e390a3b72761
-  CONFORMANCE_COMMIT: 263644f951f342b0eeaa3aceef4877293d2d7c67
+  CONFORMANCE_COMMIT: 5ba78c7ef90b8556e76de6481a18b23a3d0c2378
 
 jobs:
   msrv:
@@ -49,6 +49,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-03
         with:
@@ -98,7 +100,7 @@ jobs:
           cargo run --release --locked --bin determa-state -- validate authoritative-spec/examples/full.yaml
 
       - name: Unit and public API tests
-        run: cargo test --locked --lib --bins --test public_api --test checkpoint_adapters
+        run: cargo test --locked --lib --bins --test public_api --test closed_code_registry --test checkpoint_adapters
 
       - name: Documentation tests
         run: cargo test --locked --doc
@@ -109,7 +111,7 @@ jobs:
       - name: Persistence host profiles
         run: cargo test --locked --test persistence_profiles -- --nocapture
 
-      - name: All 85 execution-checkpoint host vectors
+      - name: All 91 execution-checkpoint host vectors
         run: cargo test --locked --test checkpoint_conformance -- --nocapture
 
   postgresql:
