@@ -263,6 +263,16 @@ pub fn migrate_aggregate_v2_route(
     resolver: &impl MigrationArtifactResolver,
     limits: &super::migration::ResourceLimits,
 ) -> Result<JsonValue, Version2Error> {
+    migrate_aggregate_v2_route_with_evidence(aggregate, request, resolver, limits)
+        .map(public_migration_result)
+}
+
+pub(crate) fn migrate_aggregate_v2_route_with_evidence(
+    aggregate: &QueueBearingAggregate,
+    request: &MigrationRequest,
+    resolver: &impl MigrationArtifactResolver,
+    limits: &super::migration::ResourceLimits,
+) -> Result<JsonValue, Version2Error> {
     if request.migration_route.is_empty() {
         if request.target_validated_bundle_fingerprint
             != aggregate.value["validated_bundle_fingerprint"]
@@ -357,12 +367,12 @@ pub fn migrate_aggregate_v2_route(
             "migration route does not reach the requested target bundle",
         ));
     }
-    Ok(public_migration_result(json!({
+    Ok(json!({
         "result": "success",
         "aggregate_state": current.value,
         "dispositions": dispositions,
         "audit_records": audit_records
-    })))
+    }))
 }
 
 fn public_migration_result(mut result: JsonValue) -> JsonValue {
@@ -1453,11 +1463,12 @@ pub(crate) fn restore_aggregate_v2_value(
             "queue-bearing aggregate-state digest does not match content",
         ));
     }
-    validate_mailbox_semantics(&value)?;
+    validate_mailbox_integrity(&value)?;
     let projected = project_v1(&value)?;
     let envelope: AggregateEnvelope =
         serde_json::from_value(projected).map_err(|error| invalid_aggregate(error.to_string()))?;
     let state = super::wire::restore_envelope(&envelope, resolver).map_err(map_persistence)?;
+    validate_mailbox_semantics(&value, &state, resolver)?;
     Ok(QueueBearingAggregate { value, state })
 }
 
@@ -1704,7 +1715,7 @@ pub(crate) fn validate_v2_schema(
         .map_err(|error| Version2Error::new(code, error.to_string()))
 }
 
-fn validate_mailbox_semantics(value: &JsonValue) -> Result<(), Version2Error> {
+fn validate_mailbox_integrity(value: &JsonValue) -> Result<(), Version2Error> {
     let next_acceptance = counter_value(value, "next_acceptance_sequence")?;
     let next_queue = counter_value(value, "next_queue_sequence")?;
     let mut event_ids = BTreeSet::new();
@@ -1751,6 +1762,111 @@ fn validate_mailbox_semantics(value: &JsonValue) -> Result<(), Version2Error> {
         }
     }
     Ok(())
+}
+
+fn validate_mailbox_semantics(
+    value: &JsonValue,
+    state: &AggregateState,
+    resolver: &(impl DefinitionResolver + ?Sized),
+) -> Result<(), Version2Error> {
+    for runtime_value in runtimes(value)? {
+        let runtime_id = runtime_value["runtime_id"]
+            .as_str()
+            .ok_or_else(|| invalid_aggregate("mailbox runtime id is absent"))?;
+        let runtime = runtime_by_id(&state.root, runtime_id)
+            .ok_or_else(|| invalid_aggregate("mailbox runtime is absent from restored state"))?;
+        let fingerprint = &runtime.current_definition.validated_bundle_fingerprint;
+        let resolved = resolver.resolve_definition(fingerprint).ok_or_else(|| {
+            invalid_aggregate("mailbox target definition is unavailable during restore")
+        })?;
+        if !resolved.trusted || resolved.bundle.fingerprint != *fingerprint {
+            return Err(invalid_aggregate(
+                "mailbox target definition is untrusted or content-addressed incorrectly",
+            ));
+        }
+        for field in ["ready_mailbox", "deferred_mailbox"] {
+            for entry in runtime_value[field]
+                .as_array()
+                .ok_or_else(|| invalid_aggregate("mailbox is not an array"))?
+            {
+                let envelope: QueueEnvelope = serde_json::from_value(entry["envelope"].clone())
+                    .map_err(|error| invalid_aggregate(error.to_string()))?;
+                let mode = entry["delivery_mode"]
+                    .as_str()
+                    .ok_or_else(|| invalid_aggregate("delivery mode is absent"))?;
+                if queue_target_to_core(&envelope.target)? != runtime.target_identity {
+                    return Err(invalid_aggregate(
+                        "mailbox target does not identify its containing runtime",
+                    ));
+                }
+                validate_restored_source(mode, &envelope, value)?;
+                let delivery = core_delivery(&AdmissionDelivery {
+                    delivery_mode: mode.to_string(),
+                    envelope,
+                    envelope_digest: entry["envelope_digest"]
+                        .as_str()
+                        .ok_or_else(|| invalid_aggregate("mailbox digest is absent"))?
+                        .to_string(),
+                })?;
+                validate_queued_event_for_migration(&resolved.bundle, state, &delivery).map_err(
+                    |code| {
+                        invalid_aggregate(format!(
+                            "mailbox delivery is invalid against its resolved definition: {}",
+                            code.as_str()
+                        ))
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_restored_source(
+    delivery_mode: &str,
+    envelope: &QueueEnvelope,
+    aggregate: &JsonValue,
+) -> Result<(), Version2Error> {
+    let source = envelope
+        .source
+        .as_object()
+        .ok_or_else(|| invalid_aggregate("mailbox source must be an object"))?;
+    let valid = match delivery_mode {
+        "input" => {
+            source.len() == 1
+                && source.get("host").and_then(JsonValue::as_bool) == Some(true)
+                && envelope.cause_id == envelope.event_id
+        }
+        "internal" => {
+            if let Some(runtime_source) = source.get("runtime").filter(|_| source.len() == 1) {
+                runtimes(aggregate)?
+                    .iter()
+                    .any(|runtime| runtime["target_identity"] == *runtime_source)
+                    && envelope.cause_id != envelope.event_id
+            } else if let Some(locator) = source
+                .get("system")
+                .and_then(JsonValue::as_str)
+                .filter(|_| source.len() == 1)
+            {
+                system_locator_matches_event(locator, &envelope.event)
+                    && envelope.cause_id != envelope.event_id
+            } else if source
+                .get("legacy_v1_internal")
+                .filter(|_| source.len() == 1)
+                .is_some()
+            {
+                valid_internal_source_shape(source) && envelope.cause_id == envelope.event_id
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_aggregate("mailbox source provenance is invalid"))
+    }
 }
 
 fn append_internal_emissions(
@@ -1862,4 +1978,158 @@ fn counter_field(value: &JsonValue, field: &str) -> Counter {
 
 fn string_field<'a>(value: &'a JsonValue, field: &str) -> &'a [u8] {
     value[field].as_str().expect("validated string").as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mailbox_bundle() -> Bundle {
+        super::super::load_bundle(
+            r#"
+format: 1
+namespace: test.v2_restore_mailbox
+events:
+  request_sent: { direction: output }
+  request:
+    direction: input
+    correlates_to: request_sent
+    payload:
+      amount: { type: float, required: true }
+      request_id: { type: string, required: true }
+  internal_notice: { direction: internal }
+machines:
+  - machine_id: worker
+    root:
+      on_events:
+        request: {}
+        internal_notice: {}
+"#,
+        )
+        .expect("mailbox semantic test bundle")
+    }
+
+    fn aggregate_with_input_mailbox(bundle: &Bundle) -> JsonValue {
+        let aggregate = create_v2(
+            bundle,
+            "worker",
+            "restore-root",
+            "restore-create",
+            &Bindings::default(),
+        )
+        .expect("create queue-bearing aggregate");
+        let target = aggregate.value()["runtimes"][0]["target_identity"].clone();
+        let envelope = QueueEnvelope {
+            event: "request".to_string(),
+            event_id: "request-1".to_string(),
+            cause_id: "request-1".to_string(),
+            source: json!({"host": true}),
+            target,
+            payload: TypedValue::Map(vec![
+                ("amount".to_string(), TypedValue::Float(1.0)),
+                (
+                    "request_id".to_string(),
+                    TypedValue::String("request-1".to_string()),
+                ),
+            ]),
+            correlation_id: Some("request-1".to_string()),
+        };
+        let digest = envelope_digest("restore-root", "input", &envelope).unwrap();
+        let result = admit_v2(
+            bundle,
+            &aggregate,
+            &[AdmissionDelivery {
+                delivery_mode: "input".to_string(),
+                envelope,
+                envelope_digest: digest,
+            }],
+        )
+        .expect("admit semantic test delivery");
+        result["state"].clone()
+    }
+
+    fn assert_resealed_mailbox_rejected(
+        source: &JsonValue,
+        bundle: &Bundle,
+        mutate: impl FnOnce(&mut JsonValue),
+    ) {
+        let mut forged = source.clone();
+        let root_instance_id = forged["root_instance_id"].as_str().unwrap().to_string();
+        let entry = &mut forged["runtimes"][0]["ready_mailbox"][0];
+        mutate(entry);
+        let envelope: QueueEnvelope = serde_json::from_value(entry["envelope"].clone())
+            .unwrap_or_else(|error| panic!("forged envelope schema: {error}; {entry}"));
+        entry["envelope_digest"] = json!(envelope_digest(
+            &root_instance_id,
+            entry["delivery_mode"].as_str().unwrap(),
+            &envelope
+        )
+        .unwrap());
+        forged = seal_aggregate(forged).unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(bundle.clone(), true);
+        let bytes = canonical_bytes(&forged).unwrap();
+        assert_eq!(
+            restore_aggregate_v2(&bytes, &resolver).unwrap_err().code,
+            "invalid_aggregate_state"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_resealed_mailboxes_invalid_against_resolved_definition() {
+        let bundle = mailbox_bundle();
+        let aggregate = aggregate_with_input_mailbox(&bundle);
+
+        assert_resealed_mailbox_rejected(&aggregate, &bundle, |entry| {
+            entry["delivery_mode"] = json!("internal");
+            entry["envelope"]["source"] = json!({"runtime": entry["envelope"]["target"].clone()});
+            entry["envelope"]["cause_id"] = json!("request-cause");
+        });
+        assert_resealed_mailbox_rejected(&aggregate, &bundle, |entry| {
+            entry["delivery_mode"] = json!("internal");
+            entry["envelope"]["event"] = json!("internal_notice");
+            entry["envelope"]["payload"] = json!(["map", []]);
+            entry["envelope"]
+                .as_object_mut()
+                .unwrap()
+                .remove("correlation_id");
+            entry["envelope"]["source"] = json!({"runtime": {"root": {
+                "root_instance_id": "restore-root",
+                "root_runtime_id": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            }}});
+            entry["envelope"]["cause_id"] = json!("request-cause");
+        });
+        assert_resealed_mailbox_rejected(&aggregate, &bundle, |entry| {
+            entry["delivery_mode"] = json!("internal");
+            entry["envelope"]["event"] = json!("internal_notice");
+            entry["envelope"]["payload"] = json!(["map", []]);
+            entry["envelope"]
+                .as_object_mut()
+                .unwrap()
+                .remove("correlation_id");
+            entry["envelope"]["source"] = json!({"system": "system:component_completion"});
+            entry["envelope"]["cause_id"] = json!("request-cause");
+        });
+        assert_resealed_mailbox_rejected(&aggregate, &bundle, |entry| {
+            entry["envelope"]["payload"][1]
+                .as_array_mut()
+                .unwrap()
+                .retain(|field| field[0] != "request_id");
+        });
+        assert_resealed_mailbox_rejected(&aggregate, &bundle, |entry| {
+            entry["envelope"]["payload"][1]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(["unexpected", ["string", "value"]]));
+        });
+        assert_resealed_mailbox_rejected(&aggregate, &bundle, |entry| {
+            entry["envelope"]["payload"][1][0][1] = json!(["integer", "1"]);
+        });
+        assert_resealed_mailbox_rejected(&aggregate, &bundle, |entry| {
+            entry["envelope"]
+                .as_object_mut()
+                .unwrap()
+                .remove("correlation_id");
+        });
+    }
 }

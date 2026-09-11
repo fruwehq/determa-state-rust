@@ -560,6 +560,11 @@ fn version2_host_contract(store: Arc<dyn ExecutionStore>) {
             .expect("v2 migration target bundle"),
     )
     .expect("load v2 migration target bundle");
+    let migration_target_second = load_bundle(
+        &fs::read_to_string(migration_directory.join("target-compatible-second.yaml"))
+            .expect("v2 second migration target bundle"),
+    )
+    .expect("load v2 second migration target bundle");
     let descriptor_bytes = fs::read(migration_directory.join("descriptor-compatible-v2.json"))
         .expect("v2 migration descriptor");
     let descriptor: serde_json::Value = serde_json::from_slice(&descriptor_bytes).unwrap();
@@ -567,9 +572,24 @@ fn version2_host_contract(store: Arc<dyn ExecutionStore>) {
         .as_str()
         .unwrap()
         .to_string();
+    let descriptor_second_bytes =
+        fs::read(migration_directory.join("descriptor-compatible-second-v2.json"))
+            .expect("v2 second migration descriptor");
+    let descriptor_second: serde_json::Value =
+        serde_json::from_slice(&descriptor_second_bytes).unwrap();
+    let descriptor_second_digest = descriptor_second["migration_descriptor_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
     resolver.insert(migration_source.clone(), true);
     resolver.insert(migration_target.clone(), true);
+    resolver.insert(migration_target_second.clone(), true);
     resolver.insert_descriptor(descriptor_digest.clone(), descriptor_bytes, true);
+    resolver.insert_descriptor(
+        descriptor_second_digest.clone(),
+        descriptor_second_bytes,
+        true,
+    );
     let terminal_bundle = load_bundle(
         r#"
 format: 1
@@ -586,6 +606,24 @@ machines:
     .expect("load v2 terminal bundle");
     resolver.insert(terminal_bundle.clone(), true);
     let host = CheckpointHost::new(store.clone(), Arc::new(resolver));
+    let mismatch = host
+        .create_checkpoint_v2(
+            &bundle,
+            "counter",
+            "fresh-v2-root",
+            "fresh-v2-create",
+            &Bindings::default(),
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            json!({
+                "mode": "permanent",
+                "permanent_replay_eligible": true,
+                "policy_identifier": null,
+                "pruned_through_receipt_sequence": null
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(mismatch.code, "invalid_execution_checkpoint");
+    assert!(store.load("fresh-v2-root").unwrap().is_none());
     let created = host
         .create_checkpoint_v2(
             &bundle,
@@ -593,7 +631,7 @@ machines:
             "fresh-v2-root",
             "fresh-v2-create",
             &Bindings::default(),
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            None,
             json!({
                 "mode": "permanent",
                 "permanent_replay_eligible": true,
@@ -640,7 +678,7 @@ machines:
             "migration-v2-root",
             "migration-v2-create",
             &Bindings::default(),
-            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            None,
             json!({
                 "mode": "permanent",
                 "permanent_replay_eligible": true,
@@ -649,6 +687,66 @@ machines:
             }),
         )
         .expect("transactional v2 migration source creation");
+    let failed = host
+        .maintenance_migration_v2(&MaintenanceMigrationRequest {
+            root_instance_id: migration.root_instance_id().to_string(),
+            operation_id: "failed-migration-operation".to_string(),
+            source_aggregate_state_digest: migration.value()["root_record"]["aggregate_state"]
+                ["aggregate_state_digest"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            target_validated_bundle_fingerprint: migration_target_second.fingerprint.clone(),
+            migration_descriptor_digest_route: vec![
+                descriptor_digest.clone(),
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    .to_string(),
+            ],
+            maintenance_mode: true,
+            supplied_request_digest: None,
+            guard: MutationGuard::new(migration.revision(), migration.digest()),
+            limits: ResourceLimits::default(),
+        })
+        .unwrap_err();
+    assert_eq!(failed.code, "migration_descriptor_not_found");
+    assert_eq!(
+        host.load_checkpoint_v2(migration.root_instance_id())
+            .unwrap()
+            .unwrap()
+            .value(),
+        migration.value()
+    );
+    let digest_mismatch = host
+        .maintenance_migration_v2(&MaintenanceMigrationRequest {
+            root_instance_id: migration.root_instance_id().to_string(),
+            operation_id: "migration-operation".to_string(),
+            source_aggregate_state_digest: migration.value()["root_record"]["aggregate_state"]
+                ["aggregate_state_digest"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            target_validated_bundle_fingerprint: migration_target_second.fingerprint.clone(),
+            migration_descriptor_digest_route: vec![
+                descriptor_digest.clone(),
+                descriptor_second_digest.clone(),
+            ],
+            maintenance_mode: true,
+            supplied_request_digest: Some(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            ),
+            guard: MutationGuard::new(migration.revision(), migration.digest()),
+            limits: ResourceLimits::default(),
+        })
+        .unwrap_err();
+    assert_eq!(digest_mismatch.code, "invalid_execution_checkpoint");
+    assert_eq!(
+        host.load_checkpoint_v2(migration.root_instance_id())
+            .unwrap()
+            .unwrap()
+            .value(),
+        migration.value()
+    );
     let migrated = host
         .maintenance_migration_v2(&MaintenanceMigrationRequest {
             root_instance_id: migration.root_instance_id().to_string(),
@@ -658,8 +756,8 @@ machines:
                 .as_str()
                 .unwrap()
                 .to_string(),
-            target_validated_bundle_fingerprint: migration_target.fingerprint.clone(),
-            migration_descriptor_digest_route: vec![descriptor_digest],
+            target_validated_bundle_fingerprint: migration_target_second.fingerprint.clone(),
+            migration_descriptor_digest_route: vec![descriptor_digest, descriptor_second_digest],
             maintenance_mode: true,
             supplied_request_digest: None,
             guard: MutationGuard::new(migration.revision(), migration.digest()),
@@ -672,7 +770,11 @@ machines:
             .as_array()
             .unwrap()
             .len(),
-        1
+        2
+    );
+    assert_eq!(
+        migrated["root_record"]["aggregate_state"]["migration_sequence"],
+        "2"
     );
 
     let terminal = host
@@ -682,7 +784,7 @@ machines:
             "terminal-v2-root",
             "terminal-v2-create",
             &Bindings::default(),
-            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            None,
             json!({
                 "mode": "permanent",
                 "permanent_replay_eligible": true,
@@ -707,7 +809,7 @@ machines:
             "outbox-v2-root",
             "outbox-v2-create",
             &Bindings::default(),
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            None,
             json!({
                 "mode": "permanent",
                 "permanent_replay_eligible": true,

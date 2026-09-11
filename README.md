@@ -171,8 +171,10 @@ For shared application and checkpoint atomicity, use
 transaction for application SQL and accepts exactly one root-bound checkpoint mutation
 through `CheckpointHost::stage_postgresql_mutation`. The host uses `SERIALIZABLE`,
 rejects cross-store/cross-root handles, rolls both parts back on failure, and returns
-the committed host result only after commit succeeds. The store's lower-level native
-transaction callback does not run host operations.
+the committed host result only after commit succeeds. Native version-2 creation,
+upgrade, admission, step, maintenance migration, pruning, outbox lifecycle, and root
+tombstone mutations use this same shared transaction API. The store's lower-level
+native transaction callback does not run host operations.
 
 Call `initialize_schema` deliberately before file or database use. Adapters never
 silently migrate schema. The execution-store trait has no checkpoint deletion method;

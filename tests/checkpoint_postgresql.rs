@@ -1,12 +1,12 @@
 #![cfg(feature = "postgresql")]
 
 use determa_state::checkpoint::{
-    register_bundled_adapters, AdapterRegistry, CheckpointHost, DurableStoreMode, ExecutionStore,
-    ExecutionStoreCapability, HostFailureCode, HostFeature, HostProfile,
-    MaintenanceMigrationRequest, MutationGuard, OutboxRetentionMode, PendingOutboxState,
-    PostgresqlExecutionStore, PostgresqlExecutionStoreFactory, PostgresqlHostMutation,
-    PostgresqlHostMutationResult, ReceiptRetentionMode, RootRecord, StoreError, StoreRecord,
-    StoreWriteResult, TerminalOutboxOutcome,
+    register_bundled_adapters, AdapterRegistry, CheckpointHost, DurableStoreMode,
+    ExecutionCheckpoint, ExecutionStore, ExecutionStoreCapability, HostFailureCode, HostFeature,
+    HostProfile, MaintenanceMigrationRequest, MutationGuard, OutboxRetentionMode,
+    PendingOutboxState, PostgresqlExecutionStore, PostgresqlExecutionStoreFactory,
+    PostgresqlHostMutation, PostgresqlHostMutationResult, ReceiptRetentionMode, RootRecord,
+    StoreError, StoreRecord, StoreWriteResult, TerminalOutboxOutcome,
 };
 use determa_state::{load_bundle, Bindings, Bundle, InMemoryDefinitionResolver, ResourceLimits};
 use postgres::{Client, NoTls};
@@ -197,8 +197,16 @@ fn postgresql_runs_native_version2_outbox_lifecycle() {
         .expect("version-2 outbox bundle"),
     )
     .expect("load version-2 outbox bundle");
+    let checkpoint_bundle = load_bundle(
+        &fs::read_to_string(
+            checkpoint_profile_directory().join("checkpoint-04-version2-mailboxes/machine.yaml"),
+        )
+        .expect("version-2 checkpoint bundle"),
+    )
+    .expect("load version-2 checkpoint bundle");
     let mut resolver = InMemoryDefinitionResolver::default();
     assert!(resolver.insert(bundle.clone(), true));
+    assert!(resolver.insert(checkpoint_bundle, true));
     let migration_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("conformance-suite/conformance/core/118-version2-persistence");
     let migration_source = load_bundle(
@@ -236,24 +244,169 @@ machines:
     )
     .expect("load v2 terminal bundle");
     assert!(resolver.insert(terminal_bundle.clone(), true));
+    let v1_bytes = fs::read(
+        checkpoint_profile_directory()
+            .join("checkpoint-04-version2-mailboxes/base-checkpoint-v1.json"),
+    )
+    .expect("version-1 checkpoint fixture");
+    let v1_checkpoint: ExecutionCheckpoint =
+        serde_json::from_slice(&v1_bytes).expect("typed version-1 checkpoint fixture");
+    let v1_record = StoreRecord::from_checkpoint(&v1_checkpoint).expect("version-1 store record");
+    assert_eq!(
+        store
+            .insert_if_absent(v1_record.clone())
+            .expect("version-1 seed"),
+        StoreWriteResult::Committed
+    );
+    let prune_bytes = fs::read(checkpoint_profile_directory().join(
+        "checkpoint-04-version2-mailboxes/creation-external-before-prune-checkpoint-v2.json",
+    ))
+    .expect("version-2 pruning checkpoint fixture");
+    let prune_value: serde_json::Value =
+        serde_json::from_slice(&prune_bytes).expect("version-2 pruning checkpoint JSON");
+    let prune_record = StoreRecord {
+        root_instance_id: prune_value["root_instance_id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        revision: prune_value["revision"].as_str().unwrap().to_string(),
+        execution_checkpoint_digest: prune_value["execution_checkpoint_digest"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        bytes: prune_bytes,
+    };
+    assert_eq!(
+        store
+            .insert_if_absent(prune_record.clone())
+            .expect("version-2 pruning seed"),
+        StoreWriteResult::Committed
+    );
     let host = CheckpointHost::new(store, Arc::new(resolver));
-    let root = unique_root("v2-outbox");
-    let created = host
-        .create_checkpoint_v2(
-            &bundle,
-            "external_creator",
-            &root,
-            "create",
-            &Bindings::default(),
-            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            json!({
-                "mode": "permanent",
-                "permanent_replay_eligible": true,
-                "policy_identifier": null,
-                "pruned_through_receipt_sequence": null
-            }),
+
+    let upgrade_guard =
+        MutationGuard::new(&v1_record.revision, &v1_record.execution_checkpoint_digest);
+    let upgraded = host
+        .with_postgresql_transaction(&v1_record.root_instance_id, |transaction| {
+            host.stage_postgresql_mutation(
+                transaction,
+                PostgresqlHostMutation::UpgradeV1ToV2 {
+                    root_instance_id: &v1_record.root_instance_id,
+                    guard: &upgrade_guard,
+                },
+            )
+        })
+        .expect("transactional native v2 upgrade");
+    let PostgresqlHostMutationResult::UpgradeV2(upgraded) = upgraded.host_result else {
+        panic!("unexpected native v2 upgrade result")
+    };
+    let operations: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            checkpoint_profile_directory()
+                .join("checkpoint-04-version2-mailboxes/operation-inputs.json"),
         )
-        .expect("create native v2 checkpoint");
+        .expect("version-2 operation inputs"),
+    )
+    .expect("version-2 operation input JSON");
+    let admission_guard = MutationGuard::new(upgraded.revision(), upgraded.digest());
+    let admitted = host
+        .with_postgresql_transaction(upgraded.root_instance_id(), |transaction| {
+            host.stage_postgresql_mutation(
+                transaction,
+                PostgresqlHostMutation::AdmitV2 {
+                    root_instance_id: upgraded.root_instance_id(),
+                    deliveries: operations["admit"]["deliveries"].as_array().unwrap(),
+                    guard: &admission_guard,
+                },
+            )
+        })
+        .expect("transactional native v2 admission");
+    let PostgresqlHostMutationResult::AdmissionV2(admitted) = admitted.host_result else {
+        panic!("unexpected native v2 admission result")
+    };
+    let admitted_checkpoint = if admitted["result"] == "batch" {
+        &admitted["checkpoint"]
+    } else {
+        &admitted
+    };
+    let target_runtime_id = admitted_checkpoint["root_record"]["aggregate_state"]
+        ["root_runtime_id"]
+        .as_str()
+        .unwrap();
+    let step_guard = MutationGuard::new(
+        admitted_checkpoint["revision"].as_str().unwrap(),
+        admitted_checkpoint["execution_checkpoint_digest"]
+            .as_str()
+            .unwrap(),
+    );
+    let stepped = host
+        .with_postgresql_transaction(upgraded.root_instance_id(), |transaction| {
+            host.stage_postgresql_mutation(
+                transaction,
+                PostgresqlHostMutation::StepV2 {
+                    root_instance_id: upgraded.root_instance_id(),
+                    target_runtime_id,
+                    guard: &step_guard,
+                },
+            )
+        })
+        .expect("transactional native v2 step");
+    assert!(matches!(
+        stepped.host_result,
+        PostgresqlHostMutationResult::StepV2(_)
+    ));
+
+    let prune_guard = MutationGuard::new(
+        &prune_record.revision,
+        &prune_record.execution_checkpoint_digest,
+    );
+    let pruned = host
+        .with_postgresql_transaction(&prune_record.root_instance_id, |transaction| {
+            host.stage_postgresql_mutation(
+                transaction,
+                PostgresqlHostMutation::PruneV2 {
+                    root_instance_id: &prune_record.root_instance_id,
+                    cutoff_receipt_sequence: "1",
+                    guard: &prune_guard,
+                },
+            )
+        })
+        .expect("transactional native v2 prune");
+    let PostgresqlHostMutationResult::PruneV2(pruned) = pruned.host_result else {
+        panic!("unexpected native v2 prune result")
+    };
+    assert_eq!(
+        pruned["replay_retention"]["pruned_through_receipt_sequence"],
+        "1"
+    );
+
+    let root = unique_root("v2-outbox");
+    let creation_bindings = Bindings::default();
+    let replay_retention = json!({
+        "mode": "permanent",
+        "permanent_replay_eligible": true,
+        "policy_identifier": null,
+        "pruned_through_receipt_sequence": null
+    });
+    let created = host
+        .with_postgresql_transaction(&root, |transaction| {
+            host.stage_postgresql_mutation(
+                transaction,
+                PostgresqlHostMutation::CreateV2 {
+                    bundle: &bundle,
+                    machine_id: "external_creator",
+                    root_instance_id: &root,
+                    creation_id: "create",
+                    bindings: &creation_bindings,
+                    supplied_request_digest: None,
+                    replay_retention: &replay_retention,
+                },
+            )
+        })
+        .expect("transactional native v2 creation");
+    let PostgresqlHostMutationResult::CreationV2(created) = created.host_result else {
+        panic!("unexpected native v2 creation result")
+    };
     let effect_id = created.value()["pending_outbox_intents"][0]["intent"]["effect_id"]
         .as_str()
         .unwrap();
@@ -357,7 +510,7 @@ machines:
             &migration_root,
             "create",
             &Bindings::default(),
-            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            None,
             json!({
                 "mode": "permanent",
                 "permanent_replay_eligible": true,
@@ -409,7 +562,7 @@ machines:
             &terminal_root,
             "create",
             &Bindings::default(),
-            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            None,
             json!({
                 "mode": "permanent",
                 "permanent_replay_eligible": true,

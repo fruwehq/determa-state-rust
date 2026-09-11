@@ -1,13 +1,13 @@
 use crate::format1::strict_json;
 use crate::format1::v2::{
-    canonical_bytes, migrate_aggregate_v2_with_evidence, validate_admission_delivery_schema,
-    validate_v2_schema,
+    canonical_bytes, migrate_aggregate_v2_route_with_evidence, migrate_aggregate_v2_with_evidence,
+    validate_admission_delivery_schema, validate_v2_schema,
 };
 use crate::format1::wire::jcs_hash;
 use crate::format1::{
     admit_v2, restore_aggregate_v2, step_v2, upgrade_aggregate_v1_to_v2, AdmissionDelivery,
-    Bindings, Bundle, Counter, DefinitionResolver, QueueBearingAggregate, ResourceLimits,
-    Version2Error,
+    Bindings, Bundle, Counter, DefinitionResolver, MigrationArtifactResolver, MigrationRequest,
+    QueueBearingAggregate, ResourceLimits, TypedValue, Version2Error,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,10 +52,6 @@ impl ExecutionCheckpointV2 {
             .as_ref()
             .and_then(|aggregate| aggregate.value()["validated_bundle_fingerprint"].as_str())
     }
-
-    pub(crate) fn aggregate(&self) -> Option<&QueueBearingAggregate> {
-        self.aggregate.as_ref()
-    }
 }
 
 pub fn create_execution_checkpoint_v2(
@@ -64,9 +60,16 @@ pub fn create_execution_checkpoint_v2(
     root_instance_id: &str,
     creation_id: &str,
     bindings: &Bindings,
-    request_digest: &str,
+    supplied_request_digest: Option<&str>,
     replay_retention: Value,
 ) -> Result<ExecutionCheckpointV2, Version2Error> {
+    let request_digest =
+        creation_request_digest_v2(bundle, machine_id, root_instance_id, creation_id, bindings)?;
+    if supplied_request_digest.is_some_and(|supplied| supplied != request_digest) {
+        return Err(invalid(
+            "supplied creation request digest does not match canonical content",
+        ));
+    }
     let created = crate::format1::v2::create_v2_with_evidence(
         bundle,
         machine_id,
@@ -134,6 +137,40 @@ pub fn create_execution_checkpoint_v2(
     let mut resolver = crate::format1::InMemoryDefinitionResolver::default();
     resolver.insert(bundle.clone(), true);
     restore_value(value, &resolver)
+}
+
+pub fn creation_request_digest_v2(
+    bundle: &Bundle,
+    machine_id: &str,
+    root_instance_id: &str,
+    creation_id: &str,
+    bindings: &Bindings,
+) -> Result<String, Version2Error> {
+    let machine = bundle.machines.get(machine_id).ok_or_else(|| {
+        Version2Error::new("invalid_machine", "creation machine is absent from bundle")
+    })?;
+    let bindings = crate::value::Value::Map(BTreeMap::from([
+        (
+            "external".to_string(),
+            crate::value::Value::Map(bindings.external.clone()),
+        ),
+        (
+            "input".to_string(),
+            crate::value::Value::Map(bindings.input.clone()),
+        ),
+    ]));
+    jcs_hash(&json!([
+        "determa-creation-request-digest-1",
+        "1",
+        bundle.fingerprint,
+        bundle.namespace,
+        machine_id,
+        machine.version.to_string(),
+        root_instance_id,
+        creation_id,
+        TypedValue::from_value(&bindings)
+    ]))
+    .map_err(|error| invalid(error.to_string()))
 }
 
 pub fn restore_execution_checkpoint_v2(
@@ -728,6 +765,40 @@ pub fn checkpoint_maintenance_migration_v2(
         maintenance_mode,
         limits,
     )?;
+    apply_checkpoint_migration_v2(checkpoint, migrated)
+}
+
+pub(crate) fn checkpoint_maintenance_migration_v2_route(
+    checkpoint: &ExecutionCheckpointV2,
+    request: &MigrationRequest,
+    resolver: &impl MigrationArtifactResolver,
+    limits: &ResourceLimits,
+    expected_revision: Option<&str>,
+    expected_checkpoint_digest: Option<&str>,
+) -> Result<Value, Version2Error> {
+    guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
+    let aggregate = checkpoint
+        .aggregate
+        .as_ref()
+        .ok_or_else(|| failure("terminal_root"))?;
+    let migrated = migrate_aggregate_v2_route_with_evidence(aggregate, request, resolver, limits)?;
+    apply_checkpoint_migration_v2(checkpoint, migrated)
+}
+
+fn apply_checkpoint_migration_v2(
+    checkpoint: &ExecutionCheckpointV2,
+    migrated: Value,
+) -> Result<Value, Version2Error> {
+    if migrated["aggregate_state"] == checkpoint.value["root_record"]["aggregate_state"]
+        && migrated["dispositions"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        && migrated["audit_records"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    {
+        return Ok(checkpoint.value.clone());
+    }
     let mut value = checkpoint.value.clone();
     value["revision"] = incremented(&value["revision"])?;
     let revision = value["revision"].clone();
@@ -1384,17 +1455,15 @@ fn validate_migration_audits(checkpoint: &Value, aggregate: &Value) -> Result<()
     let root_instance_id = checkpoint["root_instance_id"].as_str().unwrap();
     let root_runtime_id = aggregate["root_runtime_id"].as_str().unwrap();
     let aggregate_migration_sequence = counter(aggregate, "migration_sequence")?;
-    let mut prior_sequence = None;
+    let mut observed_sequence = Counter::zero();
     let mut prior_target_digest = None;
     let mut prior_target_fingerprint = None;
     for audit in checkpoint["migration_audit_records"].as_array().unwrap() {
         let sequence = counter(audit, "migration_sequence")?;
+        observed_sequence.allocate();
         if audit["root_instance_id"].as_str() != Some(root_instance_id)
             || audit["root_runtime_id"].as_str() != Some(root_runtime_id)
-            || sequence > aggregate_migration_sequence
-            || prior_sequence
-                .as_ref()
-                .is_some_and(|prior| prior >= &sequence)
+            || sequence != observed_sequence
             || prior_target_digest.is_some_and(|digest| {
                 audit["source_aggregate_state_digest"].as_str() != Some(digest)
             })
@@ -1406,15 +1475,16 @@ fn validate_migration_audits(checkpoint: &Value, aggregate: &Value) -> Result<()
                 "migration audit chronology or provenance is invalid",
             ));
         }
-        prior_sequence = Some(sequence);
         prior_target_digest = audit["target_aggregate_state_digest"].as_str();
         prior_target_fingerprint = audit["target_validated_bundle_fingerprint"].as_str();
     }
-    if prior_sequence.as_ref() == Some(&aggregate_migration_sequence)
-        && prior_target_fingerprint != aggregate["validated_bundle_fingerprint"].as_str()
+    if observed_sequence != aggregate_migration_sequence
+        || (aggregate_migration_sequence != Counter::zero()
+            && (prior_target_fingerprint != aggregate["validated_bundle_fingerprint"].as_str()
+                || prior_target_digest != aggregate["aggregate_state_digest"].as_str()))
     {
         return Err(invalid(
-            "latest migration audit bundle provenance is invalid",
+            "migration audit history is incomplete or does not attest the retained aggregate",
         ));
     }
     Ok(())
@@ -2043,7 +2113,7 @@ mod tests {
             "creation-digest-root",
             "creation-digest-operation",
             &Bindings::default(),
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            None,
             json!({
                 "mode": "permanent",
                 "permanent_replay_eligible": true,
@@ -2094,6 +2164,65 @@ mod tests {
             .unwrap()
             .reverse();
         assert!(validate_semantics(&outbox).is_err());
+    }
+
+    #[test]
+    fn restore_rejects_resealed_checkpoint_with_deleted_migration_audit() {
+        let source_bundle = load_bundle(include_str!(concat!(
+            "../../conformance-suite/conformance/core/118-version2-persistence/",
+            "machine.yaml"
+        )))
+        .unwrap();
+        let target_bundle = load_bundle(include_str!(concat!(
+            "../../conformance-suite/conformance/core/118-version2-persistence/",
+            "target-compatible.yaml"
+        )))
+        .unwrap();
+        let checkpoint = create_execution_checkpoint_v2(
+            &source_bundle,
+            "transaction_server",
+            "audit-root",
+            "audit-create",
+            &Bindings::default(),
+            None,
+            json!({
+                "mode": "permanent",
+                "permanent_replay_eligible": true,
+                "policy_identifier": null,
+                "pruned_through_receipt_sequence": null
+            }),
+        )
+        .unwrap();
+        let mut migrated = checkpoint_maintenance_migration_v2(
+            &checkpoint,
+            &source_bundle,
+            &target_bundle,
+            include_bytes!(concat!(
+                "../../conformance-suite/conformance/core/118-version2-persistence/",
+                "descriptor-compatible-v2.json"
+            )),
+            true,
+            &ResourceLimits::default(),
+            Some(checkpoint.revision()),
+            Some(checkpoint.digest()),
+        )
+        .unwrap();
+        assert_eq!(
+            migrated["migration_audit_records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        migrated["migration_audit_records"] = json!([]);
+        seal_checkpoint(&mut migrated).unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(source_bundle, true);
+        resolver.insert(target_bundle, true);
+        assert_eq!(
+            restore_value(migrated, &resolver).unwrap_err().code,
+            "invalid_execution_checkpoint"
+        );
     }
 
     fn legacy_resolver() -> InMemoryDefinitionResolver {
@@ -2439,7 +2568,7 @@ machines:
             "root",
             "create",
             &Bindings::default(),
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            None,
             json!({
                 "mode": "permanent",
                 "permanent_replay_eligible": true,
