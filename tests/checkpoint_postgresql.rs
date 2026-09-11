@@ -546,8 +546,13 @@ machines:
     else {
         panic!("unexpected native v2 migration result")
     };
+    assert_eq!(migrated["result"], "committed");
+    assert_eq!(migrated["receipt"]["migration_sequences"], json!(["1"]));
     assert_eq!(
-        migrated["migration_audit_records"]
+        host.load_checkpoint_v2(&migration_root)
+            .unwrap()
+            .unwrap()
+            .value()["migration_audit_records"]
             .as_array()
             .unwrap()
             .len(),

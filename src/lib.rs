@@ -12,10 +12,10 @@ pub mod format1;
 pub mod value;
 
 /// Exact normative specification revision implemented by this crate.
-pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "2e33036563cb966b07124197db672159b4b7e1f4";
+pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "e22f9db295d632f3f46a9d1260c63b5af92efa7e";
 
 /// Exact core conformance revision exercised by this crate.
-pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "531468c59c7a2dc32f5cbe92cfabf89805d27f6a";
+pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "8f6a4d9101fd6554e9a51da72ca48160368d4e83";
 
 pub use format1::step_v2;
 pub use format1::{

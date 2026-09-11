@@ -1842,14 +1842,12 @@ fn validate_restored_source(
                 runtimes(aggregate)?
                     .iter()
                     .any(|runtime| runtime["target_identity"] == *runtime_source)
-                    && envelope.cause_id != envelope.event_id
             } else if let Some(locator) = source
                 .get("system")
                 .and_then(JsonValue::as_str)
                 .filter(|_| source.len() == 1)
             {
                 system_locator_matches_event(locator, &envelope.event)
-                    && envelope.cause_id != envelope.event_id
             } else if source
                 .get("legacy_v1_internal")
                 .filter(|_| source.len() == 1)

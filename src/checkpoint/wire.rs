@@ -1026,6 +1026,79 @@ impl ExecutionCheckpoint {
         if self.replay_retention.is_permanent() {
             self.validate_permanent_migration_evidence(&audits, &maintenance_references)?;
         }
+        self.validate_maintenance_request_digests(&audits)?;
+        Ok(())
+    }
+
+    fn validate_maintenance_request_digests(
+        &self,
+        audits: &BTreeMap<Counter, &MigrationAuditRecord>,
+    ) -> Result<(), CheckpointError> {
+        let mut operation_ids = BTreeSet::new();
+        let mut current_fingerprint = audits
+            .values()
+            .next()
+            .map(|audit| audit.source_validated_bundle_fingerprint.clone())
+            .or_else(|| {
+                self.retained_aggregate()
+                    .map(|aggregate| aggregate.validated_bundle_fingerprint.clone())
+            });
+        for receipt in &self.operation_receipts {
+            let OperationReceipt::MaintenanceMigration(receipt) = receipt else {
+                continue;
+            };
+            if !operation_ids.insert(&receipt.operation_id) {
+                return Err(invalid("maintenance operation identity is duplicated"));
+            }
+            let selected = receipt
+                .migration_sequences
+                .iter()
+                .map(|sequence| {
+                    audits
+                        .get(sequence)
+                        .copied()
+                        .ok_or_else(|| invalid("maintenance receipt references absent audit"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (target_fingerprint, descriptor_route) = if selected.is_empty() {
+                let Some(fingerprint) = current_fingerprint.as_deref() else {
+                    continue;
+                };
+                (fingerprint, Vec::new())
+            } else {
+                (
+                    selected
+                        .last()
+                        .expect("non-empty migration audit selection")
+                        .target_validated_bundle_fingerprint
+                        .as_str(),
+                    selected
+                        .iter()
+                        .map(|audit| audit.migration_descriptor_digest.as_str())
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let mut matches = false;
+            for maintenance_mode in [false, true] {
+                let expected = hash_tagged(json!([
+                    "determa-maintenance-migration-request-digest-1",
+                    "1",
+                    self.root_instance_id,
+                    receipt.operation_id,
+                    receipt.source_aggregate_state_digest,
+                    target_fingerprint,
+                    descriptor_route,
+                    maintenance_mode
+                ]))?;
+                matches |= receipt.request_digest == expected;
+            }
+            if !matches {
+                return Err(invalid("maintenance request digest is inconsistent"));
+            }
+            if let Some(audit) = selected.last() {
+                current_fingerprint = Some(audit.target_validated_bundle_fingerprint.clone());
+            }
+        }
         Ok(())
     }
 

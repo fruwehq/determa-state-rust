@@ -16,8 +16,8 @@ workflow.
 The current draft is validated against the merged `0.2.0` metadata revisions at these
 exact immutable inputs:
 
-- specification: `2e33036563cb966b07124197db672159b4b7e1f4`;
-- conformance: `531468c59c7a2dc32f5cbe92cfabf89805d27f6a`.
+- specification: `e22f9db295d632f3f46a9d1260c63b5af92efa7e`;
+- conformance: `8f6a4d9101fd6554e9a51da72ca48160368d4e83`.
 
 The conformance suite is the arbiter of behavior. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
@@ -36,8 +36,8 @@ Never invent a release tag or weaken an exact revision check.
 - `tests/core_conformance.rs`: driver for all 114 `conformance/core` cases.
 - `tests/persistence_conformance.rs`: driver for all 108 persistence vectors.
 - `tests/persistence_profiles.rs`: driver for all six persistence host profiles.
-- `tests/checkpoint_conformance.rs`: driver for all 99 version-1 execution-checkpoint vectors.
-- `tests/checkpoint_v2_conformance.rs`: driver for all 53 queue-bearing checkpoint vectors.
+- `tests/checkpoint_conformance.rs`: driver for all 102 version-1 execution-checkpoint vectors.
+- `tests/checkpoint_v2_conformance.rs`: driver for all 60 queue-bearing checkpoint vectors.
 - `tests/checkpoint_adapters.rs`: shared memory/file/SQLite setup, restart, and CAS
   contracts.
 - `tests/checkpoint_postgresql.rs`: optional PostgreSQL exact-schema, retention-mode,
@@ -60,7 +60,7 @@ Never invent a release tag or weaken an exact revision check.
 ```sh
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
-  "531468c59c7a2dc32f5cbe92cfabf89805d27f6a"
+  "8f6a4d9101fd6554e9a51da72ca48160368d4e83"
 cargo +1.86.0 build --release --locked --all-features
 cargo +1.86.0 test --locked --all-features
 cargo clippy --locked --all-features --all-targets -- -D warnings
@@ -70,8 +70,8 @@ The declared MSRV is Rust `1.86`. CI must keep the locked default and all-featur
 including PostgreSQL, buildable and testable with that toolchain.
 
 CI runs the complete 114-case core suite, all 108 version-1 and 15 version-2
-persistence vectors, all 12 persistence-profile steps, and all 152 execution-checkpoint
-vectors. The version-2 harnesses cover 106 vectors and 143 artifacts in total. It also checks
+persistence vectors, all 12 persistence-profile steps, and all 162 execution-checkpoint
+vectors. The version-2 harnesses cover 113 vectors and 164 artifacts in total. It also checks
 every local schema byte-for-byte against the exact specification commit and runs the
 optional PostgreSQL adapter against a service.
 

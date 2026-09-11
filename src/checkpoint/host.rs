@@ -1134,6 +1134,37 @@ where
         }
         let (record, checkpoint) =
             self.require_checkpoint_v2_with_store(store, &request.root_instance_id)?;
+        if let Some(existing) = checkpoint.value()["operation_receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|receipt| {
+                receipt["operation_kind"] == "maintenance_migration"
+                    && receipt["operation_id"].as_str() == Some(request.operation_id.as_str())
+            })
+        {
+            if existing["request_digest"].as_str() == Some(request_digest.as_str()) {
+                return Ok(json!({"result": "committed", "receipt": existing}));
+            }
+            return Err(v2_failure(
+                "operation_id_conflict",
+                "maintenance operation id has different content",
+            ));
+        }
+        if checkpoint.revision() != request.guard.expected_revision
+            || checkpoint.digest() != request.guard.expected_checkpoint_digest
+        {
+            return Err(v2_failure(
+                "checkpoint_revision_conflict",
+                "checkpoint compare-and-swap guard does not match",
+            ));
+        }
+        if checkpoint.value()["root_record"]["status"] == "tombstone" {
+            return Err(v2_failure(
+                "tombstoned_root",
+                "tombstoned root cannot be migrated",
+            ));
+        }
         if checkpoint.value()["root_record"]["aggregate_state"]["aggregate_state_digest"].as_str()
             != Some(request.source_aggregate_state_digest.as_str())
         {
@@ -1151,13 +1182,29 @@ where
                     .clone(),
                 maintenance_mode: request.maintenance_mode,
             },
+            &request.operation_id,
+            &request_digest,
             self.resolver.as_ref(),
             &request.limits,
-            Some(&request.guard.expected_revision),
-            Some(&request.guard.expected_checkpoint_digest),
+            None,
+            None,
         )?;
         self.commit_v2_result_with_store(store, &record, &result)?;
-        Ok(result)
+        let receipt = result["operation_receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|receipt| {
+                receipt["operation_kind"] == "maintenance_migration"
+                    && receipt["operation_id"].as_str() == Some(request.operation_id.as_str())
+            })
+            .ok_or_else(|| {
+                v2_failure(
+                    "invalid_execution_checkpoint",
+                    "committed maintenance receipt is absent",
+                )
+            })?;
+        Ok(json!({"result": "committed", "receipt": receipt}))
     }
 
     pub fn update_pending_outbox_v2(

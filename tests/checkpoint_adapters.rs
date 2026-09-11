@@ -641,34 +641,39 @@ machines:
         )
         .expect("transactional version-2 creation");
     assert_eq!(created.revision(), "0");
+    let empty_request = MaintenanceMigrationRequest {
+        root_instance_id: created.root_instance_id().to_string(),
+        operation_id: "empty-route".to_string(),
+        source_aggregate_state_digest: created.value()["root_record"]["aggregate_state"]
+            ["aggregate_state_digest"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        target_validated_bundle_fingerprint: bundle.fingerprint.clone(),
+        migration_descriptor_digest_route: Vec::new(),
+        maintenance_mode: false,
+        supplied_request_digest: None,
+        guard: MutationGuard::new(created.revision(), created.digest()),
+        limits: ResourceLimits::default(),
+    };
     let no_op = host
-        .maintenance_migration_v2(&MaintenanceMigrationRequest {
-            root_instance_id: created.root_instance_id().to_string(),
-            operation_id: "empty-route".to_string(),
-            source_aggregate_state_digest: created.value()["root_record"]["aggregate_state"]
-                ["aggregate_state_digest"]
-                .as_str()
-                .unwrap()
-                .to_string(),
-            target_validated_bundle_fingerprint: bundle.fingerprint.clone(),
-            migration_descriptor_digest_route: Vec::new(),
-            maintenance_mode: true,
-            supplied_request_digest: None,
-            guard: MutationGuard::new(created.revision(), created.digest()),
-            limits: ResourceLimits::default(),
-        })
+        .maintenance_migration_v2(&empty_request)
         .expect("transactional v2 empty-route migration");
-    assert_eq!(no_op, *created.value());
-    assert!(no_op["migration_audit_records"]
+    assert_eq!(no_op["result"], "committed");
+    assert_eq!(no_op["receipt"]["result_code"], "migration_no_operation");
+    let after_no_op = host
+        .load_checkpoint_v2(created.root_instance_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_no_op.revision(), "1");
+    assert!(after_no_op.value()["migration_audit_records"]
         .as_array()
         .unwrap()
         .is_empty());
     assert_eq!(
-        host.load_checkpoint_v2(created.root_instance_id())
-            .unwrap()
-            .unwrap()
-            .value(),
-        created.value()
+        host.maintenance_migration_v2(&empty_request)
+            .expect("maintenance replay before stale guard"),
+        no_op
     );
 
     let migration = host
@@ -764,16 +769,24 @@ machines:
             limits: ResourceLimits::default(),
         })
         .expect("transactional native v2 maintenance migration");
-    assert_eq!(migrated["revision"], "1");
     assert_eq!(
-        migrated["migration_audit_records"]
+        migrated["receipt"]["migration_sequences"],
+        json!(["1", "2"])
+    );
+    let migrated_checkpoint = host
+        .load_checkpoint_v2(migration.root_instance_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(migrated_checkpoint.revision(), "1");
+    assert_eq!(
+        migrated_checkpoint.value()["migration_audit_records"]
             .as_array()
             .unwrap()
             .len(),
         2
     );
     assert_eq!(
-        migrated["root_record"]["aggregate_state"]["migration_sequence"],
+        migrated_checkpoint.value()["root_record"]["aggregate_state"]["migration_sequence"],
         "2"
     );
 
@@ -793,14 +806,73 @@ machines:
             }),
         )
         .expect("transactional v2 terminal creation");
+    let terminal_maintenance = MaintenanceMigrationRequest {
+        root_instance_id: terminal.root_instance_id().to_string(),
+        operation_id: "terminal-v2-maintenance".to_string(),
+        source_aggregate_state_digest: terminal.value()["root_record"]["aggregate_state"]
+            ["aggregate_state_digest"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        target_validated_bundle_fingerprint: terminal_bundle.fingerprint.clone(),
+        migration_descriptor_digest_route: Vec::new(),
+        maintenance_mode: true,
+        supplied_request_digest: None,
+        guard: MutationGuard::new(terminal.revision(), terminal.digest()),
+        limits: ResourceLimits::default(),
+    };
+    let terminal_receipt = host
+        .maintenance_migration_v2(&terminal_maintenance)
+        .expect("terminal no-op maintenance receipt");
+    let after_terminal_maintenance = host
+        .load_checkpoint_v2(terminal.root_instance_id())
+        .unwrap()
+        .unwrap();
     let tombstoned = host
         .tombstone_root_v2(
             terminal.root_instance_id(),
             "terminal-v2-tombstone",
-            &MutationGuard::new(terminal.revision(), terminal.digest()),
+            &MutationGuard::new(
+                after_terminal_maintenance.revision(),
+                after_terminal_maintenance.digest(),
+            ),
         )
         .expect("transactional native v2 root tombstone");
     assert_eq!(tombstoned["root_record"]["status"], "tombstone");
+    assert_eq!(
+        host.maintenance_migration_v2(&terminal_maintenance)
+            .expect("tombstoned maintenance replay precedes stale guard"),
+        terminal_receipt
+    );
+    let mut conflicting_terminal_maintenance = terminal_maintenance.clone();
+    conflicting_terminal_maintenance.target_validated_bundle_fingerprint =
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
+    assert_eq!(
+        host.maintenance_migration_v2(&conflicting_terminal_maintenance)
+            .unwrap_err()
+            .code,
+        "operation_id_conflict"
+    );
+    let mut stale_terminal_maintenance = terminal_maintenance.clone();
+    stale_terminal_maintenance.operation_id = "terminal-v2-stale".to_string();
+    assert_eq!(
+        host.maintenance_migration_v2(&stale_terminal_maintenance)
+            .unwrap_err()
+            .code,
+        "checkpoint_revision_conflict"
+    );
+    let mut current_terminal_maintenance = stale_terminal_maintenance;
+    current_terminal_maintenance.operation_id = "terminal-v2-current".to_string();
+    current_terminal_maintenance.guard = MutationGuard::new(
+        tombstoned["revision"].as_str().unwrap(),
+        tombstoned["execution_checkpoint_digest"].as_str().unwrap(),
+    );
+    assert_eq!(
+        host.maintenance_migration_v2(&current_terminal_maintenance)
+            .unwrap_err()
+            .code,
+        "tombstoned_root"
+    );
 
     let outbox = host
         .create_checkpoint_v2(

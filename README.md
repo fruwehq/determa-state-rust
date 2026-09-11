@@ -8,15 +8,15 @@ remains `0.1.0` until the coordinated `v0.2.0` tag runs the release workflow. Th
 branch is validated against the merged `0.2.0` metadata revisions at these exact
 normative inputs:
 
-- specification commit `2e33036563cb966b07124197db672159b4b7e1f4`;
-- conformance commit `531468c59c7a2dc32f5cbe92cfabf89805d27f6a`.
+- specification commit `e22f9db295d632f3f46a9d1260c63b5af92efa7e`;
+- conformance commit `8f6a4d9101fd6554e9a51da72ca48160368d4e83`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 114 format-1 core cases, 108 version-1 and 15 version-2 portable
 persistence vectors, and 12 steps
 across the six persistence host profiles. The execution-checkpoint integration test
-runs all 99 version-1 and 53 version-2 host vectors. The version-2 harnesses cover 106
-vectors and 143 artifacts in total.
+runs all 102 version-1 and 60 version-2 host vectors. The version-2 harnesses cover 113
+vectors and 164 artifacts in total.
 
 ## Implemented core
 
@@ -71,9 +71,9 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`531468c59c7a2dc32f5cbe92cfabf89805d27f6a`. CI also checks that all bundled schemas
+`8f6a4d9101fd6554e9a51da72ca48160368d4e83`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
-`2e33036563cb966b07124197db672159b4b7e1f4`. These exact merged commits are the
+`e22f9db295d632f3f46a9d1260c63b5af92efa7e`. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
 
 ## Library

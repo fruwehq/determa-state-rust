@@ -1,9 +1,9 @@
 use determa_state::checkpoint::{
     checkpoint_admit_v2, checkpoint_prune_v2, checkpoint_step_v2, restore_execution_checkpoint_v2,
     upgrade_execution_checkpoint_v1_to_v2, CheckpointHost, DeliveryRequest, ExecutionStore,
-    MemoryExecutionStore, MutationGuard, StoreRecord,
+    MaintenanceMigrationRequest, MemoryExecutionStore, MutationGuard, StoreRecord,
 };
-use determa_state::{load_bundle, InMemoryDefinitionResolver, Version2Error};
+use determa_state::{load_bundle, InMemoryDefinitionResolver, ResourceLimits, Version2Error};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -23,7 +23,7 @@ fn all_version2_checkpoint_vectors() {
     let requests = json(&directory.join("operation-inputs.json"));
     let (resolver, bundles) = definitions(&directory);
     let vectors = test["version2_vectors"].as_array().unwrap();
-    assert_eq!(vectors.len(), 53);
+    assert_eq!(vectors.len(), 60);
     let mut failures = Vec::new();
     for vector in vectors {
         let name = vector["name"].as_str().unwrap();
@@ -128,12 +128,104 @@ fn run_vector(
                 request["expected_checkpoint_digest"].as_str(),
             )
         }
+        "checkpoint_migrate_v2" => {
+            checkpoint_migrate_v2(directory, &before, request, vector, resolver)
+        }
         "checkpoint_v1_accept" => {
             checkpoint_v1_accept(directory, &before, request, vector, resolver)
         }
         other => return Err(format!("unsupported operation {other}")),
     };
     assert_vector(directory, vector, actual)
+}
+
+fn checkpoint_migrate_v2(
+    directory: &Path,
+    before: &[u8],
+    request: &Value,
+    vector: &Value,
+    resolver: &InMemoryDefinitionResolver,
+) -> Result<Value, Version2Error> {
+    let checkpoint: Value = serde_json::from_slice(before).unwrap();
+    let root_instance_id = checkpoint["root_instance_id"].as_str().unwrap();
+    let store = Arc::new(MemoryExecutionStore::new());
+    store
+        .insert_if_absent(StoreRecord {
+            root_instance_id: root_instance_id.to_string(),
+            revision: checkpoint["revision"].as_str().unwrap().to_string(),
+            execution_checkpoint_digest: checkpoint["execution_checkpoint_digest"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            bytes: before.to_vec(),
+        })
+        .unwrap();
+    let mut host_resolver = resolver.clone();
+    for file in request["migration_descriptor_files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let bytes = fs::read(directory.join(file.as_str().unwrap())).unwrap();
+        let descriptor: Value = serde_json::from_slice(&bytes).unwrap();
+        host_resolver.insert_descriptor(
+            descriptor["migration_descriptor_digest"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            bytes,
+            true,
+        );
+    }
+    let host = CheckpointHost::new(store.clone(), Arc::new(host_resolver));
+    let result = host.maintenance_migration_v2(&MaintenanceMigrationRequest {
+        root_instance_id: root_instance_id.to_string(),
+        operation_id: request["operation_id"].as_str().unwrap().to_string(),
+        source_aggregate_state_digest: checkpoint["root_record"]["aggregate_state"]
+            ["aggregate_state_digest"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        target_validated_bundle_fingerprint: request["target_bundle"]
+            ["validated_bundle_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        migration_descriptor_digest_route: request["migration_descriptor_digest_route"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect(),
+        maintenance_mode: request["maintenance_mode"].as_bool().unwrap(),
+        supplied_request_digest: Some(request["request_digest"].as_str().unwrap().to_string()),
+        guard: MutationGuard::new(
+            request["expected_revision"].as_str().unwrap(),
+            request["expected_checkpoint_digest"].as_str().unwrap(),
+        ),
+        limits: ResourceLimits::default(),
+    });
+    let persisted = store.load(root_instance_id).unwrap().unwrap();
+    if result.is_err() && persisted.bytes != before {
+        return Err(Version2Error::new(
+            "invalid_execution_checkpoint",
+            "failed maintenance vector changed the exact checkpoint bytes",
+        ));
+    }
+    let expected_checkpoint = if result.is_ok() {
+        vector["checkpoint_after"].as_str().unwrap()
+    } else {
+        vector["expect"]["unchanged_file"].as_str().unwrap()
+    };
+    let actual: Value = serde_json::from_slice(&persisted.bytes).unwrap();
+    let expected = json(&directory.join(expected_checkpoint));
+    if actual != expected {
+        return Err(Version2Error::new(
+            "invalid_execution_checkpoint",
+            difference(&expected, &actual, "persisted"),
+        ));
+    }
+    result
 }
 
 fn checkpoint_v1_accept(

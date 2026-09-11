@@ -34,10 +34,10 @@ pub use store::{
     StoreRecord, StoreWriteResult,
 };
 pub use v2::{
-    checkpoint_admit_v2, checkpoint_compact_outbox_v2, checkpoint_maintenance_migration_v2,
-    checkpoint_prune_v2, checkpoint_step_v2, checkpoint_terminalize_outbox_v2,
-    checkpoint_tombstone_root_v2, checkpoint_update_pending_outbox_v2,
-    create_execution_checkpoint_v2, creation_request_digest_v2, restore_execution_checkpoint_v2,
+    checkpoint_admit_v2, checkpoint_compact_outbox_v2, checkpoint_prune_v2, checkpoint_step_v2,
+    checkpoint_terminalize_outbox_v2, checkpoint_tombstone_root_v2,
+    checkpoint_update_pending_outbox_v2, create_execution_checkpoint_v2,
+    creation_request_digest_v2, restore_execution_checkpoint_v2,
     upgrade_execution_checkpoint_v1_to_v2, ExecutionCheckpointV2,
 };
 pub use wire::{

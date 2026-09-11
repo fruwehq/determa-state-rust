@@ -3,9 +3,10 @@ use determa_state::checkpoint::{
     AdapterErrorCode, AdapterRegistry, CheckpointHost, CreationRequest, DeliveryRequest,
     EmissionReference, ExecutionCheckpoint, ExecutionStore, ExecutionStoreCapability,
     ExecutionStoreFactory, HealthStatus, HostFeature, HostProfile, MaintenanceMigrationRequest,
-    MemoryExecutionStore, MutationGuard, OperationReceipt, OutboxRecord, PendingOutboxState,
-    PreAcceptanceFailureCode, ProcessingMigration, ReplayRetention, RootRecord, StoreError,
-    StoreRecord, StoreWriteResult, TerminalOutboxOutcome, TerminalRootStatus,
+    MaintenanceMigrationResultCode, MemoryExecutionStore, MutationGuard, OperationReceipt,
+    OutboxRecord, PendingOutboxState, PreAcceptanceFailureCode, ProcessingMigration,
+    ReplayRetention, RootRecord, StoreError, StoreRecord, StoreWriteResult, TerminalOutboxOutcome,
+    TerminalRootStatus,
 };
 use determa_state::{
     load_bundle, Bindings, Bundle, InMemoryDefinitionResolver, MigrationRequest, ResourceLimits,
@@ -83,7 +84,7 @@ fn all_execution_checkpoint_v1_vectors_run_through_the_host() {
             run_vector(&case, &inputs, &resolver, &bundles, vector);
         }
     }
-    assert_eq!(count, 99);
+    assert_eq!(count, 102);
 }
 
 #[test]
@@ -397,6 +398,88 @@ fn restore_reconciles_internal_origin_status_and_tombstone_evidence() {
     };
     root.terminal_status = TerminalRootStatus::Faulted;
     assert_invalid_after_digest(&mut tombstone, &lifecycle_resolver);
+}
+
+#[test]
+fn schema_v1_historical_no_op_digest_survives_later_migration() {
+    let case = PathBuf::from(PROFILE).join("checkpoint-03-retention-and-root-lifecycle");
+    let inputs = read_json(&case.join("inputs.json"));
+    let (resolver, _) = resolver_for_case(&case, &inputs);
+    let store = Arc::new(MemoryExecutionStore::new());
+    store.initialize_schema().expect("memory schema");
+    let created = restore_fixture(&case, "maintenance-created-checkpoint.json", &resolver);
+    store
+        .insert_if_absent(StoreRecord::from_checkpoint(&created).expect("created record"))
+        .expect("seed maintenance checkpoint");
+    let host = CheckpointHost::new(store, Arc::new(resolver.clone()));
+    let empty = &inputs["requests"]["maintenance_empty"];
+    host.maintenance_migration(&MaintenanceMigrationRequest {
+        root_instance_id: created.root_instance_id.clone(),
+        operation_id: empty["operation_id"].as_str().unwrap().to_string(),
+        source_aggregate_state_digest: empty["source_aggregate_state_digest"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        target_validated_bundle_fingerprint: empty["target_validated_bundle_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        migration_descriptor_digest_route: Vec::new(),
+        maintenance_mode: empty["maintenance_mode"].as_bool().unwrap(),
+        supplied_request_digest: empty["request_digest"].as_str().map(str::to_string),
+        guard: MutationGuard::new(
+            created.revision.to_string(),
+            &created.execution_checkpoint_digest,
+        ),
+        limits: ResourceLimits::default(),
+    })
+    .expect("schema-v1 no-op maintenance");
+    let after_empty = host
+        .load_checkpoint(&created.root_instance_id)
+        .expect("load after no-op")
+        .expect("checkpoint after no-op");
+    let multi = &inputs["requests"]["maintenance_multi_hop"];
+    host.maintenance_migration(&MaintenanceMigrationRequest {
+        root_instance_id: created.root_instance_id.clone(),
+        operation_id: multi["operation_id"].as_str().unwrap().to_string(),
+        source_aggregate_state_digest: multi["source_aggregate_state_digest"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        target_validated_bundle_fingerprint: multi["target_validated_bundle_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        migration_descriptor_digest_route: strings(&multi["migration_descriptor_digest_route"]),
+        maintenance_mode: multi["maintenance_mode"].as_bool().unwrap(),
+        supplied_request_digest: multi["request_digest"].as_str().map(str::to_string),
+        guard: MutationGuard::new(
+            after_empty.revision.to_string(),
+            &after_empty.execution_checkpoint_digest,
+        ),
+        limits: ResourceLimits::default(),
+    })
+    .expect("schema-v1 migration after historical no-op");
+    let mut sequential = host
+        .load_checkpoint(&created.root_instance_id)
+        .expect("load sequential migration")
+        .expect("sequential checkpoint");
+    assert_eq!(sequential.migration_audit_records.len(), 2);
+    let no_op = sequential
+        .operation_receipts
+        .iter_mut()
+        .find_map(|receipt| match receipt {
+            OperationReceipt::MaintenanceMigration(receipt)
+                if receipt.result_code == MaintenanceMigrationResultCode::MigrationNoOperation =>
+            {
+                Some(receipt)
+            }
+            _ => None,
+        })
+        .expect("historical no-op receipt");
+    no_op.request_digest =
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
+    assert_invalid_after_digest(&mut sequential, &resolver);
 }
 
 #[test]

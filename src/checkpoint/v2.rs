@@ -1,7 +1,7 @@
 use crate::format1::strict_json;
 use crate::format1::v2::{
-    canonical_bytes, migrate_aggregate_v2_route_with_evidence, migrate_aggregate_v2_with_evidence,
-    validate_admission_delivery_schema, validate_v2_schema,
+    canonical_bytes, migrate_aggregate_v2_route_with_evidence, validate_admission_delivery_schema,
+    validate_v2_schema,
 };
 use crate::format1::wire::jcs_hash;
 use crate::format1::{
@@ -742,35 +742,11 @@ pub fn checkpoint_prune_v2(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn checkpoint_maintenance_migration_v2(
-    checkpoint: &ExecutionCheckpointV2,
-    source_bundle: &Bundle,
-    target_bundle: &Bundle,
-    descriptor_source: &[u8],
-    maintenance_mode: bool,
-    limits: &ResourceLimits,
-    expected_revision: Option<&str>,
-    expected_checkpoint_digest: Option<&str>,
-) -> Result<Value, Version2Error> {
-    guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
-    let aggregate = checkpoint
-        .aggregate
-        .as_ref()
-        .ok_or_else(|| failure("terminal_root"))?;
-    let migrated = migrate_aggregate_v2_with_evidence(
-        aggregate,
-        source_bundle,
-        target_bundle,
-        descriptor_source,
-        maintenance_mode,
-        limits,
-    )?;
-    apply_checkpoint_migration_v2(checkpoint, migrated)
-}
-
 pub(crate) fn checkpoint_maintenance_migration_v2_route(
     checkpoint: &ExecutionCheckpointV2,
     request: &MigrationRequest,
+    operation_id: &str,
+    request_digest: &str,
     resolver: &impl MigrationArtifactResolver,
     limits: &ResourceLimits,
     expected_revision: Option<&str>,
@@ -782,26 +758,20 @@ pub(crate) fn checkpoint_maintenance_migration_v2_route(
         .as_ref()
         .ok_or_else(|| failure("terminal_root"))?;
     let migrated = migrate_aggregate_v2_route_with_evidence(aggregate, request, resolver, limits)?;
-    apply_checkpoint_migration_v2(checkpoint, migrated)
+    apply_checkpoint_migration_v2(checkpoint, migrated, operation_id, request_digest)
 }
 
 fn apply_checkpoint_migration_v2(
     checkpoint: &ExecutionCheckpointV2,
     migrated: Value,
+    operation_id: &str,
+    request_digest: &str,
 ) -> Result<Value, Version2Error> {
-    if migrated["aggregate_state"] == checkpoint.value["root_record"]["aggregate_state"]
-        && migrated["dispositions"]
-            .as_array()
-            .is_some_and(Vec::is_empty)
-        && migrated["audit_records"]
-            .as_array()
-            .is_some_and(Vec::is_empty)
-    {
-        return Ok(checkpoint.value.clone());
-    }
     let mut value = checkpoint.value.clone();
     value["revision"] = incremented(&value["revision"])?;
     let revision = value["revision"].clone();
+    let source_aggregate_state_digest =
+        checkpoint.value["root_record"]["aggregate_state"]["aggregate_state_digest"].clone();
     let aggregate = migrated["aggregate_state"].clone();
     let status = aggregate["runtimes"]
         .as_array()
@@ -812,6 +782,31 @@ fn apply_checkpoint_migration_v2(
         .ok_or_else(|| invalid("migrated root runtime status is absent"))?
         .to_string();
     value["root_record"]["aggregate_state"] = aggregate.clone();
+    let migration_sequences = migrated["audit_records"]
+        .as_array()
+        .ok_or_else(|| invalid("migration audit records are absent"))?
+        .iter()
+        .map(|audit| audit["migration_sequence"].clone())
+        .collect::<Vec<_>>();
+    let receipt_sequence = allocate(&mut value, "next_operation_receipt_sequence")?;
+    value["operation_receipts"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "operation_kind": "maintenance_migration",
+            "receipt_sequence": receipt_sequence,
+            "operation_id": operation_id,
+            "request_digest": request_digest,
+            "committed_revision": revision,
+            "source_aggregate_state_digest": source_aggregate_state_digest,
+            "resulting_aggregate_state_digest": aggregate["aggregate_state_digest"],
+            "migration_sequences": migration_sequences,
+            "result_code": if migrated["audit_records"].as_array().unwrap().is_empty() {
+                "migration_no_operation"
+            } else {
+                "migration_applied"
+            }
+        }));
     for disposition in migrated["dispositions"].as_array().unwrap() {
         let receipt_sequence = allocate(&mut value, "next_operation_receipt_sequence")?;
         value["operation_receipts"]
@@ -1280,6 +1275,7 @@ fn validate_semantics(value: &Value) -> Result<(), Version2Error> {
                 }
                 Some(counter(receipt, "committed_revision")?)
             }
+            "maintenance_migration" => Some(counter(receipt, "committed_revision")?),
             "legacy_v1_operation" => {
                 if receipt["legacy_receipt"]["operation_kind"] == "delivery" {
                     let acceptance =
@@ -1293,7 +1289,10 @@ fn validate_semantics(value: &Value) -> Result<(), Version2Error> {
             _ => return Err(invalid("unknown operation receipt kind")),
         };
         if let Some(committed) = committed {
-            if committed > revision || committed < prior_commit {
+            if committed > revision
+                || committed < prior_commit
+                || (kind == "maintenance_migration" && committed <= prior_commit)
+            {
                 return Err(invalid("receipt chronology is invalid"));
             }
             prior_commit = committed;
@@ -1309,6 +1308,7 @@ fn validate_semantics(value: &Value) -> Result<(), Version2Error> {
     {
         return Err(invalid("checkpoint creation evidence is invalid"));
     }
+    validate_receipt_retention(value, receipts, &next_receipt)?;
     validate_legacy_acceptance_relationships(receipts, &acceptance_by_event)?;
 
     let mut mailbox_events = BTreeMap::new();
@@ -1342,6 +1342,7 @@ fn validate_semantics(value: &Value) -> Result<(), Version2Error> {
             return Err(invalid("event allocation exceeds aggregate counters"));
         }
         validate_migration_audits(value, aggregate)?;
+        validate_maintenance_receipts(value, Some(aggregate))?;
         validate_mailboxes(
             value,
             aggregate,
@@ -1349,6 +1350,9 @@ fn validate_semantics(value: &Value) -> Result<(), Version2Error> {
             receipts,
             &mut mailbox_events,
         )?;
+    }
+    if value["root_record"]["status"] == "tombstone" {
+        validate_maintenance_receipts(value, None)?;
     }
 
     let mut tombstone_ids = BTreeSet::new();
@@ -1396,6 +1400,173 @@ fn validate_semantics(value: &Value) -> Result<(), Version2Error> {
     )?;
     validate_emission_and_outbox_relationships(value, receipts, &terminal_by_event)?;
     Ok(())
+}
+
+fn validate_receipt_retention(
+    checkpoint: &Value,
+    receipts: &[Value],
+    next_receipt: &Counter,
+) -> Result<(), Version2Error> {
+    let cutoff = checkpoint["replay_retention"]["pruned_through_receipt_sequence"]
+        .as_str()
+        .map(Counter::from_decimal)
+        .transpose()
+        .map_err(invalid)?;
+    if cutoff.as_ref().is_some_and(|cutoff| cutoff >= next_receipt) {
+        return Err(invalid("receipt retention cutoff reaches its next counter"));
+    }
+    let mut expected = cutoff.unwrap_or_else(|| Counter::from(0_u64));
+    expected.allocate();
+    for receipt in receipts.iter().skip(1) {
+        if counter(receipt, "receipt_sequence")? != expected {
+            return Err(invalid("receipt retention contains an unattested gap"));
+        }
+        expected.allocate();
+    }
+    if &expected != next_receipt {
+        return Err(invalid("next receipt sequence contains an unattested gap"));
+    }
+    Ok(())
+}
+
+fn validate_maintenance_receipts(
+    checkpoint: &Value,
+    aggregate: Option<&Value>,
+) -> Result<(), Version2Error> {
+    let audits = checkpoint["migration_audit_records"].as_array().unwrap();
+    let audits_by_sequence = audits
+        .iter()
+        .map(|audit| (audit["migration_sequence"].as_str().unwrap(), audit))
+        .collect::<BTreeMap<_, _>>();
+    let mut operation_ids = BTreeSet::new();
+    let mut referenced_sequences = BTreeSet::new();
+    let mut current_fingerprint = audits
+        .first()
+        .and_then(|audit| audit["source_validated_bundle_fingerprint"].as_str())
+        .or_else(|| {
+            aggregate.and_then(|aggregate| aggregate["validated_bundle_fingerprint"].as_str())
+        });
+    for receipt in checkpoint["operation_receipts"].as_array().unwrap() {
+        if receipt["operation_kind"] != "maintenance_migration" {
+            continue;
+        }
+        let operation_id = receipt["operation_id"].as_str().unwrap();
+        if !operation_ids.insert(operation_id) {
+            return Err(invalid("maintenance operation identity is duplicated"));
+        }
+        let sequences = receipt["migration_sequences"].as_array().unwrap();
+        let selected = sequences
+            .iter()
+            .map(|sequence| {
+                let sequence = sequence.as_str().unwrap();
+                if !referenced_sequences.insert(sequence) {
+                    return Err(invalid("migration audit has multiple receipt references"));
+                }
+                audits_by_sequence
+                    .get(sequence)
+                    .copied()
+                    .ok_or_else(|| invalid("maintenance receipt references absent audit"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        match receipt["result_code"].as_str().unwrap() {
+            "migration_no_operation" => {
+                if !selected.is_empty()
+                    || receipt["source_aggregate_state_digest"]
+                        != receipt["resulting_aggregate_state_digest"]
+                {
+                    return Err(invalid("no-operation maintenance receipt is inconsistent"));
+                }
+                if let Some(fingerprint) = current_fingerprint {
+                    if !maintenance_request_digest_matches(
+                        checkpoint,
+                        receipt,
+                        operation_id,
+                        fingerprint,
+                        &[],
+                    )? {
+                        return Err(invalid("maintenance request digest is inconsistent"));
+                    }
+                }
+            }
+            "migration_applied" => {
+                if selected.is_empty()
+                    || selected.windows(2).any(|pair| {
+                        Counter::from_decimal(pair[0]["migration_sequence"].as_str().unwrap())
+                            .is_ok_and(|mut left| {
+                                left.allocate();
+                                Counter::from_decimal(
+                                    pair[1]["migration_sequence"].as_str().unwrap(),
+                                )
+                                .is_ok_and(|right| right != left)
+                            })
+                    })
+                    || selected[0]["source_aggregate_state_digest"]
+                        != receipt["source_aggregate_state_digest"]
+                    || selected.last().unwrap()["target_aggregate_state_digest"]
+                        != receipt["resulting_aggregate_state_digest"]
+                    || selected.windows(2).any(|pair| {
+                        pair[0]["target_aggregate_state_digest"]
+                            != pair[1]["source_aggregate_state_digest"]
+                    })
+                {
+                    return Err(invalid("maintenance receipt audit chain is inconsistent"));
+                }
+                let target_fingerprint = selected.last().unwrap()
+                    ["target_validated_bundle_fingerprint"]
+                    .as_str()
+                    .unwrap();
+                let descriptor_route = selected
+                    .iter()
+                    .map(|audit| audit["migration_descriptor_digest"].clone())
+                    .collect::<Vec<_>>();
+                if !maintenance_request_digest_matches(
+                    checkpoint,
+                    receipt,
+                    operation_id,
+                    target_fingerprint,
+                    &descriptor_route,
+                )? {
+                    return Err(invalid("maintenance request digest is inconsistent"));
+                }
+                current_fingerprint = Some(target_fingerprint);
+            }
+            _ => return Err(invalid("maintenance result code is invalid")),
+        }
+    }
+    if checkpoint["replay_retention"]["mode"] == "permanent"
+        && referenced_sequences.len() != audits.len()
+    {
+        return Err(invalid(
+            "permanent migration audit lacks maintenance receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn maintenance_request_digest_matches(
+    checkpoint: &Value,
+    receipt: &Value,
+    operation_id: &str,
+    target_fingerprint: &str,
+    descriptor_route: &[Value],
+) -> Result<bool, Version2Error> {
+    for maintenance_mode in [false, true] {
+        let expected = jcs_hash(&json!([
+            "determa-maintenance-migration-request-digest-1",
+            "1",
+            checkpoint["root_instance_id"],
+            operation_id,
+            receipt["source_aggregate_state_digest"],
+            target_fingerprint,
+            descriptor_route,
+            maintenance_mode
+        ]))
+        .map_err(invalid)?;
+        if receipt["request_digest"].as_str() == Some(expected.as_str()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn validate_legacy_acceptance_relationships(
@@ -2095,6 +2266,10 @@ mod tests {
                 "../../conformance-suite/conformance/profiles/execution-checkpoint/",
                 "checkpoint-04-version2-mailboxes/processed-upgraded-internal-checkpoint-v2.json"
             )),
+            "maintenance" => include_str!(concat!(
+                "../../conformance-suite/conformance/profiles/execution-checkpoint/",
+                "checkpoint-04-version2-mailboxes/maintenance-one-hop-checkpoint-v2.json"
+            )),
             _ => unreachable!(),
         };
         serde_json::from_str(source).unwrap()
@@ -2164,6 +2339,31 @@ mod tests {
             .unwrap()
             .reverse();
         assert!(validate_semantics(&outbox).is_err());
+
+        let mut maintenance = checkpoint("maintenance");
+        maintenance["operation_receipts"][1]["committed_revision"] = json!("0");
+        seal_checkpoint(&mut maintenance).unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(
+            load_bundle(include_str!(concat!(
+                "../../conformance-suite/conformance/profiles/execution-checkpoint/",
+                "checkpoint-04-version2-mailboxes/maintenance-source.yaml"
+            )))
+            .unwrap(),
+            true,
+        );
+        resolver.insert(
+            load_bundle(include_str!(concat!(
+                "../../conformance-suite/conformance/profiles/execution-checkpoint/",
+                "checkpoint-04-version2-mailboxes/maintenance-target-one.yaml"
+            )))
+            .unwrap(),
+            true,
+        );
+        assert_eq!(
+            restore_value(maintenance, &resolver).unwrap_err().code,
+            "invalid_execution_checkpoint"
+        );
     }
 
     #[test]
@@ -2193,15 +2393,41 @@ mod tests {
             }),
         )
         .unwrap();
-        let mut migrated = checkpoint_maintenance_migration_v2(
+        let descriptor_bytes = include_bytes!(concat!(
+            "../../conformance-suite/conformance/core/118-version2-persistence/",
+            "descriptor-compatible-v2.json"
+        ));
+        let descriptor: Value = serde_json::from_slice(descriptor_bytes).unwrap();
+        let descriptor_digest = descriptor["migration_descriptor_digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(source_bundle.clone(), true);
+        resolver.insert(target_bundle.clone(), true);
+        resolver.insert_descriptor(descriptor_digest.clone(), descriptor_bytes.to_vec(), true);
+        let operation_id = "audit-migration";
+        let request_digest = jcs_hash(&json!([
+            "determa-maintenance-migration-request-digest-1",
+            "1",
+            "audit-root",
+            operation_id,
+            checkpoint.value()["root_record"]["aggregate_state"]["aggregate_state_digest"],
+            target_bundle.fingerprint,
+            [descriptor_digest.clone()],
+            true
+        ]))
+        .unwrap();
+        let mut migrated = checkpoint_maintenance_migration_v2_route(
             &checkpoint,
-            &source_bundle,
-            &target_bundle,
-            include_bytes!(concat!(
-                "../../conformance-suite/conformance/core/118-version2-persistence/",
-                "descriptor-compatible-v2.json"
-            )),
-            true,
+            &MigrationRequest {
+                migration_route: vec![descriptor_digest],
+                target_validated_bundle_fingerprint: target_bundle.fingerprint.clone(),
+                maintenance_mode: true,
+            },
+            operation_id,
+            &request_digest,
+            &resolver,
             &ResourceLimits::default(),
             Some(checkpoint.revision()),
             Some(checkpoint.digest()),
@@ -2216,9 +2442,6 @@ mod tests {
         );
         migrated["migration_audit_records"] = json!([]);
         seal_checkpoint(&mut migrated).unwrap();
-        let mut resolver = InMemoryDefinitionResolver::default();
-        resolver.insert(source_bundle, true);
-        resolver.insert(target_bundle, true);
         assert_eq!(
             restore_value(migrated, &resolver).unwrap_err().code,
             "invalid_execution_checkpoint"

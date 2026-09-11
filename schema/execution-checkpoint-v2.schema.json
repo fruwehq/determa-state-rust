@@ -419,6 +419,85 @@
         }
       }
     },
+    "maintenanceMigrationReceipt": {
+      "type": "object",
+      "required": [
+        "operation_kind",
+        "receipt_sequence",
+        "operation_id",
+        "request_digest",
+        "committed_revision",
+        "source_aggregate_state_digest",
+        "resulting_aggregate_state_digest",
+        "migration_sequences",
+        "result_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation_kind": {
+          "const": "maintenance_migration"
+        },
+        "receipt_sequence": {
+          "$ref": "execution-checkpoint.schema.json#/$defs/canonicalDecimal"
+        },
+        "operation_id": {
+          "$ref": "execution-checkpoint.schema.json#/$defs/nonEmptyString"
+        },
+        "request_digest": {
+          "$ref": "execution-checkpoint.schema.json#/$defs/sha256"
+        },
+        "committed_revision": {
+          "$ref": "execution-checkpoint.schema.json#/$defs/canonicalDecimal"
+        },
+        "source_aggregate_state_digest": {
+          "$ref": "execution-checkpoint.schema.json#/$defs/sha256"
+        },
+        "resulting_aggregate_state_digest": {
+          "$ref": "execution-checkpoint.schema.json#/$defs/sha256"
+        },
+        "migration_sequences": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "execution-checkpoint.schema.json#/$defs/positiveCanonicalDecimal"
+          }
+        },
+        "result_code": {
+          "enum": [
+            "migration_applied",
+            "migration_no_operation"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "result_code": {
+                "const": "migration_applied"
+              }
+            },
+            "required": [
+              "result_code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "migration_sequences": {
+                "minItems": 1
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "migration_sequences": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
     "operationReceipt": {
       "oneOf": [
         {
@@ -429,6 +508,9 @@
         },
         {
           "$ref": "#/$defs/terminalEventReceipt"
+        },
+        {
+          "$ref": "#/$defs/maintenanceMigrationReceipt"
         },
         {
           "$ref": "#/$defs/legacyV1CreationReceipt"
