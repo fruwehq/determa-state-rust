@@ -2,14 +2,15 @@
 use determa_state::checkpoint::SqliteExecutionStore;
 use determa_state::checkpoint::{
     register_bundled_adapters, AdapterRegistry, CheckpointHost, ExecutionCheckpoint,
-    ExecutionStore, ExecutionStoreCapability, FileExecutionStore, MemoryExecutionStore,
-    MutationGuard, StoreRecord, StoreWriteResult,
+    ExecutionStore, ExecutionStoreCapability, FileExecutionStore, MaintenanceMigrationRequest,
+    MemoryExecutionStore, MutationGuard, PendingOutboxState, StoreRecord, StoreWriteResult,
+    TerminalOutboxOutcome,
 };
 #[cfg(feature = "sqlite")]
 use determa_state::checkpoint::{
     DurableStoreMode, HostFeature, HostProfile, OutboxRetentionMode, ReceiptRetentionMode,
 };
-use determa_state::{load_bundle, Bindings, InMemoryDefinitionResolver};
+use determa_state::{load_bundle, Bindings, InMemoryDefinitionResolver, ResourceLimits};
 #[cfg(feature = "sqlite")]
 use rusqlite::Connection;
 use serde_json::json;
@@ -538,6 +539,52 @@ fn version2_host_contract(store: Arc<dyn ExecutionStore>) {
     .expect("version-2 bundle");
     let mut resolver = InMemoryDefinitionResolver::default();
     resolver.insert(bundle.clone(), true);
+    let outbox_bundle = load_bundle(
+        &fs::read_to_string(
+            PathBuf::from(CHECKPOINT_PROFILE)
+                .join("checkpoint-04-version2-mailboxes/creation-owned-work-machine.yaml"),
+        )
+        .expect("version-2 creation outbox bundle fixture"),
+    )
+    .expect("version-2 creation outbox bundle");
+    resolver.insert(outbox_bundle.clone(), true);
+    let migration_directory =
+        PathBuf::from("conformance-suite/conformance/core/118-version2-persistence");
+    let migration_source = load_bundle(
+        &fs::read_to_string(migration_directory.join("machine.yaml"))
+            .expect("v2 migration source bundle"),
+    )
+    .expect("load v2 migration source bundle");
+    let migration_target = load_bundle(
+        &fs::read_to_string(migration_directory.join("target-compatible.yaml"))
+            .expect("v2 migration target bundle"),
+    )
+    .expect("load v2 migration target bundle");
+    let descriptor_bytes = fs::read(migration_directory.join("descriptor-compatible-v2.json"))
+        .expect("v2 migration descriptor");
+    let descriptor: serde_json::Value = serde_json::from_slice(&descriptor_bytes).unwrap();
+    let descriptor_digest = descriptor["migration_descriptor_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    resolver.insert(migration_source.clone(), true);
+    resolver.insert(migration_target.clone(), true);
+    resolver.insert_descriptor(descriptor_digest.clone(), descriptor_bytes, true);
+    let terminal_bundle = load_bundle(
+        r#"
+format: 1
+namespace: test.v2_terminal
+machines:
+  - machine_id: terminal
+    root:
+      variables:
+        value: { type: int, init: 0 }
+      entry:
+        - assign: { value: "1 / 0" }
+"#,
+    )
+    .expect("load v2 terminal bundle");
+    resolver.insert(terminal_bundle.clone(), true);
     let host = CheckpointHost::new(store.clone(), Arc::new(resolver));
     let created = host
         .create_checkpoint_v2(
@@ -556,6 +603,168 @@ fn version2_host_contract(store: Arc<dyn ExecutionStore>) {
         )
         .expect("transactional version-2 creation");
     assert_eq!(created.revision(), "0");
+    let no_op = host
+        .maintenance_migration_v2(&MaintenanceMigrationRequest {
+            root_instance_id: created.root_instance_id().to_string(),
+            operation_id: "empty-route".to_string(),
+            source_aggregate_state_digest: created.value()["root_record"]["aggregate_state"]
+                ["aggregate_state_digest"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            target_validated_bundle_fingerprint: bundle.fingerprint.clone(),
+            migration_descriptor_digest_route: Vec::new(),
+            maintenance_mode: true,
+            supplied_request_digest: None,
+            guard: MutationGuard::new(created.revision(), created.digest()),
+            limits: ResourceLimits::default(),
+        })
+        .expect("transactional v2 empty-route migration");
+    assert_eq!(no_op, *created.value());
+    assert!(no_op["migration_audit_records"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        host.load_checkpoint_v2(created.root_instance_id())
+            .unwrap()
+            .unwrap()
+            .value(),
+        created.value()
+    );
+
+    let migration = host
+        .create_checkpoint_v2(
+            &migration_source,
+            "transaction_server",
+            "migration-v2-root",
+            "migration-v2-create",
+            &Bindings::default(),
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            json!({
+                "mode": "permanent",
+                "permanent_replay_eligible": true,
+                "policy_identifier": null,
+                "pruned_through_receipt_sequence": null
+            }),
+        )
+        .expect("transactional v2 migration source creation");
+    let migrated = host
+        .maintenance_migration_v2(&MaintenanceMigrationRequest {
+            root_instance_id: migration.root_instance_id().to_string(),
+            operation_id: "migration-operation".to_string(),
+            source_aggregate_state_digest: migration.value()["root_record"]["aggregate_state"]
+                ["aggregate_state_digest"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            target_validated_bundle_fingerprint: migration_target.fingerprint.clone(),
+            migration_descriptor_digest_route: vec![descriptor_digest],
+            maintenance_mode: true,
+            supplied_request_digest: None,
+            guard: MutationGuard::new(migration.revision(), migration.digest()),
+            limits: ResourceLimits::default(),
+        })
+        .expect("transactional native v2 maintenance migration");
+    assert_eq!(migrated["revision"], "1");
+    assert_eq!(
+        migrated["migration_audit_records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let terminal = host
+        .create_checkpoint_v2(
+            &terminal_bundle,
+            "terminal",
+            "terminal-v2-root",
+            "terminal-v2-create",
+            &Bindings::default(),
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            json!({
+                "mode": "permanent",
+                "permanent_replay_eligible": true,
+                "policy_identifier": null,
+                "pruned_through_receipt_sequence": null
+            }),
+        )
+        .expect("transactional v2 terminal creation");
+    let tombstoned = host
+        .tombstone_root_v2(
+            terminal.root_instance_id(),
+            "terminal-v2-tombstone",
+            &MutationGuard::new(terminal.revision(), terminal.digest()),
+        )
+        .expect("transactional native v2 root tombstone");
+    assert_eq!(tombstoned["root_record"]["status"], "tombstone");
+
+    let outbox = host
+        .create_checkpoint_v2(
+            &outbox_bundle,
+            "external_creator",
+            "outbox-v2-root",
+            "outbox-v2-create",
+            &Bindings::default(),
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            json!({
+                "mode": "permanent",
+                "permanent_replay_eligible": true,
+                "policy_identifier": null,
+                "pruned_through_receipt_sequence": null
+            }),
+        )
+        .expect("transactional version-2 outbox creation");
+    let effect_id = outbox.value()["pending_outbox_intents"][0]["intent"]["effect_id"]
+        .as_str()
+        .unwrap();
+    let retryable = host
+        .update_pending_outbox_v2(
+            outbox.root_instance_id(),
+            effect_id,
+            PendingOutboxState::RetryableFailure {
+                reason_code: "temporary".to_string(),
+            },
+            &MutationGuard::new(outbox.revision(), outbox.digest()),
+        )
+        .expect("transactional v2 pending outbox update");
+    assert_eq!(retryable["revision"], "1");
+    assert!(host
+        .terminalize_outbox_v2(
+            outbox.root_instance_id(),
+            effect_id,
+            TerminalOutboxOutcome::Confirmed,
+            &MutationGuard::new(outbox.revision(), outbox.digest()),
+        )
+        .is_err());
+    let terminal = host
+        .terminalize_outbox_v2(
+            outbox.root_instance_id(),
+            effect_id,
+            TerminalOutboxOutcome::Confirmed,
+            &MutationGuard::new(
+                retryable["revision"].as_str().unwrap(),
+                retryable["execution_checkpoint_digest"].as_str().unwrap(),
+            ),
+        )
+        .expect("transactional v2 outbox terminalization");
+    assert_eq!(terminal["revision"], "2");
+    let compacted = host
+        .compact_outbox_v2(
+            outbox.root_instance_id(),
+            effect_id,
+            &MutationGuard::new(
+                terminal["revision"].as_str().unwrap(),
+                terminal["execution_checkpoint_digest"].as_str().unwrap(),
+            ),
+        )
+        .expect("transactional v2 outbox compaction");
+    assert_eq!(compacted["revision"], "3");
+    assert_eq!(
+        compacted["outbox_effect_tombstones"][0]["effect_id"],
+        effect_id
+    );
 
     let upgraded = host
         .upgrade_checkpoint_v1_to_v2(

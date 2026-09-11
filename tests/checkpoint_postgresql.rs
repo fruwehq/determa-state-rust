@@ -2,12 +2,13 @@
 
 use determa_state::checkpoint::{
     register_bundled_adapters, AdapterRegistry, CheckpointHost, DurableStoreMode, ExecutionStore,
-    ExecutionStoreCapability, HostFailureCode, HostFeature, HostProfile, MutationGuard,
-    OutboxRetentionMode, PostgresqlExecutionStore, PostgresqlExecutionStoreFactory,
-    PostgresqlHostMutation, PostgresqlHostMutationResult, ReceiptRetentionMode, RootRecord,
-    StoreError, StoreRecord, StoreWriteResult,
+    ExecutionStoreCapability, HostFailureCode, HostFeature, HostProfile,
+    MaintenanceMigrationRequest, MutationGuard, OutboxRetentionMode, PendingOutboxState,
+    PostgresqlExecutionStore, PostgresqlExecutionStoreFactory, PostgresqlHostMutation,
+    PostgresqlHostMutationResult, ReceiptRetentionMode, RootRecord, StoreError, StoreRecord,
+    StoreWriteResult, TerminalOutboxOutcome,
 };
-use determa_state::{load_bundle, Bindings, Bundle, InMemoryDefinitionResolver};
+use determa_state::{load_bundle, Bindings, Bundle, InMemoryDefinitionResolver, ResourceLimits};
 use postgres::{Client, NoTls};
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -175,6 +176,265 @@ fn postgresql_cas_and_schema_contract() {
         first.health().is_err(),
         "health must reject a missing deletion guard"
     );
+}
+
+#[test]
+fn postgresql_runs_native_version2_outbox_lifecycle() {
+    let Some(base_url) = postgresql_url() else {
+        return;
+    };
+    let url = isolated_schema_url(&base_url, "v2_outbox");
+    let store: Arc<dyn ExecutionStore> = Arc::new(
+        PostgresqlExecutionStore::connect_no_tls(&url, DurableStoreMode::bounded())
+            .expect("PostgreSQL execution store"),
+    );
+    store.initialize_schema().expect("PostgreSQL schema");
+    let bundle = load_bundle(
+        &fs::read_to_string(
+            checkpoint_profile_directory()
+                .join("checkpoint-04-version2-mailboxes/creation-owned-work-machine.yaml"),
+        )
+        .expect("version-2 outbox bundle"),
+    )
+    .expect("load version-2 outbox bundle");
+    let mut resolver = InMemoryDefinitionResolver::default();
+    assert!(resolver.insert(bundle.clone(), true));
+    let migration_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("conformance-suite/conformance/core/118-version2-persistence");
+    let migration_source = load_bundle(
+        &fs::read_to_string(migration_directory.join("machine.yaml"))
+            .expect("v2 migration source bundle"),
+    )
+    .expect("load v2 migration source bundle");
+    let migration_target = load_bundle(
+        &fs::read_to_string(migration_directory.join("target-compatible.yaml"))
+            .expect("v2 migration target bundle"),
+    )
+    .expect("load v2 migration target bundle");
+    let descriptor_bytes = fs::read(migration_directory.join("descriptor-compatible-v2.json"))
+        .expect("v2 migration descriptor");
+    let descriptor: serde_json::Value = serde_json::from_slice(&descriptor_bytes).unwrap();
+    let descriptor_digest = descriptor["migration_descriptor_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(resolver.insert(migration_source.clone(), true));
+    assert!(resolver.insert(migration_target.clone(), true));
+    assert!(resolver.insert_descriptor(descriptor_digest.clone(), descriptor_bytes, true));
+    let terminal_bundle = load_bundle(
+        r#"
+format: 1
+namespace: test.postgresql_v2_terminal
+machines:
+  - machine_id: terminal
+    root:
+      variables:
+        value: { type: int, init: 0 }
+      entry:
+        - assign: { value: "1 / 0" }
+"#,
+    )
+    .expect("load v2 terminal bundle");
+    assert!(resolver.insert(terminal_bundle.clone(), true));
+    let host = CheckpointHost::new(store, Arc::new(resolver));
+    let root = unique_root("v2-outbox");
+    let created = host
+        .create_checkpoint_v2(
+            &bundle,
+            "external_creator",
+            &root,
+            "create",
+            &Bindings::default(),
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            json!({
+                "mode": "permanent",
+                "permanent_replay_eligible": true,
+                "policy_identifier": null,
+                "pruned_through_receipt_sequence": null
+            }),
+        )
+        .expect("create native v2 checkpoint");
+    let effect_id = created.value()["pending_outbox_intents"][0]["intent"]["effect_id"]
+        .as_str()
+        .unwrap();
+    let guard = MutationGuard::new(created.revision(), created.digest());
+    let rollback = host.with_postgresql_transaction(&root, |transaction| {
+        host.stage_postgresql_mutation(
+            transaction,
+            PostgresqlHostMutation::UpdatePendingOutboxV2 {
+                root_instance_id: &root,
+                effect_id,
+                desired: PendingOutboxState::RetryableFailure {
+                    reason_code: "temporary".to_string(),
+                },
+                guard: &guard,
+            },
+        )?;
+        host.stage_postgresql_mutation(
+            transaction,
+            PostgresqlHostMutation::UpdatePendingOutboxV2 {
+                root_instance_id: &root,
+                effect_id,
+                desired: PendingOutboxState::Ambiguous {
+                    reason_code: "unknown".to_string(),
+                },
+                guard: &guard,
+            },
+        )
+    });
+    assert_eq!(
+        rollback.unwrap_err().code,
+        HostFailureCode::TransactionMutationAlreadyStaged
+    );
+    let unchanged = host.load_checkpoint_v2(&root).unwrap().unwrap();
+    assert_eq!(unchanged.revision(), created.revision());
+    assert_eq!(unchanged.digest(), created.digest());
+
+    let pending = host
+        .with_postgresql_transaction(&root, |transaction| {
+            host.stage_postgresql_mutation(
+                transaction,
+                PostgresqlHostMutation::UpdatePendingOutboxV2 {
+                    root_instance_id: &root,
+                    effect_id,
+                    desired: PendingOutboxState::Ambiguous {
+                        reason_code: "unknown".to_string(),
+                    },
+                    guard: &guard,
+                },
+            )
+        })
+        .expect("transactional native v2 outbox update");
+    let PostgresqlHostMutationResult::PendingOutboxV2(pending) = pending.host_result else {
+        panic!("unexpected native v2 pending-outbox result")
+    };
+    let terminal_guard = MutationGuard::new(
+        pending["revision"].as_str().unwrap(),
+        pending["execution_checkpoint_digest"].as_str().unwrap(),
+    );
+    let terminal = host
+        .with_postgresql_transaction(&root, |transaction| {
+            host.stage_postgresql_mutation(
+                transaction,
+                PostgresqlHostMutation::TerminalizeOutboxV2 {
+                    root_instance_id: &root,
+                    effect_id,
+                    outcome: TerminalOutboxOutcome::Confirmed,
+                    guard: &terminal_guard,
+                },
+            )
+        })
+        .expect("transactional native v2 outbox terminalization");
+    let PostgresqlHostMutationResult::OutboxV2(terminal) = terminal.host_result else {
+        panic!("unexpected native v2 terminal-outbox result")
+    };
+    let compact_guard = MutationGuard::new(
+        terminal["revision"].as_str().unwrap(),
+        terminal["execution_checkpoint_digest"].as_str().unwrap(),
+    );
+    let compacted = host
+        .with_postgresql_transaction(&root, |transaction| {
+            host.stage_postgresql_mutation(
+                transaction,
+                PostgresqlHostMutation::CompactOutboxV2 {
+                    root_instance_id: &root,
+                    effect_id,
+                    guard: &compact_guard,
+                },
+            )
+        })
+        .expect("transactional native v2 outbox compaction");
+    let PostgresqlHostMutationResult::CompactedOutboxV2(compacted) = compacted.host_result else {
+        panic!("unexpected native v2 compacted-outbox result")
+    };
+    assert_eq!(compacted["revision"], "3");
+
+    let migration_root = unique_root("v2-migration");
+    let migration = host
+        .create_checkpoint_v2(
+            &migration_source,
+            "transaction_server",
+            &migration_root,
+            "create",
+            &Bindings::default(),
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            json!({
+                "mode": "permanent",
+                "permanent_replay_eligible": true,
+                "policy_identifier": null,
+                "pruned_through_receipt_sequence": null
+            }),
+        )
+        .expect("create native v2 migration checkpoint");
+    let migration_request = MaintenanceMigrationRequest {
+        root_instance_id: migration_root.clone(),
+        operation_id: "migrate".to_string(),
+        source_aggregate_state_digest: migration.value()["root_record"]["aggregate_state"]
+            ["aggregate_state_digest"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        target_validated_bundle_fingerprint: migration_target.fingerprint.clone(),
+        migration_descriptor_digest_route: vec![descriptor_digest],
+        maintenance_mode: true,
+        supplied_request_digest: None,
+        guard: MutationGuard::new(migration.revision(), migration.digest()),
+        limits: ResourceLimits::default(),
+    };
+    let migrated = host
+        .with_postgresql_transaction(&migration_root, |transaction| {
+            host.stage_postgresql_mutation(
+                transaction,
+                PostgresqlHostMutation::MaintenanceMigrationV2(&migration_request),
+            )
+        })
+        .expect("transactional native v2 migration");
+    let PostgresqlHostMutationResult::MaintenanceMigrationV2(migrated) = migrated.host_result
+    else {
+        panic!("unexpected native v2 migration result")
+    };
+    assert_eq!(
+        migrated["migration_audit_records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let terminal_root = unique_root("v2-terminal");
+    let terminal = host
+        .create_checkpoint_v2(
+            &terminal_bundle,
+            "terminal",
+            &terminal_root,
+            "create",
+            &Bindings::default(),
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            json!({
+                "mode": "permanent",
+                "permanent_replay_eligible": true,
+                "policy_identifier": null,
+                "pruned_through_receipt_sequence": null
+            }),
+        )
+        .expect("create native v2 terminal checkpoint");
+    let terminal_guard = MutationGuard::new(terminal.revision(), terminal.digest());
+    let tombstoned = host
+        .with_postgresql_transaction(&terminal_root, |transaction| {
+            host.stage_postgresql_mutation(
+                transaction,
+                PostgresqlHostMutation::TombstoneRootV2 {
+                    root_instance_id: &terminal_root,
+                    operation_id: "tombstone",
+                    guard: &terminal_guard,
+                },
+            )
+        })
+        .expect("transactional native v2 root tombstone");
+    let PostgresqlHostMutationResult::RootTombstoneV2(tombstoned) = tombstoned.host_result else {
+        panic!("unexpected native v2 root tombstone result")
+    };
+    assert_eq!(tombstoned["root_record"]["status"], "tombstone");
 }
 
 #[test]

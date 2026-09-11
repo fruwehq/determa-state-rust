@@ -17,7 +17,7 @@ The current draft is validated against the merged `0.2.0` metadata revisions at 
 exact immutable inputs:
 
 - specification: `2e33036563cb966b07124197db672159b4b7e1f4`;
-- conformance: `40cb119357204f62cbbbb2ef68bac342d43cb901`.
+- conformance: `531468c59c7a2dc32f5cbe92cfabf89805d27f6a`.
 
 The conformance suite is the arbiter of behavior. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
@@ -60,7 +60,7 @@ Never invent a release tag or weaken an exact revision check.
 ```sh
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
-  "40cb119357204f62cbbbb2ef68bac342d43cb901"
+  "531468c59c7a2dc32f5cbe92cfabf89805d27f6a"
 cargo +1.86.0 build --release --locked --all-features
 cargo +1.86.0 test --locked --all-features
 cargo clippy --locked --all-features --all-targets -- -D warnings
@@ -69,9 +69,9 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 The declared MSRV is Rust `1.86`. CI must keep the locked default and all-features graph,
 including PostgreSQL, buildable and testable with that toolchain.
 
-CI runs the complete 114-case core suite, all 108 version-1 and 13 version-2
+CI runs the complete 114-case core suite, all 108 version-1 and 15 version-2
 persistence vectors, all 12 persistence-profile steps, and all 152 execution-checkpoint
-vectors. It also checks
+vectors. The version-2 harnesses cover 106 vectors and 143 artifacts in total. It also checks
 every local schema byte-for-byte against the exact specification commit and runs the
 optional PostgreSQL adapter against a service.
 

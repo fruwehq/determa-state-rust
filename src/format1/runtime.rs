@@ -214,6 +214,10 @@ pub struct Emission {
     pub correlation_id: Option<String>,
     pub effect_id: Option<String>,
     pub sequence: Option<Counter>,
+    #[serde(skip)]
+    pub cause_id: Option<String>,
+    #[serde(skip)]
+    pub system_source: Option<String>,
 }
 
 impl Emission {
@@ -3196,6 +3200,8 @@ fn execute_send(
                     ordinal,
                 )),
                 sequence: Some(sequence),
+                cause_id: None,
+                system_source: None,
             });
         } else {
             let target_runtime_id = target_runtime_id(&target);
@@ -3217,6 +3223,8 @@ fn execute_send(
                 correlation_id: correlation_id.clone(),
                 effect_id: None,
                 sequence: None,
+                cause_id: Some(context.cause_id.clone()),
+                system_source: None,
             });
         }
     }
@@ -3956,6 +3964,7 @@ fn emit_completion_notification(runtime: &RuntimeState, context: &mut StepContex
                 payload,
                 "system:component_completion",
                 0,
+                &context.cause_id.clone(),
                 context,
             );
             // The owner emits the parallel done once all retained placements complete.
@@ -3998,6 +4007,7 @@ fn emit_completion_notification(runtime: &RuntimeState, context: &mut StepContex
                 payload,
                 "system:spawned_completion",
                 0,
+                &context.cause_id.clone(),
                 context,
             );
         }
@@ -4052,6 +4062,7 @@ fn emit_failure_notification(
                 payload,
                 "system:component_failure",
                 0,
+                &record.cause_id,
                 context,
             );
         }
@@ -4086,6 +4097,7 @@ fn emit_failure_notification(
                 payload,
                 "system:spawned_failure",
                 0,
+                &record.cause_id,
                 context,
             );
         }
@@ -4101,6 +4113,7 @@ fn push_system_emission(
     payload: BTreeMap<String, Value>,
     locator: &str,
     ordinal: usize,
+    cause_id: &str,
     context: &mut StepContext<'_>,
 ) {
     context.emissions.push(Emission {
@@ -4111,7 +4124,7 @@ fn push_system_emission(
             context.root_instance_id,
             &runtime.runtime_id,
             &target_runtime_id(&target),
-            &context.cause_id,
+            cause_id,
             &context.step_sequence,
             locator,
             ordinal,
@@ -4121,6 +4134,8 @@ fn push_system_emission(
         correlation_id: None,
         effect_id: None,
         sequence: None,
+        cause_id: Some(cause_id.to_string()),
+        system_source: Some(locator.to_string()),
     });
 }
 
@@ -4241,6 +4256,8 @@ fn push_parallel_done(
         correlation_id: None,
         effect_id: None,
         sequence: None,
+        cause_id: Some(cause_id.to_string()),
+        system_source: Some("system:component_completion".to_string()),
     });
 }
 

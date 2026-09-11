@@ -1,7 +1,10 @@
 use super::compile::Bundle;
 use super::counter::Counter;
+use super::migration::MigrationRequest;
 use super::model::{Bindings, Delivery, Envelope, Target};
-use super::persistence::{DefinitionResolver, InMemoryDefinitionResolver};
+use super::persistence::{
+    DefinitionResolver, InMemoryDefinitionResolver, MigrationArtifactResolver,
+};
 use super::runtime::{
     create, deferred_event_capacity, dispatch, fault_deferred_capacity, runtime_by_id,
     structural_recall_eligible, validate_delivery_for_admission,
@@ -76,6 +79,40 @@ pub struct AdmissionDelivery {
     pub delivery_mode: String,
     pub envelope: QueueEnvelope,
     pub envelope_digest: String,
+}
+
+const ADMISSION_DELIVERY_SCHEMA: &str = r#"
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "type":"object",
+  "required":["delivery_mode","envelope","envelope_digest"],
+  "additionalProperties":false,
+  "properties":{
+    "delivery_mode":{"type":"string"},
+    "envelope":{"$ref":"https://determa.dev/state/schema/aggregate-state-v2.schema.json#/$defs/envelope"},
+    "envelope_digest":{"$ref":"https://determa.dev/state/schema/aggregate-state-v2.schema.json#/$defs/sha256"}
+  }
+}
+"#;
+
+pub(crate) fn validate_admission_delivery_schema(
+    delivery: &JsonValue,
+) -> Result<(), Version2Error> {
+    validate_v2_schema(
+        delivery,
+        ADMISSION_DELIVERY_SCHEMA,
+        &[
+            (
+                "https://determa.dev/state/schema/aggregate-state-v2.schema.json",
+                include_str!("../../schema/aggregate-state-v2.schema.json"),
+            ),
+            (
+                "https://determa.dev/state/schema/aggregate-state.schema.json",
+                include_str!("../../schema/aggregate-state.schema.json"),
+            ),
+        ],
+        "invalid_delivery_source",
+    )
 }
 
 pub fn restore_aggregate_v2(
@@ -209,6 +246,168 @@ pub fn migrate_aggregate_v2(
     maintenance_mode: bool,
     limits: &super::migration::ResourceLimits,
 ) -> Result<JsonValue, Version2Error> {
+    let result = migrate_aggregate_v2_with_evidence(
+        aggregate,
+        source_bundle,
+        target_bundle,
+        descriptor_source,
+        maintenance_mode,
+        limits,
+    )?;
+    Ok(public_migration_result(result))
+}
+
+pub fn migrate_aggregate_v2_route(
+    aggregate: &QueueBearingAggregate,
+    request: &MigrationRequest,
+    resolver: &impl MigrationArtifactResolver,
+    limits: &super::migration::ResourceLimits,
+) -> Result<JsonValue, Version2Error> {
+    if request.migration_route.is_empty() {
+        if request.target_validated_bundle_fingerprint
+            != aggregate.value["validated_bundle_fingerprint"]
+        {
+            return Err(Version2Error::new(
+                "migration_totality_failure",
+                "empty migration route requires the current bundle fingerprint",
+            ));
+        }
+        return Ok(json!({
+            "result": "success",
+            "aggregate_state": aggregate.value,
+            "dispositions": [],
+            "audit_records": []
+        }));
+    }
+
+    let mut current = aggregate.clone();
+    let mut dispositions = Vec::new();
+    let mut audit_records = Vec::new();
+    for digest in &request.migration_route {
+        let descriptor = resolver
+            .resolve_migration_descriptor(digest)
+            .ok_or_else(|| {
+                Version2Error::new(
+                    "migration_descriptor_not_found",
+                    "migration descriptor is unavailable",
+                )
+            })?;
+        if !descriptor.trusted {
+            return Err(Version2Error::new(
+                "migration_descriptor_not_trusted",
+                "migration descriptor is not trusted",
+            ));
+        }
+        let decoded = decode_descriptor_v2(&descriptor.bytes)?;
+        if decoded["migration_descriptor_digest"].as_str() != Some(digest) {
+            return Err(Version2Error::new(
+                "invalid_migration_descriptor",
+                "resolved migration descriptor does not match its route digest",
+            ));
+        }
+        let source_fingerprint = current.value["validated_bundle_fingerprint"]
+            .as_str()
+            .ok_or_else(|| invalid_aggregate("current bundle fingerprint is absent"))?;
+        let source = resolver
+            .resolve_definition(source_fingerprint)
+            .ok_or_else(|| {
+                Version2Error::new("definition_not_found", "source definition is unavailable")
+            })?;
+        let target_fingerprint = decoded["base_descriptor"]["target_validated_bundle_fingerprint"]
+            .as_str()
+            .ok_or_else(|| {
+                Version2Error::new(
+                    "invalid_migration_descriptor",
+                    "target bundle fingerprint is absent",
+                )
+            })?;
+        let target = resolver
+            .resolve_definition(target_fingerprint)
+            .ok_or_else(|| {
+                Version2Error::new("definition_not_found", "target definition is unavailable")
+            })?;
+        if !source.trusted
+            || source.bundle.fingerprint != source_fingerprint
+            || !target.trusted
+            || target.bundle.fingerprint != target_fingerprint
+        {
+            return Err(Version2Error::new(
+                "definition_not_trusted",
+                "migration definition is not trusted or content-addressed correctly",
+            ));
+        }
+        let result = migrate_aggregate_v2_with_evidence_resolved(
+            &current,
+            &source.bundle,
+            &target.bundle,
+            &descriptor.bytes,
+            request.maintenance_mode,
+            limits,
+            Some(resolver),
+        )?;
+        dispositions.extend(result["dispositions"].as_array().unwrap().iter().cloned());
+        audit_records.extend(result["audit_records"].as_array().unwrap().iter().cloned());
+        current = restore_aggregate_v2_value(result["aggregate_state"].clone(), resolver)?;
+    }
+    if current.value["validated_bundle_fingerprint"].as_str()
+        != Some(request.target_validated_bundle_fingerprint.as_str())
+    {
+        return Err(Version2Error::new(
+            "migration_totality_failure",
+            "migration route does not reach the requested target bundle",
+        ));
+    }
+    Ok(public_migration_result(json!({
+        "result": "success",
+        "aggregate_state": current.value,
+        "dispositions": dispositions,
+        "audit_records": audit_records
+    })))
+}
+
+fn public_migration_result(mut result: JsonValue) -> JsonValue {
+    result["dispositions"] = json!(result["dispositions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|disposition| json!({
+            "disposition": disposition["disposition"],
+            "reason": disposition["reason"],
+            "migration_descriptor_digest": disposition["migration_descriptor_digest"]
+        }))
+        .collect::<Vec<_>>());
+    result
+}
+
+pub(crate) fn migrate_aggregate_v2_with_evidence(
+    aggregate: &QueueBearingAggregate,
+    source_bundle: &Bundle,
+    target_bundle: &Bundle,
+    descriptor_source: &[u8],
+    maintenance_mode: bool,
+    limits: &super::migration::ResourceLimits,
+) -> Result<JsonValue, Version2Error> {
+    migrate_aggregate_v2_with_evidence_resolved(
+        aggregate,
+        source_bundle,
+        target_bundle,
+        descriptor_source,
+        maintenance_mode,
+        limits,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn migrate_aggregate_v2_with_evidence_resolved(
+    aggregate: &QueueBearingAggregate,
+    source_bundle: &Bundle,
+    target_bundle: &Bundle,
+    descriptor_source: &[u8],
+    maintenance_mode: bool,
+    limits: &super::migration::ResourceLimits,
+    artifact_resolver: Option<&dyn MigrationArtifactResolver>,
+) -> Result<JsonValue, Version2Error> {
     if aggregate.value["validated_bundle_fingerprint"].as_str()
         != Some(source_bundle.fingerprint.as_str())
     {
@@ -227,6 +426,27 @@ pub fn migrate_aggregate_v2(
     let mut resolver = InMemoryDefinitionResolver::default();
     resolver.insert(source_bundle.clone(), true);
     resolver.insert(target_bundle.clone(), true);
+    if let Some(artifact_resolver) = artifact_resolver {
+        let mut fingerprints = BTreeSet::new();
+        collect_bundle_fingerprints(&aggregate.value, &mut fingerprints);
+        for fingerprint in fingerprints {
+            let resolved = artifact_resolver
+                .resolve_definition(&fingerprint)
+                .ok_or_else(|| {
+                    Version2Error::new(
+                        "source_definition_unavailable",
+                        "retained provenance definition is unavailable",
+                    )
+                })?;
+            if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
+                return Err(Version2Error::new(
+                    "source_definition_untrusted",
+                    "retained provenance definition is not trusted",
+                ));
+            }
+            resolver.insert(resolved.bundle, true);
+        }
+    }
     resolver.insert_descriptor(base_digest.clone(), base_bytes, true);
     let source = canonical_bytes(&project_v1(&aggregate.value)?)?;
     let request = super::migration::MigrationRequest {
@@ -255,11 +475,52 @@ pub fn migrate_aggregate_v2(
     recall_deferred(&mut value, &outcome.aggregate)?;
     validate_migrated_capacity(&value, &outcome.aggregate)?;
     value = seal_aggregate(value)?;
+    let audit_records = outcome
+        .audit_records
+        .into_iter()
+        .map(|record| {
+            json!({
+                "migration_audit_record_schema_version": record.migration_audit_record_schema_version,
+                "root_instance_id": record.root_instance_id,
+                "root_runtime_id": record.root_runtime_id,
+                "migration_sequence": record.migration_sequence,
+                "source_validated_bundle_fingerprint": source_bundle.fingerprint,
+                "target_validated_bundle_fingerprint": target_bundle.fingerprint,
+                "migration_descriptor_digest": descriptor_digest,
+                "source_aggregate_state_digest": aggregate.value["aggregate_state_digest"],
+                "target_aggregate_state_digest": value["aggregate_state_digest"],
+                "result_code": record.result_code
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(json!({
         "result": "success",
         "aggregate_state": value,
-        "dispositions": dispositions
+        "dispositions": dispositions,
+        "audit_records": audit_records
     }))
+}
+
+fn collect_bundle_fingerprints(value: &JsonValue, fingerprints: &mut BTreeSet<String>) {
+    match value {
+        JsonValue::Object(object) => {
+            if let Some(fingerprint) = object
+                .get("validated_bundle_fingerprint")
+                .and_then(JsonValue::as_str)
+            {
+                fingerprints.insert(fingerprint.to_string());
+            }
+            for child in object.values() {
+                collect_bundle_fingerprints(child, fingerprints);
+            }
+        }
+        JsonValue::Array(values) => {
+            for child in values {
+                collect_bundle_fingerprints(child, fingerprints);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn decode_descriptor_v2(source: &[u8]) -> Result<JsonValue, Version2Error> {
@@ -457,6 +718,11 @@ fn apply_queued_event_rules(
                         && rule["delivery_mode"].as_str() == Some(mode)
                 }) {
                     dispositions.push(json!({
+                        "event_id": entry["envelope"]["event_id"],
+                        "request_digest": entry["envelope_digest"],
+                        "acceptance_sequence": entry["acceptance_sequence"],
+                        "final_queue_sequence": entry["queue_sequence"],
+                        "target_runtime_id": runtime_id,
                         "disposition": "migration_disposed",
                         "reason": rule["reason"],
                         "migration_descriptor_digest": descriptor_digest
@@ -525,6 +791,11 @@ pub fn admit_v2(
     let mut replay = Vec::new();
     let mut fresh = Vec::new();
     for delivery in deliveries {
+        validate_admission_delivery_schema(
+            &serde_json::to_value(delivery).map_err(|error| {
+                Version2Error::new("invalid_delivery_source", error.to_string())
+            })?,
+        )?;
         let computed = envelope_digest(
             aggregate_root_instance_id(&aggregate.value)?,
             &delivery.delivery_mode,
@@ -546,7 +817,7 @@ pub fn admit_v2(
                 "supplied envelope digest does not match canonical content",
             ));
         }
-        validate_source(delivery)?;
+        validate_source(delivery, &aggregate.value)?;
         let core_delivery = core_delivery(delivery)?;
         let runtime_id = validate_delivery_for_admission(bundle, &aggregate.state, &core_delivery)
             .map_err(map_dispatch_rejection)?;
@@ -913,20 +1184,27 @@ fn append_step_emissions(
             }));
             continue;
         }
-        let original_event_id = emission
+        let event_id = emission
             .event_id
             .as_ref()
             .ok_or_else(|| invalid_aggregate("internal emission has no event id"))?;
-        let event_id = corrected_system_event_id(value, emission)?
-            .unwrap_or_else(|| original_event_id.clone());
-        let source_target = runtime_target(value, &emission.emitting_runtime_id)
-            .or_else(|| runtime_target(old, &emission.emitting_runtime_id))
-            .ok_or_else(|| invalid_aggregate("internal emission source runtime is absent"))?;
+        let cause_id = emission
+            .cause_id
+            .as_ref()
+            .ok_or_else(|| invalid_aggregate("internal emission has no causal event id"))?;
+        let source = if let Some(locator) = &emission.system_source {
+            json!({"system": locator})
+        } else {
+            let source_target = runtime_target(value, &emission.emitting_runtime_id)
+                .or_else(|| runtime_target(old, &emission.emitting_runtime_id))
+                .ok_or_else(|| invalid_aggregate("internal emission source runtime is absent"))?;
+            json!({"runtime": source_target})
+        };
         let envelope = QueueEnvelope {
             event: emission.event.clone(),
             event_id: event_id.clone(),
-            cause_id: event_id.clone(),
-            source: json!({"runtime": source_target}),
+            cause_id: cause_id.clone(),
+            source,
             target: core_target_to_queue(&emission.target)?,
             payload: TypedValue::from_value(&crate::value::Value::Map(emission.payload.clone())),
             correlation_id: emission.correlation_id.clone(),
@@ -1014,41 +1292,6 @@ fn runtime_status<'a>(value: &'a JsonValue, runtime_id: &str) -> Option<&'a str>
         .iter()
         .find(|runtime| runtime["runtime_id"].as_str() == Some(runtime_id))
         .and_then(|runtime| runtime["status"].as_str())
-}
-
-fn corrected_system_event_id(
-    value: &JsonValue,
-    emission: &Emission,
-) -> Result<Option<String>, Version2Error> {
-    let locator = match emission.event.as_str() {
-        "determa.component_failed" => "system:component_failure",
-        "determa.spawned_instance_failed" => "system:spawned_failure",
-        _ => return Ok(None),
-    };
-    let Some(crate::value::Value::Map(fault)) = emission.payload.get("fault") else {
-        return Ok(None);
-    };
-    let (Some(crate::value::Value::String(cause_id)), Some(crate::value::Value::String(step))) =
-        (fault.get("cause_id"), fault.get("step_sequence"))
-    else {
-        return Ok(None);
-    };
-    let Some(target_id) = target_runtime_id(&emission.target) else {
-        return Ok(None);
-    };
-    wire::jcs_hash(&json!([
-        "determa-event-identity-1",
-        "1",
-        aggregate_root_instance_id(value)?,
-        emission.emitting_runtime_id,
-        target_id,
-        cause_id,
-        step,
-        locator,
-        "0"
-    ]))
-    .map(Some)
-    .map_err(map_persistence)
 }
 
 fn queue_target_to_core(value: &JsonValue) -> Result<Target, Version2Error> {
@@ -1336,12 +1579,15 @@ fn core_delivery(delivery: &AdmissionDelivery) -> Result<Delivery, Version2Error
     }
 }
 
-fn validate_source(delivery: &AdmissionDelivery) -> Result<(), Version2Error> {
+fn validate_source(
+    delivery: &AdmissionDelivery,
+    aggregate: &JsonValue,
+) -> Result<(), Version2Error> {
     let source =
         delivery.envelope.source.as_object().ok_or_else(|| {
             Version2Error::new("invalid_delivery_source", "source must be an object")
         })?;
-    let host = source.get("host").and_then(JsonValue::as_bool) == Some(true);
+    let host = source.len() == 1 && source.get("host").and_then(JsonValue::as_bool) == Some(true);
     if delivery.delivery_mode == "input" {
         if !host || delivery.envelope.cause_id != delivery.envelope.event_id {
             return Err(Version2Error::new(
@@ -1349,13 +1595,68 @@ fn validate_source(delivery: &AdmissionDelivery) -> Result<(), Version2Error> {
                 "input must be host-sourced with cause equal to event id",
             ));
         }
-    } else if delivery.delivery_mode == "internal" && host {
-        return Err(Version2Error::new(
-            "invalid_delivery_source",
-            "internal delivery cannot be host-sourced",
-        ));
+    } else if delivery.delivery_mode == "internal" {
+        let valid = if let Some(runtime) = source.get("runtime").filter(|_| source.len() == 1) {
+            runtimes(aggregate)?
+                .iter()
+                .any(|candidate| candidate["target_identity"] == *runtime)
+        } else if let Some(locator) = source
+            .get("system")
+            .and_then(JsonValue::as_str)
+            .filter(|_| source.len() == 1)
+        {
+            system_locator_matches_event(locator, &delivery.envelope.event)
+        } else {
+            false
+        };
+        if !valid || !valid_internal_source_shape(source) {
+            return Err(Version2Error::new(
+                "invalid_delivery_source",
+                "internal delivery provenance is invalid",
+            ));
+        }
     }
     Ok(())
+}
+
+fn system_locator_matches_event(locator: &str, event: &str) -> bool {
+    matches!(
+        (locator, event),
+        (
+            "system:component_completion",
+            "determa.component_completed" | "done"
+        ) | ("system:spawned_completion", "done")
+            | ("system:component_failure", "determa.component_failed")
+            | ("system:spawned_failure", "determa.spawned_instance_failed")
+    )
+}
+
+fn valid_internal_source_shape(source: &serde_json::Map<String, JsonValue>) -> bool {
+    if source.len() != 1 {
+        return false;
+    }
+    match source
+        .iter()
+        .next()
+        .map(|(key, value)| (key.as_str(), value))
+    {
+        Some(("runtime", value)) => value.as_object().is_some(),
+        Some(("system", value)) => value
+            .as_str()
+            .is_some_and(|locator| locator.starts_with("system:") && locator.len() > 7),
+        Some(("legacy_v1_internal", value)) => value.as_object().is_some_and(|legacy| {
+            legacy.len() == 2
+                && legacy
+                    .get("producing_receipt_sequence")
+                    .and_then(JsonValue::as_str)
+                    .is_some()
+                && legacy
+                    .get("emission_index")
+                    .and_then(JsonValue::as_str)
+                    .is_some()
+        }),
+        _ => false,
+    }
 }
 
 fn validate_aggregate_schema(value: &JsonValue) -> Result<(), Version2Error> {

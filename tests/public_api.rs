@@ -718,7 +718,7 @@ fn examples_and_revision_metadata_are_current() {
     );
     assert_eq!(
         FORMAT_1_CONFORMANCE_COMMIT,
-        "40cb119357204f62cbbbb2ef68bac342d43cb901"
+        "531468c59c7a2dc32f5cbe92cfabf89805d27f6a"
     );
 }
 

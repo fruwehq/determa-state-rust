@@ -1,10 +1,10 @@
 use determa_state::{
     admit_v2, create_v2, downgrade_aggregate_v2_to_v1, load_bundle, migrate_aggregate_v2,
-    restore_aggregate_v2, restore_package_v2, step_v2, upgrade_aggregate_v1_to_v2,
-    AdmissionDelivery, Bindings, InMemoryDefinitionResolver, ResourceLimits,
+    migrate_aggregate_v2_route, restore_aggregate_v2, restore_package_v2, step_v2,
+    upgrade_aggregate_v1_to_v2, AdmissionDelivery, Bindings, InMemoryDefinitionResolver,
+    MigrationRequest, ResourceLimits,
 };
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -75,7 +75,7 @@ fn all_queue_bearing_persistence_vectors() {
         serde_json::from_slice(&fs::read(directory.join("operation-inputs.json")).unwrap())
             .unwrap();
     let vectors = test["version2_vectors"].as_array().unwrap();
-    assert_eq!(vectors.len(), 13);
+    assert_eq!(vectors.len(), 15);
     let mut failures = Vec::new();
     for vector in vectors {
         let name = vector["name"].as_str().unwrap();
@@ -91,6 +91,48 @@ fn all_queue_bearing_persistence_vectors() {
     );
 }
 
+#[test]
+fn successful_public_migration_returns_ordered_audit_records() {
+    let directory = case("118-version2-persistence");
+    let source_bundle =
+        load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+    let target_bundle =
+        load_bundle(&fs::read_to_string(directory.join("target-compatible.yaml")).unwrap())
+            .unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(source_bundle.clone(), true);
+    let aggregate = restore_aggregate_v2(
+        &fs::read(directory.join("base-aggregate-v2.json")).unwrap(),
+        &resolver,
+    )
+    .unwrap();
+    let result = migrate_aggregate_v2(
+        &aggregate,
+        &source_bundle,
+        &target_bundle,
+        &fs::read(directory.join("descriptor-compatible-v2.json")).unwrap(),
+        true,
+        &ResourceLimits::default(),
+    )
+    .unwrap();
+    let audits = result["audit_records"].as_array().unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0]["migration_sequence"], "1");
+    assert_eq!(
+        audits[0]["source_aggregate_state_digest"],
+        aggregate.value()["aggregate_state_digest"]
+    );
+    assert_eq!(
+        audits[0]["target_aggregate_state_digest"],
+        result["aggregate_state"]["aggregate_state_digest"]
+    );
+    let before_entry = &aggregate.value()["runtimes"][0]["ready_mailbox"][0]["envelope"];
+    let after_entry = &result["aggregate_state"]["runtimes"][0]["ready_mailbox"][0]["envelope"];
+    assert_eq!(after_entry["payload"], before_entry["payload"]);
+    assert_eq!(after_entry["source"], before_entry["source"]);
+    assert_eq!(after_entry["cause_id"], before_entry["cause_id"]);
+}
+
 fn run_persistence_vector(
     directory: &Path,
     requests: &Value,
@@ -104,6 +146,14 @@ fn run_persistence_vector(
         .map_err(|error| error.to_string())?;
     let mut resolver = InMemoryDefinitionResolver::default();
     resolver.insert(source_bundle.clone(), true);
+    for declared in requests.as_object().unwrap().values() {
+        let Some(file) = declared["target_bundle"]["bundle_file"].as_str() else {
+            continue;
+        };
+        let bundle = load_bundle(&fs::read_to_string(directory.join(file)).unwrap())
+            .map_err(|error| error.to_string())?;
+        resolver.insert(bundle, true);
+    }
     let legacy_bundle = directory
         .parent()
         .unwrap()
@@ -139,14 +189,41 @@ fn run_persistence_vector(
             let target_bundle =
                 load_bundle(&fs::read_to_string(directory.join(target_file)).unwrap())
                     .map_err(|error| error.to_string())?;
-            let descriptor =
-                fs::read(directory.join(vector["descriptor_file"].as_str().unwrap())).unwrap();
-            migrate_aggregate_v2(
+            resolver.insert(target_bundle, true);
+            let route = request["migration_descriptor_digest_route"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|digest| digest.as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            let descriptor_files = request["migration_descriptor_files"]
+                .as_array()
+                .map(|files| files.iter().map(|file| file.as_str().unwrap()).collect())
+                .unwrap_or_else(|| {
+                    request["migration_descriptor_file"]
+                        .as_str()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                });
+            for (digest, file) in route.iter().zip(descriptor_files) {
+                resolver.insert_descriptor(
+                    digest.clone(),
+                    fs::read(directory.join(file)).unwrap(),
+                    true,
+                );
+            }
+            migrate_aggregate_v2_route(
                 &aggregate,
-                &source_bundle,
-                &target_bundle,
-                &descriptor,
-                request["maintenance_mode"].as_bool().unwrap(),
+                &MigrationRequest {
+                    migration_route: route,
+                    target_validated_bundle_fingerprint: request["target_bundle"]
+                        ["validated_bundle_fingerprint"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                    maintenance_mode: request["maintenance_mode"].as_bool().unwrap(),
+                },
+                &resolver,
                 &ResourceLimits::default(),
             )
         }
@@ -163,7 +240,7 @@ fn all_queue_bearing_core_vectors() {
         serde_json::from_slice(&fs::read(directory.join("operation-inputs.json")).unwrap())
             .unwrap();
     let vectors = test["version2_vectors"].as_array().unwrap();
-    assert_eq!(vectors.len(), 37);
+    assert_eq!(vectors.len(), 38);
     let mut failures = Vec::new();
     for vector in vectors {
         let name = vector["name"].as_str().unwrap();
@@ -237,26 +314,10 @@ fn assert_vector(
             .ok_or_else(|| format!("failure {error} != {expected}"));
     }
     let actual = actual.map_err(|error| error.to_string())?;
-    let mut expected: Value = serde_json::from_slice(
+    let expected: Value = serde_json::from_slice(
         &fs::read(directory.join(expect["exact_result_file"].as_str().unwrap())).unwrap(),
     )
     .unwrap();
-    if vector["name"] == "isolated_spawned_mailboxes" {
-        // SPEC.md section 9.2 requires unhandled delivery to allocate no logical step.
-        expected["state"]["next_logical_step_sequence"] = serde_json::json!("2");
-        let mut unsigned = expected["state"].clone();
-        unsigned
-            .as_object_mut()
-            .unwrap()
-            .remove("aggregate_state_digest");
-        let bytes = serde_json_canonicalizer::to_vec(&serde_json::json!([
-            "determa-aggregate-state-digest-2",
-            unsigned
-        ]))
-        .unwrap();
-        expected["state"]["aggregate_state_digest"] =
-            serde_json::json!(format!("sha256:{:x}", Sha256::digest(bytes)));
-    }
     (actual == expected)
         .then_some(())
         .ok_or_else(|| first_difference(&expected, &actual, ""))

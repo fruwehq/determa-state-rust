@@ -9,13 +9,14 @@ branch is validated against the merged `0.2.0` metadata revisions at these exact
 normative inputs:
 
 - specification commit `2e33036563cb966b07124197db672159b4b7e1f4`;
-- conformance commit `40cb119357204f62cbbbb2ef68bac342d43cb901`.
+- conformance commit `531468c59c7a2dc32f5cbe92cfabf89805d27f6a`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
-tests run all 114 format-1 core cases, 108 version-1 and 13 version-2 portable
+tests run all 114 format-1 core cases, 108 version-1 and 15 version-2 portable
 persistence vectors, and 12 steps
 across the six persistence host profiles. The execution-checkpoint integration test
-runs all 99 version-1 and 53 version-2 host vectors.
+runs all 99 version-1 and 53 version-2 host vectors. The version-2 harnesses cover 106
+vectors and 143 artifacts in total.
 
 ## Implemented core
 
@@ -70,7 +71,7 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`40cb119357204f62cbbbb2ef68bac342d43cb901`. CI also checks that all bundled schemas
+`531468c59c7a2dc32f5cbe92cfabf89805d27f6a`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
 `2e33036563cb966b07124197db672159b4b7e1f4`. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.

@@ -1,12 +1,18 @@
 use crate::format1::strict_json;
-use crate::format1::v2::{canonical_bytes, validate_v2_schema};
+use crate::format1::v2::{
+    canonical_bytes, migrate_aggregate_v2_with_evidence, validate_admission_delivery_schema,
+    validate_v2_schema,
+};
 use crate::format1::wire::jcs_hash;
 use crate::format1::{
     admit_v2, restore_aggregate_v2, step_v2, upgrade_aggregate_v1_to_v2, AdmissionDelivery,
-    Bindings, Bundle, Counter, DefinitionResolver, QueueBearingAggregate, Version2Error,
+    Bindings, Bundle, Counter, DefinitionResolver, QueueBearingAggregate, ResourceLimits,
+    Version2Error,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+
+use super::wire::{PendingOutboxState, TerminalOutboxOutcome};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionCheckpointV2 {
@@ -45,6 +51,10 @@ impl ExecutionCheckpointV2 {
         self.aggregate
             .as_ref()
             .and_then(|aggregate| aggregate.value()["validated_bundle_fingerprint"].as_str())
+    }
+
+    pub(crate) fn aggregate(&self) -> Option<&QueueBearingAggregate> {
+        self.aggregate.as_ref()
     }
 }
 
@@ -278,6 +288,8 @@ pub(super) fn checkpoint_admit_v2_with_optional_bundle(
                 .as_str()
                 .unwrap_or("determa-inbox-envelope-digest-2");
             if domain == "determa-inbox-envelope-digest-2" {
+                validate_admission_delivery_schema(delivery)
+                    .map_err(|_| failure("malformed_delivery"))?;
                 let parsed = serde_json::from_value::<AdmissionDelivery>(delivery.clone())
                     .map_err(|_| failure("malformed_delivery"))?;
                 Ok((domain, Some(parsed)))
@@ -443,6 +455,11 @@ pub fn checkpoint_step_v2(
         .aggregate
         .as_ref()
         .ok_or_else(|| failure("terminal_root"))?;
+    if aggregate.value()["validated_bundle_fingerprint"].as_str()
+        != Some(bundle.fingerprint.as_str())
+    {
+        return Err(failure("incompatible_bundle"));
+    }
     let causal = ready_head(aggregate.value(), target_runtime_id)?.clone();
     let core = step_v2(bundle, aggregate, target_runtime_id)?;
     if core["disposition"] == "not_runnable" || core["disposition"] == "rejected" {
@@ -687,6 +704,318 @@ pub fn checkpoint_prune_v2(
     Ok(value)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn checkpoint_maintenance_migration_v2(
+    checkpoint: &ExecutionCheckpointV2,
+    source_bundle: &Bundle,
+    target_bundle: &Bundle,
+    descriptor_source: &[u8],
+    maintenance_mode: bool,
+    limits: &ResourceLimits,
+    expected_revision: Option<&str>,
+    expected_checkpoint_digest: Option<&str>,
+) -> Result<Value, Version2Error> {
+    guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
+    let aggregate = checkpoint
+        .aggregate
+        .as_ref()
+        .ok_or_else(|| failure("terminal_root"))?;
+    let migrated = migrate_aggregate_v2_with_evidence(
+        aggregate,
+        source_bundle,
+        target_bundle,
+        descriptor_source,
+        maintenance_mode,
+        limits,
+    )?;
+    let mut value = checkpoint.value.clone();
+    value["revision"] = incremented(&value["revision"])?;
+    let revision = value["revision"].clone();
+    let aggregate = migrated["aggregate_state"].clone();
+    let status = aggregate["runtimes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|runtime| runtime["runtime_id"] == aggregate["root_runtime_id"])
+        .and_then(|runtime| runtime["status"].as_str())
+        .ok_or_else(|| invalid("migrated root runtime status is absent"))?
+        .to_string();
+    value["root_record"]["aggregate_state"] = aggregate.clone();
+    for disposition in migrated["dispositions"].as_array().unwrap() {
+        let receipt_sequence = allocate(&mut value, "next_operation_receipt_sequence")?;
+        value["operation_receipts"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "operation_kind": "event_terminal",
+                "receipt_sequence": receipt_sequence,
+                "event_id": disposition["event_id"],
+                "request_digest": disposition["request_digest"],
+                "acceptance_sequence": disposition["acceptance_sequence"],
+                "final_queue_sequence": disposition["final_queue_sequence"],
+                "committed_revision": revision,
+                "resulting_aggregate_state_digest": aggregate["aggregate_state_digest"],
+                "outcome": {
+                "status": status,
+                    "disposition": "migration_disposed",
+                    "reason": disposition["reason"],
+                    "migration_descriptor_digest": disposition["migration_descriptor_digest"],
+                    "fault": null,
+                    "rejection": null
+                },
+                "emission_references": []
+            }));
+        rewrite_producer_event_reference(
+            &mut value,
+            disposition["event_id"].as_str().unwrap(),
+            &receipt_sequence,
+        )?;
+    }
+    value["migration_audit_records"]
+        .as_array_mut()
+        .unwrap()
+        .extend(
+            migrated["audit_records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+    seal_and_validate_checkpoint(&mut value)?;
+    Ok(value)
+}
+
+pub fn checkpoint_update_pending_outbox_v2(
+    checkpoint: &ExecutionCheckpointV2,
+    effect_id: &str,
+    delivery_state: PendingOutboxState,
+    expected_revision: Option<&str>,
+    expected_checkpoint_digest: Option<&str>,
+) -> Result<Value, Version2Error> {
+    let delivery_state = serde_json::to_value(delivery_state).map_err(invalid)?;
+    let existing = checkpoint.value["pending_outbox_intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["intent"]["effect_id"].as_str() == Some(effect_id))
+        .ok_or_else(|| failure("effect_id_conflict"))?;
+    if existing["delivery_state"] == delivery_state {
+        return Ok(checkpoint.value.clone());
+    }
+    guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
+    let mut value = checkpoint.value.clone();
+    value["revision"] = incremented(&value["revision"])?;
+    let revision = value["revision"].clone();
+    let record = value["pending_outbox_intents"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|record| record["intent"]["effect_id"].as_str() == Some(effect_id))
+        .unwrap();
+    record["delivery_state"] = delivery_state;
+    record["state_revision"] = revision;
+    seal_and_validate_checkpoint(&mut value)?;
+    Ok(value)
+}
+
+pub fn checkpoint_terminalize_outbox_v2(
+    checkpoint: &ExecutionCheckpointV2,
+    effect_id: &str,
+    outcome: TerminalOutboxOutcome,
+    expected_revision: Option<&str>,
+    expected_checkpoint_digest: Option<&str>,
+) -> Result<Value, Version2Error> {
+    let outcome = serde_json::to_value(outcome).map_err(invalid)?;
+    if let Some(record) = checkpoint.value["terminal_outbox_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["intent"]["effect_id"].as_str() == Some(effect_id))
+    {
+        return if record["outcome"] == outcome {
+            Ok(checkpoint.value.clone())
+        } else {
+            Err(failure("effect_id_conflict"))
+        };
+    }
+    if let Some(record) = checkpoint.value["outbox_effect_tombstones"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["effect_id"].as_str() == Some(effect_id))
+    {
+        return if record["outcome"] == outcome {
+            Ok(checkpoint.value.clone())
+        } else {
+            Err(failure("effect_id_conflict"))
+        };
+    }
+    guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
+    let mut value = checkpoint.value.clone();
+    let index = value["pending_outbox_intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|record| record["intent"]["effect_id"].as_str() == Some(effect_id))
+        .ok_or_else(|| failure("effect_id_conflict"))?;
+    value["revision"] = incremented(&value["revision"])?;
+    let pending = value["pending_outbox_intents"]
+        .as_array_mut()
+        .unwrap()
+        .remove(index);
+    let terminal_sequence = allocate(&mut value, "next_outbox_terminal_sequence")?;
+    let record = json!({
+        "terminal_sequence": terminal_sequence,
+        "intent": pending["intent"],
+        "committed_revision": value["revision"],
+        "outcome": outcome
+    });
+    value["terminal_outbox_records"]
+        .as_array_mut()
+        .unwrap()
+        .push(record);
+    seal_and_validate_checkpoint(&mut value)?;
+    Ok(value)
+}
+
+pub fn checkpoint_compact_outbox_v2(
+    checkpoint: &ExecutionCheckpointV2,
+    effect_id: &str,
+    expected_revision: Option<&str>,
+    expected_checkpoint_digest: Option<&str>,
+) -> Result<Value, Version2Error> {
+    if checkpoint.value["outbox_effect_tombstones"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["effect_id"].as_str() == Some(effect_id))
+    {
+        return Ok(checkpoint.value.clone());
+    }
+    guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
+    let mut value = checkpoint.value.clone();
+    let index = value["terminal_outbox_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|record| record["intent"]["effect_id"].as_str() == Some(effect_id))
+        .ok_or_else(|| failure("effect_id_conflict"))?;
+    value["revision"] = incremented(&value["revision"])?;
+    let terminal = value["terminal_outbox_records"]
+        .as_array_mut()
+        .unwrap()
+        .remove(index);
+    let intent: crate::checkpoint::OutboxIntent =
+        serde_json::from_value(terminal["intent"].clone()).map_err(invalid)?;
+    let intent_digest =
+        crate::checkpoint::wire::outbox_intent_digest(checkpoint.root_instance_id(), &intent)
+            .map_err(invalid)?;
+    value["outbox_effect_tombstones"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "terminal_sequence": terminal["terminal_sequence"],
+            "effect_id": effect_id,
+            "intent_digest": intent_digest,
+            "committed_revision": terminal["committed_revision"],
+            "outcome": terminal["outcome"]
+        }));
+    value["outbox_effect_tombstones"]
+        .as_array_mut()
+        .unwrap()
+        .sort_by_key(|record| {
+            Counter::from_decimal(record["terminal_sequence"].as_str().unwrap()).unwrap()
+        });
+    seal_and_validate_checkpoint(&mut value)?;
+    Ok(value)
+}
+
+pub fn checkpoint_tombstone_root_v2(
+    checkpoint: &ExecutionCheckpointV2,
+    operation_id: &str,
+    expected_revision: Option<&str>,
+    expected_checkpoint_digest: Option<&str>,
+) -> Result<Value, Version2Error> {
+    if operation_id.is_empty() {
+        return Err(invalid("tombstone operation id is empty"));
+    }
+    if checkpoint.value["root_record"]["status"] == "tombstone" {
+        return if checkpoint.value["root_record"]["tombstone_operation_id"].as_str()
+            == Some(operation_id)
+        {
+            Ok(checkpoint.value.clone())
+        } else {
+            Err(failure("operation_id_conflict"))
+        };
+    }
+    if !checkpoint.value["pending_outbox_intents"]
+        .as_array()
+        .unwrap()
+        .is_empty()
+    {
+        return Err(invalid("root has unresolved pending outbox work"));
+    }
+    guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
+    let aggregate = checkpoint.value["root_record"]["aggregate_state"].clone();
+    let root_runtime = aggregate["runtimes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|runtime| runtime["runtime_id"] == aggregate["root_runtime_id"])
+        .ok_or_else(|| invalid("aggregate root runtime is absent"))?;
+    let terminal_status = match root_runtime["status"].as_str() {
+        Some("completed") => "completed",
+        Some("faulted") => "faulted",
+        _ => return Err(invalid("running aggregate cannot be tombstoned")),
+    };
+    let mut value = checkpoint.value.clone();
+    value["revision"] = incremented(&value["revision"])?;
+    let revision = value["revision"].clone();
+    for runtime in aggregate["runtimes"].as_array().unwrap() {
+        for field in ["ready_mailbox", "deferred_mailbox"] {
+            for entry in runtime[field].as_array().unwrap() {
+                let receipt_sequence = allocate(&mut value, "next_operation_receipt_sequence")?;
+                value["operation_receipts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({
+                        "operation_kind": "event_terminal",
+                        "receipt_sequence": receipt_sequence,
+                        "event_id": entry["envelope"]["event_id"],
+                        "request_digest": entry["envelope_digest"],
+                        "acceptance_sequence": entry["acceptance_sequence"],
+                        "final_queue_sequence": entry["queue_sequence"],
+                        "committed_revision": revision,
+                        "resulting_aggregate_state_digest": aggregate["aggregate_state_digest"],
+                        "outcome": {
+                            "status": terminal_status,
+                            "disposition": "disposed",
+                            "reason": "root_tombstoned",
+                            "fault": null,
+                            "rejection": null
+                        },
+                        "emission_references": []
+                    }));
+                rewrite_producer_event_reference(
+                    &mut value,
+                    entry["envelope"]["event_id"].as_str().unwrap(),
+                    &receipt_sequence,
+                )?;
+            }
+        }
+    }
+    value["root_record"] = json!({
+        "status": "tombstone",
+        "root_runtime_id": aggregate["root_runtime_id"],
+        "creation_id": aggregate["creation_id"],
+        "terminal_status": terminal_status,
+        "final_aggregate_state_digest": aggregate["aggregate_state_digest"],
+        "tombstone_operation_id": operation_id
+    });
+    seal_and_validate_checkpoint(&mut value)?;
+    Ok(value)
+}
+
 struct Identity {
     digest: String,
     replay: Value,
@@ -881,6 +1210,13 @@ fn validate_semantics(value: &Value) -> Result<(), Version2Error> {
                 Some(counter(receipt, "committed_revision")?)
             }
             "legacy_v1_operation" => {
+                if receipt["legacy_receipt"]["operation_kind"] == "delivery" {
+                    let acceptance =
+                        counter(&receipt["legacy_receipt"], "accepted_delivery_sequence")?;
+                    if !acceptance_sequences.insert(acceptance) {
+                        return Err(invalid("acceptance identity is duplicated"));
+                    }
+                }
                 Some(counter(&receipt["legacy_receipt"], "committed_revision")?)
             }
             _ => return Err(invalid("unknown operation receipt kind")),
@@ -902,6 +1238,7 @@ fn validate_semantics(value: &Value) -> Result<(), Version2Error> {
     {
         return Err(invalid("checkpoint creation evidence is invalid"));
     }
+    validate_legacy_acceptance_relationships(receipts, &acceptance_by_event)?;
 
     let mut mailbox_events = BTreeMap::new();
     if value["root_record"]["status"] == "retained" {
@@ -911,11 +1248,21 @@ fn validate_semantics(value: &Value) -> Result<(), Version2Error> {
         {
             return Err(invalid("root or creation identity is inconsistent"));
         }
+        if revision == Counter::zero()
+            && receipts.len() == 1
+            && receipts[0]["operation_kind"] == "creation"
+            && receipts[0]["resulting_aggregate_state_digest"]
+                != aggregate["aggregate_state_digest"]
+        {
+            return Err(invalid(
+                "creation receipt aggregate digest attestation is invalid",
+            ));
+        }
         let next_acceptance = counter(aggregate, "next_acceptance_sequence")?;
         let next_queue = counter(aggregate, "next_queue_sequence")?;
-        if acceptance_by_event
-            .values()
-            .any(|receipt| counter(receipt, "acceptance_sequence").unwrap() >= next_acceptance)
+        if acceptance_sequences
+            .iter()
+            .any(|acceptance| acceptance >= &next_acceptance)
             || terminal_by_event.values().any(|receipt| {
                 counter(receipt, "acceptance_sequence").unwrap() >= next_acceptance
                     || counter(receipt, "final_queue_sequence").unwrap() >= next_queue
@@ -923,6 +1270,7 @@ fn validate_semantics(value: &Value) -> Result<(), Version2Error> {
         {
             return Err(invalid("event allocation exceeds aggregate counters"));
         }
+        validate_migration_audits(value, aggregate)?;
         validate_mailboxes(
             value,
             aggregate,
@@ -979,6 +1327,99 @@ fn validate_semantics(value: &Value) -> Result<(), Version2Error> {
     Ok(())
 }
 
+fn validate_legacy_acceptance_relationships(
+    receipts: &[Value],
+    acceptances: &BTreeMap<&str, &Value>,
+) -> Result<(), Version2Error> {
+    for acceptance in acceptances
+        .values()
+        .filter(|receipt| receipt["delivery_mode"] == "internal")
+    {
+        let evidence = &acceptance["legacy_v1_delivery"];
+        let origin = &evidence["origin"];
+        let producer_sequence = origin["producing_receipt_sequence"]
+            .as_str()
+            .ok_or_else(|| invalid("legacy internal producer sequence is absent"))?;
+        let emission_index = origin["emission_index"]
+            .as_str()
+            .ok_or_else(|| invalid("legacy internal emission index is absent"))?;
+        if origin["kind"] != "internal_emission"
+            || evidence["delivery_sequence"] != acceptance["acceptance_sequence"]
+            || Counter::from_decimal(producer_sequence).map_err(invalid)?
+                >= counter(acceptance, "receipt_sequence")?
+        {
+            return Err(invalid("legacy delivery origin is invalid"));
+        }
+        let producer = receipts
+            .iter()
+            .find(|receipt| receipt["receipt_sequence"].as_str() == Some(producer_sequence))
+            .ok_or_else(|| invalid("legacy delivery producer receipt is absent"))?;
+        if !matches!(
+            producer["operation_kind"].as_str(),
+            Some("legacy_v1_creation" | "legacy_v1_operation")
+        ) {
+            return Err(invalid(
+                "legacy delivery producer is not a wrapped v1 receipt",
+            ));
+        }
+        let matching = producer["legacy_receipt"]["emission_references"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|reference| {
+                reference["kind"] == "internal_delivery"
+                    && reference["emission_index"].as_str() == Some(emission_index)
+                    && reference["delivery_sequence"] == evidence["delivery_sequence"]
+                    && reference["event_id"] == acceptance["event_id"]
+            })
+            .count();
+        if matching != 1 {
+            return Err(invalid("wrapped v1 producer reference is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_migration_audits(checkpoint: &Value, aggregate: &Value) -> Result<(), Version2Error> {
+    let root_instance_id = checkpoint["root_instance_id"].as_str().unwrap();
+    let root_runtime_id = aggregate["root_runtime_id"].as_str().unwrap();
+    let aggregate_migration_sequence = counter(aggregate, "migration_sequence")?;
+    let mut prior_sequence = None;
+    let mut prior_target_digest = None;
+    let mut prior_target_fingerprint = None;
+    for audit in checkpoint["migration_audit_records"].as_array().unwrap() {
+        let sequence = counter(audit, "migration_sequence")?;
+        if audit["root_instance_id"].as_str() != Some(root_instance_id)
+            || audit["root_runtime_id"].as_str() != Some(root_runtime_id)
+            || sequence > aggregate_migration_sequence
+            || prior_sequence
+                .as_ref()
+                .is_some_and(|prior| prior >= &sequence)
+            || prior_target_digest.is_some_and(|digest| {
+                audit["source_aggregate_state_digest"].as_str() != Some(digest)
+            })
+            || prior_target_fingerprint.is_some_and(|fingerprint| {
+                audit["source_validated_bundle_fingerprint"].as_str() != Some(fingerprint)
+            })
+        {
+            return Err(invalid(
+                "migration audit chronology or provenance is invalid",
+            ));
+        }
+        prior_sequence = Some(sequence);
+        prior_target_digest = audit["target_aggregate_state_digest"].as_str();
+        prior_target_fingerprint = audit["target_validated_bundle_fingerprint"].as_str();
+    }
+    if prior_sequence.as_ref() == Some(&aggregate_migration_sequence)
+        && prior_target_fingerprint != aggregate["validated_bundle_fingerprint"].as_str()
+    {
+        return Err(invalid(
+            "latest migration audit bundle provenance is invalid",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_mailboxes<'a>(
     checkpoint: &Value,
     aggregate: &'a Value,
@@ -1031,14 +1472,13 @@ fn validate_mailboxes<'a>(
                     entry["delivery_mode"].as_str().unwrap(),
                     &parsed,
                 )?;
-                if entry["envelope_digest"].as_str() != Some(expected.as_str())
-                    || envelope["cause_id"] != envelope["event_id"]
-                {
+                if entry["envelope_digest"].as_str() != Some(expected.as_str()) {
                     return Err(invalid("mailbox envelope digest or cause is invalid"));
                 }
                 match entry["delivery_mode"].as_str().unwrap() {
                     "input" => {
                         if envelope["source"] != json!({"host": true})
+                            || envelope["cause_id"] != envelope["event_id"]
                             || !acceptances.get(event_id).is_some_and(|receipt| {
                                 receipt["request_digest"] == entry["envelope_digest"]
                                     && receipt["acceptance_sequence"]
@@ -1050,11 +1490,32 @@ fn validate_mailboxes<'a>(
                         }
                     }
                     "internal" => {
-                        let source_valid =
-                            envelope["source"].get("runtime").is_some_and(|source| {
+                        let source = envelope["source"]
+                            .as_object()
+                            .ok_or_else(|| invalid("internal mailbox source is not an object"))?;
+                        let runtime_source = source.len() == 1
+                            && source.get("runtime").is_some_and(|source| {
                                 runtime_targets.values().any(|target| *target == source)
-                            }) || envelope["source"].get("legacy_v1_internal").is_some();
-                        let acceptance_valid = acceptances.get(event_id).is_some_and(|receipt| {
+                            });
+                        let system_source = source.len() == 1
+                            && source.get("system").and_then(Value::as_str).is_some_and(
+                                |locator| {
+                                    system_locator_matches_event(
+                                        locator,
+                                        envelope["event"].as_str().unwrap(),
+                                    )
+                                },
+                            );
+                        let legacy_source = source.len() == 1
+                            && source.get("legacy_v1_internal").is_some_and(|legacy| {
+                                legacy.as_object().is_some_and(|legacy| {
+                                    legacy.len() == 2
+                                        && legacy["producing_receipt_sequence"].is_string()
+                                        && legacy["emission_index"].is_string()
+                                })
+                            });
+                        let acceptance = acceptances.get(event_id);
+                        let acceptance_valid = acceptance.is_some_and(|receipt| {
                             receipt["request_digest"] == entry["envelope_digest"]
                                 && receipt["acceptance_sequence"] == entry["acceptance_sequence"]
                                 && receipt["delivery_mode"] == "internal"
@@ -1073,7 +1534,27 @@ fn validate_mailboxes<'a>(
                                         && reference["queue_sequence"] == entry["queue_sequence"]
                                 })
                         });
-                        if !source_valid || acceptance_valid == producer_valid {
+                        let legacy_source_matches = source
+                            .get("legacy_v1_internal")
+                            .zip(acceptance)
+                            .is_some_and(|(source, receipt)| {
+                                source["producing_receipt_sequence"]
+                                    == receipt["legacy_v1_delivery"]["origin"]
+                                        ["producing_receipt_sequence"]
+                                    && source["emission_index"]
+                                        == receipt["legacy_v1_delivery"]["origin"]["emission_index"]
+                            });
+                        let native = runtime_source || system_source;
+                        let valid = if native {
+                            envelope["cause_id"] != envelope["event_id"]
+                                && !acceptance_valid
+                                && producer_valid
+                        } else if legacy_source {
+                            acceptance_valid && legacy_source_matches && !producer_valid
+                        } else {
+                            false
+                        };
+                        if !valid {
                             return Err(invalid("internal mailbox provenance is invalid"));
                         }
                     }
@@ -1083,6 +1564,18 @@ fn validate_mailboxes<'a>(
         }
     }
     Ok(())
+}
+
+fn system_locator_matches_event(locator: &str, event: &str) -> bool {
+    matches!(
+        (locator, event),
+        (
+            "system:component_completion",
+            "determa.component_completed" | "done"
+        ) | ("system:spawned_completion", "done")
+            | ("system:component_failure", "determa.component_failed")
+            | ("system:spawned_failure", "determa.spawned_instance_failed")
+    )
 }
 
 fn validate_terminal_relationships(
@@ -1290,8 +1783,7 @@ fn rewrite_producer_reference(
     terminal: &str,
 ) -> Result<(), Version2Error> {
     let source = &causal["envelope"]["source"];
-    if let Some(runtime) = source.get("runtime") {
-        let _ = runtime;
+    if source.get("runtime").is_some() || source.get("system").is_some() {
         let event_id = causal["envelope"]["event_id"].as_str().unwrap();
         rewrite_producer_event_reference(value, event_id, terminal)?;
     }
@@ -1448,6 +1940,30 @@ fn seal_checkpoint(value: &mut Value) -> Result<(), Version2Error> {
     Ok(())
 }
 
+fn seal_and_validate_checkpoint(value: &mut Value) -> Result<(), Version2Error> {
+    seal_checkpoint(value)?;
+    validate_v2_schema(
+        value,
+        include_str!("../../schema/execution-checkpoint-v2.schema.json"),
+        &[
+            (
+                "https://determa.dev/state/schema/execution-checkpoint.schema.json",
+                include_str!("../../schema/execution-checkpoint.schema.json"),
+            ),
+            (
+                "https://determa.dev/state/schema/aggregate-state.schema.json",
+                include_str!("../../schema/aggregate-state.schema.json"),
+            ),
+            (
+                "https://determa.dev/state/schema/aggregate-state-v2.schema.json",
+                include_str!("../../schema/aggregate-state-v2.schema.json"),
+            ),
+        ],
+        "invalid_execution_checkpoint",
+    )?;
+    validate_semantics(value)
+}
+
 fn checkpoint_digest(value: &Value) -> Result<String, Version2Error> {
     let mut unsigned = value.clone();
     unsigned
@@ -1489,7 +2005,7 @@ fn failure(code: &str) -> Version2Error {
 mod tests {
     use super::*;
     use crate::format1::v2::{envelope_digest, restore_aggregate_v2_value};
-    use crate::format1::{create_v2, load_bundle, InMemoryDefinitionResolver};
+    use crate::format1::{create_v2, load_bundle, InMemoryDefinitionResolver, QueueEnvelope};
 
     fn checkpoint(name: &str) -> Value {
         let source = match name {
@@ -1501,9 +2017,56 @@ mod tests {
                 "../../conformance-suite/conformance/profiles/execution-checkpoint/",
                 "checkpoint-04-version2-mailboxes/upgraded-outbox-checkpoint-v2.json"
             )),
+            "legacy" => include_str!(concat!(
+                "../../conformance-suite/conformance/profiles/execution-checkpoint/",
+                "checkpoint-04-version2-mailboxes/upgraded-checkpoint-v2.json"
+            )),
+            "legacy_processed" => include_str!(concat!(
+                "../../conformance-suite/conformance/profiles/execution-checkpoint/",
+                "checkpoint-04-version2-mailboxes/processed-upgraded-internal-checkpoint-v2.json"
+            )),
             _ => unreachable!(),
         };
         serde_json::from_str(source).unwrap()
+    }
+
+    #[test]
+    fn native_creation_receipt_attests_exact_initial_aggregate_digest() {
+        let bundle = load_bundle(include_str!(concat!(
+            "../../conformance-suite/conformance/profiles/execution-checkpoint/",
+            "checkpoint-04-version2-mailboxes/machine.yaml"
+        )))
+        .unwrap();
+        let checkpoint = create_execution_checkpoint_v2(
+            &bundle,
+            "counter",
+            "creation-digest-root",
+            "creation-digest-operation",
+            &Bindings::default(),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            json!({
+                "mode": "permanent",
+                "permanent_replay_eligible": true,
+                "policy_identifier": null,
+                "pruned_through_receipt_sequence": null
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint.value()["operation_receipts"][0]["resulting_aggregate_state_digest"],
+            checkpoint.value()["root_record"]["aggregate_state"]["aggregate_state_digest"]
+        );
+
+        let mut forged = checkpoint.value().clone();
+        forged["operation_receipts"][0]["resulting_aggregate_state_digest"] =
+            json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        seal_checkpoint(&mut forged).unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(bundle, true);
+        assert_eq!(
+            restore_value(forged, &resolver).unwrap_err().code,
+            "invalid_execution_checkpoint"
+        );
     }
 
     #[test]
@@ -1533,6 +2096,151 @@ mod tests {
         assert!(validate_semantics(&outbox).is_err());
     }
 
+    fn legacy_resolver() -> InMemoryDefinitionResolver {
+        let bundle = load_bundle(include_str!(concat!(
+            "../../conformance-suite/conformance/profiles/execution-checkpoint/",
+            "checkpoint-04-version2-mailboxes/machine.yaml"
+        )))
+        .unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(bundle, true);
+        resolver
+    }
+
+    fn reseal_legacy_mailbox(value: &mut Value) {
+        let root_instance_id = value["root_instance_id"].as_str().unwrap().to_string();
+        let event_id = value["operation_receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|receipt| receipt["operation_kind"] == "acceptance")
+            .unwrap()["event_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let aggregate = &mut value["root_record"]["aggregate_state"];
+        let entry = aggregate["runtimes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .flat_map(|runtime| runtime["ready_mailbox"].as_array_mut().unwrap())
+            .find(|entry| entry["envelope"]["event_id"] == event_id)
+            .unwrap();
+        let envelope: QueueEnvelope = serde_json::from_value(entry["envelope"].clone()).unwrap();
+        let digest = envelope_digest(
+            &root_instance_id,
+            entry["delivery_mode"].as_str().unwrap(),
+            &envelope,
+        )
+        .unwrap();
+        entry["envelope_digest"] = json!(digest);
+        let aggregate = seal_aggregate(aggregate.clone()).unwrap();
+        value["root_record"]["aggregate_state"] = aggregate;
+        let acceptance = value["operation_receipts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|receipt| {
+                receipt["operation_kind"] == "acceptance" && receipt["event_id"] == event_id
+            })
+            .unwrap();
+        acceptance["request_digest"] = json!(digest);
+        seal_checkpoint(value).unwrap();
+    }
+
+    #[test]
+    fn restore_rejects_resealed_legacy_provenance_forgery() {
+        let resolver = legacy_resolver();
+
+        let mut wrong_origin = checkpoint("legacy");
+        let acceptance = wrong_origin["operation_receipts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|receipt| receipt["operation_kind"] == "acceptance")
+            .unwrap();
+        acceptance["legacy_v1_delivery"]["origin"] = json!({"kind": "host_input"});
+        seal_checkpoint(&mut wrong_origin).unwrap();
+        assert_eq!(
+            restore_value(wrong_origin, &resolver).unwrap_err().code,
+            "invalid_execution_checkpoint"
+        );
+
+        let mut wrong_source_locator = checkpoint("legacy");
+        wrong_source_locator["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"][0]
+            ["envelope"]["source"]["legacy_v1_internal"]["producing_receipt_sequence"] = json!("1");
+        reseal_legacy_mailbox(&mut wrong_source_locator);
+        assert_eq!(
+            restore_value(wrong_source_locator, &resolver)
+                .unwrap_err()
+                .code,
+            "invalid_execution_checkpoint"
+        );
+
+        let mut wrong_wrapped_reference = checkpoint("legacy");
+        wrong_wrapped_reference["operation_receipts"][2]["legacy_receipt"]["emission_references"]
+            [0]["emission_index"] = json!("1");
+        seal_checkpoint(&mut wrong_wrapped_reference).unwrap();
+        assert_eq!(
+            restore_value(wrong_wrapped_reference, &resolver)
+                .unwrap_err()
+                .code,
+            "invalid_execution_checkpoint"
+        );
+
+        let mut native_relabel = checkpoint("legacy");
+        let runtime_source = native_relabel["root_record"]["aggregate_state"]["runtimes"][0]
+            ["target_identity"]
+            .clone();
+        let envelope = &mut native_relabel["root_record"]["aggregate_state"]["runtimes"][0]
+            ["ready_mailbox"][0]["envelope"];
+        envelope["source"] = json!({"runtime": runtime_source});
+        envelope["cause_id"] = json!("native-cause");
+        reseal_legacy_mailbox(&mut native_relabel);
+        assert_eq!(
+            restore_value(native_relabel, &resolver).unwrap_err().code,
+            "invalid_execution_checkpoint"
+        );
+
+        let mut wrong_preserved_origin = checkpoint("legacy_processed");
+        let acceptance = wrong_preserved_origin["operation_receipts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|receipt| receipt["operation_kind"] == "acceptance")
+            .unwrap();
+        acceptance["legacy_v1_delivery"]["origin"]["producing_receipt_sequence"] = json!("1");
+        seal_checkpoint(&mut wrong_preserved_origin).unwrap();
+        assert_eq!(
+            restore_value(wrong_preserved_origin, &resolver)
+                .unwrap_err()
+                .code,
+            "invalid_execution_checkpoint"
+        );
+
+        let mut legacy_native_collision = checkpoint("legacy_processed");
+        legacy_native_collision["operation_receipts"][2]["legacy_receipt"]
+            ["accepted_delivery_sequence"] = json!("2");
+        seal_checkpoint(&mut legacy_native_collision).unwrap();
+        assert_eq!(
+            restore_value(legacy_native_collision, &resolver)
+                .unwrap_err()
+                .code,
+            "invalid_execution_checkpoint"
+        );
+
+        let mut legacy_out_of_range = checkpoint("legacy_processed");
+        legacy_out_of_range["operation_receipts"][2]["legacy_receipt"]
+            ["accepted_delivery_sequence"] = json!("3");
+        seal_checkpoint(&mut legacy_out_of_range).unwrap();
+        assert_eq!(
+            restore_value(legacy_out_of_range, &resolver)
+                .unwrap_err()
+                .code,
+            "invalid_execution_checkpoint"
+        );
+    }
+
     #[test]
     fn restore_reports_digest_mismatch_after_embedded_aggregate_validation() {
         let mut value = checkpoint("admitted");
@@ -1547,6 +2255,56 @@ mod tests {
         resolver.insert(bundle, true);
         let error = restore_value(value, &resolver).unwrap_err();
         assert_eq!(error.code, "execution_checkpoint_digest_mismatch");
+    }
+
+    #[test]
+    fn admission_rejects_nested_source_extras_before_wrong_root() {
+        let value = checkpoint("admitted");
+        let bundle = load_bundle(include_str!(concat!(
+            "../../conformance-suite/conformance/profiles/execution-checkpoint/",
+            "checkpoint-04-version2-mailboxes/machine.yaml"
+        )))
+        .unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(bundle.clone(), true);
+        let restored = restore_value(value.clone(), &resolver).unwrap();
+        let entry = &value["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"][0];
+        let mut delivery = json!({
+            "delivery_mode": entry["delivery_mode"],
+            "envelope": entry["envelope"],
+            "envelope_digest": entry["envelope_digest"]
+        });
+        delivery["envelope"]["source"]["extra"] = json!(true);
+        delivery["envelope"]["target"]["root"]["root_instance_id"] = json!("wrong-root");
+        let error = checkpoint_admit_v2(&bundle, &restored, &[delivery], None, None).unwrap_err();
+        assert_eq!(error.code, "malformed_delivery");
+        assert_eq!(restored.value(), &value);
+    }
+
+    #[test]
+    fn bundle_compatibility_precedes_empty_ready_mailbox() {
+        let mut value = checkpoint("admitted");
+        value["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"] = json!([]);
+        value["root_record"]["aggregate_state"] =
+            seal_aggregate(value["root_record"]["aggregate_state"].clone()).unwrap();
+        seal_checkpoint(&mut value).unwrap();
+        let bundle = load_bundle(include_str!(concat!(
+            "../../conformance-suite/conformance/profiles/execution-checkpoint/",
+            "checkpoint-04-version2-mailboxes/machine.yaml"
+        )))
+        .unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(bundle.clone(), true);
+        let restored = restore_value(value, &resolver).unwrap();
+        let mut incompatible = bundle;
+        incompatible.fingerprint =
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
+        let runtime_id = restored.value()["root_record"]["aggregate_state"]["root_runtime_id"]
+            .as_str()
+            .unwrap();
+        let error =
+            checkpoint_step_v2(&incompatible, &restored, runtime_id, None, None).unwrap_err();
+        assert_eq!(error.code, "incompatible_bundle");
     }
 
     #[test]
@@ -1643,5 +2401,108 @@ machines:
         let owner_failure = step_v2(&bundle, &overflow, root_runtime_id).unwrap();
         assert_eq!(owner_failure["status"], "faulted");
         assert_eq!(owner_failure["fault"]["code"], "contained_runtime_fault");
+    }
+
+    #[test]
+    fn root_tombstone_terminalizes_frozen_native_internal_work() {
+        let bundle = load_bundle(
+            r#"
+format: 1
+namespace: test.tombstone
+events:
+  trigger: { direction: input }
+  boom: { direction: input }
+  work: { direction: internal }
+machines:
+  - machine_id: root
+    root:
+      variables:
+        count: { type: int, init: 0 }
+      on_events:
+        trigger:
+          action:
+            - send: { event: work }
+        boom:
+          action:
+            - assign: { count: "1 / 0" }
+        work:
+          action:
+            - assign: { count: "count + 1" }
+"#,
+        )
+        .unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(bundle.clone(), true);
+        let created = create_execution_checkpoint_v2(
+            &bundle,
+            "root",
+            "root",
+            "create",
+            &Bindings::default(),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            json!({
+                "mode": "permanent",
+                "permanent_replay_eligible": true,
+                "policy_identifier": null,
+                "pruned_through_receipt_sequence": null
+            }),
+        )
+        .unwrap();
+        let runtime_id = created.value()["root_record"]["aggregate_state"]["root_runtime_id"]
+            .as_str()
+            .unwrap();
+        let delivery = |event: &str| {
+            let envelope = QueueEnvelope {
+                event: event.to_string(),
+                event_id: format!("{event}-1"),
+                cause_id: format!("{event}-1"),
+                source: json!({"host": true}),
+                target: json!({"root": {
+                    "root_instance_id": "root",
+                    "root_runtime_id": runtime_id
+                }}),
+                payload: serde_json::from_value(json!(["map", []])).unwrap(),
+                correlation_id: None,
+            };
+            let digest = envelope_digest("root", "input", &envelope).unwrap();
+            serde_json::to_value(AdmissionDelivery {
+                delivery_mode: "input".to_string(),
+                envelope,
+                envelope_digest: digest,
+            })
+            .unwrap()
+        };
+        let admitted = checkpoint_admit_v2(
+            &bundle,
+            &created,
+            &[delivery("trigger"), delivery("boom")],
+            None,
+            None,
+        )
+        .unwrap();
+        let admitted = restore_value(admitted["checkpoint"].clone(), &resolver).unwrap();
+        let triggered = checkpoint_step_v2(&bundle, &admitted, runtime_id, None, None).unwrap();
+        let triggered = restore_value(triggered, &resolver).unwrap();
+        let faulted = checkpoint_step_v2(&bundle, &triggered, runtime_id, None, None).unwrap();
+        let faulted = restore_value(faulted, &resolver).unwrap();
+        assert_eq!(
+            faulted.value()["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let tombstoned = checkpoint_tombstone_root_v2(&faulted, "tombstone", None, None).unwrap();
+        let restored = restore_value(tombstoned, &resolver).unwrap();
+        assert_eq!(restored.value()["root_record"]["status"], "tombstone");
+        assert!(restored.value()["operation_receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|receipt| {
+                receipt["event_id"] == "work-1"
+                    || (receipt["outcome"]["disposition"] == "disposed"
+                        && receipt["outcome"]["reason"] == "root_tombstoned")
+            }));
     }
 }

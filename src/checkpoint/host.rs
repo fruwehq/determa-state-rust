@@ -7,9 +7,11 @@ use super::store::{
     StoreError, StoreErrorCode, StoreRecord, StoreWriteResult,
 };
 use super::v2::{
-    checkpoint_admit_v2_with_optional_bundle, checkpoint_prune_v2, checkpoint_step_v2,
-    create_execution_checkpoint_v2, restore_execution_checkpoint_v2,
-    upgrade_execution_checkpoint_v1_to_v2, ExecutionCheckpointV2,
+    checkpoint_admit_v2_with_optional_bundle, checkpoint_compact_outbox_v2,
+    checkpoint_maintenance_migration_v2, checkpoint_prune_v2, checkpoint_step_v2,
+    checkpoint_terminalize_outbox_v2, checkpoint_tombstone_root_v2,
+    checkpoint_update_pending_outbox_v2, create_execution_checkpoint_v2,
+    restore_execution_checkpoint_v2, upgrade_execution_checkpoint_v1_to_v2, ExecutionCheckpointV2,
 };
 use super::wire::{
     envelope_digest, hash_tagged, outbox_intent_digest, AcceptanceResult, CheckpointFault,
@@ -24,9 +26,10 @@ use super::wire::{
     RootTombstoneStatus, TerminalOutboxOutcome, TerminalOutboxRecord, TerminalRootStatus,
 };
 use crate::format1::{
-    create, dispatch, encode_aggregate, migrate_aggregate, AggregateState, Bindings, Bundle,
-    Counter, Delivery, Disposition, Emission, MigrationArtifactResolver, MigrationRequest,
-    ResourceLimits, ResultStatus, RuntimeStatus, TypedValue, Version2Error,
+    create, dispatch, encode_aggregate, migrate_aggregate, migrate_aggregate_v2_route,
+    AggregateState, Bindings, Bundle, Counter, Delivery, Disposition, Emission,
+    MigrationArtifactResolver, MigrationRequest, ResourceLimits, ResultStatus, RuntimeStatus,
+    TypedValue, Version2Error,
 };
 use crate::Value;
 use serde_json::{json, Value as JsonValue};
@@ -290,7 +293,14 @@ pub enum PostgresqlHostMutation<'a> {
         migration: Option<&'a ProcessingMigration>,
     },
     MaintenanceMigration(&'a MaintenanceMigrationRequest),
+    MaintenanceMigrationV2(&'a MaintenanceMigrationRequest),
     UpdatePendingOutbox {
+        root_instance_id: &'a str,
+        effect_id: &'a str,
+        desired: PendingOutboxState,
+        guard: &'a MutationGuard,
+    },
+    UpdatePendingOutboxV2 {
         root_instance_id: &'a str,
         effect_id: &'a str,
         desired: PendingOutboxState,
@@ -302,7 +312,18 @@ pub enum PostgresqlHostMutation<'a> {
         outcome: TerminalOutboxOutcome,
         guard: &'a MutationGuard,
     },
+    TerminalizeOutboxV2 {
+        root_instance_id: &'a str,
+        effect_id: &'a str,
+        outcome: TerminalOutboxOutcome,
+        guard: &'a MutationGuard,
+    },
     CompactOutbox {
+        root_instance_id: &'a str,
+        effect_id: &'a str,
+        guard: &'a MutationGuard,
+    },
+    CompactOutboxV2 {
         root_instance_id: &'a str,
         effect_id: &'a str,
         guard: &'a MutationGuard,
@@ -322,6 +343,11 @@ pub enum PostgresqlHostMutation<'a> {
         operation_id: &'a str,
         guard: &'a MutationGuard,
     },
+    TombstoneRootV2 {
+        root_instance_id: &'a str,
+        operation_id: &'a str,
+        guard: &'a MutationGuard,
+    },
     DeleteCheckpoint {
         root_instance_id: &'a str,
         guard: &'a MutationGuard,
@@ -337,13 +363,23 @@ impl PostgresqlHostMutation<'_> {
             | Self::ForegroundProcessDelivery { request, .. }
             | Self::ProcessPendingDelivery { request, .. } => &request.checkpoint_root_instance_id,
             Self::MaintenanceMigration(request) => &request.root_instance_id,
+            Self::MaintenanceMigrationV2(request) => &request.root_instance_id,
             Self::UpdatePendingOutbox {
                 root_instance_id, ..
             }
             | Self::TerminalizeOutbox {
                 root_instance_id, ..
             }
+            | Self::UpdatePendingOutboxV2 {
+                root_instance_id, ..
+            }
+            | Self::TerminalizeOutboxV2 {
+                root_instance_id, ..
+            }
             | Self::CompactOutbox {
+                root_instance_id, ..
+            }
+            | Self::CompactOutboxV2 {
                 root_instance_id, ..
             }
             | Self::DeleteOutboxRecord {
@@ -353,6 +389,9 @@ impl PostgresqlHostMutation<'_> {
                 root_instance_id, ..
             }
             | Self::TombstoneRoot {
+                root_instance_id, ..
+            }
+            | Self::TombstoneRootV2 {
                 root_instance_id, ..
             }
             | Self::DeleteCheckpoint {
@@ -369,12 +408,17 @@ pub enum PostgresqlHostMutationResult {
     Acceptance(AcceptanceResult),
     Delivery(DeliveryReceipt),
     MaintenanceMigration(MaintenanceMigrationReceipt),
+    MaintenanceMigrationV2(JsonValue),
     PendingOutbox(PendingOutboxIntent),
+    PendingOutboxV2(JsonValue),
     Outbox(OutboxRecord),
+    OutboxV2(JsonValue),
     CompactedOutbox(OutboxEffectTombstone),
+    CompactedOutboxV2(JsonValue),
     OutboxRecordDeleted,
     ReplayRetention(ReplayRetention),
     RootTombstone(RootTombstone),
+    RootTombstoneV2(JsonValue),
     CheckpointDeleted,
 }
 
@@ -552,6 +596,12 @@ where
                     self.maintenance_migration_with_store(&mut store, request)?,
                 )
             }
+            PostgresqlHostMutation::MaintenanceMigrationV2(request) => {
+                PostgresqlHostMutationResult::MaintenanceMigrationV2(
+                    self.maintenance_migration_v2_with_store(&mut store, request)
+                        .map_err(v2_host_failure)?,
+                )
+            }
             PostgresqlHostMutation::UpdatePendingOutbox {
                 root_instance_id,
                 effect_id,
@@ -566,6 +616,21 @@ where
                     guard,
                 )?)
             }
+            PostgresqlHostMutation::UpdatePendingOutboxV2 {
+                root_instance_id,
+                effect_id,
+                desired,
+                guard,
+            } => PostgresqlHostMutationResult::PendingOutboxV2(
+                self.update_pending_outbox_v2_with_store(
+                    &mut store,
+                    root_instance_id,
+                    effect_id,
+                    desired,
+                    guard,
+                )
+                .map_err(v2_host_failure)?,
+            ),
             PostgresqlHostMutation::TerminalizeOutbox {
                 root_instance_id,
                 effect_id,
@@ -578,6 +643,21 @@ where
                 outcome,
                 guard,
             )?),
+            PostgresqlHostMutation::TerminalizeOutboxV2 {
+                root_instance_id,
+                effect_id,
+                outcome,
+                guard,
+            } => PostgresqlHostMutationResult::OutboxV2(
+                self.terminalize_outbox_v2_with_store(
+                    &mut store,
+                    root_instance_id,
+                    effect_id,
+                    outcome,
+                    guard,
+                )
+                .map_err(v2_host_failure)?,
+            ),
             PostgresqlHostMutation::CompactOutbox {
                 root_instance_id,
                 effect_id,
@@ -588,6 +668,14 @@ where
                 effect_id,
                 guard,
             )?),
+            PostgresqlHostMutation::CompactOutboxV2 {
+                root_instance_id,
+                effect_id,
+                guard,
+            } => PostgresqlHostMutationResult::CompactedOutboxV2(
+                self.compact_outbox_v2_with_store(&mut store, root_instance_id, effect_id, guard)
+                    .map_err(v2_host_failure)?,
+            ),
             PostgresqlHostMutation::DeleteOutboxRecord {
                 root_instance_id,
                 effect_id,
@@ -623,6 +711,19 @@ where
                 operation_id,
                 guard,
             )?),
+            PostgresqlHostMutation::TombstoneRootV2 {
+                root_instance_id,
+                operation_id,
+                guard,
+            } => PostgresqlHostMutationResult::RootTombstoneV2(
+                self.tombstone_root_v2_with_store(
+                    &mut store,
+                    root_instance_id,
+                    operation_id,
+                    guard,
+                )
+                .map_err(v2_host_failure)?,
+            ),
             PostgresqlHostMutation::DeleteCheckpoint {
                 root_instance_id,
                 guard,
@@ -792,6 +893,257 @@ where
             Some(&guard.expected_checkpoint_digest),
         )?;
         self.commit_v2_result(&record, &result)?;
+        Ok(result)
+    }
+
+    pub fn maintenance_migration_v2(
+        &self,
+        request: &MaintenanceMigrationRequest,
+    ) -> Result<JsonValue, Version2Error> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.maintenance_migration_v2_with_store(&mut store, request)
+    }
+
+    fn maintenance_migration_v2_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        request: &MaintenanceMigrationRequest,
+    ) -> Result<JsonValue, Version2Error> {
+        if request.operation_id.is_empty() {
+            return Err(v2_failure(
+                "invalid_execution_checkpoint",
+                "v2 maintenance migration requires an operation id",
+            ));
+        }
+        let request_digest = maintenance_request_digest(&request.root_instance_id, request)
+            .map_err(|error| Version2Error::new(error.code.as_str(), error.message))?;
+        if request
+            .supplied_request_digest
+            .as_ref()
+            .is_some_and(|supplied| supplied != &request_digest)
+        {
+            return Err(v2_failure(
+                "invalid_execution_checkpoint",
+                "supplied maintenance request digest does not match",
+            ));
+        }
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, &request.root_instance_id)?;
+        if checkpoint.value()["root_record"]["aggregate_state"]["aggregate_state_digest"].as_str()
+            != Some(request.source_aggregate_state_digest.as_str())
+        {
+            return Err(v2_failure(
+                "invalid_execution_checkpoint",
+                "maintenance source digest differs from checkpoint aggregate",
+            ));
+        }
+        let source_bundle = self.checkpoint_v2_bundle(&checkpoint)?;
+        if request.migration_descriptor_digest_route.is_empty() {
+            let migration = migrate_aggregate_v2_route(
+                checkpoint.aggregate().unwrap(),
+                &MigrationRequest {
+                    migration_route: Vec::new(),
+                    target_validated_bundle_fingerprint: request
+                        .target_validated_bundle_fingerprint
+                        .clone(),
+                    maintenance_mode: request.maintenance_mode,
+                },
+                self.resolver.as_ref(),
+                &request.limits,
+            )?;
+            debug_assert!(migration["audit_records"].as_array().unwrap().is_empty());
+            return Ok(checkpoint.value().clone());
+        }
+        if request.migration_descriptor_digest_route.len() != 1 {
+            return Err(v2_failure(
+                "invalid_execution_checkpoint",
+                "checkpoint v2 maintenance migration currently requires at most one descriptor",
+            ));
+        }
+        let target = self
+            .resolver
+            .resolve_definition(&request.target_validated_bundle_fingerprint)
+            .ok_or_else(|| {
+                v2_failure("definition_not_found", "target definition is unavailable")
+            })?;
+        if !target.trusted
+            || target.bundle.fingerprint != request.target_validated_bundle_fingerprint
+        {
+            return Err(v2_failure(
+                "definition_not_trusted",
+                "target definition is not trusted or content-addressed correctly",
+            ));
+        }
+        let descriptor = self
+            .resolver
+            .resolve_migration_descriptor(&request.migration_descriptor_digest_route[0])
+            .ok_or_else(|| {
+                v2_failure(
+                    "migration_descriptor_not_found",
+                    "migration descriptor is unavailable",
+                )
+            })?;
+        if !descriptor.trusted {
+            return Err(v2_failure(
+                "migration_descriptor_not_trusted",
+                "migration descriptor is not trusted",
+            ));
+        }
+        let result = checkpoint_maintenance_migration_v2(
+            &checkpoint,
+            &source_bundle,
+            &target.bundle,
+            &descriptor.bytes,
+            request.maintenance_mode,
+            &request.limits,
+            Some(&request.guard.expected_revision),
+            Some(&request.guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
+    }
+
+    pub fn update_pending_outbox_v2(
+        &self,
+        root_instance_id: &str,
+        effect_id: &str,
+        desired: PendingOutboxState,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, Version2Error> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.update_pending_outbox_v2_with_store(
+            &mut store,
+            root_instance_id,
+            effect_id,
+            desired,
+            guard,
+        )
+    }
+
+    fn update_pending_outbox_v2_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        root_instance_id: &str,
+        effect_id: &str,
+        desired: PendingOutboxState,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, Version2Error> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let result = checkpoint_update_pending_outbox_v2(
+            &checkpoint,
+            effect_id,
+            desired,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
+    }
+
+    pub fn terminalize_outbox_v2(
+        &self,
+        root_instance_id: &str,
+        effect_id: &str,
+        outcome: TerminalOutboxOutcome,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, Version2Error> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.terminalize_outbox_v2_with_store(
+            &mut store,
+            root_instance_id,
+            effect_id,
+            outcome,
+            guard,
+        )
+    }
+
+    fn terminalize_outbox_v2_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        root_instance_id: &str,
+        effect_id: &str,
+        outcome: TerminalOutboxOutcome,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, Version2Error> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let result = checkpoint_terminalize_outbox_v2(
+            &checkpoint,
+            effect_id,
+            outcome,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
+    }
+
+    pub fn compact_outbox_v2(
+        &self,
+        root_instance_id: &str,
+        effect_id: &str,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, Version2Error> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.compact_outbox_v2_with_store(&mut store, root_instance_id, effect_id, guard)
+    }
+
+    fn compact_outbox_v2_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        root_instance_id: &str,
+        effect_id: &str,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, Version2Error> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let result = checkpoint_compact_outbox_v2(
+            &checkpoint,
+            effect_id,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
+    }
+
+    pub fn tombstone_root_v2(
+        &self,
+        root_instance_id: &str,
+        operation_id: &str,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, Version2Error> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.tombstone_root_v2_with_store(&mut store, root_instance_id, operation_id, guard)
+    }
+
+    fn tombstone_root_v2_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        root_instance_id: &str,
+        operation_id: &str,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, Version2Error> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let result = checkpoint_tombstone_root_v2(
+            &checkpoint,
+            operation_id,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
         Ok(result)
     }
 
@@ -1874,8 +2226,18 @@ where
         &self,
         root_instance_id: &str,
     ) -> Result<(StoreRecord, ExecutionCheckpointV2), Version2Error> {
-        let record = self
-            .store
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.require_checkpoint_v2_with_store(&mut store, root_instance_id)
+    }
+
+    fn require_checkpoint_v2_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        root_instance_id: &str,
+    ) -> Result<(StoreRecord, ExecutionCheckpointV2), Version2Error> {
+        let record = store
             .load(root_instance_id)
             .map_err(v2_store_error)?
             .ok_or_else(|| {
@@ -1918,6 +2280,18 @@ where
         current: &StoreRecord,
         result: &JsonValue,
     ) -> Result<(), Version2Error> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.commit_v2_result_with_store(&mut store, current, result)
+    }
+
+    fn commit_v2_result_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        current: &StoreRecord,
+        result: &JsonValue,
+    ) -> Result<(), Version2Error> {
         let candidate = if result["execution_checkpoint_format"] == "determa.execution_checkpoint" {
             Some(result)
         } else if result["result"] == "batch"
@@ -1938,7 +2312,7 @@ where
             return Ok(());
         }
         let replacement = StoreRecord::from_checkpoint_v2(&checkpoint).map_err(v2_store_error)?;
-        self.commit_record_v2(current, replacement)
+        self.commit_record_v2_with_store(store, current, replacement)
     }
 
     fn commit_record_v2(
@@ -1946,8 +2320,19 @@ where
         current: &StoreRecord,
         replacement: StoreRecord,
     ) -> Result<(), Version2Error> {
-        match self
-            .store
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.commit_record_v2_with_store(&mut store, current, replacement)
+    }
+
+    fn commit_record_v2_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        current: &StoreRecord,
+        replacement: StoreRecord,
+    ) -> Result<(), Version2Error> {
+        match store
             .compare_and_swap(
                 &current.root_instance_id,
                 &current.revision,
@@ -2012,6 +2397,14 @@ fn require_v2_store_guard(
 
 fn v2_store_error(error: StoreError) -> Version2Error {
     Version2Error::new(error.code.as_str(), error.message)
+}
+
+#[cfg(feature = "postgresql")]
+fn v2_host_failure(error: Version2Error) -> HostFailure {
+    HostFailure::new(
+        HostFailureCode::InvalidExecutionCheckpoint,
+        format!("{}: {}", error.code, error.message),
+    )
 }
 
 fn v2_failure(code: &str, message: &str) -> Version2Error {
