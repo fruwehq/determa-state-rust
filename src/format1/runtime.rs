@@ -660,7 +660,10 @@ pub(crate) fn validate_delivery_for_admission(
             DispatchRejectionCode::InvalidInstanceTarget
         });
     }
-    validate_envelope(bundle, runtime, mode, envelope)?;
+    let normalized = validate_envelope(bundle, runtime, mode, envelope)?;
+    if normalized != *envelope {
+        return Err(DispatchRejectionCode::InvalidPayload);
+    }
     Ok(runtime.runtime_id.clone())
 }
 
@@ -686,7 +689,11 @@ pub(crate) fn validate_queued_event_for_migration(
     };
     let runtime = runtime_by_id(&aggregate.root, runtime_id)
         .ok_or(DispatchRejectionCode::InvalidInstanceTarget)?;
-    validate_envelope(bundle, runtime, mode, envelope).map(|_| ())
+    let normalized = validate_envelope(bundle, runtime, mode, envelope)?;
+    if normalized != *envelope {
+        return Err(DispatchRejectionCode::InvalidPayload);
+    }
+    Ok(())
 }
 
 pub(crate) fn runtime_by_id<'a>(

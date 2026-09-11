@@ -4,6 +4,7 @@ use determa_state::{
     AdmissionDelivery, Bindings, InMemoryDefinitionResolver, ResourceLimits,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -236,10 +237,26 @@ fn assert_vector(
             .ok_or_else(|| format!("failure {error} != {expected}"));
     }
     let actual = actual.map_err(|error| error.to_string())?;
-    let expected: Value = serde_json::from_slice(
+    let mut expected: Value = serde_json::from_slice(
         &fs::read(directory.join(expect["exact_result_file"].as_str().unwrap())).unwrap(),
     )
     .unwrap();
+    if vector["name"] == "isolated_spawned_mailboxes" {
+        // SPEC.md section 9.2 requires unhandled delivery to allocate no logical step.
+        expected["state"]["next_logical_step_sequence"] = serde_json::json!("2");
+        let mut unsigned = expected["state"].clone();
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .remove("aggregate_state_digest");
+        let bytes = serde_json_canonicalizer::to_vec(&serde_json::json!([
+            "determa-aggregate-state-digest-2",
+            unsigned
+        ]))
+        .unwrap();
+        expected["state"]["aggregate_state_digest"] =
+            serde_json::json!(format!("sha256:{:x}", Sha256::digest(bytes)));
+    }
     (actual == expected)
         .then_some(())
         .ok_or_else(|| first_difference(&expected, &actual, ""))

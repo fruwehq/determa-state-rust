@@ -1,16 +1,15 @@
 #[cfg(feature = "sqlite")]
 use determa_state::checkpoint::SqliteExecutionStore;
 use determa_state::checkpoint::{
-    register_bundled_adapters, AdapterRegistry, ExecutionStore, ExecutionStoreCapability,
-    FileExecutionStore, MemoryExecutionStore, StoreRecord, StoreWriteResult,
+    register_bundled_adapters, AdapterRegistry, CheckpointHost, ExecutionCheckpoint,
+    ExecutionStore, ExecutionStoreCapability, FileExecutionStore, MemoryExecutionStore,
+    MutationGuard, StoreRecord, StoreWriteResult,
 };
 #[cfg(feature = "sqlite")]
 use determa_state::checkpoint::{
-    CheckpointHost, DurableStoreMode, ExecutionCheckpoint, HostFeature, HostProfile,
-    OutboxRetentionMode, ReceiptRetentionMode,
+    DurableStoreMode, HostFeature, HostProfile, OutboxRetentionMode, ReceiptRetentionMode,
 };
-#[cfg(feature = "sqlite")]
-use determa_state::InMemoryDefinitionResolver;
+use determa_state::{load_bundle, Bindings, InMemoryDefinitionResolver};
 #[cfg(feature = "sqlite")]
 use rusqlite::Connection;
 use serde_json::json;
@@ -21,8 +20,38 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "sqlite")]
 const CHECKPOINT_PROFILE: &str = "conformance-suite/conformance/profiles/execution-checkpoint";
+
+#[test]
+fn memory_store_runs_version2_host_upgrade_and_step_transactionally() {
+    let store: Arc<dyn ExecutionStore> = Arc::new(MemoryExecutionStore::new());
+    store.initialize_schema().expect("memory initialization");
+    version2_host_contract(store);
+}
+
+#[test]
+fn file_store_runs_version2_host_upgrade_and_step_transactionally() {
+    let directory = temporary_path("file-v2-host");
+    let store: Arc<dyn ExecutionStore> =
+        Arc::new(FileExecutionStore::new(&directory).expect("file store"));
+    store.initialize_schema().expect("file schema");
+    version2_host_contract(store);
+    fs::remove_dir_all(directory).expect("remove temporary file store");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_store_runs_version2_host_upgrade_and_step_transactionally() {
+    let directory = temporary_path("sqlite-v2-host");
+    fs::create_dir_all(&directory).expect("SQLite temporary directory");
+    let path = directory.join("checkpoints.sqlite3");
+    let store: Arc<dyn ExecutionStore> = Arc::new(
+        SqliteExecutionStore::open(&path, DurableStoreMode::bounded()).expect("SQLite store"),
+    );
+    store.initialize_schema().expect("SQLite schema");
+    version2_host_contract(store);
+    fs::remove_dir_all(directory).expect("remove temporary SQLite store");
+}
 
 #[test]
 fn memory_store_satisfies_the_shared_cas_contract() {
@@ -484,6 +513,93 @@ fn concurrent_cas_contract_with_stores(
             .count(),
         1
     );
+}
+
+fn version2_host_contract(store: Arc<dyn ExecutionStore>) {
+    let relative = "checkpoint-04-version2-mailboxes/base-checkpoint-v1.json";
+    let bytes = fs::read(PathBuf::from(CHECKPOINT_PROFILE).join(relative))
+        .expect("version-1 checkpoint fixture");
+    let checkpoint: ExecutionCheckpoint =
+        serde_json::from_slice(&bytes).expect("typed checkpoint fixture");
+    let record = StoreRecord::from_checkpoint(&checkpoint).expect("fixture store record");
+    assert_eq!(
+        store
+            .insert_if_absent(record.clone())
+            .expect("version-1 seed"),
+        StoreWriteResult::Committed
+    );
+
+    let bundle = load_bundle(
+        &fs::read_to_string(
+            PathBuf::from(CHECKPOINT_PROFILE).join("checkpoint-04-version2-mailboxes/machine.yaml"),
+        )
+        .expect("version-2 bundle fixture"),
+    )
+    .expect("version-2 bundle");
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle.clone(), true);
+    let host = CheckpointHost::new(store.clone(), Arc::new(resolver));
+    let created = host
+        .create_checkpoint_v2(
+            &bundle,
+            "counter",
+            "fresh-v2-root",
+            "fresh-v2-create",
+            &Bindings::default(),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            json!({
+                "mode": "permanent",
+                "permanent_replay_eligible": true,
+                "policy_identifier": null,
+                "pruned_through_receipt_sequence": null
+            }),
+        )
+        .expect("transactional version-2 creation");
+    assert_eq!(created.revision(), "0");
+
+    let upgraded = host
+        .upgrade_checkpoint_v1_to_v2(
+            &record.root_instance_id,
+            &MutationGuard::new(&record.revision, &record.execution_checkpoint_digest),
+        )
+        .expect("transactional checkpoint upgrade");
+    assert_eq!(upgraded.revision(), "4");
+
+    let target_runtime_id = upgraded.value()["root_record"]["aggregate_state"]["root_runtime_id"]
+        .as_str()
+        .expect("root runtime id");
+    let stepped = host
+        .step_checkpoint_v2(
+            upgraded.root_instance_id(),
+            target_runtime_id,
+            &MutationGuard::new(upgraded.revision(), upgraded.digest()),
+        )
+        .expect("transactional checkpoint step");
+    assert_eq!(stepped["revision"], "5");
+    let operations: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            PathBuf::from(CHECKPOINT_PROFILE)
+                .join("checkpoint-04-version2-mailboxes/operation-inputs.json"),
+        )
+        .expect("version-2 operation inputs"),
+    )
+    .expect("version-2 operation input JSON");
+    let admitted = host
+        .admit_checkpoint_v2(
+            upgraded.root_instance_id(),
+            operations["admit"]["deliveries"].as_array().unwrap(),
+            &MutationGuard::new(
+                stepped["revision"].as_str().unwrap(),
+                stepped["execution_checkpoint_digest"].as_str().unwrap(),
+            ),
+        )
+        .expect("transactional checkpoint admission");
+    assert_eq!(admitted["revision"], "6");
+    let persisted = host
+        .load_checkpoint_v2(upgraded.root_instance_id())
+        .expect("version-2 reload")
+        .expect("persisted version-2 checkpoint");
+    assert_eq!(persisted.value(), &admitted);
 }
 
 fn record(root_instance_id: &str, revision: &str, marker: char) -> StoreRecord {

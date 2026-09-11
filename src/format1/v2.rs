@@ -94,6 +94,25 @@ pub fn create_v2(
     creation_id: &str,
     bindings: &Bindings,
 ) -> Result<QueueBearingAggregate, Version2Error> {
+    create_v2_with_evidence(bundle, machine_id, root_instance_id, creation_id, bindings)
+        .map(|result| result.aggregate)
+}
+
+pub(crate) struct CreateV2Evidence {
+    pub aggregate: QueueBearingAggregate,
+    pub status: String,
+    pub emissions: Vec<JsonValue>,
+    pub lifecycle_dispositions: Vec<JsonValue>,
+    pub fault: Option<JsonValue>,
+}
+
+pub(crate) fn create_v2_with_evidence(
+    bundle: &Bundle,
+    machine_id: &str,
+    root_instance_id: &str,
+    creation_id: &str,
+    bindings: &Bindings,
+) -> Result<CreateV2Evidence, Version2Error> {
     let result = create(bundle, machine_id, root_instance_id, creation_id, bindings);
     if result.status == ResultStatus::Rejected {
         return Err(Version2Error::new(
@@ -113,10 +132,30 @@ pub fn create_v2(
     let mut value: JsonValue = serde_json::from_slice(&bytes)
         .map_err(|error| Version2Error::new("invalid_aggregate_state", error.to_string()))?;
     upgrade_value(&mut value)?;
+    let status = match result.status {
+        ResultStatus::Running => "running",
+        ResultStatus::Completed => "completed",
+        ResultStatus::Faulted => "faulted",
+        ResultStatus::Rejected => unreachable!("rejected creation returned before state"),
+    }
+    .to_string();
+    let fault = result
+        .fault
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| invalid_aggregate(error.to_string()))?;
     let mut aggregate = QueueBearingAggregate { value, state };
-    append_internal_emissions(&mut aggregate, &result.emissions)?;
+    let (emissions, lifecycle_dispositions) =
+        append_internal_emissions(&mut aggregate, &result.emissions)?;
     aggregate.value = seal_aggregate(aggregate.value)?;
-    Ok(aggregate)
+    Ok(CreateV2Evidence {
+        aggregate,
+        status,
+        emissions,
+        lifecycle_dispositions,
+        fault,
+    })
 }
 
 pub fn upgrade_aggregate_v1_to_v2(
@@ -567,6 +606,10 @@ pub fn step_v2(
     target_runtime_id: &str,
 ) -> Result<JsonValue, Version2Error> {
     let root_status = aggregate_status(&aggregate.value)?;
+    if aggregate.value["validated_bundle_fingerprint"].as_str() != Some(bundle.fingerprint.as_str())
+    {
+        return core_step_rejected(aggregate, "incompatible_bundle");
+    }
     let runtime = runtimes(&aggregate.value)?
         .iter()
         .find(|runtime| runtime["runtime_id"].as_str() == Some(target_runtime_id));
@@ -625,12 +668,25 @@ pub fn step_v2(
                 .ok_or_else(|| invalid_aggregate("capacity fault returned no state"))?;
             let mut value = merge_abstract_state(bundle, &aggregate.value, state)?;
             remove_ready_head(&mut value, target_runtime_id)?;
+            let mut lifecycle = dispose_removed_mailboxes(
+                &aggregate.value,
+                &mut value,
+                &faulted.emissions,
+                state.root.status,
+                &delivery.envelope.event_id,
+            )?;
+            let emission_results = append_step_emissions(
+                &mut value,
+                &aggregate.value,
+                &faulted.emissions,
+                &mut lifecycle,
+            )?;
             value = seal_aggregate(value)?;
             return core_step_result(
                 value,
                 "faulted",
-                Vec::new(),
-                Vec::new(),
+                emission_results,
+                lifecycle,
                 faulted
                     .fault
                     .as_ref()
@@ -661,9 +717,6 @@ pub fn step_v2(
         .as_ref()
         .ok_or_else(|| invalid_aggregate("core step returned no aggregate state"))?;
     let mut value = merge_abstract_state(bundle, &aggregate.value, state)?;
-    if result.disposition == Some(Disposition::Unhandled) {
-        allocate_counter(&mut value, "next_logical_step_sequence")?;
-    }
     remove_ready_head(&mut value, target_runtime_id)?;
     let mut lifecycle = dispose_removed_mailboxes(
         &aggregate.value,
@@ -1402,11 +1455,12 @@ fn validate_mailbox_semantics(value: &JsonValue) -> Result<(), Version2Error> {
 fn append_internal_emissions(
     aggregate: &mut QueueBearingAggregate,
     emissions: &[Emission],
-) -> Result<(), Version2Error> {
+) -> Result<(Vec<JsonValue>, Vec<JsonValue>), Version2Error> {
     let before = aggregate.value.clone();
     let mut lifecycle = Vec::new();
-    append_step_emissions(&mut aggregate.value, &before, emissions, &mut lifecycle)?;
-    Ok(())
+    let references =
+        append_step_emissions(&mut aggregate.value, &before, emissions, &mut lifecycle)?;
+    Ok((references, lifecycle))
 }
 
 fn map_dispatch_rejection(code: DispatchRejectionCode) -> Version2Error {

@@ -1,12 +1,14 @@
 use determa_state::checkpoint::{
     checkpoint_admit_v2, checkpoint_prune_v2, checkpoint_step_v2, restore_execution_checkpoint_v2,
-    upgrade_execution_checkpoint_v1_to_v2,
+    upgrade_execution_checkpoint_v1_to_v2, CheckpointHost, DeliveryRequest, ExecutionStore,
+    MemoryExecutionStore, MutationGuard, StoreRecord,
 };
 use determa_state::{load_bundle, InMemoryDefinitionResolver, Version2Error};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn directory() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
@@ -126,13 +128,73 @@ fn run_vector(
                 request["expected_checkpoint_digest"].as_str(),
             )
         }
-        "checkpoint_v1_accept" => Err(Version2Error::new(
-            "checkpoint_upgrade_required",
-            "version 2 bundle requires checkpoint upgrade",
-        )),
+        "checkpoint_v1_accept" => {
+            checkpoint_v1_accept(directory, &before, request, vector, resolver)
+        }
         other => return Err(format!("unsupported operation {other}")),
     };
     assert_vector(directory, vector, actual)
+}
+
+fn checkpoint_v1_accept(
+    directory: &Path,
+    before: &[u8],
+    request: &Value,
+    vector: &Value,
+    resolver: &InMemoryDefinitionResolver,
+) -> Result<Value, Version2Error> {
+    let checkpoint: Value = serde_json::from_slice(before).unwrap();
+    let store = Arc::new(MemoryExecutionStore::new());
+    store
+        .insert_if_absent(StoreRecord {
+            root_instance_id: checkpoint["root_instance_id"].as_str().unwrap().to_string(),
+            revision: checkpoint["revision"].as_str().unwrap().to_string(),
+            execution_checkpoint_digest: checkpoint["execution_checkpoint_digest"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            bytes: before.to_vec(),
+        })
+        .unwrap();
+    let mut host_resolver = resolver.clone();
+    let bundle = load_bundle(
+        &fs::read_to_string(directory.join(vector["bundle"].as_str().unwrap())).unwrap(),
+    )
+    .unwrap();
+    let selected_bundle_fingerprint = bundle.fingerprint.clone();
+    host_resolver.insert(bundle, true);
+    let host = CheckpointHost::new(store.clone(), Arc::new(host_resolver));
+    let result = host.accept_delivery_for_bundle(
+        DeliveryRequest {
+            checkpoint_root_instance_id: checkpoint["root_instance_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            candidate: request["deliveries"][0].clone(),
+            guard: MutationGuard::new(
+                request["expected_revision"].as_str().unwrap(),
+                request["expected_checkpoint_digest"].as_str().unwrap(),
+            ),
+        },
+        &selected_bundle_fingerprint,
+    );
+    let after = store
+        .load(checkpoint["root_instance_id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    if after.bytes != before {
+        return Err(Version2Error::new(
+            "invalid_execution_checkpoint",
+            "version-1 rejection mutated the stored checkpoint",
+        ));
+    }
+    match result {
+        Ok(determa_state::checkpoint::AcceptanceResult::NotAccepted(result)) => Err(
+            Version2Error::new(result.failure.code.as_str(), "delivery was not accepted"),
+        ),
+        Ok(_) => Ok(Value::Null),
+        Err(error) => Err(Version2Error::new(error.code.as_str(), error.message)),
+    }
 }
 
 fn assert_vector(

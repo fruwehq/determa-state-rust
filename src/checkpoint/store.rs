@@ -106,6 +106,19 @@ impl StoreRecord {
                 .map_err(|error| StoreError::new(error.to_string()))?,
         })
     }
+
+    pub fn from_checkpoint_v2(
+        checkpoint: &super::v2::ExecutionCheckpointV2,
+    ) -> Result<Self, StoreError> {
+        Ok(Self {
+            root_instance_id: checkpoint.root_instance_id().to_string(),
+            revision: checkpoint.revision().to_string(),
+            execution_checkpoint_digest: checkpoint.digest().to_string(),
+            bytes: checkpoint
+                .canonical_bytes()
+                .map_err(|error| StoreError::new(error.to_string()))?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

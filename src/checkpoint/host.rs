@@ -6,6 +6,11 @@ use super::store::{
     validate_store_host_profile, AdapterError, ExecutionStore, HostFeature, HostProfile,
     StoreError, StoreErrorCode, StoreRecord, StoreWriteResult,
 };
+use super::v2::{
+    checkpoint_admit_v2_with_optional_bundle, checkpoint_prune_v2, checkpoint_step_v2,
+    create_execution_checkpoint_v2, restore_execution_checkpoint_v2,
+    upgrade_execution_checkpoint_v1_to_v2, ExecutionCheckpointV2,
+};
 use super::wire::{
     envelope_digest, hash_tagged, outbox_intent_digest, AcceptanceResult, CheckpointFault,
     CommittedDeliveryResult, CommittedResultKind, CreationOperationKind, CreationReceipt,
@@ -21,7 +26,7 @@ use super::wire::{
 use crate::format1::{
     create, dispatch, encode_aggregate, migrate_aggregate, AggregateState, Bindings, Bundle,
     Counter, Delivery, Disposition, Emission, MigrationArtifactResolver, MigrationRequest,
-    ResourceLimits, ResultStatus, RuntimeStatus, TypedValue,
+    ResourceLimits, ResultStatus, RuntimeStatus, TypedValue, Version2Error,
 };
 use crate::Value;
 use serde_json::{json, Value as JsonValue};
@@ -529,7 +534,7 @@ where
             }
             PostgresqlHostMutation::AcceptDelivery(request) => {
                 PostgresqlHostMutationResult::Acceptance(
-                    self.accept_delivery_with_store(&mut store, request)?,
+                    self.accept_delivery_with_store(&mut store, request, None)?,
                 )
             }
             PostgresqlHostMutation::ForegroundProcessDelivery { request, migration } => {
@@ -643,6 +648,151 @@ where
             store: self.store.as_ref(),
         };
         self.load_checkpoint_with_store(&mut store, root_instance_id)
+    }
+
+    pub fn load_checkpoint_v2(
+        &self,
+        root_instance_id: &str,
+    ) -> Result<Option<ExecutionCheckpointV2>, Version2Error> {
+        self.store
+            .load(root_instance_id)
+            .map_err(v2_store_error)?
+            .map(|record| self.restore_record_v2(record))
+            .transpose()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_checkpoint_v2(
+        &self,
+        bundle: &Bundle,
+        machine_id: &str,
+        root_instance_id: &str,
+        creation_id: &str,
+        bindings: &Bindings,
+        request_digest: &str,
+        replay_retention: JsonValue,
+    ) -> Result<ExecutionCheckpointV2, Version2Error> {
+        let candidate = create_execution_checkpoint_v2(
+            bundle,
+            machine_id,
+            root_instance_id,
+            creation_id,
+            bindings,
+            request_digest,
+            replay_retention,
+        )?;
+        let record = StoreRecord::from_checkpoint_v2(&candidate).map_err(v2_store_error)?;
+        match self
+            .store
+            .insert_if_absent(record)
+            .map_err(v2_store_error)?
+        {
+            StoreWriteResult::Committed => Ok(candidate),
+            StoreWriteResult::Conflict(Some(current)) => {
+                let current = self.restore_record_v2(current)?;
+                let receipt = current.value()["operation_receipts"]
+                    .as_array()
+                    .and_then(|receipts| receipts.first())
+                    .ok_or_else(|| {
+                        v2_failure("invalid_execution_checkpoint", "creation receipt is absent")
+                    })?;
+                if receipt["creation_id"].as_str() == Some(creation_id)
+                    && receipt["request_digest"].as_str() == Some(request_digest)
+                {
+                    Ok(current)
+                } else {
+                    Err(v2_failure(
+                        "creation_id_conflict",
+                        "root identity already has different creation evidence",
+                    ))
+                }
+            }
+            StoreWriteResult::Conflict(None) => Err(v2_failure(
+                "checkpoint_revision_conflict",
+                "checkpoint insertion conflicted",
+            )),
+        }
+    }
+
+    pub fn upgrade_checkpoint_v1_to_v2(
+        &self,
+        root_instance_id: &str,
+        guard: &MutationGuard,
+    ) -> Result<ExecutionCheckpointV2, Version2Error> {
+        let current = self
+            .store
+            .load(root_instance_id)
+            .map_err(v2_store_error)?
+            .ok_or_else(|| {
+                v2_failure(
+                    "checkpoint_not_found",
+                    "execution checkpoint does not exist",
+                )
+            })?;
+        require_v2_store_guard(&current, guard)?;
+        let candidate =
+            upgrade_execution_checkpoint_v1_to_v2(&current.bytes, self.resolver.as_ref())?;
+        let replacement = StoreRecord::from_checkpoint_v2(&candidate).map_err(v2_store_error)?;
+        self.commit_record_v2(&current, replacement)?;
+        Ok(candidate)
+    }
+
+    pub fn admit_checkpoint_v2(
+        &self,
+        root_instance_id: &str,
+        deliveries: &[JsonValue],
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, Version2Error> {
+        let (record, checkpoint) = self.require_checkpoint_v2(root_instance_id)?;
+        let bundle = checkpoint
+            .bundle_fingerprint()
+            .map(|_| self.checkpoint_v2_bundle(&checkpoint))
+            .transpose()?;
+        let result = checkpoint_admit_v2_with_optional_bundle(
+            bundle.as_ref(),
+            &checkpoint,
+            deliveries,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result(&record, &result)?;
+        Ok(result)
+    }
+
+    pub fn step_checkpoint_v2(
+        &self,
+        root_instance_id: &str,
+        target_runtime_id: &str,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, Version2Error> {
+        let (record, checkpoint) = self.require_checkpoint_v2(root_instance_id)?;
+        let bundle = self.checkpoint_v2_bundle(&checkpoint)?;
+        let result = checkpoint_step_v2(
+            &bundle,
+            &checkpoint,
+            target_runtime_id,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result(&record, &result)?;
+        Ok(result)
+    }
+
+    pub fn prune_checkpoint_v2(
+        &self,
+        root_instance_id: &str,
+        cutoff_receipt_sequence: &str,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, Version2Error> {
+        let (record, checkpoint) = self.require_checkpoint_v2(root_instance_id)?;
+        let result = checkpoint_prune_v2(
+            &checkpoint,
+            cutoff_receipt_sequence,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result(&record, &result)?;
+        Ok(result)
     }
 
     fn load_checkpoint_with_store(
@@ -776,15 +926,32 @@ where
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
-        self.accept_delivery_with_store(&mut store, request)
+        self.accept_delivery_with_store(&mut store, request, None)
+    }
+
+    pub fn accept_delivery_for_bundle(
+        &self,
+        request: DeliveryRequest,
+        selected_bundle_fingerprint: &str,
+    ) -> Result<AcceptanceResult, HostFailure> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.accept_delivery_with_store(&mut store, request, Some(selected_bundle_fingerprint))
     }
 
     fn accept_delivery_with_store(
         &self,
         store: &mut dyn StoreAccess,
         request: DeliveryRequest,
+        selected_bundle_fingerprint: Option<&str>,
     ) -> Result<AcceptanceResult, HostFailure> {
         let current = self.require_checkpoint(store, &request.checkpoint_root_instance_id)?;
+        if self.require_v1_bundle_compatibility(&current, selected_bundle_fingerprint)? {
+            return Ok(not_accepted(
+                PreAcceptanceFailureCode::CheckpointUpgradeRequired,
+            ));
+        }
         let parsed = match parse_delivery_candidate(&request.candidate, &current.root_instance_id) {
             Ok(value) => value,
             Err(code) => return Ok(not_accepted(code)),
@@ -843,6 +1010,11 @@ where
         migration: Option<&ProcessingMigration>,
     ) -> Result<DeliveryReceipt, HostFailure> {
         let current = self.require_checkpoint(store, &request.checkpoint_root_instance_id)?;
+        if self.require_v1_bundle_compatibility(&current, None)? {
+            return Err(invalid_host(
+                "selected bundle requires execution-checkpoint schema version 2",
+            ));
+        }
         let parsed = parse_delivery_candidate(&request.candidate, &current.root_instance_id)
             .map_err(|code| {
                 HostFailure::new(preaccept_failure_code(code), "delivery was not accepted")
@@ -1680,6 +1852,170 @@ where
         }
         Ok(checkpoint)
     }
+
+    fn restore_record_v2(
+        &self,
+        record: StoreRecord,
+    ) -> Result<ExecutionCheckpointV2, Version2Error> {
+        let checkpoint = restore_execution_checkpoint_v2(&record.bytes, self.resolver.as_ref())?;
+        if checkpoint.root_instance_id() != record.root_instance_id
+            || checkpoint.revision() != record.revision
+            || checkpoint.digest() != record.execution_checkpoint_digest
+        {
+            return Err(v2_failure(
+                "invalid_execution_checkpoint",
+                "store metadata differs from checkpoint artifact",
+            ));
+        }
+        Ok(checkpoint)
+    }
+
+    fn require_checkpoint_v2(
+        &self,
+        root_instance_id: &str,
+    ) -> Result<(StoreRecord, ExecutionCheckpointV2), Version2Error> {
+        let record = self
+            .store
+            .load(root_instance_id)
+            .map_err(v2_store_error)?
+            .ok_or_else(|| {
+                v2_failure(
+                    "checkpoint_not_found",
+                    "execution checkpoint does not exist",
+                )
+            })?;
+        let checkpoint = self.restore_record_v2(record.clone())?;
+        Ok((record, checkpoint))
+    }
+
+    fn checkpoint_v2_bundle(
+        &self,
+        checkpoint: &ExecutionCheckpointV2,
+    ) -> Result<Bundle, Version2Error> {
+        let fingerprint = checkpoint.bundle_fingerprint().ok_or_else(|| {
+            v2_failure(
+                "terminal_root",
+                "terminal checkpoint has no runnable aggregate",
+            )
+        })?;
+        let resolved = self
+            .resolver
+            .resolve_definition(fingerprint)
+            .ok_or_else(|| {
+                v2_failure("definition_not_found", "current definition is unavailable")
+            })?;
+        if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
+            return Err(v2_failure(
+                "definition_not_trusted",
+                "current definition is not trusted or content-addressed correctly",
+            ));
+        }
+        Ok(resolved.bundle)
+    }
+
+    fn commit_v2_result(
+        &self,
+        current: &StoreRecord,
+        result: &JsonValue,
+    ) -> Result<(), Version2Error> {
+        let candidate = if result["execution_checkpoint_format"] == "determa.execution_checkpoint" {
+            Some(result)
+        } else if result["result"] == "batch"
+            && result["checkpoint"]["execution_checkpoint_format"] == "determa.execution_checkpoint"
+        {
+            Some(&result["checkpoint"])
+        } else {
+            None
+        };
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        let bytes = crate::format1::v2::canonical_bytes(candidate)?;
+        let checkpoint = restore_execution_checkpoint_v2(&bytes, self.resolver.as_ref())?;
+        if checkpoint.revision() == current.revision
+            && checkpoint.digest() == current.execution_checkpoint_digest
+        {
+            return Ok(());
+        }
+        let replacement = StoreRecord::from_checkpoint_v2(&checkpoint).map_err(v2_store_error)?;
+        self.commit_record_v2(current, replacement)
+    }
+
+    fn commit_record_v2(
+        &self,
+        current: &StoreRecord,
+        replacement: StoreRecord,
+    ) -> Result<(), Version2Error> {
+        match self
+            .store
+            .compare_and_swap(
+                &current.root_instance_id,
+                &current.revision,
+                &current.execution_checkpoint_digest,
+                replacement,
+            )
+            .map_err(v2_store_error)?
+        {
+            StoreWriteResult::Committed => Ok(()),
+            StoreWriteResult::Conflict(_) => Err(v2_failure(
+                "checkpoint_revision_conflict",
+                "checkpoint compare-and-swap conflicted",
+            )),
+        }
+    }
+
+    fn require_v1_bundle_compatibility(
+        &self,
+        checkpoint: &ExecutionCheckpoint,
+        selected_bundle_fingerprint: Option<&str>,
+    ) -> Result<bool, HostFailure> {
+        let RootRecord::Retained(root) = &checkpoint.root_record else {
+            return Ok(false);
+        };
+        let fingerprint = selected_bundle_fingerprint
+            .unwrap_or(&root.aggregate_state.validated_bundle_fingerprint);
+        let definition = self
+            .resolver
+            .resolve_definition(fingerprint)
+            .ok_or_else(|| invalid_host("current definition is unavailable"))?;
+        if !definition.trusted {
+            return Err(invalid_host("current definition is not trusted"));
+        }
+        Ok(value_requires_v2(&definition.bundle.normalized))
+    }
+}
+
+fn value_requires_v2(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::Array(values) => values.iter().any(value_requires_v2),
+        JsonValue::Object(values) => {
+            values.contains_key("deferred_events") || values.values().any(value_requires_v2)
+        }
+        _ => false,
+    }
+}
+
+fn require_v2_store_guard(
+    record: &StoreRecord,
+    guard: &MutationGuard,
+) -> Result<(), Version2Error> {
+    if record.revision != guard.expected_revision
+        || record.execution_checkpoint_digest != guard.expected_checkpoint_digest
+    {
+        return Err(v2_failure(
+            "checkpoint_revision_conflict",
+            "checkpoint mutation guard does not match stored state",
+        ));
+    }
+    Ok(())
+}
+
+fn v2_store_error(error: StoreError) -> Version2Error {
+    Version2Error::new(error.code.as_str(), error.message)
+}
+
+fn v2_failure(code: &str, message: &str) -> Version2Error {
+    Version2Error::new(code, message)
 }
 
 struct ProcessedCore {
