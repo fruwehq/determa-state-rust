@@ -69,7 +69,7 @@ fn all_checkpoint_artifacts_have_the_declared_classification() {
 }
 
 #[test]
-fn all_91_execution_checkpoint_vectors_run_through_the_host() {
+fn all_execution_checkpoint_v1_vectors_run_through_the_host() {
     let mut count = 0;
     for case in case_directories() {
         let document = read_yaml(&case.join("test.yaml"));
@@ -83,7 +83,7 @@ fn all_91_execution_checkpoint_vectors_run_through_the_host() {
             run_vector(&case, &inputs, &resolver, &bundles, vector);
         }
     }
-    assert_eq!(count, 91);
+    assert_eq!(count, 99);
 }
 
 #[test]
@@ -1913,7 +1913,7 @@ fn case_directories() -> Vec<PathBuf> {
         .expect("checkpoint profile")
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.join("test.yaml").is_file())
+        .filter(|path| path.join("test.yaml").is_file() && path.join("inputs.json").is_file())
         .collect::<Vec<_>>();
     cases.sort();
     cases
@@ -1995,6 +1995,10 @@ fn root_from_before(vector: &JsonValue) -> &str {
         "maintenance-root"
     } else if name == "completed-checkpoint.json" || name == "tombstone-checkpoint.json" {
         "terminal-root"
+    } else if name.starts_with("spawned-") {
+        "owned-migration-root"
+    } else if name.starts_with("terminal-spawned-") {
+        "terminal-spawn-root"
     } else {
         "checkpoint-root"
     }
@@ -2016,7 +2020,10 @@ fn root_for_vector(input: Option<&JsonValue>, vector: &JsonValue, expected: &[u8
 
 fn mutation_root(input: Option<&JsonValue>, vector: &JsonValue) -> String {
     if vector["checkpoint_before"].as_str().is_some() {
-        root_from_before(vector).to_string()
+        input
+            .map(|input| checkpoint_root(input, vector))
+            .unwrap_or_else(|| root_from_before(vector))
+            .to_string()
     } else {
         input
             .and_then(|value| value["root_instance_id"].as_str())
@@ -2065,12 +2072,21 @@ fn strings(value: &JsonValue) -> Vec<String> {
 
 fn preaccept_code(code: PreAcceptanceFailureCode) -> &'static str {
     match code {
+        PreAcceptanceFailureCode::CheckpointUpgradeRequired => "checkpoint_upgrade_required",
         PreAcceptanceFailureCode::MalformedDelivery => "malformed_delivery",
         PreAcceptanceFailureCode::WrongRoot => "wrong_root",
         PreAcceptanceFailureCode::InvalidDeliveryMode => "invalid_delivery_mode",
         PreAcceptanceFailureCode::InvalidDeliveryOrigin => "invalid_delivery_origin",
+        PreAcceptanceFailureCode::InvalidDeliverySource => "invalid_delivery_source",
         PreAcceptanceFailureCode::DeliveryDigestMismatch => "delivery_digest_mismatch",
+        PreAcceptanceFailureCode::DuplicateEventIdInBatch => "duplicate_event_id_in_batch",
         PreAcceptanceFailureCode::EventIdConflict => "event_id_conflict",
+        PreAcceptanceFailureCode::InactiveComponentTarget => "inactive_component_target",
+        PreAcceptanceFailureCode::InvalidCorrelation => "invalid_correlation",
+        PreAcceptanceFailureCode::InvalidEvent => "invalid_event",
+        PreAcceptanceFailureCode::InvalidInstanceTarget => "invalid_instance_target",
+        PreAcceptanceFailureCode::InvalidPayload => "invalid_payload",
+        PreAcceptanceFailureCode::TerminalRoot => "terminal_root",
         PreAcceptanceFailureCode::TombstonedRoot => "tombstoned_root",
     }
 }

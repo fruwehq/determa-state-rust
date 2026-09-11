@@ -12,21 +12,25 @@ pub mod format1;
 pub mod value;
 
 /// Exact normative specification revision implemented by this crate.
-pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "7782671b56165a59caa61a65c29fefc63105ebf8";
+pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "2e33036563cb966b07124197db672159b4b7e1f4";
 
 /// Exact core conformance revision exercised by this crate.
-pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "d6a45d31614ee25de20476ed93f10e14997d882c";
+pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "40cb119357204f62cbbbb2ef68bac342d43cb901";
 
+pub use format1::step_v2;
 pub use format1::{
-    create, decode_selected_migration_descriptor, dispatch, encode_aggregate, load_bundle,
-    load_bundle_from_json, migrate_aggregate, migrate_and_dispatch, restore_aggregate,
-    restore_package, restore_package_and_migrate, AggregateEnvelope, AggregateState, Bindings,
+    admit_v2, create, create_v2, decode_selected_migration_descriptor, dispatch,
+    downgrade_aggregate_v2_to_v1, encode_aggregate, load_bundle, load_bundle_from_json,
+    migrate_aggregate, migrate_aggregate_v2, migrate_and_dispatch, restore_aggregate,
+    restore_aggregate_v2, restore_package, restore_package_and_migrate, restore_package_v2,
+    upgrade_aggregate_v1_to_v2, AdmissionDelivery, AggregateEnvelope, AggregateState, Bindings,
     Bundle, CoreResult, Counter, CreationRejectionCode, DefinitionResolver, Delivery,
     DispatchRejectionCode, Disposition, Emission, EngineFaultCode, Envelope, FaultRecord,
     InMemoryDefinitionResolver, LoadError, LoadErrorCode, MigrationArtifactResolver,
     MigrationAuditRecord, MigrationDispatchOutcome, MigrationOutcome, MigrationRequest,
-    PersistenceError, PersistenceErrorCode, Rejection, ResourceLimits, RestoredPackage,
-    ResultStatus, RuntimeStatus, Target, TypedValue, CREATION_REJECTION_CODES,
-    DISPATCH_REJECTION_CODES, ENGINE_FAULT_CODES,
+    PersistenceError, PersistenceErrorCode, QueueBearingAggregate, QueueEnvelope, Rejection,
+    ResourceLimits, RestoredPackage, RestoredPackageV2, ResultStatus, RuntimeStatus, Target,
+    TypedValue, Version2Error, CREATION_REJECTION_CODES, DISPATCH_REJECTION_CODES,
+    ENGINE_FAULT_CODES,
 };
 pub use value::{string_from_utf16, InstanceReference, InvalidUnicodeString, Value};

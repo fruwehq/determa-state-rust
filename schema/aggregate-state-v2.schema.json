@@ -1,0 +1,447 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/aggregate-state-v2.schema.json",
+  "title": "Determa State portable aggregate-state envelope version 2",
+  "description": "Closed wire schema for aggregate_state_schema_version 2 with runtime-local mailboxes.",
+  "$ref": "#/$defs/aggregateState",
+  "$defs": {
+    "nonEmptyString": {
+      "$ref": "aggregate-state.schema.json#/$defs/nonEmptyString"
+    },
+    "identifier": {
+      "$ref": "aggregate-state.schema.json#/$defs/identifier"
+    },
+    "namespace": {
+      "$ref": "aggregate-state.schema.json#/$defs/namespace"
+    },
+    "canonicalDecimal": {
+      "$ref": "aggregate-state.schema.json#/$defs/canonicalDecimal"
+    },
+    "positiveCanonicalDecimal": {
+      "$ref": "aggregate-state.schema.json#/$defs/positiveCanonicalDecimal"
+    },
+    "signedCanonicalDecimal": {
+      "$ref": "aggregate-state.schema.json#/$defs/signedCanonicalDecimal"
+    },
+    "sha256": {
+      "$ref": "aggregate-state.schema.json#/$defs/sha256"
+    },
+    "jsonPointer": {
+      "$ref": "aggregate-state.schema.json#/$defs/jsonPointer"
+    },
+    "sourceLocator": {
+      "$ref": "aggregate-state.schema.json#/$defs/sourceLocator"
+    },
+    "typedValue": {
+      "$ref": "aggregate-state.schema.json#/$defs/typedValue"
+    },
+    "eventName": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "enum": [
+            "determa.component_completed",
+            "determa.component_failed",
+            "determa.spawned_instance_failed"
+          ]
+        }
+      ]
+    },
+    "typedMap": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "const": "map"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/typedValue"
+              }
+            ],
+            "minItems": 2,
+            "maxItems": 2
+          }
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "machineIdentity": {
+      "$ref": "aggregate-state.schema.json#/$defs/machineIdentity"
+    },
+    "definitionBinding": {
+      "$ref": "aggregate-state.schema.json#/$defs/definitionBinding"
+    },
+    "rootIdentityOrigin": {
+      "$ref": "aggregate-state.schema.json#/$defs/rootIdentityOrigin"
+    },
+    "componentIdentityOrigin": {
+      "$ref": "aggregate-state.schema.json#/$defs/componentIdentityOrigin"
+    },
+    "spawnedIdentityOrigin": {
+      "$ref": "aggregate-state.schema.json#/$defs/spawnedIdentityOrigin"
+    },
+    "identityOrigin": {
+      "$ref": "aggregate-state.schema.json#/$defs/identityOrigin"
+    },
+    "instanceReference": {
+      "$ref": "aggregate-state.schema.json#/$defs/instanceReference"
+    },
+    "targetIdentity": {
+      "$ref": "aggregate-state.schema.json#/$defs/targetIdentity"
+    },
+    "envelopeSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "host"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "const": true
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "runtime"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "runtime": {
+              "$ref": "#/$defs/targetIdentity"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "system"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "system": {
+              "$ref": "#/$defs/sourceLocator"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "legacy_v1_internal"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "legacy_v1_internal": {
+              "type": "object",
+              "required": [
+                "producing_receipt_sequence",
+                "emission_index"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "producing_receipt_sequence": {
+                  "$ref": "#/$defs/canonicalDecimal"
+                },
+                "emission_index": {
+                  "$ref": "#/$defs/canonicalDecimal"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "envelope": {
+      "type": "object",
+      "required": [
+        "event",
+        "event_id",
+        "cause_id",
+        "source",
+        "target",
+        "payload"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/eventName"
+        },
+        "event_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "cause_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "source": {
+          "$ref": "#/$defs/envelopeSource"
+        },
+        "target": {
+          "$ref": "#/$defs/targetIdentity"
+        },
+        "payload": {
+          "$ref": "#/$defs/typedMap"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "mailboxEntry": {
+      "type": "object",
+      "required": [
+        "acceptance_sequence",
+        "queue_sequence",
+        "delivery_mode",
+        "envelope",
+        "envelope_digest",
+        "deferral_count"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "acceptance_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "queue_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "delivery_mode": {
+          "enum": [
+            "input",
+            "internal"
+          ]
+        },
+        "envelope": {
+          "$ref": "#/$defs/envelope"
+        },
+        "envelope_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "deferral_count": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "lifetimeHolder": {
+      "$ref": "aggregate-state.schema.json#/$defs/lifetimeHolder"
+    },
+    "relation": {
+      "$ref": "aggregate-state.schema.json#/$defs/relation"
+    },
+    "stateActivation": {
+      "$ref": "aggregate-state.schema.json#/$defs/stateActivation"
+    },
+    "variable": {
+      "$ref": "aggregate-state.schema.json#/$defs/variable"
+    },
+    "history": {
+      "$ref": "aggregate-state.schema.json#/$defs/history"
+    },
+    "nextCounter": {
+      "$ref": "aggregate-state.schema.json#/$defs/nextCounter"
+    },
+    "fault": {
+      "$ref": "aggregate-state.schema.json#/$defs/fault"
+    },
+    "runtime": {
+      "type": "object",
+      "required": [
+        "runtime_id",
+        "identity_origin",
+        "target_identity",
+        "current_definition",
+        "relation",
+        "status",
+        "active_leaf_state_definition_pointers",
+        "active_state_activations",
+        "variables",
+        "history",
+        "next_spawn_sequence",
+        "next_state_activation_sequences",
+        "next_component_activation_sequences",
+        "ready_mailbox",
+        "deferred_mailbox",
+        "fault"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "runtime_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "identity_origin": {
+          "$ref": "#/$defs/identityOrigin"
+        },
+        "target_identity": {
+          "$ref": "#/$defs/targetIdentity"
+        },
+        "current_definition": {
+          "$ref": "#/$defs/definitionBinding"
+        },
+        "relation": {
+          "$ref": "#/$defs/relation"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "faulted"
+          ]
+        },
+        "active_leaf_state_definition_pointers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/jsonPointer"
+          },
+          "uniqueItems": true
+        },
+        "active_state_activations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stateActivation"
+          }
+        },
+        "variables": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/variable"
+          }
+        },
+        "history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/history"
+          }
+        },
+        "next_spawn_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "next_state_activation_sequences": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nextCounter"
+          }
+        },
+        "next_component_activation_sequences": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nextCounter"
+          }
+        },
+        "ready_mailbox": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/mailboxEntry"
+          }
+        },
+        "deferred_mailbox": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/mailboxEntry"
+          }
+        },
+        "fault": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/fault"
+            }
+          ]
+        }
+      }
+    },
+    "aggregateState": {
+      "type": "object",
+      "required": [
+        "aggregate_state_format",
+        "aggregate_state_schema_version",
+        "machine_format",
+        "validated_bundle_fingerprint",
+        "namespace",
+        "root_machine_id",
+        "root_machine_version",
+        "root_instance_id",
+        "creation_id",
+        "root_runtime_id",
+        "migration_sequence",
+        "next_logical_step_sequence",
+        "next_output_sequence",
+        "next_acceptance_sequence",
+        "next_queue_sequence",
+        "runtimes",
+        "aggregate_state_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "aggregate_state_format": {
+          "const": "determa.aggregate_state"
+        },
+        "aggregate_state_schema_version": {
+          "const": 2
+        },
+        "machine_format": {
+          "const": 1
+        },
+        "validated_bundle_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "namespace": {
+          "$ref": "#/$defs/namespace"
+        },
+        "root_machine_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "root_machine_version": {
+          "$ref": "#/$defs/positiveCanonicalDecimal"
+        },
+        "root_instance_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "creation_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "root_runtime_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "migration_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "next_logical_step_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "next_output_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "next_acceptance_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "next_queue_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "runtimes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/runtime"
+          }
+        },
+        "aggregate_state_digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  }
+}

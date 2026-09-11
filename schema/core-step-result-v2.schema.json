@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/core-step-result-v2.schema.json",
+  "title": "Determa State queue-bearing core step result version 2",
+  "description": "Closed result for one explicitly targeted aggregate-state version-2 mailbox step.",
+  "$ref": "#/$defs/coreStepResult",
+  "$defs": {
+    "canonicalDecimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "internalMailboxEmission": {
+      "type": "object",
+      "required": [
+        "kind",
+        "emission_index",
+        "event_id",
+        "acceptance_sequence",
+        "queue_sequence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "internal_mailbox" },
+        "emission_index": { "$ref": "#/$defs/canonicalDecimal" },
+        "event_id": { "$ref": "#/$defs/nonEmptyString" },
+        "acceptance_sequence": { "$ref": "#/$defs/canonicalDecimal" },
+        "queue_sequence": { "$ref": "#/$defs/canonicalDecimal" }
+      }
+    },
+    "internalDisposedEmission": {
+      "type": "object",
+      "required": [
+        "kind",
+        "emission_index",
+        "event_id",
+        "acceptance_sequence",
+        "lifecycle_disposition_index"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "internal_disposed" },
+        "emission_index": { "$ref": "#/$defs/canonicalDecimal" },
+        "event_id": { "$ref": "#/$defs/nonEmptyString" },
+        "acceptance_sequence": { "$ref": "#/$defs/canonicalDecimal" },
+        "lifecycle_disposition_index": { "$ref": "#/$defs/canonicalDecimal" }
+      }
+    },
+    "emission": {
+      "oneOf": [
+        { "$ref": "#/$defs/internalMailboxEmission" },
+        { "$ref": "#/$defs/internalDisposedEmission" },
+        { "$ref": "execution-checkpoint.schema.json#/$defs/outboxIntent" }
+      ]
+    },
+    "lifecycleDisposition": {
+      "type": "object",
+      "required": [
+        "event_id",
+        "request_digest",
+        "acceptance_sequence",
+        "final_queue_sequence",
+        "target_runtime_id",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "event_id": { "$ref": "#/$defs/nonEmptyString" },
+        "request_digest": { "$ref": "#/$defs/sha256" },
+        "acceptance_sequence": { "$ref": "#/$defs/canonicalDecimal" },
+        "final_queue_sequence": { "$ref": "#/$defs/canonicalDecimal" },
+        "target_runtime_id": { "$ref": "#/$defs/sha256" },
+        "reason": {
+          "enum": [
+            "runtime_cancelled",
+            "runtime_completed",
+            "aggregate_completed"
+          ]
+        }
+      }
+    },
+    "rejection": {
+      "type": "object",
+      "required": ["code"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_instance_target",
+            "inactive_component_target",
+            "invalid_prior_state",
+            "incompatible_bundle"
+          ]
+        }
+      }
+    },
+    "coreStepResult": {
+      "type": "object",
+      "required": [
+        "core_step_result_format",
+        "core_step_result_schema_version",
+        "status",
+        "disposition",
+        "state",
+        "emissions",
+        "lifecycle_dispositions",
+        "fault",
+        "rejection"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "core_step_result_format": {
+          "const": "determa.core_step_result"
+        },
+        "core_step_result_schema_version": {
+          "const": 2
+        },
+        "status": {
+          "enum": ["running", "completed", "faulted"]
+        },
+        "disposition": {
+          "enum": [
+            "handled",
+            "deferred",
+            "unhandled",
+            "not_runnable",
+            "rejected",
+            "faulted"
+          ]
+        },
+        "state": {
+          "$ref": "aggregate-state-v2.schema.json"
+        },
+        "emissions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/emission" }
+        },
+        "lifecycle_dispositions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/lifecycleDisposition" }
+        },
+        "fault": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "aggregate-state-v2.schema.json#/$defs/fault" }
+          ]
+        },
+        "rejection": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/rejection" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "disposition": { "const": "rejected" }
+            },
+            "required": ["disposition"]
+          },
+          "then": {
+            "properties": {
+              "emissions": { "maxItems": 0 },
+              "lifecycle_dispositions": { "maxItems": 0 },
+              "fault": { "type": "null" },
+              "rejection": { "$ref": "#/$defs/rejection" }
+            }
+          },
+          "else": {
+            "properties": {
+              "rejection": { "type": "null" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

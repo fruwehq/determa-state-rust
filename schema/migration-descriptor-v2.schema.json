@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/migration-descriptor-v2.schema.json",
+  "title": "Determa State aggregate migration descriptor version 2",
+  "description": "Closed migration descriptor for queue-bearing aggregate-state version 2.",
+  "type": "object",
+  "required": [
+    "migration_descriptor_format",
+    "migration_descriptor_schema_version",
+    "base_descriptor",
+    "queued_event_default",
+    "queued_event_rules",
+    "migration_descriptor_digest"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "migration_descriptor_format": {
+      "const": "determa.aggregate_migration"
+    },
+    "migration_descriptor_schema_version": {
+      "const": 2
+    },
+    "base_descriptor": {
+      "$ref": "migration-descriptor.schema.json"
+    },
+    "queued_event_default": {
+      "const": "preserve_if_compatible"
+    },
+    "queued_event_rules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/queuedEventRule"
+      }
+    },
+    "migration_descriptor_digest": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "eventName": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "enum": [
+            "determa.component_completed",
+            "determa.component_failed",
+            "determa.spawned_instance_failed"
+          ]
+        }
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "disposeRule": {
+      "type": "object",
+      "required": [
+        "machine_id",
+        "event",
+        "delivery_mode",
+        "action",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "machine_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "event": {
+          "$ref": "#/$defs/eventName"
+        },
+        "delivery_mode": {
+          "enum": ["input", "internal"]
+        },
+        "action": {
+          "const": "dispose"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "queuedEventRule": {
+      "$ref": "#/$defs/disposeRule"
+    }
+  }
+}

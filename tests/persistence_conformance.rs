@@ -285,6 +285,8 @@ fn assert_result(
             Some(Disposition::Unhandled) => "unhandled",
             Some(Disposition::Rejected) => "rejected",
             Some(Disposition::Faulted) => "faulted",
+            Some(Disposition::Deferred) => "deferred",
+            Some(Disposition::NotRunnable) => "not_runnable",
             None => "<none>",
         };
         if actual != disposition {

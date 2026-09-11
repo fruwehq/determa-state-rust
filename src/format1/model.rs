@@ -129,6 +129,10 @@ pub struct RawState {
     #[serde(default)]
     pub on_events: BTreeMap<String, TransitionOrList>,
     #[serde(default)]
+    pub deferred_events: Vec<String>,
+    #[serde(default)]
+    pub deferred_event_capacity: Option<i64>,
+    #[serde(default)]
     pub history: Option<HistoryKind>,
     #[serde(default)]
     pub choice: Option<Vec<ChoiceBranch>>,

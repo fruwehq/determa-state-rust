@@ -211,7 +211,9 @@ impl TypedValue {
                     .collect::<Result<BTreeMap<_, _>, PersistenceError>>()?,
             ),
         };
-        if declaration.is_some_and(|declaration| declaration.value_type == "instance_reference") {
+        if declaration.is_some_and(|declaration| declaration.value_type == "instance_reference")
+            && !matches!(value, Value::Null)
+        {
             return instance_reference_from_value(value);
         }
         Ok(value)
@@ -1220,7 +1222,7 @@ fn origin_from_wire(
     })
 }
 
-fn target_from_wire(target: &WireTarget) -> Result<Target, PersistenceError> {
+pub(crate) fn target_from_wire(target: &WireTarget) -> Result<Target, PersistenceError> {
     Ok(match target {
         WireTarget::Root { root } => Target::Root {
             root_instance_id: root.root_instance_id.clone(),
@@ -1520,7 +1522,7 @@ fn origin_to_wire(origin: &IdentityOrigin) -> WireIdentityOrigin {
     }
 }
 
-fn target_to_wire(target: &Target) -> Result<WireTarget, PersistenceError> {
+pub(crate) fn target_to_wire(target: &Target) -> Result<WireTarget, PersistenceError> {
     Ok(match target {
         Target::Root {
             root_instance_id,

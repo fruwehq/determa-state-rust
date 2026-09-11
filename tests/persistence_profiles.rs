@@ -170,6 +170,8 @@ fn disposition_name(disposition: Option<Disposition>) -> &'static str {
         Some(Disposition::Unhandled) => "unhandled",
         Some(Disposition::Rejected) => "rejected",
         Some(Disposition::Faulted) => "faulted",
+        Some(Disposition::Deferred) => "deferred",
+        Some(Disposition::NotRunnable) => "not_runnable",
         None => "none",
     }
 }

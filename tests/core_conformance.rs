@@ -21,7 +21,7 @@ fn all_format_1_core_cases() {
         .filter(|path| path.is_dir())
         .collect::<Vec<_>>();
     cases.sort();
-    assert_eq!(cases.len(), 111, "expected the complete merged core suite");
+    assert_eq!(cases.len(), 114, "expected the complete merged core suite");
     let mut failures = Vec::new();
     for case in cases {
         if let Err(error) = run_case(&case) {
@@ -505,7 +505,9 @@ fn check_result(
     {
         let actual = result.disposition.map(|value| match value {
             Disposition::Handled => "handled",
+            Disposition::Deferred => "deferred",
             Disposition::Unhandled => "unhandled",
+            Disposition::NotRunnable => "not_runnable",
             Disposition::Rejected => "rejected",
             Disposition::Faulted => "faulted",
         });
@@ -533,12 +535,9 @@ fn check_result(
         prior_state.ok_or_else(|| "caller ownership asserted without prior state".to_string())?;
         if !matches!(
             result.disposition,
-            Some(Disposition::Rejected | Disposition::Faulted)
+            Some(Disposition::Deferred | Disposition::Rejected | Disposition::Faulted)
         ) {
-            return Err(
-                "caller input ownership asserted for a non-rejected, non-faulted dispatch"
-                    .to_string(),
-            );
+            return Err("caller input ownership asserted for a consuming dispatch".to_string());
         }
     }
     if expected

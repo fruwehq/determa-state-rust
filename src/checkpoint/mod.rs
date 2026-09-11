@@ -7,6 +7,7 @@
 mod adapters;
 mod host;
 mod store;
+mod v2;
 mod wire;
 
 pub use adapters::{
@@ -31,6 +32,10 @@ pub use store::{
     ExecutionStore, ExecutionStoreCapability, ExecutionStoreFactory, HealthStatus, HostFeature,
     HostProfile, OutboxRetentionMode, ReceiptRetentionMode, StoreError, StoreErrorCode,
     StoreRecord, StoreWriteResult,
+};
+pub use v2::{
+    checkpoint_admit_v2, checkpoint_prune_v2, checkpoint_step_v2, restore_execution_checkpoint_v2,
+    upgrade_execution_checkpoint_v1_to_v2, ExecutionCheckpointV2,
 };
 pub use wire::{
     restore_execution_checkpoint, validate_outbox_compaction, AcceptanceResult, BoundedReplayMode,

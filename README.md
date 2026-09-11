@@ -8,13 +8,14 @@ remains `0.1.0` until the coordinated `v0.2.0` tag runs the release workflow. Th
 branch is validated against the merged `0.2.0` metadata revisions at these exact
 normative inputs:
 
-- specification commit `7782671b56165a59caa61a65c29fefc63105ebf8`;
-- conformance commit `d6a45d31614ee25de20476ed93f10e14997d882c`.
+- specification commit `2e33036563cb966b07124197db672159b4b7e1f4`;
+- conformance commit `40cb119357204f62cbbbb2ef68bac342d43cb901`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
-tests run all 111 format-1 core cases, 108 portable persistence vectors, and 12 steps
+tests run all 114 format-1 core cases, 108 version-1 and 13 version-2 portable
+persistence vectors, and 12 steps
 across the six persistence host profiles. The execution-checkpoint integration test
-runs all 91 host vectors through actual Rust host operations.
+runs all 99 version-1 and 53 version-2 host vectors.
 
 ## Implemented core
 
@@ -23,14 +24,15 @@ runs all 91 host vectors through actual Rust host operations.
 - Multiple machines per bundle, shared and private events, typed payloads and
   variables, and the portable CEL profile.
 - Hierarchical dispatch, ordered guards, internal/local/unmarked transitions, choices,
-  history, entry/exit actions, final states, and `stop`.
+  history, entry/exit actions, final states, UML event deferral, and `stop`.
 - Isolated synchronous components with explicit routing.
 - Owned spawned instances, nominal references, cancellation, completion, failure
   propagation, and deterministic lifecycle cleanup.
 - Pure `create` and `dispatch` operations with deterministic runtime, cause, event, and
   external-effect identities.
 - Portable aggregate serialization and restoration with strict typed values, canonical
-  JSON, content-addressed definitions, and self-contained aggregate packages.
+  JSON, content-addressed definitions, queue-bearing version-2 artifacts, and
+  self-contained aggregate packages.
 - Resolver-backed compatible and transforming definition migration, exact route
   execution, resource limits, audit records, and atomic migration-and-dispatch.
 - Strict execution-checkpoint Serde types, canonical digests, semantic restoration,
@@ -68,9 +70,9 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`d6a45d31614ee25de20476ed93f10e14997d882c`. CI also checks that all bundled schemas
+`40cb119357204f62cbbbb2ef68bac342d43cb901`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
-`7782671b56165a59caa61a65c29fefc63105ebf8`. These exact merged commits are the
+`2e33036563cb966b07124197db672159b4b7e1f4`. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
 
 ## Library

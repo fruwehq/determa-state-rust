@@ -95,10 +95,31 @@ pub enum DeliveryMode {
 pub struct PortableEnvelope {
     pub event: String,
     pub event_id: String,
+    #[serde(
+        serialize_with = "serialize_portable_target",
+        deserialize_with = "deserialize_portable_target"
+    )]
     pub target: Target,
     pub payload: TypedValue,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
+}
+
+fn serialize_portable_target<S>(target: &Target, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    crate::format1::wire::target_to_wire(target)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
+}
+
+fn deserialize_portable_target<'de, D>(deserializer: D) -> Result<Target, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let target = crate::format1::wire::WireTarget::deserialize(deserializer)?;
+    crate::format1::wire::target_from_wire(&target).map_err(serde::de::Error::custom)
 }
 
 impl PortableEnvelope {
@@ -1173,35 +1194,62 @@ pub struct PreAcceptanceFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreAcceptanceFailureCode {
+    CheckpointUpgradeRequired,
     MalformedDelivery,
     WrongRoot,
     InvalidDeliveryMode,
     InvalidDeliveryOrigin,
+    InvalidDeliverySource,
     DeliveryDigestMismatch,
+    DuplicateEventIdInBatch,
     EventIdConflict,
+    InactiveComponentTarget,
+    InvalidCorrelation,
+    InvalidEvent,
+    InvalidInstanceTarget,
+    InvalidPayload,
+    TerminalRoot,
     TombstonedRoot,
 }
 
 impl PreAcceptanceFailureCode {
     /// Complete pre-acceptance failure set defined by the portable registry.
     pub const PORTABLE_CODES: &'static [Self] = &[
+        Self::CheckpointUpgradeRequired,
         Self::MalformedDelivery,
         Self::WrongRoot,
         Self::InvalidDeliveryMode,
         Self::InvalidDeliveryOrigin,
+        Self::InvalidDeliverySource,
         Self::DeliveryDigestMismatch,
+        Self::DuplicateEventIdInBatch,
         Self::EventIdConflict,
+        Self::InactiveComponentTarget,
+        Self::InvalidCorrelation,
+        Self::InvalidEvent,
+        Self::InvalidInstanceTarget,
+        Self::InvalidPayload,
+        Self::TerminalRoot,
         Self::TombstonedRoot,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::CheckpointUpgradeRequired => "checkpoint_upgrade_required",
             Self::MalformedDelivery => "malformed_delivery",
             Self::WrongRoot => "wrong_root",
             Self::InvalidDeliveryMode => "invalid_delivery_mode",
             Self::InvalidDeliveryOrigin => "invalid_delivery_origin",
+            Self::InvalidDeliverySource => "invalid_delivery_source",
             Self::DeliveryDigestMismatch => "delivery_digest_mismatch",
+            Self::DuplicateEventIdInBatch => "duplicate_event_id_in_batch",
             Self::EventIdConflict => "event_id_conflict",
+            Self::InactiveComponentTarget => "inactive_component_target",
+            Self::InvalidCorrelation => "invalid_correlation",
+            Self::InvalidEvent => "invalid_event",
+            Self::InvalidInstanceTarget => "invalid_instance_target",
+            Self::InvalidPayload => "invalid_payload",
+            Self::TerminalRoot => "terminal_root",
             Self::TombstonedRoot => "tombstoned_root",
         }
     }
@@ -1488,6 +1536,11 @@ fn validate_outcome(outcome: &DeliveryOutcome, no_emissions: bool) -> Result<(),
             {
                 return Err(invalid("faulted outcome is inconsistent"));
             }
+        }
+        Disposition::Deferred | Disposition::NotRunnable => {
+            return Err(invalid(
+                "version-2 disposition is invalid in a schema-version-1 checkpoint",
+            ));
         }
     }
     Ok(())
