@@ -7,8 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  SPECIFICATION_COMMIT: 7782671b56165a59caa61a65c29fefc63105ebf8
-  CONFORMANCE_COMMIT: d6a45d31614ee25de20476ed93f10e14997d882c
+  SPECIFICATION_COMMIT: ee38796d5e38e67e350a06548fd50faa530cbb12
+  CONFORMANCE_COMMIT: 99a4d9ad5256f7330e75b06d48f340cc7239a40d
 
 jobs:
   msrv:
@@ -82,10 +82,11 @@ jobs:
           test "$(git -C conformance-suite rev-parse HEAD)" = "$CONFORMANCE_COMMIT"
           test "$(git -C authoritative-spec rev-parse HEAD)" = "$SPECIFICATION_COMMIT"
           cmp schema/machine.schema.json authoritative-spec/schema/machine.schema.json
-          cmp schema/aggregate-state.schema.json authoritative-spec/schema/aggregate-state.schema.json
-          cmp schema/migration-descriptor.schema.json authoritative-spec/schema/migration-descriptor.schema.json
-          cmp schema/aggregate-state-package.schema.json authoritative-spec/schema/aggregate-state-package.schema.json
-          cmp schema/execution-checkpoint.schema.json authoritative-spec/schema/execution-checkpoint.schema.json
+          cmp schema/aggregate-state-v2.schema.json authoritative-spec/schema/aggregate-state-v2.schema.json
+          cmp schema/aggregate-state-package-v2.schema.json authoritative-spec/schema/aggregate-state-package-v2.schema.json
+          cmp schema/migration-descriptor-v2.schema.json authoritative-spec/schema/migration-descriptor-v2.schema.json
+          cmp schema/core-step-result-v2.schema.json authoritative-spec/schema/core-step-result-v2.schema.json
+          cmp schema/execution-checkpoint-v2.schema.json authoritative-spec/schema/execution-checkpoint-v2.schema.json
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-03
 
@@ -105,14 +106,11 @@ jobs:
       - name: Documentation tests
         run: cargo test --locked --doc
 
-      - name: All 111 format 1 core conformance cases
-        run: cargo test --locked --test core_conformance --test persistence_conformance -- --nocapture
+      - name: All 162 native artifact/checkpoint schema-v2 vectors
+        run: cargo test --locked --test native_v2_conformance -- --nocapture
 
-      - name: Persistence host profiles
-        run: cargo test --locked --test persistence_profiles -- --nocapture
-
-      - name: All 91 execution-checkpoint host vectors
-        run: cargo test --locked --test checkpoint_conformance -- --nocapture
+      - name: All 138 durable-host vectors
+        run: cargo test --locked --test durable_host_conformance -- --nocapture
 
   postgresql:
     name: PostgreSQL execution-store integration

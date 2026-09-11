@@ -16,8 +16,8 @@ workflow.
 The current draft is validated against the merged `0.2.0` metadata revisions at these
 exact immutable inputs:
 
-- specification: `7782671b56165a59caa61a65c29fefc63105ebf8`;
-- conformance: `d6a45d31614ee25de20476ed93f10e14997d882c`.
+- specification: `ee38796d5e38e67e350a06548fd50faa530cbb12`;
+- conformance: `99a4d9ad5256f7330e75b06d48f340cc7239a40d`.
 
 The conformance suite is the arbiter of behavior. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
@@ -33,10 +33,8 @@ Never invent a release tag or weaken an exact revision check.
   store registry, capability profiles, and bundled adapters.
 - `src/value.rs`: portable values and nominal instance references.
 - `src/cli.rs`: nonportable validation utility only.
-- `tests/core_conformance.rs`: driver for all 111 `conformance/core` cases.
-- `tests/persistence_conformance.rs`: driver for all 108 persistence vectors.
-- `tests/persistence_profiles.rs`: driver for all six persistence host profiles.
-- `tests/checkpoint_conformance.rs`: driver for all 91 execution-checkpoint vectors.
+- `tests/native_v2_conformance.rs`: driver for all 162 applicable native schema-v2
+  aggregate, migration, package, and execution-checkpoint vectors.
 - `tests/checkpoint_adapters.rs`: shared memory/file/SQLite setup, restart, and CAS
   contracts.
 - `tests/checkpoint_postgresql.rs`: optional PostgreSQL exact-schema, retention-mode,
@@ -59,7 +57,7 @@ Never invent a release tag or weaken an exact revision check.
 ```sh
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
-  "d6a45d31614ee25de20476ed93f10e14997d882c"
+  "99a4d9ad5256f7330e75b06d48f340cc7239a40d"
 cargo +1.86.0 build --release --locked --all-features
 cargo +1.86.0 test --locked --all-features
 cargo clippy --locked --all-features --all-targets -- -D warnings
@@ -68,21 +66,21 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 The declared MSRV is Rust `1.86`. CI must keep the locked default and all-features graph,
 including PostgreSQL, buildable and testable with that toolchain.
 
-CI runs the complete 111-case core suite, all 108 persistence vectors, all 12
-persistence-profile steps, and all 91 execution-checkpoint vectors. It also checks
-every local schema byte-for-byte against the exact specification commit and runs the
-optional PostgreSQL adapter against a service.
+CI runs all 162 applicable native schema-v2 core vectors and all 138 durable-host
+vectors.
+It also checks every local schema byte-for-byte against the exact specification commit
+and runs the optional PostgreSQL adapter against a service.
 
 ## Boundaries
 
-The portable API exposes pure foreground create/dispatch, aggregate
-serialization/restoration, package restoration, definition migration, and
-migration-and-dispatch operations. The optional synchronous host wraps those unchanged
+The portable API exposes only queue-bearing schema-v2 create, admission, step,
+serialization/restoration, package restoration, and definition migration operations.
+The optional synchronous host wraps those unchanged
 operations with portable checkpoint transactions. It owns no broker, timer, worker,
 daemon, socket, subprocess protocol, package imports, or scheduling. Execution stores
 must be directly injected or explicitly registered; database schema setup is explicit,
-and schema-version-1 root/checkpoint deletion is unsupported. The CLI currently
-validates bundles only.
+and durable-host profiles remain optional host contracts. The CLI currently validates
+bundles only.
 
 ## Releases
 

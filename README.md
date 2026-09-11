@@ -8,13 +8,14 @@ remains `0.1.0` until the coordinated `v0.2.0` tag runs the release workflow. Th
 branch is validated against the merged `0.2.0` metadata revisions at these exact
 normative inputs:
 
-- specification commit `7782671b56165a59caa61a65c29fefc63105ebf8`;
-- conformance commit `d6a45d31614ee25de20476ed93f10e14997d882c`.
+- specification commit `ee38796d5e38e67e350a06548fd50faa530cbb12`;
+- conformance commit `99a4d9ad5256f7330e75b06d48f340cc7239a40d`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
-tests run all 111 format-1 core cases, 108 portable persistence vectors, and 12 steps
-across the six persistence host profiles. The execution-checkpoint integration test
-runs all 91 host vectors through actual Rust host operations.
+tests run all 162 applicable native artifact/checkpoint schema-v2 core vectors and all
+138 durable-host vectors. Durable host profiles remain
+optional host contracts; memory, file, SQLite, and PostgreSQL tests exercise the
+implemented transactional host surface.
 
 ## Implemented core
 
@@ -23,16 +24,17 @@ runs all 91 host vectors through actual Rust host operations.
 - Multiple machines per bundle, shared and private events, typed payloads and
   variables, and the portable CEL profile.
 - Hierarchical dispatch, ordered guards, internal/local/unmarked transitions, choices,
-  history, entry/exit actions, final states, and `stop`.
+  history, entry/exit actions, final states, UML event deferral, and `stop`.
 - Isolated synchronous components with explicit routing.
 - Owned spawned instances, nominal references, cancellation, completion, failure
   propagation, and deterministic lifecycle cleanup.
-- Pure `create` and `dispatch` operations with deterministic runtime, cause, event, and
-  external-effect identities.
+- Pure queue-bearing `create`, `admit`, and `step` operations with deterministic
+  runtime, cause, event, and external-effect identities.
 - Portable aggregate serialization and restoration with strict typed values, canonical
-  JSON, content-addressed definitions, and self-contained aggregate packages.
+  JSON, content-addressed definitions, sole schema-v2 artifacts, and
+  self-contained aggregate packages.
 - Resolver-backed compatible and transforming definition migration, exact route
-  execution, resource limits, audit records, and atomic migration-and-dispatch.
+  execution, resource limits, and ordered audit records.
 - Strict execution-checkpoint Serde types, canonical digests, semantic restoration,
   operation receipts, durable pending delivery, outbox lifecycle, bounded retention,
   migration audit, root tombstones, and revision/digest compare-and-swap.
@@ -41,12 +43,9 @@ runs all 91 host vectors through actual Rust host operations.
   third-party factories.
 - Default `memory`, `file`, and bundled-SQLite adapters plus optional PostgreSQL,
   with explicit durable receipt/outbox modes and schema-contract health checks.
-- Inspection through the returned logical aggregate state, result disposition, fault,
-  rejection, configuration, variables, components, owned instances, and emissions.
+- Inspection through the returned native aggregate and core-step JSON values.
 - Immutable `PORTABLE_CODES` slices on public closed-code enums, including
-  `CreationRejectionCode`, `DispatchRejectionCode`, and `EngineFaultCode`, plus
-  `CREATION_REJECTION_CODES`, `DISPATCH_REJECTION_CODES`, and `ENGINE_FAULT_CODES` for
-  compatibility with the existing string-slice API.
+  `CreationRejectionCode`, `DispatchRejectionCode`, and `EngineFaultCode`.
 
 The portable core remains a pure foreground transform and does not own queues, broker
 acknowledgement, timers, package imports, or a background scheduler. The optional host
@@ -68,55 +67,33 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`d6a45d31614ee25de20476ed93f10e14997d882c`. CI also checks that all bundled schemas
+`99a4d9ad5256f7330e75b06d48f340cc7239a40d`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
-`7782671b56165a59caa61a65c29fefc63105ebf8`. These exact merged commits are the
+`ee38796d5e38e67e350a06548fd50faa530cbb12`. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
 
 ## Library
 
 ```rust
-use determa_state::{
-    create, dispatch, load_bundle, Bindings, Delivery, Envelope, Target, Value,
-};
-use std::collections::BTreeMap;
+use determa_state::{create, load_bundle, Bindings};
 
 let source = std::fs::read_to_string("examples/minimal.yaml")?;
 let bundle = load_bundle(&source)?;
-let created = create(
+let aggregate = create(
     &bundle,
     "turnstile",
     "turnstile-1",
     "create-1",
     &Bindings::default(),
-);
-let state = created.state.expect("creation succeeds");
+)?;
 
-let result = dispatch(
-    &bundle,
-    &state,
-    Some(Delivery::Input(Envelope {
-        event: "coin".to_string(),
-        event_id: "input-1".to_string(),
-        target: Target::Root {
-            root_instance_id: state.root_instance_id.clone(),
-            root_runtime_id: state.root.runtime_id.clone(),
-        },
-        payload: BTreeMap::from([("amount".to_string(), Value::Int(100))]),
-        correlation_id: None,
-    })),
-);
-
-assert_eq!(
-    result.state.expect("dispatch succeeds").root.config(),
-    vec!["unlocked"]
-);
+assert_eq!(aggregate.value()["aggregate_state_schema_version"], 2);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Input and internal envelopes are caller-owned. Internal emissions may be delivered back
-through `dispatch` explicitly. External emissions are deterministic output intents for
-the host to persist and deliver.
+Input and internal envelopes are caller-owned. `admit` retains accepted work in the
+aggregate and `step` processes one ready event. External emissions are deterministic
+output intents for the host to persist and deliver.
 
 ## Execution-checkpoint host
 
@@ -168,8 +145,10 @@ For shared application and checkpoint atomicity, use
 transaction for application SQL and accepts exactly one root-bound checkpoint mutation
 through `CheckpointHost::stage_postgresql_mutation`. The host uses `SERIALIZABLE`,
 rejects cross-store/cross-root handles, rolls both parts back on failure, and returns
-the committed host result only after commit succeeds. The store's lower-level native
-transaction callback does not run host operations.
+the committed host result only after commit succeeds. Native schema-v2 creation,
+admission, step, maintenance migration, pruning, outbox lifecycle, and root
+tombstone mutations use this same shared transaction API. The store's lower-level
+native transaction callback does not run host operations.
 
 Call `initialize_schema` deliberately before file or database use. Adapters never
 silently migrate schema. The execution-store trait has no checkpoint deletion method;

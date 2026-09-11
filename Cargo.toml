@@ -12,11 +12,9 @@ exclude = [
     "authoritative-spec/",
     "conformance-suite/",
     "tests/core_conformance.rs",
-    "tests/checkpoint_conformance.rs",
+    "tests/native_v2_conformance.rs",
     "tests/closed_code_registry.rs",
     "tests/checkpoint_postgresql.rs",
-    "tests/persistence_conformance.rs",
-    "tests/persistence_profiles.rs",
     ".github/",
 ]
 

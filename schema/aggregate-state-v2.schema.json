@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://determa.dev/state/schema/aggregate-state.schema.json",
-  "title": "Determa State portable aggregate-state envelope",
-  "description": "Closed wire schema for aggregate_state_schema_version 1.",
+  "$id": "https://determa.dev/state/schema/aggregate-state-v2.schema.json",
+  "title": "Determa State portable aggregate state",
+  "description": "Closed wire schema for the sole supported queue-bearing aggregate state artifact.",
   "$ref": "#/$defs/aggregateState",
   "$defs": {
     "nonEmptyString": {
@@ -615,6 +615,8 @@
         "next_spawn_sequence",
         "next_state_activation_sequences",
         "next_component_activation_sequences",
+        "ready_mailbox",
+        "deferred_mailbox",
         "fault"
       ],
       "additionalProperties": false,
@@ -681,6 +683,18 @@
             "$ref": "#/$defs/nextCounter"
           }
         },
+        "ready_mailbox": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/mailboxEntry"
+          }
+        },
+        "deferred_mailbox": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/mailboxEntry"
+          }
+        },
         "fault": {
           "oneOf": [
             {
@@ -709,6 +723,8 @@
         "migration_sequence",
         "next_logical_step_sequence",
         "next_output_sequence",
+        "next_acceptance_sequence",
+        "next_queue_sequence",
         "runtimes",
         "aggregate_state_digest"
       ],
@@ -718,7 +734,7 @@
           "const": "determa.aggregate_state"
         },
         "aggregate_state_schema_version": {
-          "const": 1
+          "const": 2
         },
         "machine_format": {
           "const": 1
@@ -753,6 +769,12 @@
         "next_output_sequence": {
           "$ref": "#/$defs/canonicalDecimal"
         },
+        "next_acceptance_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "next_queue_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
         "runtimes": {
           "type": "array",
           "minItems": 1,
@@ -762,6 +784,156 @@
         },
         "aggregate_state_digest": {
           "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "eventName": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "enum": [
+            "determa.component_completed",
+            "determa.component_failed",
+            "determa.spawned_instance_failed"
+          ]
+        }
+      ]
+    },
+    "typedMap": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "const": "map"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/typedValue"
+              }
+            ],
+            "minItems": 2,
+            "maxItems": 2
+          }
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "envelopeSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "host"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "const": true
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "runtime"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "runtime": {
+              "$ref": "#/$defs/targetIdentity"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "system"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "system": {
+              "$ref": "#/$defs/sourceLocator"
+            }
+          }
+        }
+      ]
+    },
+    "envelope": {
+      "type": "object",
+      "required": [
+        "event",
+        "event_id",
+        "cause_id",
+        "source",
+        "target",
+        "payload"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/eventName"
+        },
+        "event_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "cause_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "source": {
+          "$ref": "#/$defs/envelopeSource"
+        },
+        "target": {
+          "$ref": "#/$defs/targetIdentity"
+        },
+        "payload": {
+          "$ref": "#/$defs/typedMap"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "mailboxEntry": {
+      "type": "object",
+      "required": [
+        "acceptance_sequence",
+        "queue_sequence",
+        "delivery_mode",
+        "envelope",
+        "envelope_digest",
+        "deferral_count"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "acceptance_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "queue_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "delivery_mode": {
+          "enum": [
+            "input",
+            "internal"
+          ]
+        },
+        "envelope": {
+          "$ref": "#/$defs/envelope"
+        },
+        "envelope_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "deferral_count": {
+          "$ref": "#/$defs/canonicalDecimal"
         }
       }
     }

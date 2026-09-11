@@ -6,26 +6,21 @@ use super::store::{
     validate_store_host_profile, AdapterError, ExecutionStore, HostFeature, HostProfile,
     StoreError, StoreErrorCode, StoreRecord, StoreWriteResult,
 };
-use super::wire::{
-    envelope_digest, hash_tagged, outbox_intent_digest, AcceptanceResult, CheckpointFault,
-    CommittedDeliveryResult, CommittedResultKind, CreationOperationKind, CreationReceipt,
-    DeliveryMode, DeliveryOperationKind, DeliveryOrigin, DeliveryOutcome, DeliveryReceipt,
-    EmissionReference, ExecutionCheckpoint, MaintenanceMigrationOperationKind,
-    MaintenanceMigrationReceipt, MaintenanceMigrationResultCode, NotAcceptedResult,
-    NotAcceptedResultKind, OperationReceipt, OutboxEffectTombstone, OutboxIntent, OutboxRecord,
-    PendingAcceptanceResult, PendingAcceptanceResultKind, PendingDelivery, PendingOutboxIntent,
-    PendingOutboxState, PortableEnvelope, PreAcceptanceFailure, PreAcceptanceFailureCode,
-    ReplayRetention, RetainedRootRecord, RetainedRootStatus, RootRecord, RootTombstone,
-    RootTombstoneStatus, TerminalOutboxOutcome, TerminalOutboxRecord, TerminalRootStatus,
+use super::types::{
+    AdmissionSource, PendingOutboxState, ProcessingRequest, PruneRequest, TerminalOutboxOutcome,
+    TransactionalProcessRequest,
+};
+use super::v2::{
+    checkpoint_admit_v2_with_optional_bundle, checkpoint_compact_outbox,
+    checkpoint_maintenance_migration_route, checkpoint_process, checkpoint_process_with_migration,
+    checkpoint_prune_v2, checkpoint_step_v2, checkpoint_terminalize_outbox,
+    checkpoint_tombstone_root, checkpoint_update_pending_outbox, create_execution_checkpoint_v2,
+    creation_request_digest, restore_execution_checkpoint, ExecutionCheckpoint,
 };
 use crate::format1::{
-    create, dispatch, encode_aggregate, migrate_aggregate, AggregateState, Bindings, Bundle,
-    Counter, Delivery, Disposition, Emission, MigrationArtifactResolver, MigrationRequest,
-    ResourceLimits, ResultStatus, RuntimeStatus, TypedValue,
+    ArtifactError, Bindings, Bundle, MigrationArtifactResolver, MigrationRequest, ResourceLimits,
 };
-use crate::Value;
 use serde_json::{json, Value as JsonValue};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 trait StoreAccess {
@@ -156,7 +151,6 @@ impl HostFailureCode {
         Self::EffectIdConflict,
         Self::CheckpointRevisionConflict,
         Self::InvalidExecutionCheckpoint,
-        Self::PhysicalDeletionUnsupported,
         Self::InjectedPreCommitFailure,
         Self::ResponseLostAfterCommit,
     ];
@@ -212,6 +206,9 @@ impl From<StoreError> for HostFailure {
             StoreErrorCode::ExecutionStoreFailure => HostFailureCode::ExecutionStoreFailure,
             StoreErrorCode::InjectedPreCommitFailure => HostFailureCode::InjectedPreCommitFailure,
             StoreErrorCode::ResponseLostAfterCommit => HostFailureCode::ResponseLostAfterCommit,
+            StoreErrorCode::InvalidStoreScope
+            | StoreErrorCode::PermanentProcessingFailure
+            | StoreErrorCode::TransientProcessingFailure => HostFailureCode::ExecutionStoreFailure,
         };
         Self::new(code, value.message)
     }
@@ -235,30 +232,6 @@ impl MutationGuard {
     }
 }
 
-pub struct CreationRequest<'a> {
-    pub bundle: &'a Bundle,
-    pub namespace: &'a str,
-    pub machine_id: &'a str,
-    pub machine_version: i64,
-    pub root_instance_id: &'a str,
-    pub creation_id: &'a str,
-    pub bindings: &'a Bindings,
-    pub supplied_request_digest: Option<&'a str>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DeliveryRequest {
-    pub checkpoint_root_instance_id: String,
-    pub candidate: JsonValue,
-    pub guard: MutationGuard,
-}
-
-#[derive(Debug, Clone)]
-pub struct ProcessingMigration {
-    pub request: MigrationRequest,
-    pub limits: ResourceLimits,
-}
-
 #[derive(Debug, Clone)]
 pub struct MaintenanceMigrationRequest {
     pub root_instance_id: String,
@@ -274,15 +247,40 @@ pub struct MaintenanceMigrationRequest {
 
 #[cfg(feature = "postgresql")]
 pub enum PostgresqlHostMutation<'a> {
-    Create(CreationRequest<'a>),
-    AcceptDelivery(DeliveryRequest),
-    ForegroundProcessDelivery {
-        request: DeliveryRequest,
-        migration: Option<&'a ProcessingMigration>,
+    Create {
+        bundle: &'a Bundle,
+        machine_id: &'a str,
+        root_instance_id: &'a str,
+        creation_id: &'a str,
+        bindings: &'a Bindings,
+        supplied_request_digest: Option<&'a str>,
+        replay_retention: &'a JsonValue,
     },
-    ProcessPendingDelivery {
-        request: DeliveryRequest,
-        migration: Option<&'a ProcessingMigration>,
+    Admit {
+        root_instance_id: &'a str,
+        deliveries: &'a [JsonValue],
+        guard: &'a MutationGuard,
+    },
+    Step {
+        root_instance_id: &'a str,
+        request: &'a ProcessingRequest,
+        guard: &'a MutationGuard,
+    },
+    Process {
+        root_instance_id: &'a str,
+        delivery: &'a JsonValue,
+        processing_mode: &'a str,
+        guard: &'a MutationGuard,
+    },
+    TransactionalProcess {
+        root_instance_id: &'a str,
+        request: &'a TransactionalProcessRequest,
+        guard: &'a MutationGuard,
+    },
+    Prune {
+        root_instance_id: &'a str,
+        request: &'a PruneRequest,
+        guard: &'a MutationGuard,
     },
     MaintenanceMigration(&'a MaintenanceMigrationRequest),
     UpdatePendingOutbox {
@@ -302,23 +300,9 @@ pub enum PostgresqlHostMutation<'a> {
         effect_id: &'a str,
         guard: &'a MutationGuard,
     },
-    DeleteOutboxRecord {
-        root_instance_id: &'a str,
-        effect_id: &'a str,
-        guard: &'a MutationGuard,
-    },
-    UpdateReplayRetention {
-        root_instance_id: &'a str,
-        target: ReplayRetention,
-        guard: &'a MutationGuard,
-    },
     TombstoneRoot {
         root_instance_id: &'a str,
         operation_id: &'a str,
-        guard: &'a MutationGuard,
-    },
-    DeleteCheckpoint {
-        root_instance_id: &'a str,
         guard: &'a MutationGuard,
     },
 }
@@ -327,12 +311,25 @@ pub enum PostgresqlHostMutation<'a> {
 impl PostgresqlHostMutation<'_> {
     fn root_instance_id(&self) -> &str {
         match self {
-            Self::Create(request) => request.root_instance_id,
-            Self::AcceptDelivery(request)
-            | Self::ForegroundProcessDelivery { request, .. }
-            | Self::ProcessPendingDelivery { request, .. } => &request.checkpoint_root_instance_id,
-            Self::MaintenanceMigration(request) => &request.root_instance_id,
-            Self::UpdatePendingOutbox {
+            Self::Create {
+                root_instance_id, ..
+            }
+            | Self::Admit {
+                root_instance_id, ..
+            }
+            | Self::Step {
+                root_instance_id, ..
+            }
+            | Self::Process {
+                root_instance_id, ..
+            }
+            | Self::TransactionalProcess {
+                root_instance_id, ..
+            }
+            | Self::Prune {
+                root_instance_id, ..
+            }
+            | Self::UpdatePendingOutbox {
                 root_instance_id, ..
             }
             | Self::TerminalizeOutbox {
@@ -341,18 +338,10 @@ impl PostgresqlHostMutation<'_> {
             | Self::CompactOutbox {
                 root_instance_id, ..
             }
-            | Self::DeleteOutboxRecord {
-                root_instance_id, ..
-            }
-            | Self::UpdateReplayRetention {
-                root_instance_id, ..
-            }
             | Self::TombstoneRoot {
                 root_instance_id, ..
-            }
-            | Self::DeleteCheckpoint {
-                root_instance_id, ..
             } => root_instance_id,
+            Self::MaintenanceMigration(request) => &request.root_instance_id,
         }
     }
 }
@@ -360,17 +349,17 @@ impl PostgresqlHostMutation<'_> {
 #[cfg(feature = "postgresql")]
 #[derive(Debug, Clone, PartialEq)]
 pub enum PostgresqlHostMutationResult {
-    Creation(CreationReceipt),
-    Acceptance(AcceptanceResult),
-    Delivery(DeliveryReceipt),
-    MaintenanceMigration(MaintenanceMigrationReceipt),
-    PendingOutbox(PendingOutboxIntent),
-    Outbox(OutboxRecord),
-    CompactedOutbox(OutboxEffectTombstone),
-    OutboxRecordDeleted,
-    ReplayRetention(ReplayRetention),
-    RootTombstone(RootTombstone),
-    CheckpointDeleted,
+    Creation(Box<ExecutionCheckpoint>),
+    Admission(JsonValue),
+    Step(JsonValue),
+    Process(JsonValue),
+    TransactionalProcess(JsonValue),
+    Prune(JsonValue),
+    MaintenanceMigration(JsonValue),
+    PendingOutbox(JsonValue),
+    Outbox(JsonValue),
+    CompactedOutbox(JsonValue),
+    RootTombstone(JsonValue),
 }
 
 #[cfg(feature = "postgresql")]
@@ -524,27 +513,78 @@ where
             root_instance_id: &root_instance_id,
         };
         let result = match mutation {
-            PostgresqlHostMutation::Create(request) => {
-                PostgresqlHostMutationResult::Creation(self.create_with_store(&mut store, request)?)
-            }
-            PostgresqlHostMutation::AcceptDelivery(request) => {
-                PostgresqlHostMutationResult::Acceptance(
-                    self.accept_delivery_with_store(&mut store, request)?,
+            PostgresqlHostMutation::Create {
+                bundle,
+                machine_id,
+                root_instance_id,
+                creation_id,
+                bindings,
+                supplied_request_digest,
+                replay_retention,
+            } => PostgresqlHostMutationResult::Creation(Box::new(
+                self.create_checkpoint_with_store(
+                    &mut store,
+                    bundle,
+                    machine_id,
+                    root_instance_id,
+                    creation_id,
+                    bindings,
+                    supplied_request_digest,
+                    replay_retention.clone(),
                 )
-            }
-            PostgresqlHostMutation::ForegroundProcessDelivery { request, migration } => {
-                PostgresqlHostMutationResult::Delivery(
-                    self.foreground_process_delivery_with_store(&mut store, request, migration)?,
+                .map_err(v2_host_failure)?,
+            )),
+            PostgresqlHostMutation::Admit {
+                root_instance_id,
+                deliveries,
+                guard,
+            } => PostgresqlHostMutationResult::Admission(
+                self.admit_checkpoint_with_store(&mut store, root_instance_id, deliveries, guard)
+                    .map_err(v2_host_failure)?,
+            ),
+            PostgresqlHostMutation::Step {
+                root_instance_id,
+                request,
+                guard,
+            } => PostgresqlHostMutationResult::Step(
+                self.step_checkpoint_with_store(&mut store, root_instance_id, request, guard)
+                    .map_err(v2_host_failure)?,
+            ),
+            PostgresqlHostMutation::Process {
+                root_instance_id,
+                delivery,
+                processing_mode,
+                guard,
+            } => PostgresqlHostMutationResult::Process(
+                self.process_checkpoint_with_store(
+                    &mut store,
+                    root_instance_id,
+                    delivery,
+                    processing_mode,
+                    guard,
                 )
-            }
-            PostgresqlHostMutation::ProcessPendingDelivery { request, migration } => {
-                PostgresqlHostMutationResult::Delivery(
-                    self.process_pending_delivery_with_store(&mut store, request, migration)?,
-                )
-            }
+                .map_err(v2_host_failure)?,
+            ),
+            PostgresqlHostMutation::TransactionalProcess {
+                root_instance_id,
+                request,
+                guard,
+            } => PostgresqlHostMutationResult::TransactionalProcess(
+                self.transactional_process_with_store(&mut store, root_instance_id, request, guard)
+                    .map_err(v2_host_failure)?,
+            ),
+            PostgresqlHostMutation::Prune {
+                root_instance_id,
+                request,
+                guard,
+            } => PostgresqlHostMutationResult::Prune(
+                self.prune_checkpoint_with_store(&mut store, root_instance_id, request, guard)
+                    .map_err(v2_host_failure)?,
+            ),
             PostgresqlHostMutation::MaintenanceMigration(request) => {
                 PostgresqlHostMutationResult::MaintenanceMigration(
-                    self.maintenance_migration_with_store(&mut store, request)?,
+                    self.maintenance_migration_with_store(&mut store, request)
+                        .map_err(v2_host_failure)?,
                 )
             }
             PostgresqlHostMutation::UpdatePendingOutbox {
@@ -552,79 +592,47 @@ where
                 effect_id,
                 desired,
                 guard,
-            } => {
-                PostgresqlHostMutationResult::PendingOutbox(self.update_pending_outbox_with_store(
+            } => PostgresqlHostMutationResult::PendingOutbox(
+                self.update_pending_outbox_with_store(
                     &mut store,
                     root_instance_id,
                     effect_id,
                     desired,
                     guard,
-                )?)
-            }
+                )
+                .map_err(v2_host_failure)?,
+            ),
             PostgresqlHostMutation::TerminalizeOutbox {
                 root_instance_id,
                 effect_id,
                 outcome,
                 guard,
-            } => PostgresqlHostMutationResult::Outbox(self.terminalize_outbox_with_store(
-                &mut store,
-                root_instance_id,
-                effect_id,
-                outcome,
-                guard,
-            )?),
+            } => PostgresqlHostMutationResult::Outbox(
+                self.terminalize_outbox_with_store(
+                    &mut store,
+                    root_instance_id,
+                    effect_id,
+                    outcome,
+                    guard,
+                )
+                .map_err(v2_host_failure)?,
+            ),
             PostgresqlHostMutation::CompactOutbox {
                 root_instance_id,
                 effect_id,
                 guard,
-            } => PostgresqlHostMutationResult::CompactedOutbox(self.compact_outbox_with_store(
-                &mut store,
-                root_instance_id,
-                effect_id,
-                guard,
-            )?),
-            PostgresqlHostMutation::DeleteOutboxRecord {
-                root_instance_id,
-                effect_id,
-                guard,
-            } => {
-                self.delete_outbox_record_with_store(
-                    &mut store,
-                    root_instance_id,
-                    effect_id,
-                    guard,
-                )?;
-                PostgresqlHostMutationResult::OutboxRecordDeleted
-            }
-            PostgresqlHostMutation::UpdateReplayRetention {
-                root_instance_id,
-                target,
-                guard,
-            } => PostgresqlHostMutationResult::ReplayRetention(
-                self.update_replay_retention_with_store(
-                    &mut store,
-                    root_instance_id,
-                    target,
-                    guard,
-                )?,
+            } => PostgresqlHostMutationResult::CompactedOutbox(
+                self.compact_outbox_with_store(&mut store, root_instance_id, effect_id, guard)
+                    .map_err(v2_host_failure)?,
             ),
             PostgresqlHostMutation::TombstoneRoot {
                 root_instance_id,
                 operation_id,
                 guard,
-            } => PostgresqlHostMutationResult::RootTombstone(self.tombstone_root_with_store(
-                &mut store,
-                root_instance_id,
-                operation_id,
-                guard,
-            )?),
-            PostgresqlHostMutation::DeleteCheckpoint {
-                root_instance_id,
-                guard,
-            } => {
-                self.delete_checkpoint_with_store(&mut store, root_instance_id, guard)?;
-                PostgresqlHostMutationResult::CheckpointDeleted
-            }
+            } => PostgresqlHostMutationResult::RootTombstone(
+                self.tombstone_root_with_store(&mut store, root_instance_id, operation_id, guard)
+                    .map_err(v2_host_failure)?,
+            ),
         };
         transaction.staged_result = Some(result);
         Ok(())
@@ -638,313 +646,330 @@ where
     pub fn load_checkpoint(
         &self,
         root_instance_id: &str,
-    ) -> Result<Option<ExecutionCheckpoint>, HostFailure> {
-        let mut store = DirectStoreAccess {
-            store: self.store.as_ref(),
-        };
-        self.load_checkpoint_with_store(&mut store, root_instance_id)
-    }
-
-    fn load_checkpoint_with_store(
-        &self,
-        store: &mut dyn StoreAccess,
-        root_instance_id: &str,
-    ) -> Result<Option<ExecutionCheckpoint>, HostFailure> {
-        store
-            .load(root_instance_id)?
-            .map(|record| self.restore_record(record))
+    ) -> Result<Option<ExecutionCheckpoint>, ArtifactError> {
+        self.store
+            .load(root_instance_id)
+            .map_err(v2_store_error)?
+            .map(|record| self.restore_record_v2(record))
             .transpose()
     }
 
-    pub fn create(&self, request: CreationRequest<'_>) -> Result<CreationReceipt, HostFailure> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_checkpoint(
+        &self,
+        bundle: &Bundle,
+        machine_id: &str,
+        root_instance_id: &str,
+        creation_id: &str,
+        bindings: &Bindings,
+        supplied_request_digest: Option<&str>,
+        replay_retention: JsonValue,
+    ) -> Result<ExecutionCheckpoint, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
-        self.create_with_store(&mut store, request)
+        self.create_checkpoint_with_store(
+            &mut store,
+            bundle,
+            machine_id,
+            root_instance_id,
+            creation_id,
+            bindings,
+            supplied_request_digest,
+            replay_retention,
+        )
     }
 
-    fn create_with_store(
+    #[allow(clippy::too_many_arguments)]
+    fn create_checkpoint_with_store(
         &self,
         store: &mut dyn StoreAccess,
-        request: CreationRequest<'_>,
-    ) -> Result<CreationReceipt, HostFailure> {
-        let request_digest = creation_request_digest(&request)?;
-        if let Some(supplied) = request.supplied_request_digest {
-            if supplied != request_digest {
-                return Err(HostFailure::new(
-                    HostFailureCode::InvalidExecutionCheckpoint,
-                    "supplied creation request digest does not match",
-                ));
+        bundle: &Bundle,
+        machine_id: &str,
+        root_instance_id: &str,
+        creation_id: &str,
+        bindings: &Bindings,
+        supplied_request_digest: Option<&str>,
+        replay_retention: JsonValue,
+    ) -> Result<ExecutionCheckpoint, ArtifactError> {
+        let request_digest =
+            creation_request_digest(bundle, machine_id, root_instance_id, creation_id, bindings)?;
+        if let Some(current) = store.load(root_instance_id).map_err(v2_store_error)? {
+            return self.replay_or_reject_creation(current, creation_id, &request_digest);
+        }
+        let candidate = create_execution_checkpoint_v2(
+            bundle,
+            machine_id,
+            root_instance_id,
+            creation_id,
+            bindings,
+            supplied_request_digest,
+            replay_retention,
+        )
+        .map_err(|error| {
+            if crate::format1::CREATION_REJECTION_CODES.contains(&error.code.as_str()) {
+                v2_failure("creation_rejected", &error.message)
+            } else {
+                error
             }
-        }
-        if let Some(current) = self.load_checkpoint_with_store(store, request.root_instance_id)? {
-            return replay_creation(&current, request.creation_id, &request_digest);
-        }
-        if request.namespace != request.bundle.namespace
-            || request
-                .bundle
-                .machines
-                .get(request.machine_id)
-                .is_some_and(|machine| machine.version != request.machine_version)
-        {
-            return Err(HostFailure::new(
-                HostFailureCode::CreationRejected,
-                "creation metadata does not match the validated bundle",
-            ));
-        }
-        let result = create(
-            request.bundle,
-            request.machine_id,
-            request.root_instance_id,
-            request.creation_id,
-            request.bindings,
-        );
-        let Some(state) = result.state else {
-            return Err(HostFailure::new(
-                HostFailureCode::CreationRejected,
-                result
-                    .rejection
-                    .map(|value| value.code)
-                    .unwrap_or_else(|| "core rejected creation".to_string()),
-            ));
-        };
-        let (aggregate, _) = encode_aggregate(request.bundle, &state)
-            .map_err(|error| invalid_host(error.to_string()))?;
-        let status = result_status_to_runtime(result.status)?;
-        let mut checkpoint = ExecutionCheckpoint {
-            execution_checkpoint_format: "determa.execution_checkpoint".to_string(),
-            execution_checkpoint_schema_version: 1,
-            root_instance_id: request.root_instance_id.to_string(),
-            revision: Counter::zero(),
-            root_record: RootRecord::Retained(RetainedRootRecord {
-                status: RetainedRootStatus::Retained,
-                aggregate_state: aggregate.clone(),
-            }),
-            replay_retention: ReplayRetention::permanent(),
-            next_delivery_sequence: Counter::zero(),
-            pending_deliveries: Vec::new(),
-            next_operation_receipt_sequence: Counter::from(1_u64),
-            operation_receipts: Vec::new(),
-            pending_outbox_intents: Vec::new(),
-            next_outbox_terminal_sequence: Counter::zero(),
-            terminal_outbox_records: Vec::new(),
-            outbox_effect_tombstones: Vec::new(),
-            migration_audit_records: Vec::new(),
-            execution_checkpoint_digest: String::new(),
-        };
-        let mut receipt = CreationReceipt {
-            operation_kind: CreationOperationKind::Creation,
-            receipt_sequence: Counter::zero(),
-            creation_id: request.creation_id.to_string(),
-            request_digest,
-            committed_revision: Counter::zero(),
-            resulting_aggregate_state_digest: aggregate.aggregate_state_digest,
-            status,
-            fault: result.fault.as_ref().map(CheckpointFault::from),
-            emission_references: Vec::new(),
-        };
-        receipt.emission_references = append_emissions(
-            &mut checkpoint,
-            &receipt.receipt_sequence,
-            &receipt.committed_revision,
-            &result.emissions,
-        )?;
-        checkpoint
-            .operation_receipts
-            .push(OperationReceipt::Creation(receipt.clone()));
-        checkpoint
-            .recompute_digest()
-            .map_err(|error| invalid_host(error.to_string()))?;
-        checkpoint
-            .validate_for_persistence(self.resolver.as_ref())
-            .map_err(|error| invalid_host(error.to_string()))?;
-        let record = StoreRecord::from_checkpoint(&checkpoint)?;
-        match store.insert_if_absent(record)? {
-            StoreWriteResult::Committed => Ok(receipt),
-            StoreWriteResult::Conflict(Some(current)) => {
-                let current = self.restore_record(current)?;
-                replay_creation(&current, request.creation_id, &receipt.request_digest)
-            }
-            StoreWriteResult::Conflict(None) => Err(revision_conflict()),
-        }
-    }
-
-    pub fn accept_delivery(
-        &self,
-        request: DeliveryRequest,
-    ) -> Result<AcceptanceResult, HostFailure> {
-        let mut store = DirectStoreAccess {
-            store: self.store.as_ref(),
-        };
-        self.accept_delivery_with_store(&mut store, request)
-    }
-
-    fn accept_delivery_with_store(
-        &self,
-        store: &mut dyn StoreAccess,
-        request: DeliveryRequest,
-    ) -> Result<AcceptanceResult, HostFailure> {
-        let current = self.require_checkpoint(store, &request.checkpoint_root_instance_id)?;
-        let parsed = match parse_delivery_candidate(&request.candidate, &current.root_instance_id) {
-            Ok(value) => value,
-            Err(code) => return Ok(not_accepted(code)),
-        };
-        let replay = delivery_replay(&current, &parsed.envelope.event_id, &parsed.envelope_digest)?;
-        if let Some(replay) = replay {
-            return Ok(replay);
-        }
-        if matches!(current.root_record, RootRecord::Tombstone(_)) {
-            return Ok(not_accepted(PreAcceptanceFailureCode::TombstonedRoot));
-        }
-        let parsed = match parsed.validate() {
-            Ok(value) => value,
-            Err(code) => return Ok(not_accepted(code)),
-        };
-        check_guard(&current, &request.guard)?;
-        let mut candidate = current.clone();
-        candidate.increment_revision();
-        let delivery_sequence = candidate.next_delivery_sequence.allocate();
-        let accepted_revision = candidate.revision.clone();
-        candidate.pending_deliveries.push(PendingDelivery {
-            delivery_sequence: delivery_sequence.clone(),
-            accepted_revision: accepted_revision.clone(),
-            delivery_mode: parsed.delivery_mode,
-            origin: parsed.origin,
-            envelope: parsed.envelope.clone(),
-            envelope_digest: parsed.envelope_digest,
-        });
-        candidate
-            .recompute_digest()
-            .map_err(|error| invalid_host(error.to_string()))?;
-        self.commit_candidate(store, &current, &candidate)?;
-        Ok(AcceptanceResult::Pending(PendingAcceptanceResult {
-            result: PendingAcceptanceResultKind::Pending,
-            event_id: parsed.envelope.event_id,
-            delivery_sequence,
-            accepted_revision,
-        }))
-    }
-
-    pub fn foreground_process_delivery(
-        &self,
-        request: DeliveryRequest,
-        migration: Option<&ProcessingMigration>,
-    ) -> Result<DeliveryReceipt, HostFailure> {
-        let mut store = DirectStoreAccess {
-            store: self.store.as_ref(),
-        };
-        self.foreground_process_delivery_with_store(&mut store, request, migration)
-    }
-
-    fn foreground_process_delivery_with_store(
-        &self,
-        store: &mut dyn StoreAccess,
-        request: DeliveryRequest,
-        migration: Option<&ProcessingMigration>,
-    ) -> Result<DeliveryReceipt, HostFailure> {
-        let current = self.require_checkpoint(store, &request.checkpoint_root_instance_id)?;
-        let parsed = parse_delivery_candidate(&request.candidate, &current.root_instance_id)
-            .map_err(|code| {
-                HostFailure::new(preaccept_failure_code(code), "delivery was not accepted")
-            })?;
-        let replay = delivery_replay(&current, &parsed.envelope.event_id, &parsed.envelope_digest)?;
-        if let Some(replay) = replay {
-            return acceptance_receipt(replay);
-        }
-        if matches!(current.root_record, RootRecord::Tombstone(_)) {
-            return Err(HostFailure::new(
-                HostFailureCode::InvalidExecutionCheckpoint,
-                "tombstoned root cannot process a delivery",
-            ));
-        }
-        let parsed = parsed.validate().map_err(|code| {
-            HostFailure::new(preaccept_failure_code(code), "delivery was not accepted")
         })?;
-        check_guard(&current, &request.guard)?;
-        let accepted_delivery_sequence = current.next_delivery_sequence.clone();
-        self.process_delivery(
-            store,
-            ProcessDeliveryRequest {
-                current,
-                parsed,
-                accepted_delivery_sequence,
-                accepted_revision: None,
-                foreground: true,
-                migration,
-            },
-        )
+        let record = StoreRecord::from_checkpoint(&candidate).map_err(v2_store_error)?;
+        match store.insert_if_absent(record).map_err(v2_store_error)? {
+            StoreWriteResult::Committed => Ok(candidate),
+            StoreWriteResult::Conflict(Some(current)) => {
+                self.replay_or_reject_creation(current, creation_id, &request_digest)
+            }
+            StoreWriteResult::Conflict(None) => Err(v2_failure(
+                "checkpoint_revision_conflict",
+                "checkpoint insertion conflicted",
+            )),
+        }
     }
 
-    pub fn process_pending_delivery(
+    fn replay_or_reject_creation(
         &self,
-        request: DeliveryRequest,
-        migration: Option<&ProcessingMigration>,
-    ) -> Result<DeliveryReceipt, HostFailure> {
+        current: StoreRecord,
+        creation_id: &str,
+        request_digest: &str,
+    ) -> Result<ExecutionCheckpoint, ArtifactError> {
+        let current = self.restore_record_v2(current)?;
+        let receipt = current.value()["operation_receipts"]
+            .as_array()
+            .and_then(|receipts| receipts.first())
+            .ok_or_else(|| {
+                v2_failure("invalid_execution_checkpoint", "creation receipt is absent")
+            })?;
+        if receipt["creation_id"].as_str() == Some(creation_id)
+            && receipt["request_digest"].as_str() == Some(request_digest)
+        {
+            Ok(current)
+        } else {
+            Err(v2_failure(
+                "creation_id_conflict",
+                "root identity already has different creation evidence",
+            ))
+        }
+    }
+
+    pub fn admit_checkpoint(
+        &self,
+        root_instance_id: &str,
+        deliveries: &[JsonValue],
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
-        self.process_pending_delivery_with_store(&mut store, request, migration)
+        self.admit_checkpoint_with_store(&mut store, root_instance_id, deliveries, guard)
     }
 
-    fn process_pending_delivery_with_store(
+    pub fn admit_checkpoint_sources(
+        &self,
+        root_instance_id: &str,
+        sources: &[AdmissionSource],
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let deliveries = sources
+            .iter()
+            .map(|source| match source {
+                AdmissionSource::JsonValue(value) => Ok(value.clone()),
+                AdmissionSource::Utf8Json(source) => crate::format1::strict_json::parse(source)
+                    .map_err(|error| ArtifactError::new("malformed_delivery", error.to_string())),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.admit_checkpoint(root_instance_id, &deliveries, guard)
+    }
+
+    fn admit_checkpoint_with_store(
         &self,
         store: &mut dyn StoreAccess,
-        request: DeliveryRequest,
-        migration: Option<&ProcessingMigration>,
-    ) -> Result<DeliveryReceipt, HostFailure> {
-        let current = self.require_checkpoint(store, &request.checkpoint_root_instance_id)?;
-        let parsed = parse_delivery_candidate(&request.candidate, &current.root_instance_id)
-            .map_err(|code| {
-                HostFailure::new(
-                    preaccept_failure_code(code),
-                    "pending delivery request is invalid",
-                )
-            })?;
-        if let Some(receipt) =
-            committed_delivery_replay(&current, &parsed.envelope.event_id, &parsed.envelope_digest)?
-        {
-            return Ok(receipt);
-        }
-        let pending = current
-            .pending_deliveries
-            .iter()
-            .find(|pending| pending.envelope.event_id == parsed.envelope.event_id)
-            .cloned()
-            .ok_or_else(|| {
-                HostFailure::new(
-                    HostFailureCode::EventIdConflict,
-                    "pending delivery identity is absent",
-                )
-            })?;
-        if pending.envelope_digest != parsed.envelope_digest {
-            return Err(HostFailure::new(
-                HostFailureCode::EventIdConflict,
-                "pending event id has different content",
-            ));
-        }
-        check_guard(&current, &request.guard)?;
-        self.process_delivery(
-            store,
-            ProcessDeliveryRequest {
-                current,
-                parsed: ParsedDelivery {
-                    delivery_mode: pending.delivery_mode,
-                    origin: pending.origin.clone(),
-                    envelope: pending.envelope.clone(),
-                    envelope_digest: pending.envelope_digest.clone(),
-                },
-                accepted_delivery_sequence: pending.delivery_sequence,
-                accepted_revision: Some(pending.accepted_revision),
-                foreground: false,
-                migration,
-            },
+        root_instance_id: &str,
+        deliveries: &[JsonValue],
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let bundle = checkpoint
+            .bundle_fingerprint()
+            .map(|_| self.checkpoint_v2_bundle(&checkpoint))
+            .transpose()?;
+        let result = checkpoint_admit_v2_with_optional_bundle(
+            bundle.as_ref(),
+            &checkpoint,
+            deliveries,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
+    }
+
+    pub fn step_checkpoint(
+        &self,
+        root_instance_id: &str,
+        request: &ProcessingRequest,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.step_checkpoint_with_store(&mut store, root_instance_id, request, guard)
+    }
+
+    fn step_checkpoint_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        root_instance_id: &str,
+        request: &ProcessingRequest,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let bundle = self.checkpoint_v2_bundle(&checkpoint)?;
+        let result = checkpoint_step_v2(
+            &bundle,
+            &checkpoint,
+            request,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
+    }
+
+    pub fn process_checkpoint(
+        &self,
+        root_instance_id: &str,
+        delivery: &JsonValue,
+        processing_mode: &str,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.process_checkpoint_with_store(
+            &mut store,
+            root_instance_id,
+            delivery,
+            processing_mode,
+            guard,
         )
+    }
+
+    fn process_checkpoint_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        root_instance_id: &str,
+        delivery: &JsonValue,
+        processing_mode: &str,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let bundle = self.checkpoint_v2_bundle(&checkpoint)?;
+        let result = checkpoint_process(
+            &bundle,
+            &checkpoint,
+            delivery.clone(),
+            processing_mode,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
+    }
+
+    pub fn transactional_process(
+        &self,
+        root_instance_id: &str,
+        request: &TransactionalProcessRequest,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.transactional_process_with_store(&mut store, root_instance_id, request, guard)
+    }
+
+    fn transactional_process_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        root_instance_id: &str,
+        request: &TransactionalProcessRequest,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let result = checkpoint_process_with_migration(
+            &checkpoint,
+            &request.migration,
+            self.resolver.as_ref(),
+            &request.migration_limits,
+            request.delivery.clone(),
+            &request.processing_mode,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
+    }
+
+    pub fn prune_checkpoint(
+        &self,
+        root_instance_id: &str,
+        request: &PruneRequest,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.prune_checkpoint_with_store(&mut store, root_instance_id, request, guard)
+    }
+
+    fn prune_checkpoint_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        root_instance_id: &str,
+        request: &PruneRequest,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let result = checkpoint_prune_v2(
+            &checkpoint,
+            request,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
+    }
+
+    pub fn delete_retained_record(
+        &self,
+        root_instance_id: &str,
+        guard: &MutationGuard,
+    ) -> Result<(), ArtifactError> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        let (_, checkpoint) =
+            self.require_checkpoint_v2_with_store(&mut store, root_instance_id)?;
+        crate::checkpoint::v2::validate_mutation_guard(
+            &checkpoint,
+            &guard.expected_revision,
+            &guard.expected_checkpoint_digest,
+        )?;
+        Err(v2_failure(
+            "invalid_execution_checkpoint",
+            "physical deletion of retained checkpoint evidence is unsupported",
+        ))
     }
 
     pub fn maintenance_migration(
         &self,
         request: &MaintenanceMigrationRequest,
-    ) -> Result<MaintenanceMigrationReceipt, HostFailure> {
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
@@ -955,104 +980,98 @@ where
         &self,
         store: &mut dyn StoreAccess,
         request: &MaintenanceMigrationRequest,
-    ) -> Result<MaintenanceMigrationReceipt, HostFailure> {
+    ) -> Result<JsonValue, ArtifactError> {
         if request.operation_id.is_empty() {
-            return Err(invalid_host("maintenance operation id is empty"));
+            return Err(v2_failure(
+                "invalid_execution_checkpoint",
+                "v2 maintenance migration requires an operation id",
+            ));
         }
-        let current = self.require_checkpoint(store, &request.root_instance_id)?;
-        let request_digest = maintenance_request_digest(&request.root_instance_id, request)?;
+        let request_digest = maintenance_request_digest(&request.root_instance_id, request)
+            .map_err(|error| ArtifactError::new(error.code.as_str(), error.message))?;
         if request
             .supplied_request_digest
             .as_ref()
-            .is_some_and(|value| value != &request_digest)
+            .is_some_and(|supplied| supplied != &request_digest)
         {
-            return Err(invalid_host(
+            return Err(v2_failure(
+                "invalid_execution_checkpoint",
                 "supplied maintenance request digest does not match",
             ));
         }
-        if let Some(existing) = current.operation_receipts.iter().find_map(|receipt| {
-            let OperationReceipt::MaintenanceMigration(value) = receipt else {
-                return None;
-            };
-            (value.operation_id == request.operation_id).then_some(value)
-        }) {
-            if existing.request_digest == request_digest {
-                return Ok(existing.clone());
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, &request.root_instance_id)?;
+        if let Some(existing) = checkpoint.value()["operation_receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|receipt| {
+                receipt["operation_kind"] == "maintenance_migration"
+                    && receipt["operation_id"].as_str() == Some(request.operation_id.as_str())
+            })
+        {
+            if existing["request_digest"].as_str() == Some(request_digest.as_str()) {
+                return Ok(json!({"result": "committed", "receipt": existing}));
             }
-            return Err(HostFailure::new(
-                HostFailureCode::OperationIdConflict,
+            return Err(v2_failure(
+                "operation_id_conflict",
                 "maintenance operation id has different content",
             ));
         }
-        check_guard(&current, &request.guard)?;
-        let RootRecord::Retained(root) = &current.root_record else {
-            return Err(invalid_host("tombstoned root cannot be migrated"));
-        };
-        if root.aggregate_state.aggregate_state_digest != request.source_aggregate_state_digest {
-            return Err(invalid_host(
+        if checkpoint.revision() != request.guard.expected_revision
+            || checkpoint.digest() != request.guard.expected_checkpoint_digest
+        {
+            return Err(v2_failure(
+                "checkpoint_revision_conflict",
+                "checkpoint compare-and-swap guard does not match",
+            ));
+        }
+        if checkpoint.value()["root_record"]["status"] == "tombstone" {
+            return Err(v2_failure(
+                "tombstoned_root",
+                "tombstoned root cannot be migrated",
+            ));
+        }
+        if checkpoint.value()["root_record"]["aggregate_state"]["aggregate_state_digest"].as_str()
+            != Some(request.source_aggregate_state_digest.as_str())
+        {
+            return Err(v2_failure(
+                "invalid_execution_checkpoint",
                 "maintenance source digest differs from checkpoint aggregate",
             ));
         }
-        let source = root
-            .aggregate_state
-            .canonical_bytes()
-            .map_err(|error| invalid_host(error.to_string()))?;
-        let migration_request = MigrationRequest {
-            migration_route: request.migration_descriptor_digest_route.clone(),
-            target_validated_bundle_fingerprint: request
-                .target_validated_bundle_fingerprint
-                .clone(),
-            maintenance_mode: request.maintenance_mode,
-        };
-        let outcome = migrate_aggregate(
-            &source,
-            &migration_request,
+        let result = checkpoint_maintenance_migration_route(
+            &checkpoint,
+            &MigrationRequest {
+                migration_route: request.migration_descriptor_digest_route.clone(),
+                target_validated_bundle_fingerprint: request
+                    .target_validated_bundle_fingerprint
+                    .clone(),
+                maintenance_mode: request.maintenance_mode,
+            },
+            &request.operation_id,
+            &request_digest,
             self.resolver.as_ref(),
             &request.limits,
-        )
-        .map_err(|error| invalid_host(error.to_string()))?;
-        let mut candidate = current.clone();
-        candidate.increment_revision();
-        let receipt_sequence = candidate.next_operation_receipt_sequence.allocate();
-        let audit_sequences = outcome
-            .audit_records
+            None,
+            None,
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        let receipt = result["operation_receipts"]
+            .as_array()
+            .unwrap()
             .iter()
-            .map(|record| Counter::from_decimal(&record.migration_sequence).map_err(invalid_host))
-            .collect::<Result<Vec<_>, _>>()?;
-        let result_code = if audit_sequences.is_empty() {
-            MaintenanceMigrationResultCode::MigrationNoOperation
-        } else {
-            MaintenanceMigrationResultCode::MigrationApplied
-        };
-        let receipt = MaintenanceMigrationReceipt {
-            operation_kind: MaintenanceMigrationOperationKind::MaintenanceMigration,
-            receipt_sequence,
-            operation_id: request.operation_id.clone(),
-            request_digest,
-            committed_revision: candidate.revision.clone(),
-            source_aggregate_state_digest: request.source_aggregate_state_digest.clone(),
-            resulting_aggregate_state_digest: outcome
-                .aggregate_envelope
-                .aggregate_state_digest
-                .clone(),
-            migration_sequences: audit_sequences,
-            result_code,
-        };
-        let RootRecord::Retained(candidate_root) = &mut candidate.root_record else {
-            unreachable!("retained root checked");
-        };
-        candidate_root.aggregate_state = outcome.aggregate_envelope;
-        candidate
-            .migration_audit_records
-            .extend(outcome.audit_records);
-        candidate
-            .operation_receipts
-            .push(OperationReceipt::MaintenanceMigration(receipt.clone()));
-        candidate
-            .recompute_digest()
-            .map_err(|error| invalid_host(error.to_string()))?;
-        self.commit_candidate(store, &current, &candidate)?;
-        Ok(receipt)
+            .find(|receipt| {
+                receipt["operation_kind"] == "maintenance_migration"
+                    && receipt["operation_id"].as_str() == Some(request.operation_id.as_str())
+            })
+            .ok_or_else(|| {
+                v2_failure(
+                    "invalid_execution_checkpoint",
+                    "committed maintenance receipt is absent",
+                )
+            })?;
+        Ok(json!({"result": "committed", "receipt": receipt}))
     }
 
     pub fn update_pending_outbox(
@@ -1061,7 +1080,7 @@ where
         effect_id: &str,
         desired: PendingOutboxState,
         guard: &MutationGuard,
-    ) -> Result<PendingOutboxIntent, HostFailure> {
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
@@ -1081,38 +1100,18 @@ where
         effect_id: &str,
         desired: PendingOutboxState,
         guard: &MutationGuard,
-    ) -> Result<PendingOutboxIntent, HostFailure> {
-        let current = self.require_checkpoint(store, root_instance_id)?;
-        let existing = current
-            .pending_outbox_intents
-            .iter()
-            .find(|value| value.intent.effect_id == effect_id)
-            .cloned();
-        let Some(existing) = existing else {
-            return Err(HostFailure::new(
-                HostFailureCode::EffectIdConflict,
-                "effect is not pending",
-            ));
-        };
-        if existing.delivery_state == desired {
-            return Ok(existing);
-        }
-        check_guard(&current, guard)?;
-        let mut candidate = current.clone();
-        candidate.increment_revision();
-        let record = candidate
-            .pending_outbox_intents
-            .iter_mut()
-            .find(|value| value.intent.effect_id == effect_id)
-            .expect("pending record cloned");
-        record.delivery_state = desired;
-        record.state_revision = candidate.revision.clone();
-        let response = record.clone();
-        candidate
-            .recompute_digest()
-            .map_err(|error| invalid_host(error.to_string()))?;
-        self.commit_candidate(store, &current, &candidate)?;
-        Ok(response)
+    ) -> Result<JsonValue, ArtifactError> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let result = checkpoint_update_pending_outbox(
+            &checkpoint,
+            effect_id,
+            desired,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
     }
 
     pub fn terminalize_outbox(
@@ -1121,7 +1120,7 @@ where
         effect_id: &str,
         outcome: TerminalOutboxOutcome,
         guard: &MutationGuard,
-    ) -> Result<OutboxRecord, HostFailure> {
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
@@ -1135,53 +1134,18 @@ where
         effect_id: &str,
         outcome: TerminalOutboxOutcome,
         guard: &MutationGuard,
-    ) -> Result<OutboxRecord, HostFailure> {
-        let current = self.require_checkpoint(store, root_instance_id)?;
-        if let Some(record) = current
-            .terminal_outbox_records
-            .iter()
-            .find(|value| value.intent.effect_id == effect_id)
-        {
-            return if record.outcome == outcome {
-                Ok(OutboxRecord::Terminal(record.clone()))
-            } else {
-                Err(effect_conflict())
-            };
-        }
-        if let Some(record) = current
-            .outbox_effect_tombstones
-            .iter()
-            .find(|value| value.effect_id == effect_id)
-        {
-            return if record.outcome == outcome {
-                Ok(OutboxRecord::Tombstone(record.clone()))
-            } else {
-                Err(effect_conflict())
-            };
-        }
-        check_guard(&current, guard)?;
-        let mut candidate = current.clone();
-        let Some(index) = candidate
-            .pending_outbox_intents
-            .iter()
-            .position(|value| value.intent.effect_id == effect_id)
-        else {
-            return Err(effect_conflict());
-        };
-        candidate.increment_revision();
-        let pending = candidate.pending_outbox_intents.remove(index);
-        let record = TerminalOutboxRecord {
-            terminal_sequence: candidate.next_outbox_terminal_sequence.allocate(),
-            intent: pending.intent,
-            committed_revision: candidate.revision.clone(),
+    ) -> Result<JsonValue, ArtifactError> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let result = checkpoint_terminalize_outbox(
+            &checkpoint,
+            effect_id,
             outcome,
-        };
-        candidate.terminal_outbox_records.push(record.clone());
-        candidate
-            .recompute_digest()
-            .map_err(|error| invalid_host(error.to_string()))?;
-        self.commit_candidate(store, &current, &candidate)?;
-        Ok(OutboxRecord::Terminal(record))
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
     }
 
     pub fn compact_outbox(
@@ -1189,7 +1153,7 @@ where
         root_instance_id: &str,
         effect_id: &str,
         guard: &MutationGuard,
-    ) -> Result<OutboxEffectTombstone, HostFailure> {
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
@@ -1202,187 +1166,17 @@ where
         root_instance_id: &str,
         effect_id: &str,
         guard: &MutationGuard,
-    ) -> Result<OutboxEffectTombstone, HostFailure> {
-        let current = self.require_checkpoint(store, root_instance_id)?;
-        if let Some(record) = current
-            .outbox_effect_tombstones
-            .iter()
-            .find(|value| value.effect_id == effect_id)
-        {
-            return Ok(record.clone());
-        }
-        check_guard(&current, guard)?;
-        let mut candidate = current.clone();
-        let Some(index) = candidate
-            .terminal_outbox_records
-            .iter()
-            .position(|value| value.intent.effect_id == effect_id)
-        else {
-            return Err(effect_conflict());
-        };
-        candidate.increment_revision();
-        let terminal = candidate.terminal_outbox_records.remove(index);
-        let tombstone = OutboxEffectTombstone {
-            terminal_sequence: terminal.terminal_sequence,
-            effect_id: terminal.intent.effect_id.clone(),
-            intent_digest: outbox_intent_digest(&candidate.root_instance_id, &terminal.intent)
-                .map_err(|error| invalid_host(error.to_string()))?,
-            committed_revision: terminal.committed_revision,
-            outcome: terminal.outcome,
-        };
-        candidate.outbox_effect_tombstones.push(tombstone.clone());
-        candidate
-            .outbox_effect_tombstones
-            .sort_by(|left, right| left.terminal_sequence.cmp(&right.terminal_sequence));
-        candidate
-            .recompute_digest()
-            .map_err(|error| invalid_host(error.to_string()))?;
-        self.commit_candidate(store, &current, &candidate)?;
-        Ok(tombstone)
-    }
-
-    pub fn delete_outbox_record(
-        &self,
-        root_instance_id: &str,
-        effect_id: &str,
-        guard: &MutationGuard,
-    ) -> Result<(), HostFailure> {
-        let mut store = DirectStoreAccess {
-            store: self.store.as_ref(),
-        };
-        self.delete_outbox_record_with_store(&mut store, root_instance_id, effect_id, guard)
-    }
-
-    fn delete_outbox_record_with_store(
-        &self,
-        store: &mut dyn StoreAccess,
-        root_instance_id: &str,
-        effect_id: &str,
-        guard: &MutationGuard,
-    ) -> Result<(), HostFailure> {
-        let current = self.require_checkpoint(store, root_instance_id)?;
-        if current.operation_receipts.iter().any(|receipt| {
-            receipt.emission_references().iter().any(|reference| {
-                matches!(
-                    reference,
-                    EmissionReference::ExternalOutbox {
-                        effect_id: referenced,
-                        ..
-                    } if referenced == effect_id
-                )
-            })
-        }) {
-            return Err(invalid_host(
-                "retained operation receipt still references effect",
-            ));
-        }
-        check_guard(&current, guard)?;
-        let mut candidate = current.clone();
-        let terminal_index = candidate
-            .terminal_outbox_records
-            .iter()
-            .position(|value| value.intent.effect_id == effect_id);
-        let tombstone_index = candidate
-            .outbox_effect_tombstones
-            .iter()
-            .position(|value| value.effect_id == effect_id);
-        if terminal_index.is_none() && tombstone_index.is_none() {
-            return Err(effect_conflict());
-        }
-        candidate.increment_revision();
-        if let Some(index) = terminal_index {
-            candidate.terminal_outbox_records.remove(index);
-        }
-        if let Some(index) = tombstone_index {
-            candidate.outbox_effect_tombstones.remove(index);
-        }
-        candidate
-            .recompute_digest()
-            .map_err(|error| invalid_host(error.to_string()))?;
-        self.commit_candidate(store, &current, &candidate)
-    }
-
-    pub fn update_replay_retention(
-        &self,
-        root_instance_id: &str,
-        target: ReplayRetention,
-        guard: &MutationGuard,
-    ) -> Result<ReplayRetention, HostFailure> {
-        let mut store = DirectStoreAccess {
-            store: self.store.as_ref(),
-        };
-        self.update_replay_retention_with_store(&mut store, root_instance_id, target, guard)
-    }
-
-    fn update_replay_retention_with_store(
-        &self,
-        store: &mut dyn StoreAccess,
-        root_instance_id: &str,
-        target: ReplayRetention,
-        guard: &MutationGuard,
-    ) -> Result<ReplayRetention, HostFailure> {
-        let current = self.require_checkpoint(store, root_instance_id)?;
-        if current.replay_retention == target {
-            return Ok(target);
-        }
-        if matches!(current.replay_retention, ReplayRetention::Bounded(_))
-            && matches!(target, ReplayRetention::Permanent(_))
-        {
-            return Err(invalid_host(
-                "bounded replay retention cannot return to permanent",
-            ));
-        }
-        check_guard(&current, guard)?;
-        let ReplayRetention::Bounded(target_bounded) = &target else {
-            return Err(invalid_host("unsupported replay retention transition"));
-        };
-        if target_bounded.permanent_replay_eligible || target_bounded.policy_identifier.is_empty() {
-            return Err(invalid_host("invalid bounded retention target"));
-        }
-        let current_cutoff = current.replay_retention.cutoff();
-        if current_cutoff
-            .zip(target_bounded.pruned_through_receipt_sequence.as_ref())
-            .is_some_and(|(current, target)| target < current)
-        {
-            return Err(invalid_host("bounded replay cutoff cannot decrease"));
-        }
-        let mut candidate = current.clone();
-        if let Some(cutoff) = &target_bounded.pruned_through_receipt_sequence {
-            for receipt in candidate.operation_receipts.iter().skip(1) {
-                if receipt.receipt_sequence() <= cutoff {
-                    continue;
-                }
-                if let OperationReceipt::Delivery(delivery) = receipt {
-                    if let DeliveryOrigin::InternalEmission(origin) = &delivery.origin {
-                        if &origin.producing_receipt_sequence <= cutoff {
-                            return Err(invalid_host(
-                                "retained internal delivery depends on pruned producer",
-                            ));
-                        }
-                    }
-                }
-            }
-            for pending in &candidate.pending_deliveries {
-                if let DeliveryOrigin::InternalEmission(origin) = &pending.origin {
-                    if &origin.producing_receipt_sequence <= cutoff {
-                        return Err(invalid_host(
-                            "pending internal delivery depends on pruned producer",
-                        ));
-                    }
-                }
-            }
-            candidate.operation_receipts.retain(|receipt| {
-                receipt.receipt_sequence() == &Counter::zero()
-                    || receipt.receipt_sequence() > cutoff
-            });
-        }
-        candidate.increment_revision();
-        candidate.replay_retention = target.clone();
-        candidate
-            .recompute_digest()
-            .map_err(|error| invalid_host(error.to_string()))?;
-        self.commit_candidate(store, &current, &candidate)?;
-        Ok(target)
+    ) -> Result<JsonValue, ArtifactError> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let result = checkpoint_compact_outbox(
+            &checkpoint,
+            effect_id,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
     }
 
     pub fn tombstone_root(
@@ -1390,7 +1184,7 @@ where
         root_instance_id: &str,
         operation_id: &str,
         guard: &MutationGuard,
-    ) -> Result<RootTombstone, HostFailure> {
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
@@ -1403,548 +1197,136 @@ where
         root_instance_id: &str,
         operation_id: &str,
         guard: &MutationGuard,
-    ) -> Result<RootTombstone, HostFailure> {
-        if operation_id.is_empty() {
-            return Err(invalid_host("tombstone operation id is empty"));
-        }
-        let current = self.require_checkpoint(store, root_instance_id)?;
-        if let RootRecord::Tombstone(tombstone) = &current.root_record {
-            return if tombstone.tombstone_operation_id == operation_id {
-                Ok(tombstone.clone())
-            } else {
-                Err(HostFailure::new(
-                    HostFailureCode::OperationIdConflict,
-                    "root was tombstoned by another operation",
-                ))
-            };
-        }
-        check_guard(&current, guard)?;
-        if !current.pending_deliveries.is_empty() || !current.pending_outbox_intents.is_empty() {
-            return Err(invalid_host("root has unresolved pending work"));
-        }
-        let RootRecord::Retained(root) = &current.root_record else {
-            unreachable!("tombstone replay handled");
-        };
-        let root_runtime = root
-            .aggregate_state
-            .runtimes
-            .iter()
-            .find(|runtime| runtime.runtime_id == root.aggregate_state.root_runtime_id)
-            .ok_or_else(|| invalid_host("aggregate root runtime is absent"))?;
-        let terminal_status = match root_runtime.status {
-            RuntimeStatus::Completed => TerminalRootStatus::Completed,
-            RuntimeStatus::Faulted => TerminalRootStatus::Faulted,
-            RuntimeStatus::Running => {
-                return Err(invalid_host("running aggregate cannot be tombstoned"));
-            }
-        };
-        let tombstone = RootTombstone {
-            status: RootTombstoneStatus::Tombstone,
-            root_runtime_id: root.aggregate_state.root_runtime_id.clone(),
-            creation_id: root.aggregate_state.creation_id.clone(),
-            terminal_status,
-            final_aggregate_state_digest: root.aggregate_state.aggregate_state_digest.clone(),
-            tombstone_operation_id: operation_id.to_string(),
-        };
-        let mut candidate = current.clone();
-        candidate.increment_revision();
-        candidate.root_record = RootRecord::Tombstone(tombstone.clone());
-        candidate
-            .recompute_digest()
-            .map_err(|error| invalid_host(error.to_string()))?;
-        self.commit_candidate(store, &current, &candidate)?;
-        Ok(tombstone)
-    }
-
-    pub fn delete_checkpoint(
-        &self,
-        root_instance_id: &str,
-        guard: &MutationGuard,
-    ) -> Result<(), HostFailure> {
-        let mut store = DirectStoreAccess {
-            store: self.store.as_ref(),
-        };
-        self.delete_checkpoint_with_store(&mut store, root_instance_id, guard)
-    }
-
-    fn delete_checkpoint_with_store(
-        &self,
-        _store: &mut dyn StoreAccess,
-        _root_instance_id: &str,
-        _guard: &MutationGuard,
-    ) -> Result<(), HostFailure> {
-        Err(HostFailure::new(
-            HostFailureCode::PhysicalDeletionUnsupported,
-            "checkpoint and root identity deletion is unsupported",
-        ))
-    }
-
-    fn process_delivery(
-        &self,
-        store: &mut dyn StoreAccess,
-        request: ProcessDeliveryRequest<'_>,
-    ) -> Result<DeliveryReceipt, HostFailure> {
-        let ProcessDeliveryRequest {
-            current,
-            parsed,
-            accepted_delivery_sequence,
-            accepted_revision,
-            foreground,
-            migration,
-        } = request;
-        let RootRecord::Retained(root) = &current.root_record else {
-            return Err(invalid_host("tombstoned root cannot dispatch"));
-        };
-        let aggregate_bytes = root
-            .aggregate_state
-            .canonical_bytes()
-            .map_err(|error| invalid_host(error.to_string()))?;
-        let aggregate = crate::format1::restore_aggregate(&aggregate_bytes, self.resolver.as_ref())
-            .map_err(|error| invalid_host(error.to_string()))?;
-        let core_delivery = match parsed.delivery_mode {
-            DeliveryMode::Input => Delivery::Input(
-                parsed
-                    .envelope
-                    .to_core_envelope()
-                    .map_err(|error| invalid_host(error.to_string()))?,
-            ),
-            DeliveryMode::Internal => Delivery::Internal(
-                parsed
-                    .envelope
-                    .to_core_envelope()
-                    .map_err(|error| invalid_host(error.to_string()))?,
-            ),
-        };
-        let processed = if let Some(migration) = migration {
-            let outcome = crate::format1::migrate_and_dispatch(
-                &aggregate_bytes,
-                &migration.request,
-                self.resolver.as_ref(),
-                &migration.limits,
-                Some(core_delivery),
-            )
-            .map_err(|error| invalid_host(error.to_string()))?;
-            let status = outcome.migration.aggregate.root.status;
-            ProcessedCore {
-                aggregate: outcome.migration.aggregate,
-                aggregate_envelope: outcome.migration.aggregate_envelope,
-                status,
-                disposition: outcome
-                    .disposition
-                    .ok_or_else(|| invalid_host("dispatch disposition is absent"))?,
-                emissions: outcome.emissions,
-                fault: outcome.fault,
-                rejection: outcome.rejection,
-                audit_records: outcome.migration.audit_records,
-            }
-        } else {
-            let definition = self
-                .resolver
-                .resolve_definition(&aggregate.validated_bundle_fingerprint)
-                .ok_or_else(|| invalid_host("current definition is unavailable"))?;
-            if !definition.trusted {
-                return Err(invalid_host("current definition is untrusted"));
-            }
-            let result = dispatch(&definition.bundle, &aggregate, Some(core_delivery));
-            let state = result
-                .state
-                .ok_or_else(|| invalid_host("dispatch did not return aggregate state"))?;
-            let (aggregate_envelope, _) = encode_aggregate(&definition.bundle, &state)
-                .map_err(|error| invalid_host(error.to_string()))?;
-            ProcessedCore {
-                status: state.root.status,
-                aggregate: state,
-                aggregate_envelope,
-                disposition: result
-                    .disposition
-                    .ok_or_else(|| invalid_host("dispatch disposition is absent"))?,
-                emissions: result.emissions,
-                fault: result.fault,
-                rejection: result.rejection,
-                audit_records: Vec::new(),
-            }
-        };
-        let mut candidate = current.clone();
-        candidate.increment_revision();
-        if foreground {
-            candidate.next_delivery_sequence.allocate();
-        } else {
-            let position = candidate
-                .pending_deliveries
-                .iter()
-                .position(|pending| {
-                    pending.delivery_sequence == accepted_delivery_sequence
-                        && pending.envelope.event_id == parsed.envelope.event_id
-                })
-                .ok_or_else(|| invalid_host("pending delivery disappeared"))?;
-            candidate.pending_deliveries.remove(position);
-        }
-        let receipt_sequence = candidate.next_operation_receipt_sequence.allocate();
-        let committed_revision = candidate.revision.clone();
-        let accepted_revision = accepted_revision.unwrap_or_else(|| committed_revision.clone());
-        let outcome = DeliveryOutcome {
-            status: processed.status,
-            disposition: processed.disposition,
-            fault: processed.fault.as_ref().map(CheckpointFault::from),
-            rejection: processed
-                .rejection
-                .map(|value| super::wire::CheckpointRejection { code: value.code }),
-        };
-        let mut receipt = DeliveryReceipt {
-            operation_kind: DeliveryOperationKind::Delivery,
-            receipt_sequence,
-            event_id: parsed.envelope.event_id,
-            request_digest: parsed.envelope_digest,
-            accepted_delivery_sequence,
-            accepted_revision,
-            delivery_mode: parsed.delivery_mode,
-            origin: parsed.origin,
-            committed_revision,
-            resulting_aggregate_state_digest: processed
-                .aggregate_envelope
-                .aggregate_state_digest
-                .clone(),
-            outcome,
-            emission_references: Vec::new(),
-        };
-        let RootRecord::Retained(candidate_root) = &mut candidate.root_record else {
-            unreachable!("retained root checked");
-        };
-        candidate_root.aggregate_state = processed.aggregate_envelope;
-        candidate
-            .migration_audit_records
-            .extend(processed.audit_records);
-        receipt.emission_references = append_emissions(
-            &mut candidate,
-            &receipt.receipt_sequence,
-            &receipt.committed_revision,
-            &processed.emissions,
+    ) -> Result<JsonValue, ArtifactError> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let result = checkpoint_tombstone_root(
+            &checkpoint,
+            operation_id,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
         )?;
-        candidate
-            .operation_receipts
-            .push(OperationReceipt::Delivery(receipt.clone()));
-        candidate
-            .recompute_digest()
-            .map_err(|error| invalid_host(error.to_string()))?;
-        self.commit_candidate(store, &current, &candidate)?;
-        drop(processed.aggregate);
-        Ok(receipt)
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
     }
 
-    fn commit_candidate(
-        &self,
-        store: &mut dyn StoreAccess,
-        current: &ExecutionCheckpoint,
-        candidate: &ExecutionCheckpoint,
-    ) -> Result<(), HostFailure> {
-        candidate
-            .validate_for_persistence(self.resolver.as_ref())
-            .map_err(|error| invalid_host(error.to_string()))?;
-        let replacement = StoreRecord::from_checkpoint(candidate)?;
-        match store.compare_and_swap(
-            &current.root_instance_id,
-            &current.revision.to_string(),
-            &current.execution_checkpoint_digest,
-            replacement,
-        )? {
-            StoreWriteResult::Committed => Ok(()),
-            StoreWriteResult::Conflict(_) => Err(revision_conflict()),
-        }
-    }
-
-    fn require_checkpoint(
-        &self,
-        store: &mut dyn StoreAccess,
-        root_instance_id: &str,
-    ) -> Result<ExecutionCheckpoint, HostFailure> {
-        self.load_checkpoint_with_store(store, root_instance_id)?
-            .ok_or_else(|| {
-                HostFailure::new(
-                    HostFailureCode::CheckpointNotFound,
-                    "execution checkpoint does not exist",
-                )
-            })
-    }
-
-    fn restore_record(&self, record: StoreRecord) -> Result<ExecutionCheckpoint, HostFailure> {
-        let checkpoint =
-            super::wire::restore_execution_checkpoint(&record.bytes, self.resolver.as_ref())
-                .map_err(|error| invalid_host(error.to_string()))?;
-        if checkpoint.root_instance_id != record.root_instance_id
-            || checkpoint.revision.to_string() != record.revision
-            || checkpoint.execution_checkpoint_digest != record.execution_checkpoint_digest
+    fn restore_record_v2(&self, record: StoreRecord) -> Result<ExecutionCheckpoint, ArtifactError> {
+        let checkpoint = restore_execution_checkpoint(&record.bytes, self.resolver.as_ref())?;
+        if checkpoint.root_instance_id() != record.root_instance_id
+            || checkpoint.revision() != record.revision
+            || checkpoint.digest() != record.execution_checkpoint_digest
         {
-            return Err(invalid_host(
+            return Err(v2_failure(
+                "invalid_execution_checkpoint",
                 "store metadata differs from checkpoint artifact",
             ));
         }
         Ok(checkpoint)
     }
-}
 
-struct ProcessedCore {
-    aggregate: AggregateState,
-    aggregate_envelope: crate::format1::AggregateEnvelope,
-    status: RuntimeStatus,
-    disposition: Disposition,
-    emissions: Vec<Emission>,
-    fault: Option<crate::format1::FaultRecord>,
-    rejection: Option<crate::format1::Rejection>,
-    audit_records: Vec<crate::format1::MigrationAuditRecord>,
-}
+    fn require_checkpoint_v2_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        root_instance_id: &str,
+    ) -> Result<(StoreRecord, ExecutionCheckpoint), ArtifactError> {
+        let record = store
+            .load(root_instance_id)
+            .map_err(v2_store_error)?
+            .ok_or_else(|| {
+                v2_failure(
+                    "checkpoint_not_found",
+                    "execution checkpoint does not exist",
+                )
+            })?;
+        let checkpoint = self.restore_record_v2(record.clone())?;
+        Ok((record, checkpoint))
+    }
 
-#[derive(Debug, Clone)]
-struct ParsedDeliveryCandidate {
-    delivery_mode: String,
-    origin: JsonValue,
-    envelope: PortableEnvelope,
-    envelope_digest: String,
-    supplied_envelope_digest: Option<JsonValue>,
-}
+    fn checkpoint_v2_bundle(
+        &self,
+        checkpoint: &ExecutionCheckpoint,
+    ) -> Result<Bundle, ArtifactError> {
+        let fingerprint = checkpoint.bundle_fingerprint().ok_or_else(|| {
+            v2_failure(
+                "terminal_root",
+                "terminal checkpoint has no runnable aggregate",
+            )
+        })?;
+        let resolved = self
+            .resolver
+            .resolve_definition(fingerprint)
+            .ok_or_else(|| {
+                v2_failure("definition_not_found", "current definition is unavailable")
+            })?;
+        if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
+            return Err(v2_failure(
+                "definition_not_trusted",
+                "current definition is not trusted or content-addressed correctly",
+            ));
+        }
+        Ok(resolved.bundle)
+    }
 
-impl ParsedDeliveryCandidate {
-    fn validate(self) -> Result<ParsedDelivery, PreAcceptanceFailureCode> {
-        let delivery_mode = match self.delivery_mode.as_str() {
-            "input" => DeliveryMode::Input,
-            "internal" => DeliveryMode::Internal,
-            _ => return Err(PreAcceptanceFailureCode::InvalidDeliveryMode),
+    fn commit_v2_result_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        current: &StoreRecord,
+        result: &JsonValue,
+    ) -> Result<(), ArtifactError> {
+        let candidate = if result["execution_checkpoint_format"] == "determa.execution_checkpoint" {
+            Some(result)
+        } else if result["result"] == "batch"
+            && result["checkpoint"]["execution_checkpoint_format"] == "determa.execution_checkpoint"
+        {
+            Some(&result["checkpoint"])
+        } else {
+            None
         };
-        let origin: DeliveryOrigin = serde_json::from_value(self.origin)
-            .map_err(|_| PreAcceptanceFailureCode::InvalidDeliveryOrigin)?;
-        if !matches!(
-            (delivery_mode, &origin),
-            (DeliveryMode::Input, DeliveryOrigin::HostInput(_))
-                | (DeliveryMode::Internal, DeliveryOrigin::InternalEmission(_))
-        ) {
-            return Err(PreAcceptanceFailureCode::InvalidDeliveryOrigin);
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        let bytes = crate::format1::v2::canonical_bytes(candidate)?;
+        let checkpoint = restore_execution_checkpoint(&bytes, self.resolver.as_ref())?;
+        if checkpoint.revision() == current.revision
+            && checkpoint.digest() == current.execution_checkpoint_digest
+        {
+            return Ok(());
         }
-        if let Some(supplied) = self.supplied_envelope_digest {
-            let Some(supplied) = supplied.as_str() else {
-                return Err(PreAcceptanceFailureCode::MalformedDelivery);
-            };
-            if supplied != self.envelope_digest {
-                return Err(PreAcceptanceFailureCode::DeliveryDigestMismatch);
-            }
+        let replacement = StoreRecord::from_checkpoint(&checkpoint).map_err(v2_store_error)?;
+        self.commit_record_v2_with_store(store, current, replacement)
+    }
+
+    fn commit_record_v2_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        current: &StoreRecord,
+        replacement: StoreRecord,
+    ) -> Result<(), ArtifactError> {
+        match store
+            .compare_and_swap(
+                &current.root_instance_id,
+                &current.revision,
+                &current.execution_checkpoint_digest,
+                replacement,
+            )
+            .map_err(v2_store_error)?
+        {
+            StoreWriteResult::Committed => Ok(()),
+            StoreWriteResult::Conflict(_) => Err(v2_failure(
+                "checkpoint_revision_conflict",
+                "checkpoint compare-and-swap conflicted",
+            )),
         }
-        Ok(ParsedDelivery {
-            delivery_mode,
-            origin,
-            envelope: self.envelope,
-            envelope_digest: self.envelope_digest,
-        })
     }
-}
-
-#[derive(Debug, Clone)]
-struct ParsedDelivery {
-    delivery_mode: DeliveryMode,
-    origin: DeliveryOrigin,
-    envelope: PortableEnvelope,
-    envelope_digest: String,
-}
-
-struct ProcessDeliveryRequest<'a> {
-    current: ExecutionCheckpoint,
-    parsed: ParsedDelivery,
-    accepted_delivery_sequence: Counter,
-    accepted_revision: Option<Counter>,
-    foreground: bool,
-    migration: Option<&'a ProcessingMigration>,
-}
-
-fn parse_delivery_candidate(
-    candidate: &JsonValue,
-    checkpoint_root_instance_id: &str,
-) -> Result<ParsedDeliveryCandidate, PreAcceptanceFailureCode> {
-    let object = candidate
-        .as_object()
-        .ok_or(PreAcceptanceFailureCode::MalformedDelivery)?;
-    if object.keys().any(|key| {
-        !matches!(
-            key.as_str(),
-            "root_instance_id" | "delivery_mode" | "origin" | "envelope" | "envelope_digest"
-        )
-    }) {
-        return Err(PreAcceptanceFailureCode::MalformedDelivery);
-    }
-    let root_instance_id = object
-        .get("root_instance_id")
-        .and_then(JsonValue::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or(PreAcceptanceFailureCode::MalformedDelivery)?;
-    if root_instance_id != checkpoint_root_instance_id {
-        return Err(PreAcceptanceFailureCode::WrongRoot);
-    }
-    let delivery_mode = object
-        .get("delivery_mode")
-        .and_then(JsonValue::as_str)
-        .ok_or(PreAcceptanceFailureCode::MalformedDelivery)?
-        .to_owned();
-    let origin = object
-        .get("origin")
-        .cloned()
-        .ok_or(PreAcceptanceFailureCode::MalformedDelivery)?;
-    let envelope: PortableEnvelope = serde_json::from_value(
-        object
-            .get("envelope")
-            .cloned()
-            .ok_or(PreAcceptanceFailureCode::MalformedDelivery)?,
-    )
-    .map_err(|_| PreAcceptanceFailureCode::MalformedDelivery)?;
-    if envelope.root_instance_id() != Some(checkpoint_root_instance_id) {
-        return Err(PreAcceptanceFailureCode::WrongRoot);
-    }
-    if envelope.event_id.is_empty()
-        || !valid_checkpoint_event_name(&envelope.event)
-        || envelope
-            .correlation_id
-            .as_ref()
-            .is_some_and(String::is_empty)
-        || !matches!(envelope.payload, TypedValue::Map(_))
-    {
-        return Err(PreAcceptanceFailureCode::MalformedDelivery);
-    }
-    let computed = crate::checkpoint::wire::envelope_digest_for_mode(
-        root_instance_id,
-        &delivery_mode,
-        &envelope,
-    )
-    .map_err(|_| PreAcceptanceFailureCode::MalformedDelivery)?;
-    Ok(ParsedDeliveryCandidate {
-        delivery_mode,
-        origin,
-        envelope,
-        envelope_digest: computed,
-        supplied_envelope_digest: object.get("envelope_digest").cloned(),
-    })
-}
-
-fn delivery_replay(
-    checkpoint: &ExecutionCheckpoint,
-    event_id: &str,
-    envelope_digest: &str,
-) -> Result<Option<AcceptanceResult>, HostFailure> {
-    if let Some(pending) = checkpoint
-        .pending_deliveries
-        .iter()
-        .find(|pending| pending.envelope.event_id == event_id)
-    {
-        if pending.envelope_digest != envelope_digest {
-            return Ok(Some(not_accepted(
-                PreAcceptanceFailureCode::EventIdConflict,
-            )));
-        }
-        return Ok(Some(AcceptanceResult::Pending(PendingAcceptanceResult {
-            result: PendingAcceptanceResultKind::Pending,
-            event_id: pending.envelope.event_id.clone(),
-            delivery_sequence: pending.delivery_sequence.clone(),
-            accepted_revision: pending.accepted_revision.clone(),
-        })));
-    }
-    match committed_delivery_replay(checkpoint, event_id, envelope_digest) {
-        Ok(value) => Ok(value.map(|receipt| {
-            AcceptanceResult::Committed(CommittedDeliveryResult {
-                result: CommittedResultKind::Committed,
-                receipt,
-            })
-        })),
-        Err(error) if error.code == HostFailureCode::EventIdConflict => Ok(Some(not_accepted(
-            PreAcceptanceFailureCode::EventIdConflict,
-        ))),
-        Err(error) => Err(error),
-    }
-}
-
-fn committed_delivery_replay(
-    checkpoint: &ExecutionCheckpoint,
-    event_id: &str,
-    envelope_digest: &str,
-) -> Result<Option<DeliveryReceipt>, HostFailure> {
-    let existing = checkpoint
-        .operation_receipts
-        .iter()
-        .find_map(|receipt| match receipt {
-            OperationReceipt::Delivery(value) if value.event_id == event_id => Some(value),
-            _ => None,
-        });
-    let Some(existing) = existing else {
-        return Ok(None);
-    };
-    if existing.request_digest != envelope_digest {
-        return Err(HostFailure::new(
-            HostFailureCode::EventIdConflict,
-            "committed event id has different content",
-        ));
-    }
-    Ok(Some(existing.clone()))
-}
-
-fn valid_checkpoint_event_name(value: &str) -> bool {
-    matches!(
-        value,
-        "determa.component_completed"
-            | "determa.component_failed"
-            | "determa.spawned_instance_failed"
-    ) || valid_checkpoint_identifier(value)
-}
-
-fn valid_checkpoint_identifier(value: &str) -> bool {
-    let mut bytes = value.bytes();
-    matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-}
-
-fn replay_creation(
-    checkpoint: &ExecutionCheckpoint,
-    creation_id: &str,
-    request_digest: &str,
-) -> Result<CreationReceipt, HostFailure> {
-    let Some(OperationReceipt::Creation(receipt)) = checkpoint.operation_receipts.first() else {
-        return Err(invalid_host("checkpoint creation receipt is absent"));
-    };
-    if receipt.creation_id == creation_id && receipt.request_digest == request_digest {
-        Ok(receipt.clone())
-    } else {
-        Err(HostFailure::new(
-            HostFailureCode::CreationIdConflict,
-            "root identity is already reserved by another creation request",
-        ))
-    }
-}
-
-fn creation_request_digest(request: &CreationRequest<'_>) -> Result<String, HostFailure> {
-    let bindings = Value::Map(BTreeMap::from([
-        (
-            "external".to_string(),
-            Value::Map(request.bindings.external.clone()),
-        ),
-        (
-            "input".to_string(),
-            Value::Map(request.bindings.input.clone()),
-        ),
-    ]));
-    let typed = TypedValue::from_value(&bindings);
-    hash_tagged(json!([
-        "determa-creation-request-digest-1",
-        "1",
-        request.bundle.fingerprint,
-        request.namespace,
-        request.machine_id,
-        request.machine_version.to_string(),
-        request.root_instance_id,
-        request.creation_id,
-        typed
-    ]))
-    .map_err(|error| invalid_host(error.to_string()))
 }
 
 fn maintenance_request_digest(
     root_instance_id: &str,
     request: &MaintenanceMigrationRequest,
-) -> Result<String, HostFailure> {
-    hash_tagged(json!([
-        "determa-maintenance-migration-request-digest-1",
-        "1",
+) -> Result<String, ArtifactError> {
+    crate::format1::native::jcs_hash(&json!([
+        "determa-maintenance-migration-request-digest-2",
+        "2",
         root_instance_id,
         request.operation_id,
         request.source_aggregate_state_digest,
@@ -1952,151 +1334,21 @@ fn maintenance_request_digest(
         request.migration_descriptor_digest_route,
         request.maintenance_mode
     ]))
-    .map_err(|error| invalid_host(error.to_string()))
+    .map_err(|error| v2_failure("invalid_execution_checkpoint", &error.to_string()))
 }
 
-fn append_emissions(
-    checkpoint: &mut ExecutionCheckpoint,
-    producing_receipt_sequence: &Counter,
-    committed_revision: &Counter,
-    emissions: &[Emission],
-) -> Result<Vec<EmissionReference>, HostFailure> {
-    let mut references = Vec::with_capacity(emissions.len());
-    for (index, emission) in emissions.iter().enumerate() {
-        let emission_index = Counter::from(index);
-        match &emission.target {
-            crate::format1::Target::External => {
-                let effect_id = emission
-                    .effect_id
-                    .clone()
-                    .ok_or_else(|| invalid_host("external emission has no effect id"))?;
-                let sequence = emission
-                    .sequence
-                    .clone()
-                    .ok_or_else(|| invalid_host("external emission has no output sequence"))?;
-                checkpoint.pending_outbox_intents.push(PendingOutboxIntent {
-                    intent: OutboxIntent {
-                        effect_id: effect_id.clone(),
-                        sequence,
-                        event: emission.event.clone(),
-                        payload: TypedValue::from_value(&Value::Map(emission.payload.clone())),
-                        correlation_id: emission.correlation_id.clone(),
-                    },
-                    state_revision: committed_revision.clone(),
-                    delivery_state: PendingOutboxState::NotAttempted,
-                });
-                references.push(EmissionReference::ExternalOutbox {
-                    emission_index,
-                    effect_id,
-                });
-            }
-            _ => {
-                let envelope = emission
-                    .envelope()
-                    .ok_or_else(|| invalid_host("internal emission has no event id"))?;
-                let portable = PortableEnvelope {
-                    event: envelope.event,
-                    event_id: envelope.event_id.clone(),
-                    target: envelope.target,
-                    payload: TypedValue::from_value(&Value::Map(envelope.payload)),
-                    correlation_id: envelope.correlation_id,
-                };
-                let delivery_sequence = checkpoint.next_delivery_sequence.allocate();
-                let digest = envelope_digest(
-                    &checkpoint.root_instance_id,
-                    DeliveryMode::Internal,
-                    &portable,
-                )
-                .map_err(|error| invalid_host(error.to_string()))?;
-                checkpoint.pending_deliveries.push(PendingDelivery {
-                    delivery_sequence: delivery_sequence.clone(),
-                    accepted_revision: committed_revision.clone(),
-                    delivery_mode: DeliveryMode::Internal,
-                    origin: DeliveryOrigin::internal(
-                        producing_receipt_sequence.clone(),
-                        emission_index.clone(),
-                    ),
-                    envelope: portable,
-                    envelope_digest: digest,
-                });
-                references.push(EmissionReference::InternalDelivery {
-                    emission_index,
-                    event_id: envelope.event_id,
-                    delivery_sequence,
-                });
-            }
-        }
-    }
-    checkpoint
-        .pending_outbox_intents
-        .sort_by(|left, right| left.intent.sequence.cmp(&right.intent.sequence));
-    Ok(references)
+fn v2_store_error(error: StoreError) -> ArtifactError {
+    ArtifactError::new(error.code.as_str(), error.message)
 }
 
-fn result_status_to_runtime(status: ResultStatus) -> Result<RuntimeStatus, HostFailure> {
-    match status {
-        ResultStatus::Running => Ok(RuntimeStatus::Running),
-        ResultStatus::Completed => Ok(RuntimeStatus::Completed),
-        ResultStatus::Faulted => Ok(RuntimeStatus::Faulted),
-        ResultStatus::Rejected => Err(HostFailure::new(
-            HostFailureCode::CreationRejected,
-            "core rejected creation",
-        )),
-    }
-}
-
-fn check_guard(checkpoint: &ExecutionCheckpoint, guard: &MutationGuard) -> Result<(), HostFailure> {
-    if checkpoint.revision.to_string() != guard.expected_revision
-        || checkpoint.execution_checkpoint_digest != guard.expected_checkpoint_digest
-    {
-        Err(revision_conflict())
-    } else {
-        Ok(())
-    }
-}
-
-fn acceptance_receipt(result: AcceptanceResult) -> Result<DeliveryReceipt, HostFailure> {
-    match result {
-        AcceptanceResult::Committed(value) => Ok(value.receipt),
-        AcceptanceResult::Pending(_) => Err(HostFailure::new(
-            HostFailureCode::EventIdConflict,
-            "event is already pending",
-        )),
-        AcceptanceResult::NotAccepted(value) => Err(HostFailure::new(
-            preaccept_failure_code(value.failure.code),
-            "delivery was not accepted",
-        )),
-    }
-}
-
-fn not_accepted(code: PreAcceptanceFailureCode) -> AcceptanceResult {
-    AcceptanceResult::NotAccepted(NotAcceptedResult {
-        result: NotAcceptedResultKind::NotAccepted,
-        failure: PreAcceptanceFailure { code },
-    })
-}
-
-fn preaccept_failure_code(code: PreAcceptanceFailureCode) -> HostFailureCode {
-    match code {
-        PreAcceptanceFailureCode::EventIdConflict => HostFailureCode::EventIdConflict,
-        _ => HostFailureCode::InvalidExecutionCheckpoint,
-    }
-}
-
-fn effect_conflict() -> HostFailure {
+#[cfg(feature = "postgresql")]
+fn v2_host_failure(error: ArtifactError) -> HostFailure {
     HostFailure::new(
-        HostFailureCode::EffectIdConflict,
-        "effect identity has a different or unavailable outbox record",
+        HostFailureCode::InvalidExecutionCheckpoint,
+        format!("{}: {}", error.code, error.message),
     )
 }
 
-fn revision_conflict() -> HostFailure {
-    HostFailure::new(
-        HostFailureCode::CheckpointRevisionConflict,
-        "checkpoint revision or digest changed",
-    )
-}
-
-fn invalid_host(message: impl Into<String>) -> HostFailure {
-    HostFailure::new(HostFailureCode::InvalidExecutionCheckpoint, message)
+fn v2_failure(code: &str, message: &str) -> ArtifactError {
+    ArtifactError::new(code, message)
 }

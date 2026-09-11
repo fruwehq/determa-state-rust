@@ -7,7 +7,8 @@
 mod adapters;
 mod host;
 mod store;
-mod wire;
+mod types;
+mod v2;
 
 pub use adapters::{
     register_bundled_adapters, FileExecutionStore, FileExecutionStoreFactory, MemoryExecutionStore,
@@ -18,8 +19,7 @@ pub use adapters::{PostgresqlExecutionStore, PostgresqlExecutionStoreFactory};
 #[cfg(feature = "sqlite")]
 pub use adapters::{SqliteExecutionStore, SqliteExecutionStoreFactory};
 pub use host::{
-    CheckpointHost, CreationRequest, DeliveryRequest, HostFailure, HostFailureCode,
-    MaintenanceMigrationRequest, MutationGuard, ProcessingMigration,
+    CheckpointHost, HostFailure, HostFailureCode, MaintenanceMigrationRequest, MutationGuard,
 };
 #[cfg(feature = "postgresql")]
 pub use host::{
@@ -32,18 +32,18 @@ pub use store::{
     HostProfile, OutboxRetentionMode, ReceiptRetentionMode, StoreError, StoreErrorCode,
     StoreRecord, StoreWriteResult,
 };
-pub use wire::{
-    restore_execution_checkpoint, validate_outbox_compaction, AcceptanceResult, BoundedReplayMode,
-    BoundedReplayRetention, CheckpointError, CheckpointErrorCode, CheckpointFault,
-    CheckpointRejection, CommittedDeliveryResult, CommittedResultKind, CreationOperationKind,
-    CreationReceipt, DeliveryMode, DeliveryOperationKind, DeliveryOrigin, DeliveryOutcome,
-    DeliveryReceipt, EmissionReference, ExecutionCheckpoint, HostInputOrigin, HostInputOriginKind,
-    InternalEmissionOrigin, InternalEmissionOriginKind, MaintenanceMigrationOperationKind,
-    MaintenanceMigrationReceipt, MaintenanceMigrationResultCode, NotAcceptedResult,
-    NotAcceptedResultKind, OperationReceipt, OutboxEffectTombstone, OutboxIntent, OutboxRecord,
-    PendingAcceptanceResult, PendingAcceptanceResultKind, PendingDelivery, PendingOutboxIntent,
-    PendingOutboxState, PermanentReplayMode, PermanentReplayRetention, PortableEnvelope,
-    PreAcceptanceFailure, PreAcceptanceFailureCode, ReplayRetention, RetainedRootRecord,
-    RetainedRootStatus, RootRecord, RootTombstone, RootTombstoneStatus, TerminalOutboxOutcome,
-    TerminalOutboxRecord, TerminalRootStatus,
+pub use types::{
+    AdmissionSource, CheckpointErrorCode, OutboxIntent, PendingOutboxState,
+    PreAcceptanceFailureCode, ProcessingRequest, PruneRequest, TerminalOutboxOutcome,
+    TransactionalProcessRequest,
+};
+pub use v2::{
+    checkpoint_admit_v2 as admit, checkpoint_compact_outbox as compact_outbox,
+    checkpoint_process as process, checkpoint_process_with_migration as process_with_migration,
+    checkpoint_prune_v2 as prune, checkpoint_step_v2 as step,
+    checkpoint_terminalize_outbox as terminalize_outbox,
+    checkpoint_tombstone_root as tombstone_root,
+    checkpoint_update_pending_outbox as update_pending_outbox,
+    create_execution_checkpoint_v2 as create, creation_request_digest,
+    restore_execution_checkpoint as restore, ExecutionCheckpoint,
 };

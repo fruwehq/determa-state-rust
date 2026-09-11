@@ -51,6 +51,8 @@ pub struct State {
     pub children: Vec<String>,
     pub components: Vec<Component>,
     pub handlers: BTreeMap<String, Vec<CompiledTransition>>,
+    pub deferred_events: Vec<String>,
+    pub deferred_event_capacity: Option<i64>,
     pub history: HistoryKind,
     pub choice: Option<Vec<CompiledChoice>>,
 }
@@ -498,6 +500,8 @@ fn compile_state(
             children,
             components,
             handlers,
+            deferred_events: raw.deferred_events.clone(),
+            deferred_event_capacity: raw.deferred_event_capacity,
             history: raw.history.unwrap_or(HistoryKind::None),
             choice,
         },
@@ -755,6 +759,25 @@ fn validate_machine(
         .map(String::as_str)
         .collect();
     for state in machine.states.values() {
+        if state.deferred_event_capacity.is_some() && state.path != "root" {
+            return semantic(
+                &format!("{}/deferred_event_capacity", state.pointer),
+                "deferred_event_capacity is valid only on a runtime root",
+            );
+        }
+        for event in &state.deferred_events {
+            let declaration = machine
+                .events
+                .get(event)
+                .or_else(|| bundle_events.get(event));
+            if declaration.is_none_or(|declaration| declaration.direction == EventDirection::Output)
+            {
+                return semantic(
+                    &format!("{}/deferred_events", state.pointer),
+                    "deferred event must name a declared non-output event",
+                );
+            }
+        }
         for (name, declaration) in &state.variables {
             if let Some(init) = &declaration.init {
                 let init = init.clone().unwrap_or(Value::Null);

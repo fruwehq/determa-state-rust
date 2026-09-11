@@ -25,7 +25,9 @@ pub enum RuntimeStatus {
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
     Handled,
+    Deferred,
     Unhandled,
+    NotRunnable,
     Rejected,
     Faulted,
 }
@@ -34,7 +36,9 @@ impl Disposition {
     /// Complete result-disposition set defined by the portable registry.
     pub const PORTABLE_CODES: &'static [Self] = &[
         Self::Handled,
+        Self::Deferred,
         Self::Unhandled,
+        Self::NotRunnable,
         Self::Rejected,
         Self::Faulted,
     ];
@@ -42,7 +46,9 @@ impl Disposition {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Handled => "handled",
+            Self::Deferred => "deferred",
             Self::Unhandled => "unhandled",
+            Self::NotRunnable => "not_runnable",
             Self::Rejected => "rejected",
             Self::Faulted => "faulted",
         }
@@ -134,6 +140,7 @@ pub enum EngineFaultCode {
     BindingNotEmpty,
     CascadeFault,
     ContainedRuntimeFault,
+    DeferredEventCapacityExceeded,
     GuardFault,
     InactiveComponentTarget,
     InvalidInstanceTarget,
@@ -146,6 +153,7 @@ impl EngineFaultCode {
         Self::BindingNotEmpty,
         Self::CascadeFault,
         Self::ContainedRuntimeFault,
+        Self::DeferredEventCapacityExceeded,
         Self::GuardFault,
         Self::InactiveComponentTarget,
         Self::InvalidInstanceTarget,
@@ -158,6 +166,7 @@ impl EngineFaultCode {
             Self::BindingNotEmpty => "binding_not_empty",
             Self::CascadeFault => "cascade_fault",
             Self::ContainedRuntimeFault => "contained_runtime_fault",
+            Self::DeferredEventCapacityExceeded => "deferred_event_capacity_exceeded",
             Self::GuardFault => "guard_fault",
             Self::InactiveComponentTarget => "inactive_component_target",
             Self::InvalidInstanceTarget => "invalid_instance_target",
@@ -172,6 +181,7 @@ pub const ENGINE_FAULT_CODES: &[&str] = &[
     EngineFaultCode::BindingNotEmpty.as_str(),
     EngineFaultCode::CascadeFault.as_str(),
     EngineFaultCode::ContainedRuntimeFault.as_str(),
+    EngineFaultCode::DeferredEventCapacityExceeded.as_str(),
     EngineFaultCode::GuardFault.as_str(),
     EngineFaultCode::InactiveComponentTarget.as_str(),
     EngineFaultCode::InvalidInstanceTarget.as_str(),
@@ -204,18 +214,12 @@ pub struct Emission {
     pub correlation_id: Option<String>,
     pub effect_id: Option<String>,
     pub sequence: Option<Counter>,
-}
-
-impl Emission {
-    pub fn envelope(&self) -> Option<Envelope> {
-        Some(Envelope {
-            event: self.event.clone(),
-            event_id: self.event_id.clone()?,
-            target: self.target.clone(),
-            payload: self.payload.clone(),
-            correlation_id: self.correlation_id.clone(),
-        })
-    }
+    #[serde(skip)]
+    pub emission_index: usize,
+    #[serde(skip)]
+    pub cause_id: Option<String>,
+    #[serde(skip)]
+    pub system_source: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -237,7 +241,7 @@ pub enum ResultStatus {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct AggregateState {
+pub(crate) struct AggregateState {
     pub validated_bundle_fingerprint: String,
     pub namespace: String,
     pub root_instance_id: String,
@@ -341,7 +345,7 @@ struct StepContext<'a> {
     emissions: &'a mut Vec<Emission>,
 }
 
-pub fn create(
+pub(crate) fn create_runtime_aggregate(
     bundle: &Bundle,
     machine_id: &str,
     root_instance_id: &str,
@@ -451,7 +455,7 @@ pub fn create(
     }
 }
 
-pub fn dispatch(
+pub(crate) fn dispatch_runtime_aggregate(
     bundle: &Bundle,
     prior_state: &AggregateState,
     delivery: Option<Delivery>,
@@ -519,30 +523,43 @@ pub fn dispatch(
             return fault_dispatch(bundle, prior_state, &address, &normalized_envelope, fault)
         }
     };
-    let Some((source_path, transition)) = selected else {
-        if matches!(
-            normalized_envelope.event.as_str(),
-            "determa.component_failed" | "determa.spawned_instance_failed"
-        ) {
-            return fault_dispatch(
-                bundle,
-                prior_state,
-                &address,
-                &normalized_envelope,
-                StepFault {
-                    code: EngineFaultCode::ContainedRuntimeFault,
-                    source_locator: "system:unhandled_contained_failure".to_string(),
-                },
-            );
+    let (source_path, transition) = match selected {
+        HandlerSelection::Handled(source_path, transition) => (source_path, transition),
+        HandlerSelection::Deferred => {
+            return CoreResult {
+                status: result_status(prior_state.root.status),
+                disposition: Some(Disposition::Deferred),
+                state: Some(prior_state.clone()),
+                emissions: Vec::new(),
+                fault: prior_state.root.fault.clone(),
+                rejection: None,
+            };
         }
-        return CoreResult {
-            status: result_status(prior_state.root.status),
-            disposition: Some(Disposition::Unhandled),
-            state: Some(prior_state.clone()),
-            emissions: Vec::new(),
-            fault: prior_state.root.fault.clone(),
-            rejection: None,
-        };
+        HandlerSelection::Unhandled => {
+            if matches!(
+                normalized_envelope.event.as_str(),
+                "determa.component_failed" | "determa.spawned_instance_failed"
+            ) {
+                return fault_dispatch(
+                    bundle,
+                    prior_state,
+                    &address,
+                    &normalized_envelope,
+                    StepFault {
+                        code: EngineFaultCode::ContainedRuntimeFault,
+                        source_locator: "system:unhandled_contained_failure".to_string(),
+                    },
+                );
+            }
+            return CoreResult {
+                status: result_status(prior_state.root.status),
+                disposition: Some(Disposition::Unhandled),
+                state: Some(prior_state.clone()),
+                emissions: Vec::new(),
+                fault: prior_state.root.fault.clone(),
+                rejection: None,
+            };
+        }
     };
 
     let mut aggregate = prior_state.clone();
@@ -599,6 +616,151 @@ pub fn dispatch(
 enum DeliveryMode {
     Input,
     Internal,
+}
+
+pub(crate) fn validate_delivery_for_admission(
+    bundle: &Bundle,
+    aggregate: &AggregateState,
+    delivery: &Delivery,
+) -> Result<String, DispatchRejectionCode> {
+    let (mode, envelope) = match delivery {
+        Delivery::Input(envelope) => (DeliveryMode::Input, envelope),
+        Delivery::Internal(envelope) => (DeliveryMode::Internal, envelope),
+    };
+    if aggregate.root.status == RuntimeStatus::Faulted {
+        return Err(DispatchRejectionCode::InvalidInstanceTarget);
+    }
+    if let Target::Component {
+        component_runtime_id,
+        ..
+    } = &envelope.target
+    {
+        if runtime_by_id(&aggregate.root, component_runtime_id).is_none() {
+            return Err(DispatchRejectionCode::InvalidInstanceTarget);
+        }
+    }
+    let address = resolve_delivery_target(aggregate, &envelope.target)?;
+    let runtime = runtime_at(&aggregate.root, &address).ok_or({
+        if matches!(envelope.target, Target::Component { .. }) {
+            DispatchRejectionCode::InactiveComponentTarget
+        } else {
+            DispatchRejectionCode::InvalidInstanceTarget
+        }
+    })?;
+    if runtime.status != RuntimeStatus::Running {
+        return Err(if matches!(envelope.target, Target::Component { .. }) {
+            DispatchRejectionCode::InactiveComponentTarget
+        } else {
+            DispatchRejectionCode::InvalidInstanceTarget
+        });
+    }
+    let normalized = validate_envelope(bundle, runtime, mode, envelope)?;
+    if !envelopes_wire_equivalent(&normalized, envelope) {
+        return Err(DispatchRejectionCode::InvalidPayload);
+    }
+    Ok(runtime.runtime_id.clone())
+}
+
+pub(crate) fn validate_queued_event_for_migration(
+    bundle: &Bundle,
+    aggregate: &AggregateState,
+    delivery: &Delivery,
+) -> Result<(), DispatchRejectionCode> {
+    let (mode, envelope) = match delivery {
+        Delivery::Input(envelope) => (DeliveryMode::Input, envelope),
+        Delivery::Internal(envelope) => (DeliveryMode::Internal, envelope),
+    };
+    let runtime_id = match &envelope.target {
+        Target::Root {
+            root_runtime_id, ..
+        } => root_runtime_id,
+        Target::Component {
+            component_runtime_id,
+            ..
+        } => component_runtime_id,
+        Target::SpawnedInstance(reference) => &reference.instance_id,
+        Target::External => return Err(DispatchRejectionCode::InvalidInstanceTarget),
+    };
+    let runtime = runtime_by_id(&aggregate.root, runtime_id)
+        .ok_or(DispatchRejectionCode::InvalidInstanceTarget)?;
+    let normalized = validate_envelope(bundle, runtime, mode, envelope)?;
+    if !envelopes_wire_equivalent(&normalized, envelope) {
+        return Err(DispatchRejectionCode::InvalidPayload);
+    }
+    Ok(())
+}
+
+pub(crate) fn runtime_by_id<'a>(
+    runtime: &'a RuntimeState,
+    runtime_id: &str,
+) -> Option<&'a RuntimeState> {
+    if runtime.runtime_id == runtime_id {
+        return Some(runtime);
+    }
+    runtime
+        .components
+        .iter()
+        .find_map(|component| runtime_by_id(&component.runtime, runtime_id))
+        .or_else(|| {
+            runtime
+                .owned_instances
+                .iter()
+                .find_map(|owned| runtime_by_id(&owned.runtime, runtime_id))
+        })
+}
+
+pub(crate) fn structural_recall_eligible(runtime: &RuntimeState, event: &str) -> bool {
+    let mut candidates = runtime.config();
+    if candidates.is_empty() && runtime.active.contains("root") {
+        candidates.push("root".to_string());
+    }
+    candidates.sort_by_key(|path| std::cmp::Reverse(path_depth(path)));
+    let mut visited = BTreeSet::new();
+    for leaf in candidates {
+        let mut current = Some(leaf);
+        while let Some(path) = current {
+            if !visited.insert(path.clone()) {
+                current = runtime.definition.states[&path].parent.clone();
+                continue;
+            }
+            let state = &runtime.definition.states[&path];
+            if state.handlers.contains_key(event) {
+                return true;
+            }
+            if state
+                .deferred_events
+                .iter()
+                .any(|deferred| deferred == event)
+            {
+                return false;
+            }
+            current = state.parent.clone();
+        }
+    }
+    true
+}
+
+pub(crate) fn deferred_event_capacity(runtime: &RuntimeState) -> Option<i64> {
+    runtime.definition.states["root"].deferred_event_capacity
+}
+
+pub(crate) fn fault_deferred_capacity(
+    bundle: &Bundle,
+    aggregate: &AggregateState,
+    envelope: &Envelope,
+) -> CoreResult {
+    let address = resolve_delivery_target(aggregate, &envelope.target)
+        .expect("mailbox target was validated before capacity classification");
+    fault_dispatch(
+        bundle,
+        aggregate,
+        &address,
+        envelope,
+        StepFault {
+            code: EngineFaultCode::DeferredEventCapacityExceeded,
+            source_locator: "system:deferred_event_capacity".to_string(),
+        },
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -664,15 +826,6 @@ impl RuntimeState {
             .collect::<Vec<_>>();
         leaves.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         leaves
-    }
-
-    pub fn visible_variables(&self) -> BTreeMap<String, Value> {
-        let scope = self
-            .config()
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "root".to_string());
-        visible_variables(self, &scope)
     }
 }
 
@@ -1215,6 +1368,7 @@ fn validate_historical_fault(code: &str, locator: &str) -> bool {
             | "binding_not_empty"
             | "cascade_fault"
             | "contained_runtime_fault"
+            | "deferred_event_capacity_exceeded"
             | "guard_fault"
             | "inactive_component_target"
             | "invalid_instance_target"
@@ -1412,6 +1566,7 @@ fn validate_fault_locator(runtime: &RuntimeState, code: &str, locator: &str) -> 
         "contained_runtime_fault" => locator == "system:unhandled_contained_failure",
         "cascade_fault" => locator == "system:cascade_cleanup",
         "invariant_fault" => locator == "system:invariant",
+        "deferred_event_capacity_exceeded" => locator == "system:deferred_event_capacity",
         "guard_fault" => runtime.definition.states.values().any(|state| {
             state
                 .handlers
@@ -2080,9 +2235,13 @@ fn validate_envelope(
             if envelope.correlation_id.is_some() {
                 return Err(DispatchRejectionCode::InvalidCorrelation);
             }
-            validate_reserved_lifecycle_payload(&envelope.event, &envelope.payload)
+            let payload = normalize_lifecycle_payload(&envelope.payload)?;
+            validate_reserved_lifecycle_payload(&envelope.event, &payload)
                 .map_err(|_| DispatchRejectionCode::InvalidPayload)?;
-            return Ok(envelope.clone());
+            return Ok(Envelope {
+                payload,
+                ..envelope.clone()
+            });
         }
         _ => {}
     }
@@ -2100,6 +2259,8 @@ fn validate_envelope(
             return Err(DispatchRejectionCode::InvalidEvent);
         }
     }
+    let payload = normalize_payload(declaration, &envelope.payload)
+        .map_err(|_| DispatchRejectionCode::InvalidPayload)?;
     if envelope
         .correlation_id
         .as_ref()
@@ -2108,12 +2269,19 @@ fn validate_envelope(
     {
         return Err(DispatchRejectionCode::InvalidCorrelation);
     }
-    let payload = normalize_payload(declaration, &envelope.payload)
-        .map_err(|_| DispatchRejectionCode::InvalidPayload)?;
     Ok(Envelope {
         payload,
         ..envelope.clone()
     })
+}
+
+fn envelopes_wire_equivalent(left: &Envelope, right: &Envelope) -> bool {
+    left.event == right.event
+        && left.event_id == right.event_id
+        && left.target == right.target
+        && left.correlation_id == right.correlation_id
+        && super::native::TypedValue::from_value(&Value::Map(left.payload.clone()))
+            == super::native::TypedValue::from_value(&Value::Map(right.payload.clone()))
 }
 
 fn normalize_payload(
@@ -2213,6 +2381,36 @@ fn validate_reserved_lifecycle_payload(
     Ok(())
 }
 
+fn normalize_lifecycle_payload(
+    payload: &BTreeMap<String, Value>,
+) -> Result<BTreeMap<String, Value>, DispatchRejectionCode> {
+    let mut normalized = payload.clone();
+    let Some(Value::Map(members)) = normalized.get("instance") else {
+        return Ok(normalized);
+    };
+    let string = |name: &str| match members.get(name) {
+        Some(Value::String(value)) if !value.is_empty() => Ok(value.clone()),
+        _ => Err(DispatchRejectionCode::InvalidPayload),
+    };
+    let machine_version = match members.get("machine_version") {
+        Some(Value::Int(value)) if *value > 0 => *value,
+        _ => return Err(DispatchRejectionCode::InvalidPayload),
+    };
+    if members.len() != 4 {
+        return Err(DispatchRejectionCode::InvalidPayload);
+    }
+    normalized.insert(
+        "instance".to_string(),
+        Value::InstanceReference(crate::value::InstanceReference {
+            root_instance_id: string("root_instance_id")?,
+            instance_id: string("instance_id")?,
+            machine_id: string("machine_id")?,
+            machine_version,
+        }),
+    );
+    Ok(normalized)
+}
+
 fn require_exact_keys(payload: &BTreeMap<String, Value>, keys: &[&str]) -> Result<(), ()> {
     if payload.len() != keys.len() || keys.iter().any(|key| !payload.contains_key(*key)) {
         return Err(());
@@ -2295,10 +2493,16 @@ fn validate_public_fault(value: Option<&Value>) -> Result<(), ()> {
     Ok(())
 }
 
+enum HandlerSelection {
+    Handled(String, CompiledTransition),
+    Deferred,
+    Unhandled,
+}
+
 fn select_handler(
     runtime: &RuntimeState,
     envelope: &Envelope,
-) -> Result<Option<(String, CompiledTransition)>, StepFault> {
+) -> Result<HandlerSelection, StepFault> {
     let mut candidates = runtime.config();
     if candidates.is_empty() && runtime.active.contains("root") {
         candidates.push("root".to_string());
@@ -2318,7 +2522,9 @@ fn select_handler(
                 for transition in transitions {
                     if let Some(guard) = &transition.guard {
                         match cel::evaluate_boolean(guard, &environment) {
-                            Ok(true) => return Ok(Some((path, transition.clone()))),
+                            Ok(true) => {
+                                return Ok(HandlerSelection::Handled(path, transition.clone()))
+                            }
                             Ok(false) => continue,
                             Err(_) => {
                                 return Err(StepFault {
@@ -2331,14 +2537,21 @@ fn select_handler(
                             }
                         }
                     } else {
-                        return Ok(Some((path, transition.clone())));
+                        return Ok(HandlerSelection::Handled(path, transition.clone()));
                     }
                 }
+            }
+            if state
+                .deferred_events
+                .iter()
+                .any(|event| event == &envelope.event)
+            {
+                return Ok(HandlerSelection::Deferred);
             }
             current = state.parent.clone();
         }
     }
-    Ok(None)
+    Ok(HandlerSelection::Unhandled)
 }
 
 fn initialize_runtime(
@@ -2977,6 +3190,9 @@ fn execute_send(
                     ordinal,
                 )),
                 sequence: Some(sequence),
+                emission_index: ordinal,
+                cause_id: None,
+                system_source: None,
             });
         } else {
             let target_runtime_id = target_runtime_id(&target);
@@ -2998,6 +3214,9 @@ fn execute_send(
                 correlation_id: correlation_id.clone(),
                 effect_id: None,
                 sequence: None,
+                emission_index: ordinal,
+                cause_id: Some(context.cause_id.clone()),
+                system_source: None,
             });
         }
     }
@@ -3737,6 +3956,7 @@ fn emit_completion_notification(runtime: &RuntimeState, context: &mut StepContex
                 payload,
                 "system:component_completion",
                 0,
+                &context.cause_id.clone(),
                 context,
             );
             // The owner emits the parallel done once all retained placements complete.
@@ -3779,6 +3999,7 @@ fn emit_completion_notification(runtime: &RuntimeState, context: &mut StepContex
                 payload,
                 "system:spawned_completion",
                 0,
+                &context.cause_id.clone(),
                 context,
             );
         }
@@ -3833,6 +4054,7 @@ fn emit_failure_notification(
                 payload,
                 "system:component_failure",
                 0,
+                &record.cause_id,
                 context,
             );
         }
@@ -3867,6 +4089,7 @@ fn emit_failure_notification(
                 payload,
                 "system:spawned_failure",
                 0,
+                &record.cause_id,
                 context,
             );
         }
@@ -3882,6 +4105,7 @@ fn push_system_emission(
     payload: BTreeMap<String, Value>,
     locator: &str,
     ordinal: usize,
+    cause_id: &str,
     context: &mut StepContext<'_>,
 ) {
     context.emissions.push(Emission {
@@ -3892,7 +4116,7 @@ fn push_system_emission(
             context.root_instance_id,
             &runtime.runtime_id,
             &target_runtime_id(&target),
-            &context.cause_id,
+            cause_id,
             &context.step_sequence,
             locator,
             ordinal,
@@ -3902,6 +4126,9 @@ fn push_system_emission(
         correlation_id: None,
         effect_id: None,
         sequence: None,
+        emission_index: ordinal,
+        cause_id: Some(cause_id.to_string()),
+        system_source: Some(locator.to_string()),
     });
 }
 
@@ -4022,6 +4249,9 @@ fn push_parallel_done(
         correlation_id: None,
         effect_id: None,
         sequence: None,
+        emission_index: 1,
+        cause_id: Some(cause_id.to_string()),
+        system_source: Some("system:component_completion".to_string()),
     });
 }
 
@@ -4117,6 +4347,7 @@ fn direct_child_path(leaf: &str, parent: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{create_runtime_aggregate as create, dispatch_runtime_aggregate as dispatch};
     use crate::format1::load_bundle;
 
     const IDENTITY_VECTOR_BUNDLE: &str = r#"

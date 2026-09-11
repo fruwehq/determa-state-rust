@@ -1,521 +1,426 @@
-#[cfg(feature = "sqlite")]
-use determa_state::checkpoint::SqliteExecutionStore;
 use determa_state::checkpoint::{
-    register_bundled_adapters, AdapterRegistry, ExecutionStore, ExecutionStoreCapability,
-    FileExecutionStore, MemoryExecutionStore, StoreRecord, StoreWriteResult,
+    CheckpointHost, ExecutionStore, FileExecutionStore, MaintenanceMigrationRequest,
+    MemoryExecutionStore, MutationGuard, PendingOutboxState, ProcessingRequest, PruneRequest,
+    StoreRecord, StoreWriteResult, TerminalOutboxOutcome, TransactionalProcessRequest,
 };
 #[cfg(feature = "sqlite")]
-use determa_state::checkpoint::{
-    CheckpointHost, DurableStoreMode, ExecutionCheckpoint, HostFeature, HostProfile,
-    OutboxRetentionMode, ReceiptRetentionMode,
+use determa_state::checkpoint::{DurableStoreMode, SqliteExecutionStore};
+use determa_state::{
+    load_bundle, Bindings, InMemoryDefinitionResolver, MigrationRequest, ResourceLimits,
 };
-#[cfg(feature = "sqlite")]
-use determa_state::InMemoryDefinitionResolver;
-#[cfg(feature = "sqlite")]
-use rusqlite::Connection;
-use serde_json::json;
-use std::collections::BTreeSet;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::PathBuf;
-use std::sync::{Arc, Barrier};
-use std::thread;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "sqlite")]
-const CHECKPOINT_PROFILE: &str = "conformance-suite/conformance/profiles/execution-checkpoint";
-
 #[test]
-fn memory_store_satisfies_the_shared_cas_contract() {
-    let store = MemoryExecutionStore::new();
-    store.initialize_schema().expect("memory initialization");
-    shared_store_contract(&store, "memory-root");
-    assert_eq!(
-        store.capabilities(),
-        BTreeSet::from([ExecutionStoreCapability::Ephemeral])
-    );
-}
-
-#[test]
-fn file_store_requires_explicit_setup_and_survives_restart() {
-    let directory = temporary_path("file-store");
-    let store = FileExecutionStore::new(&directory).expect("file store");
-    assert!(store.health().is_err());
-    store.initialize_schema().expect("file schema");
-    shared_store_contract(&store, "file-root");
-    drop(store);
-
-    let reopened = FileExecutionStore::new(&directory).expect("reopened file store");
-    assert_eq!(
-        reopened
-            .load("file-root")
-            .expect("restart load")
-            .expect("persisted record")
-            .revision,
-        "1"
-    );
-    assert_eq!(
-        reopened.capabilities(),
-        BTreeSet::from([ExecutionStoreCapability::RestartPersistent])
-    );
-    fs::remove_dir_all(directory).expect("remove temporary file store");
-}
-
-#[cfg(feature = "sqlite")]
-#[test]
-fn sqlite_store_requires_explicit_setup_and_satisfies_the_shared_contract() {
-    let directory = temporary_path("sqlite-store");
-    fs::create_dir_all(&directory).expect("SQLite temporary directory");
-    let path = directory.join("checkpoints.sqlite3");
-    let store =
-        SqliteExecutionStore::open(&path, DurableStoreMode::bounded()).expect("SQLite store");
-    assert!(store.health().is_err());
-    store.initialize_schema().expect("SQLite schema");
-    shared_store_contract(&store, "sqlite-root");
-    drop(store);
-
-    let reopened = SqliteExecutionStore::open(&path, DurableStoreMode::bounded())
-        .expect("reopened SQLite store");
-    assert_eq!(
-        reopened
-            .load("sqlite-root")
-            .expect("restart load")
-            .expect("persisted record")
-            .revision,
-        "1"
-    );
-    assert_eq!(
-        reopened.capabilities(),
-        BTreeSet::from([
-            ExecutionStoreCapability::DurableSingleWriter,
-            ExecutionStoreCapability::RootIdentityRetention,
-        ])
-    );
-    let raw = rusqlite::Connection::open(&path).expect("raw SQLite connection");
-    assert!(
-        raw.execute(
-            "DELETE FROM determa_execution_checkpoints WHERE root_instance_id = ?1",
-            ["sqlite-root"]
-        )
-        .is_err(),
-        "schema trigger must reject physical root deletion"
-    );
-    raw.execute_batch("DROP TRIGGER determa_execution_checkpoints_no_delete")
-        .expect("drop test trigger");
-    drop(raw);
-    assert!(
-        reopened.health().is_err(),
-        "health must reject a missing deletion guard"
-    );
-    drop(reopened);
-    fs::remove_dir_all(directory).expect("remove temporary SQLite store");
-}
-
-#[cfg(feature = "sqlite")]
-#[test]
-fn sqlite_factory_modes_derive_real_profile_capabilities() {
-    let directory = temporary_path("sqlite-policy-capabilities");
-    fs::create_dir_all(&directory).expect("SQLite temporary directory");
-    let strict_path = directory.join("strict.sqlite3");
-    let compact_path = directory.join("compact.sqlite3");
-    let registry = AdapterRegistry::new();
-    register_bundled_adapters(&registry).expect("register bundled adapters");
-
-    let strict_configuration = format!(
-        "sqlite:{}#receipt_retention=permanent&outbox_retention=strict",
-        strict_path.display()
-    );
-    let strict = registry
-        .resolve(
-            &strict_configuration,
-            &BTreeSet::from([
-                ExecutionStoreCapability::DurableSingleWriter,
-                ExecutionStoreCapability::RootIdentityRetention,
-                ExecutionStoreCapability::PermanentReceiptRetention,
-                ExecutionStoreCapability::PermanentOutboxTerminalRetention,
-            ]),
-        )
-        .expect("strict configured SQLite store");
-    strict.initialize_schema().expect("strict SQLite schema");
-    strict.health().expect("strict SQLite health");
-    let strict_host = CheckpointHost::new(strict, Arc::new(InMemoryDefinitionResolver::default()));
-    assert!(strict_host
-        .validate_profile(
-            HostProfile::ExactlyOnceCommittedProcessing,
-            &BTreeSet::from([HostFeature::AtomicCheckpointProcessing]),
-            true,
-        )
-        .is_ok());
-    assert!(strict_host
-        .validate_profile(
-            HostProfile::ExactlyOnceCommittedProcessing,
-            &BTreeSet::from([HostFeature::AtomicCheckpointProcessing]),
-            false,
-        )
-        .is_err());
-    assert!(strict_host
-        .validate_profile(
-            HostProfile::StrictDurableOutbox,
-            &BTreeSet::from([
-                HostFeature::AtomicCheckpointProcessing,
-                HostFeature::OutboxWorker,
-                HostFeature::TotalOutboxLifecycle,
-                HostFeature::RetainUnresolvedOutbox,
-            ]),
-            true,
-        )
-        .is_ok());
-
-    let compact_configuration = format!(
-        "sqlite:{}#receipt_retention=bounded&outbox_retention=compact",
-        compact_path.display()
-    );
-    let compact = registry
-        .resolve(
-            &compact_configuration,
-            &BTreeSet::from([
-                ExecutionStoreCapability::DurableSingleWriter,
-                ExecutionStoreCapability::RootIdentityRetention,
-                ExecutionStoreCapability::CompactEffectIdentityRetention,
-            ]),
-        )
-        .expect("compact configured SQLite store");
-    compact.initialize_schema().expect("compact SQLite schema");
-    let compact_host =
-        CheckpointHost::new(compact, Arc::new(InMemoryDefinitionResolver::default()));
-    assert!(compact_host
-        .validate_profile(
-            HostProfile::CompactDurableOutbox,
-            &BTreeSet::from([
-                HostFeature::AtomicCheckpointProcessing,
-                HostFeature::OutboxWorker,
-                HostFeature::TotalOutboxLifecycle,
-                HostFeature::RetainReferencedEffectTombstones,
-            ]),
-            false,
-        )
-        .is_ok());
-
-    assert!(registry
-        .resolve(
-            &format!("sqlite:{}", directory.join("missing.sqlite3").display()),
-            &BTreeSet::new(),
-        )
-        .is_err());
-    fs::remove_dir_all(directory).expect("remove temporary SQLite stores");
-}
-
-#[cfg(feature = "sqlite")]
-#[test]
-fn sqlite_schema_mode_and_policy_transitions_are_enforced() {
-    let directory = temporary_path("sqlite-policy-enforcement");
-    fs::create_dir_all(&directory).expect("SQLite temporary directory");
-    let strict_path = directory.join("strict.sqlite3");
-    let strict_mode =
-        DurableStoreMode::new(ReceiptRetentionMode::Permanent, OutboxRetentionMode::Strict);
-    let strict =
-        SqliteExecutionStore::open(&strict_path, strict_mode).expect("strict SQLite store");
-    strict.initialize_schema().expect("strict SQLite schema");
-    let before = fixture_record("checkpoint-02-outbox-lifecycle/outbox-total-checkpoint.json");
-    let compacted = fixture_record("checkpoint-02-outbox-lifecycle/outbox-compact-checkpoint.json");
-    assert_eq!(
-        strict
-            .insert_if_absent(before.clone())
-            .expect("strict seed"),
-        StoreWriteResult::Committed
-    );
-    assert!(strict
-        .compare_and_swap(
-            &before.root_instance_id,
-            &before.revision,
-            &before.execution_checkpoint_digest,
-            compacted.clone(),
-        )
-        .is_err());
-
-    let mut pruned_checkpoint: ExecutionCheckpoint =
-        serde_json::from_slice(&before.bytes).expect("checkpoint fixture");
-    pruned_checkpoint.operation_receipts.pop();
-    pruned_checkpoint.increment_revision();
-    pruned_checkpoint
-        .recompute_digest()
-        .expect("pruned checkpoint digest");
-    let pruned = StoreRecord::from_checkpoint(&pruned_checkpoint).expect("pruned record");
-    assert!(strict
-        .compare_and_swap(
-            &before.root_instance_id,
-            &before.revision,
-            &before.execution_checkpoint_digest,
-            pruned,
-        )
-        .is_err());
-
-    let mismatched = SqliteExecutionStore::open(
-        &strict_path,
-        DurableStoreMode::new(ReceiptRetentionMode::Bounded, OutboxRetentionMode::Compact),
-    )
-    .expect("mismatched SQLite store");
-    assert!(mismatched.health().is_err());
-    assert!(mismatched.initialize_schema().is_err());
-
-    let compact_path = directory.join("compact.sqlite3");
-    let compact_store = SqliteExecutionStore::open(
-        &compact_path,
-        DurableStoreMode::new(
-            ReceiptRetentionMode::Permanent,
-            OutboxRetentionMode::Compact,
-        ),
-    )
-    .expect("compact SQLite store");
-    compact_store
-        .initialize_schema()
-        .expect("compact SQLite schema");
-    assert_eq!(
-        compact_store
-            .insert_if_absent(before.clone())
-            .expect("compact seed"),
-        StoreWriteResult::Committed
-    );
-    assert_eq!(
-        compact_store
-            .compare_and_swap(
-                &before.root_instance_id,
-                &before.revision,
-                &before.execution_checkpoint_digest,
-                compacted.clone(),
-            )
-            .expect("valid compaction"),
-        StoreWriteResult::Committed
-    );
-    let mut deleted_checkpoint: ExecutionCheckpoint =
-        serde_json::from_slice(&compacted.bytes).expect("compacted checkpoint fixture");
-    deleted_checkpoint.outbox_effect_tombstones.clear();
-    deleted_checkpoint.increment_revision();
-    deleted_checkpoint
-        .recompute_digest()
-        .expect("deleted tombstone digest");
-    let deleted = StoreRecord::from_checkpoint(&deleted_checkpoint).expect("deleted record");
-    assert!(compact_store
-        .compare_and_swap(
-            &compacted.root_instance_id,
-            &compacted.revision,
-            &compacted.execution_checkpoint_digest,
-            deleted,
-        )
-        .is_err());
-
-    let malformed_path = directory.join("malformed.sqlite3");
-    let malformed_connection = Connection::open(&malformed_path).expect("malformed SQLite file");
-    malformed_connection
-        .execute_batch(
-            "
-            CREATE TABLE determa_execution_store_metadata (
-                singleton INTEGER,
-                schema_version INTEGER,
-                receipt_retention TEXT,
-                outbox_retention TEXT
-            );
-            INSERT INTO determa_execution_store_metadata
-                (singleton, schema_version, receipt_retention, outbox_retention)
-            VALUES (1, 1, 'permanent', 'strict');
-            CREATE TABLE determa_execution_checkpoints (
-                root_instance_id TEXT,
-                revision TEXT,
-                checkpoint_digest TEXT,
-                checkpoint_bytes BLOB
-            );
-            ",
-        )
-        .expect("lookalike SQLite schema");
-    drop(malformed_connection);
-    let malformed =
-        SqliteExecutionStore::open(&malformed_path, strict_mode).expect("malformed SQLite store");
-    assert!(malformed.initialize_schema().is_err());
-    assert!(malformed.health().is_err());
-
-    fs::remove_dir_all(directory).expect("remove temporary SQLite stores");
-}
-
-#[test]
-fn memory_compare_and_swap_has_one_concurrent_winner() {
+fn memory_store_runs_the_native_v2_host_contract() {
     let store: Arc<dyn ExecutionStore> = Arc::new(MemoryExecutionStore::new());
-    concurrent_cas_contract(store, "memory-concurrent");
+    store.initialize_schema().unwrap();
+    native_v2_host_contract(store);
 }
 
 #[test]
-fn file_compare_and_swap_has_one_concurrent_winner() {
-    let directory = temporary_path("file-concurrent");
-    let first = Arc::new(FileExecutionStore::new(&directory).expect("first file store"));
-    first.initialize_schema().expect("file schema");
-    let second = Arc::new(FileExecutionStore::new(&directory).expect("second file store"));
-    concurrent_cas_contract_with_stores(first, second, "file-concurrent");
-    fs::remove_dir_all(directory).expect("remove temporary file store");
+fn file_store_runs_the_native_v2_host_contract_and_survives_restart() {
+    let directory = temporary_path("file-native-v2");
+    let store: Arc<dyn ExecutionStore> = Arc::new(FileExecutionStore::new(&directory).unwrap());
+    store.initialize_schema().unwrap();
+    native_v2_host_contract(store.clone());
+    drop(store);
+    let reopened = FileExecutionStore::new(&directory).unwrap();
+    assert!(reopened.load("server-1").unwrap().is_some());
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn sqlite_compare_and_swap_has_one_concurrent_winner() {
-    let directory = temporary_path("sqlite-concurrent");
-    fs::create_dir_all(&directory).expect("SQLite temporary directory");
+fn sqlite_store_runs_the_native_v2_host_contract_and_survives_restart() {
+    let directory = temporary_path("sqlite-native-v2");
+    fs::create_dir_all(&directory).unwrap();
     let path = directory.join("checkpoints.sqlite3");
-    let first = Arc::new(
-        SqliteExecutionStore::open(&path, DurableStoreMode::bounded()).expect("first SQLite store"),
-    );
-    first.initialize_schema().expect("SQLite schema");
-    let second = Arc::new(
-        SqliteExecutionStore::open(&path, DurableStoreMode::bounded())
-            .expect("second SQLite store"),
-    );
-    concurrent_cas_contract_with_stores(first, second, "sqlite-concurrent");
-    fs::remove_dir_all(directory).expect("remove temporary SQLite store");
+    let store: Arc<dyn ExecutionStore> =
+        Arc::new(SqliteExecutionStore::open(&path, DurableStoreMode::bounded()).unwrap());
+    store.initialize_schema().unwrap();
+    native_v2_host_contract(store.clone());
+    drop(store);
+    let reopened = SqliteExecutionStore::open(&path, DurableStoreMode::bounded()).unwrap();
+    assert!(reopened.load("server-1").unwrap().is_some());
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
-fn bundled_adapters_use_an_initially_empty_public_registry() {
-    let registry = AdapterRegistry::new();
-    assert!(registry.identifiers().expect("empty registry").is_empty());
-    register_bundled_adapters(&registry).expect("register bundled adapters");
-    let identifiers = registry.identifiers().expect("registered identifiers");
-    assert!(identifiers.contains(&"memory".to_string()));
-    assert!(identifiers.contains(&"file".to_string()));
-    #[cfg(feature = "sqlite")]
-    assert!(identifiers.contains(&"sqlite".to_string()));
-    #[cfg(feature = "postgresql")]
-    assert!(identifiers.contains(&"postgresql".to_string()));
-    assert!(register_bundled_adapters(&registry).is_err());
+fn memory_store_satisfies_compare_and_swap() {
+    raw_store_contract(&MemoryExecutionStore::new(), "memory-cas");
 }
 
-fn shared_store_contract(store: &dyn ExecutionStore, root_instance_id: &str) {
-    let initial = record(root_instance_id, "0", '0');
-    assert_eq!(
-        store
-            .insert_if_absent(initial.clone())
-            .expect("initial insert"),
-        StoreWriteResult::Committed
-    );
-    assert_eq!(
-        store
-            .insert_if_absent(initial.clone())
-            .expect("duplicate insert"),
-        StoreWriteResult::Conflict(Some(initial.clone()))
-    );
-    assert_eq!(
-        store.load(root_instance_id).expect("load initial"),
-        Some(initial.clone())
-    );
-    assert!(matches!(
-        store
-            .compare_and_swap(
-                root_instance_id,
-                "9",
-                &initial.execution_checkpoint_digest,
-                record(root_instance_id, "1", '1')
-            )
-            .expect("stale CAS"),
-        StoreWriteResult::Conflict(Some(_))
-    ));
-    let replacement = record(root_instance_id, "1", '1');
-    assert_eq!(
-        store
-            .compare_and_swap(
-                root_instance_id,
-                "0",
-                &initial.execution_checkpoint_digest,
-                replacement.clone()
-            )
-            .expect("successful CAS"),
-        StoreWriteResult::Committed
-    );
-    assert_eq!(
-        store.load(root_instance_id).expect("load replacement"),
-        Some(replacement)
-    );
-    assert!(store.health().expect("store health").healthy);
+#[test]
+fn file_store_satisfies_compare_and_swap() {
+    let directory = temporary_path("file-cas");
+    let store = FileExecutionStore::new(&directory).unwrap();
+    raw_store_contract(&store, "file-cas");
+    fs::remove_dir_all(directory).unwrap();
 }
 
-fn concurrent_cas_contract(store: Arc<dyn ExecutionStore>, root_instance_id: &str) {
-    concurrent_cas_contract_with_stores(store.clone(), store, root_instance_id);
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_store_satisfies_compare_and_swap() {
+    let directory = temporary_path("sqlite-cas");
+    fs::create_dir_all(&directory).unwrap();
+    let store = SqliteExecutionStore::open(
+        directory.join("checkpoints.sqlite3"),
+        DurableStoreMode::bounded(),
+    )
+    .unwrap();
+    raw_store_contract(&store, "sqlite-cas");
+    fs::remove_dir_all(directory).unwrap();
 }
 
-fn concurrent_cas_contract_with_stores(
-    first: Arc<dyn ExecutionStore>,
-    second: Arc<dyn ExecutionStore>,
-    root_instance_id: &str,
-) {
-    first.initialize_schema().expect("store initialization");
-    let initial = record(root_instance_id, "0", '0');
+fn native_v2_host_contract(store: Arc<dyn ExecutionStore>) {
+    let core = Path::new("conformance-suite/conformance/core/117-version2-mailboxes");
+    let bundle = load_bundle(&fs::read_to_string(core.join("machine.yaml")).unwrap()).unwrap();
+    let outbox_bundle = load_bundle(
+        r#"
+format: 1
+namespace: test.native_v2_adapter
+events:
+  published: { direction: output, payload: {} }
+machines:
+  - machine_id: publisher
+    root:
+      entry:
+        - send: { event: published, to: { external: true }, correlation_id: '"created"' }
+"#,
+    )
+    .unwrap();
+    let terminal_bundle = load_bundle(
+        r#"
+format: 1
+namespace: test.native_v2_terminal
+machines:
+  - machine_id: terminal
+    root:
+      variables:
+        value: { type: int, init: 0 }
+      entry:
+        - assign: { value: "1 / 0" }
+"#,
+    )
+    .unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle.clone(), true);
+    resolver.insert(outbox_bundle.clone(), true);
+    resolver.insert(terminal_bundle.clone(), true);
+    let host = CheckpointHost::new(store.clone(), Arc::new(resolver));
+    let retention = json!({
+        "mode": "bounded",
+        "permanent_replay_eligible": false,
+        "policy_identifier": "native-v2-test",
+        "pruned_through_receipt_sequence": null
+    });
+
+    let mismatch = host
+        .create_checkpoint(
+            &bundle,
+            "transaction_server",
+            "digest-mismatch",
+            "create-digest-mismatch",
+            &Bindings::default(),
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            retention.clone(),
+        )
+        .unwrap_err();
+    assert_eq!(mismatch.code, "invalid_execution_checkpoint");
+    assert!(store.load("digest-mismatch").unwrap().is_none());
+
+    let created = host
+        .create_checkpoint(
+            &bundle,
+            "transaction_server",
+            "server-1",
+            "create-server-1",
+            &Bindings::default(),
+            None,
+            retention.clone(),
+        )
+        .unwrap();
+    let inputs: Value =
+        serde_json::from_slice(&fs::read(core.join("operation-inputs.json")).unwrap()).unwrap();
+    let admitted = host
+        .admit_checkpoint(
+            "server-1",
+            inputs["admit_two"]["deliveries"].as_array().unwrap(),
+            &MutationGuard::new(created.revision(), created.digest()),
+        )
+        .unwrap();
+    let admitted_checkpoint = &admitted["checkpoint"];
+    let first_processing = processing_for(admitted_checkpoint);
+    let stepped = host
+        .step_checkpoint(
+            "server-1",
+            &first_processing,
+            &MutationGuard::new(
+                admitted_checkpoint["revision"].as_str().unwrap(),
+                admitted_checkpoint["execution_checkpoint_digest"]
+                    .as_str()
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+    let second_processing = processing_for(&stepped);
+    let stepped_again = host
+        .step_checkpoint(
+            "server-1",
+            &second_processing,
+            &MutationGuard::new(
+                stepped["revision"].as_str().unwrap(),
+                stepped["execution_checkpoint_digest"].as_str().unwrap(),
+            ),
+        )
+        .unwrap();
+    let pruned = host
+        .prune_checkpoint(
+            "server-1",
+            &PruneRequest {
+                cutoff_receipt_sequence: "4".to_string(),
+                target_mode: "bounded".to_string(),
+                policy_identifier: Some("native-v2-test".to_string()),
+                dependency_receipt_sequences: Vec::new(),
+                dependency_effect_ids: Vec::new(),
+            },
+            &MutationGuard::new(
+                stepped_again["revision"].as_str().unwrap(),
+                stepped_again["execution_checkpoint_digest"]
+                    .as_str()
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
     assert_eq!(
-        first
-            .insert_if_absent(initial.clone())
-            .expect("concurrent seed"),
-        StoreWriteResult::Committed
+        pruned["replay_retention"]["pruned_through_receipt_sequence"],
+        "4"
     );
-    let barrier = Arc::new(Barrier::new(3));
-    let root = root_instance_id.to_string();
-    let workers = [(first, '1'), (second, '2')]
-        .into_iter()
-        .map(|(store, marker)| {
-            let barrier = barrier.clone();
-            let root = root.clone();
-            let digest = initial.execution_checkpoint_digest.clone();
-            thread::spawn(move || {
-                barrier.wait();
-                store
-                    .compare_and_swap(&root, "0", &digest, record(&root, "1", marker))
-                    .expect("concurrent CAS")
-            })
-        })
-        .collect::<Vec<_>>();
-    barrier.wait();
-    let results = workers
-        .into_iter()
-        .map(|worker| worker.join().expect("CAS worker"))
-        .collect::<Vec<_>>();
+
+    let maintenance = MaintenanceMigrationRequest {
+        root_instance_id: "server-1".to_string(),
+        operation_id: "native-v2-no-op".to_string(),
+        source_aggregate_state_digest: pruned["root_record"]["aggregate_state"]
+            ["aggregate_state_digest"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        target_validated_bundle_fingerprint: bundle.fingerprint.clone(),
+        migration_descriptor_digest_route: Vec::new(),
+        maintenance_mode: false,
+        supplied_request_digest: None,
+        guard: MutationGuard::new(
+            pruned["revision"].as_str().unwrap(),
+            pruned["execution_checkpoint_digest"].as_str().unwrap(),
+        ),
+        limits: ResourceLimits::default(),
+    };
+    let maintained = host.maintenance_migration(&maintenance).unwrap();
     assert_eq!(
-        results
-            .iter()
-            .filter(|result| **result == StoreWriteResult::Committed)
-            .count(),
-        1
+        maintained["receipt"]["result_code"],
+        "migration_no_operation"
     );
     assert_eq!(
-        results
-            .iter()
-            .filter(|result| matches!(result, StoreWriteResult::Conflict(Some(_))))
-            .count(),
-        1
+        host.maintenance_migration(&maintenance).unwrap(),
+        maintained
+    );
+
+    let transactional_created = host
+        .create_checkpoint(
+            &bundle,
+            "transaction_server",
+            "transactional-process-root",
+            "create-transactional-process-root",
+            &Bindings::default(),
+            None,
+            retention.clone(),
+        )
+        .unwrap();
+    let transactional = host
+        .transactional_process(
+            "transactional-process-root",
+            &TransactionalProcessRequest {
+                migration: MigrationRequest {
+                    migration_route: Vec::new(),
+                    target_validated_bundle_fingerprint: bundle.fingerprint.clone(),
+                    maintenance_mode: false,
+                },
+                migration_limits: ResourceLimits::default(),
+                delivery: input_delivery(&transactional_created, "transactional-event"),
+                processing_mode: "delayed".to_string(),
+            },
+            &MutationGuard::new(
+                transactional_created.revision(),
+                transactional_created.digest(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(transactional["revision"], "1");
+    assert_eq!(transactional["migration_audit_records"], json!([]));
+    let terminal = host
+        .create_checkpoint(
+            &terminal_bundle,
+            "terminal",
+            "terminal-root",
+            "create-terminal",
+            &Bindings::default(),
+            None,
+            retention.clone(),
+        )
+        .unwrap();
+    let tombstoned = host
+        .tombstone_root(
+            "terminal-root",
+            "native-v2-tombstone",
+            &MutationGuard::new(terminal.revision(), terminal.digest()),
+        )
+        .unwrap();
+    assert_eq!(tombstoned["root_record"]["status"], "tombstone");
+
+    let outbox = host
+        .create_checkpoint(
+            &outbox_bundle,
+            "publisher",
+            "outbox-root",
+            "create-outbox",
+            &Bindings::default(),
+            None,
+            retention,
+        )
+        .unwrap();
+    let effect_id = outbox.value()["pending_outbox_intents"][0]["intent"]["effect_id"]
+        .as_str()
+        .unwrap();
+    let pending = host
+        .update_pending_outbox(
+            "outbox-root",
+            effect_id,
+            PendingOutboxState::RetryableFailure {
+                reason_code: "retry".to_string(),
+            },
+            &MutationGuard::new(outbox.revision(), outbox.digest()),
+        )
+        .unwrap();
+    let terminal = host
+        .terminalize_outbox(
+            "outbox-root",
+            effect_id,
+            TerminalOutboxOutcome::Confirmed,
+            &guard_for(&pending),
+        )
+        .unwrap();
+    let compacted = host
+        .compact_outbox("outbox-root", effect_id, &guard_for(&terminal))
+        .unwrap();
+    assert_eq!(
+        compacted["outbox_effect_tombstones"][0]["effect_id"],
+        effect_id
     );
 }
 
-fn record(root_instance_id: &str, revision: &str, marker: char) -> StoreRecord {
-    let digest = format!("sha256:{}", marker.to_string().repeat(64));
-    let bytes = serde_json_canonicalizer::to_vec(&json!({
-        "root_instance_id": root_instance_id,
-        "revision": revision,
-        "execution_checkpoint_digest": digest
-    }))
-    .expect("record bytes");
-    StoreRecord {
-        root_instance_id: root_instance_id.to_string(),
-        revision: revision.to_string(),
-        execution_checkpoint_digest: digest,
-        bytes,
+fn input_delivery(
+    checkpoint: &determa_state::checkpoint::ExecutionCheckpoint,
+    event_id: &str,
+) -> Value {
+    let envelope = json!({
+        "event": "received",
+        "event_id": event_id,
+        "cause_id": event_id,
+        "source": {"host": true},
+        "target": checkpoint.value()["root_record"]["aggregate_state"]["runtimes"][0]
+            ["target_identity"],
+        "payload": ["map", []]
+    });
+    let bytes = serde_json_canonicalizer::to_vec(&json!([
+        "determa-inbox-envelope-digest-2",
+        "2",
+        checkpoint.root_instance_id(),
+        "input",
+        envelope
+    ]))
+    .unwrap();
+    json!({
+        "delivery_mode": "input",
+        "envelope": envelope,
+        "envelope_digest": format!("sha256:{:x}", Sha256::digest(bytes))
+    })
+}
+
+fn processing_for(checkpoint: &Value) -> ProcessingRequest {
+    let runtime = checkpoint["root_record"]["aggregate_state"]["runtimes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|runtime| !runtime["ready_mailbox"].as_array().unwrap().is_empty())
+        .unwrap();
+    let entry = &runtime["ready_mailbox"][0];
+    ProcessingRequest {
+        target_runtime_id: runtime["runtime_id"].as_str().unwrap().to_string(),
+        event_id: entry["envelope"]["event_id"].as_str().unwrap().to_string(),
+        envelope_digest: entry["envelope_digest"].as_str().unwrap().to_string(),
+        acceptance_sequence: entry["acceptance_sequence"].as_str().unwrap().to_string(),
+        queue_sequence: entry["queue_sequence"].as_str().unwrap().to_string(),
+        processing_mode: "delayed".to_string(),
     }
 }
 
-#[cfg(feature = "sqlite")]
-#[cfg(feature = "sqlite")]
-fn fixture_record(relative_path: &str) -> StoreRecord {
-    let bytes = fs::read(PathBuf::from(CHECKPOINT_PROFILE).join(relative_path))
-        .expect("checkpoint fixture");
-    let checkpoint: ExecutionCheckpoint =
-        serde_json::from_slice(&bytes).expect("typed checkpoint fixture");
-    StoreRecord::from_checkpoint(&checkpoint).expect("fixture store record")
+fn guard_for(value: &Value) -> MutationGuard {
+    MutationGuard::new(
+        value["revision"].as_str().unwrap(),
+        value["execution_checkpoint_digest"].as_str().unwrap(),
+    )
+}
+
+fn raw_store_contract(store: &dyn ExecutionStore, root: &str) {
+    store.initialize_schema().unwrap();
+    let initial = record(root, "0", 'a');
+    assert_eq!(
+        store.insert_if_absent(initial.clone()).unwrap(),
+        StoreWriteResult::Committed
+    );
+    assert!(matches!(
+        store.insert_if_absent(initial.clone()).unwrap(),
+        StoreWriteResult::Conflict(Some(_))
+    ));
+    let replacement = record(root, "1", 'b');
+    assert_eq!(
+        store
+            .compare_and_swap(
+                root,
+                &initial.revision,
+                &initial.execution_checkpoint_digest,
+                replacement.clone(),
+            )
+            .unwrap(),
+        StoreWriteResult::Committed
+    );
+    assert_eq!(store.load(root).unwrap().unwrap(), replacement);
+}
+
+fn record(root: &str, revision: &str, marker: char) -> StoreRecord {
+    let digest = format!("sha256:{}", marker.to_string().repeat(64));
+    StoreRecord {
+        root_instance_id: root.to_string(),
+        revision: revision.to_string(),
+        execution_checkpoint_digest: digest.clone(),
+        bytes: serde_json_canonicalizer::to_vec(&json!({
+            "root_instance_id": root,
+            "revision": revision,
+            "execution_checkpoint_digest": digest
+        }))
+        .unwrap(),
+    }
 }
 
 fn temporary_path(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("clock")
+        .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("determa-{label}-{}-{nonce}", std::process::id()))
 }
