@@ -8,15 +8,13 @@ remains `0.1.0` until the coordinated `v0.2.0` tag runs the release workflow. Th
 branch is validated against the merged `0.2.0` metadata revisions at these exact
 normative inputs:
 
-- specification commit `e22f9db295d632f3f46a9d1260c63b5af92efa7e`;
-- conformance commit `8f6a4d9101fd6554e9a51da72ca48160368d4e83`.
+- specification commit `3f2dc4217971d5c6598436b19e415c53ec095dfe`;
+- conformance commit `e72f72396fae44cbee323bf988d86966235dbd16`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
-tests run all 114 format-1 core cases, 108 version-1 and 15 version-2 portable
-persistence vectors, and 12 steps
-across the six persistence host profiles. The execution-checkpoint integration test
-runs all 102 version-1 and 60 version-2 host vectors. The version-2 harnesses cover 113
-vectors and 164 artifacts in total.
+tests run all 98 format-1 core cases and all 162 applicable native artifact/checkpoint
+schema-v2 vectors. Durable host profiles remain optional host contracts; memory, file,
+SQLite, and PostgreSQL tests exercise the implemented transactional host surface.
 
 ## Implemented core
 
@@ -32,10 +30,10 @@ vectors and 164 artifacts in total.
 - Pure `create` and `dispatch` operations with deterministic runtime, cause, event, and
   external-effect identities.
 - Portable aggregate serialization and restoration with strict typed values, canonical
-  JSON, content-addressed definitions, queue-bearing version-2 artifacts, and
+  JSON, content-addressed definitions, sole schema-v2 artifacts, and
   self-contained aggregate packages.
 - Resolver-backed compatible and transforming definition migration, exact route
-  execution, resource limits, audit records, and atomic migration-and-dispatch.
+  execution, resource limits, and ordered audit records.
 - Strict execution-checkpoint Serde types, canonical digests, semantic restoration,
   operation receipts, durable pending delivery, outbox lifecycle, bounded retention,
   migration audit, root tombstones, and revision/digest compare-and-swap.
@@ -47,9 +45,7 @@ vectors and 164 artifacts in total.
 - Inspection through the returned logical aggregate state, result disposition, fault,
   rejection, configuration, variables, components, owned instances, and emissions.
 - Immutable `PORTABLE_CODES` slices on public closed-code enums, including
-  `CreationRejectionCode`, `DispatchRejectionCode`, and `EngineFaultCode`, plus
-  `CREATION_REJECTION_CODES`, `DISPATCH_REJECTION_CODES`, and `ENGINE_FAULT_CODES` for
-  compatibility with the existing string-slice API.
+  `CreationRejectionCode`, `DispatchRejectionCode`, and `EngineFaultCode`.
 
 The portable core remains a pure foreground transform and does not own queues, broker
 acknowledgement, timers, package imports, or a background scheduler. The optional host
@@ -71,9 +67,9 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`8f6a4d9101fd6554e9a51da72ca48160368d4e83`. CI also checks that all bundled schemas
+`e72f72396fae44cbee323bf988d86966235dbd16`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
-`e22f9db295d632f3f46a9d1260c63b5af92efa7e`. These exact merged commits are the
+`3f2dc4217971d5c6598436b19e415c53ec095dfe`. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
 
 ## Library
@@ -171,8 +167,8 @@ For shared application and checkpoint atomicity, use
 transaction for application SQL and accepts exactly one root-bound checkpoint mutation
 through `CheckpointHost::stage_postgresql_mutation`. The host uses `SERIALIZABLE`,
 rejects cross-store/cross-root handles, rolls both parts back on failure, and returns
-the committed host result only after commit succeeds. Native version-2 creation,
-upgrade, admission, step, maintenance migration, pruning, outbox lifecycle, and root
+the committed host result only after commit succeeds. Native schema-v2 creation,
+admission, step, maintenance migration, pruning, outbox lifecycle, and root
 tombstone mutations use this same shared transaction API. The store's lower-level
 native transaction callback does not run host operations.
 

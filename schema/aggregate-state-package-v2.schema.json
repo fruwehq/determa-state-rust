@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://determa.dev/state/schema/aggregate-state-package-v2.schema.json",
-  "title": "Determa State self-contained aggregate-state package version 2",
-  "description": "Closed transport package for one queue-bearing aggregate and its verified attachments.",
+  "title": "Determa State self-contained aggregate-state package",
+  "description": "Closed transport package for the sole supported queue-bearing aggregate artifact and its verified attachments.",
   "type": "object",
   "required": [
     "aggregate_state_package_format",

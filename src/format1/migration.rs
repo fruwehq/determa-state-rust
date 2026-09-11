@@ -143,58 +143,10 @@ pub struct MigrationAuditRecord {
 pub struct MigrationOutcome {
     pub aggregate: super::runtime::AggregateState,
     pub aggregate_envelope: AggregateEnvelope,
-    pub aggregate_bytes: Vec<u8>,
     pub audit_records: Vec<MigrationAuditRecord>,
 }
 
-#[derive(Debug, Clone)]
-pub struct MigrationDispatchOutcome {
-    pub migration: MigrationOutcome,
-    pub disposition: Option<super::runtime::Disposition>,
-    pub emissions: Vec<super::runtime::Emission>,
-    pub fault: Option<super::runtime::FaultRecord>,
-    pub rejection: Option<super::runtime::Rejection>,
-}
-
-pub fn migrate_and_dispatch(
-    source: &[u8],
-    request: &MigrationRequest,
-    resolver: &(impl MigrationArtifactResolver + ?Sized),
-    limits: &ResourceLimits,
-    delivery: Option<super::model::Delivery>,
-) -> Result<MigrationDispatchOutcome, PersistenceError> {
-    let mut migration = migrate_aggregate(source, request, resolver, limits)?;
-    let target = resolve_definition(
-        resolver,
-        &migration.aggregate_envelope.validated_bundle_fingerprint,
-        DefinitionRole::Target,
-    )?;
-    let result = super::runtime::dispatch(&target, &migration.aggregate, delivery);
-    let state = result
-        .state
-        .ok_or_else(|| totality("core dispatch did not return aggregate state"))?;
-    let (aggregate_envelope, aggregate_bytes) = super::wire::encode_aggregate(&target, &state)?;
-    migration.aggregate = state;
-    migration.aggregate_envelope = aggregate_envelope;
-    migration.aggregate_bytes = aggregate_bytes;
-    Ok(MigrationDispatchOutcome {
-        migration,
-        disposition: result.disposition,
-        emissions: result.emissions,
-        fault: result.fault,
-        rejection: result.rejection,
-    })
-}
-
-/// Decode one selected migration-descriptor artifact without resolving a route.
-///
-/// This is the portable descriptor-decoder boundary used by conformance vectors for
-/// legacy bytes that have no modern routing digest.
-pub fn decode_selected_migration_descriptor(source: &[u8]) -> Result<(), PersistenceError> {
-    decode_descriptor(source, None, &ResourceLimits::default()).map(|_| ())
-}
-
-pub fn migrate_aggregate(
+pub(crate) fn migrate_aggregate(
     source: &[u8],
     request: &MigrationRequest,
     resolver: &(impl MigrationArtifactResolver + ?Sized),
@@ -223,7 +175,6 @@ pub fn migrate_aggregate(
         return Ok(MigrationOutcome {
             aggregate,
             aggregate_envelope: envelope,
-            aggregate_bytes: source.to_vec(),
             audit_records: Vec::new(),
         });
     }
@@ -275,7 +226,6 @@ pub fn migrate_aggregate(
     }
 
     let mut audit_records = Vec::new();
-    let mut current_bytes = source.to_vec();
     for (digest, descriptor, target_bundle) in prepared_route {
         let source_fingerprint =
             string(&descriptor, "source_validated_bundle_fingerprint")?.to_string();
@@ -287,10 +237,10 @@ pub fn migrate_aggregate(
         enforce_aggregate_limits(&envelope, limits)?;
         let aggregate = restore_envelope(&envelope, resolver)
             .map_err(|failure| totality(failure.to_string()))?;
-        current_bytes = envelope.canonical_bytes()?;
+        let current_bytes = envelope.canonical_bytes()?;
         require_within(current_bytes.len(), &limits.maximum_aggregate_bytes)?;
         audit_records.push(MigrationAuditRecord {
-            migration_audit_record_schema_version: 1,
+            migration_audit_record_schema_version: 2,
             root_instance_id: envelope.root_instance_id.clone(),
             root_runtime_id: envelope.root_runtime_id.clone(),
             migration_sequence: envelope.migration_sequence.clone(),
@@ -307,7 +257,6 @@ pub fn migrate_aggregate(
     Ok(MigrationOutcome {
         aggregate,
         aggregate_envelope: envelope,
-        aggregate_bytes: current_bytes,
         audit_records,
     })
 }
@@ -396,7 +345,7 @@ fn decode_descriptor(
         }
     }
     match object.get("migration_descriptor_schema_version") {
-        Some(JsonValue::Number(value)) if value.as_i64() == Some(1) => {}
+        Some(JsonValue::Number(value)) if value.as_i64() == Some(2) => {}
         _ => {
             return Err(error(
                 PersistenceErrorCode::UnsupportedMigrationDescriptorSchemaVersion,
@@ -406,7 +355,7 @@ fn decode_descriptor(
     }
     super::wire::validate_schema(
         &value,
-        include_str!("../../schema/migration-descriptor.schema.json"),
+        include_str!("../../schema/migration-descriptor-v2.schema.json"),
         PersistenceErrorCode::InvalidMigrationDescriptor,
     )?;
     let mut without_digest = value.clone();
@@ -414,7 +363,7 @@ fn decode_descriptor(
         .as_object_mut()
         .expect("checked object")
         .remove("migration_descriptor_digest");
-    let computed = jcs_hash(&json!(["determa-migration-descriptor-1", without_digest]))?;
+    let computed = jcs_hash(&json!(["determa-migration-descriptor-2", without_digest]))?;
     let declared_digest = string(&value, "migration_descriptor_digest")?;
     let expected_digest = expected_digest.unwrap_or(declared_digest);
     if computed != expected_digest || declared_digest != expected_digest {
@@ -1683,273 +1632,4 @@ fn totality(message: impl Into<String>) -> PersistenceError {
 
 fn route_mismatch(message: impl Into<String>) -> PersistenceError {
     error(PersistenceErrorCode::MigrationRouteMismatch, message)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::format1::{
-        create, encode_aggregate, load_bundle, Bindings, InMemoryDefinitionResolver,
-    };
-
-    #[test]
-    fn applies_normative_compatible_migration() {
-        let directory = "conformance-suite/conformance/core/99-compatible-definition-upgrade";
-        let source_bundle =
-            load_bundle(&std::fs::read_to_string(format!("{directory}/machine.yaml")).unwrap())
-                .unwrap();
-        let target_bundle =
-            load_bundle(&std::fs::read_to_string(format!("{directory}/target.yaml")).unwrap())
-                .unwrap();
-        let descriptor = std::fs::read(format!("{directory}/migration-descriptor.json")).unwrap();
-        let descriptor_value: JsonValue = serde_json::from_slice(&descriptor).unwrap();
-        let digest = descriptor_value["migration_descriptor_digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let mut resolver = InMemoryDefinitionResolver::default();
-        assert!(resolver.insert(source_bundle, true));
-        assert!(resolver.insert(target_bundle.clone(), true));
-        assert!(resolver.insert_descriptor(digest.clone(), descriptor, true));
-        let result = migrate_aggregate(
-            &std::fs::read(format!("{directory}/source-aggregate-state.json")).unwrap(),
-            &MigrationRequest {
-                migration_route: vec![digest],
-                target_validated_bundle_fingerprint: target_bundle.fingerprint,
-                maintenance_mode: false,
-            },
-            &resolver,
-            &ResourceLimits::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            result.aggregate_bytes,
-            std::fs::read(format!(
-                "{directory}/expected-aggregate-state.canonical.json"
-            ))
-            .unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(result.audit_records).unwrap(),
-            serde_json::from_slice::<JsonValue>(
-                &std::fs::read(format!("{directory}/expected-migration-audit.json")).unwrap()
-            )
-            .unwrap()
-        );
-    }
-
-    #[test]
-    fn applies_normative_variable_transform() {
-        assert_single_hop_case(
-            "102-variable-migration",
-            "source-aggregate-state.json",
-            "expected-aggregate-state.canonical.json",
-            "expected-migration-audit.json",
-        );
-    }
-
-    #[test]
-    fn applies_normative_structural_transforms() {
-        for case in [
-            "100-explicit-active-state-remap",
-            "104-component-migration",
-            "105-owned-runtime-migration",
-            "106-counter-and-identity-preservation",
-        ] {
-            assert_single_hop_case(
-                case,
-                "source-aggregate-state.json",
-                "expected-aggregate-state.canonical.json",
-                "expected-migration-audit.json",
-            );
-        }
-    }
-
-    #[test]
-    fn applies_occurrence_local_transforms() {
-        assert_single_hop_case(
-            "114-occurrence-local-transform-binding",
-            "repeated-runtime-source.json",
-            "repeated-runtime-expected.canonical.json",
-            "repeated-runtime-audit.json",
-        );
-        assert_single_hop_case(
-            "114-occurrence-local-transform-binding",
-            "repeated-activation-source.json",
-            "repeated-activation-expected.canonical.json",
-            "repeated-activation-audit.json",
-        );
-    }
-
-    #[test]
-    fn applies_normative_history_transforms() {
-        assert_single_hop_case(
-            "103-history-migration",
-            "source-aggregate-state.json",
-            "expected-aggregate-state.canonical.json",
-            "expected-migration-audit.json",
-        );
-        assert_single_hop_case(
-            "103-history-migration",
-            "recorded-source-aggregate-state.json",
-            "recorded-expected-aggregate-state.canonical.json",
-            "recorded-expected-migration-audit.json",
-        );
-        assert_single_hop_case_with_descriptor(
-            "103-history-migration",
-            "shallow-source-aggregate-state.json",
-            "shallow-expected-aggregate-state.canonical.json",
-            "shallow-expected-migration-audit.json",
-            "shallow-migration-descriptor.json",
-        );
-    }
-
-    #[test]
-    fn definition_byte_limits_use_exact_typed_large_integer_projection() {
-        let source_bundle = large_version_bundle("9007199254740992", "");
-        let target_bundle = large_version_bundle("9007199254740992", "meta:\n  release: next\n");
-        let adjacent_bundle = large_version_bundle("9007199254740993", "");
-        let source_typed = super::super::compile::typed_projection(&source_bundle.normalized);
-        let target_typed = super::super::compile::typed_projection(&target_bundle.normalized);
-        let adjacent_typed = super::super::compile::typed_projection(&adjacent_bundle.normalized);
-        let source_bytes = canonical_bytes(&source_typed).unwrap();
-        let target_bytes = canonical_bytes(&target_typed).unwrap();
-        let adjacent_bytes = canonical_bytes(&adjacent_typed).unwrap();
-        assert_ne!(source_bundle.fingerprint, adjacent_bundle.fingerprint);
-        assert_ne!(source_bytes, adjacent_bytes);
-
-        let shape = aggregate_shape_fingerprint(&source_bundle).unwrap();
-        assert_eq!(shape, aggregate_shape_fingerprint(&target_bundle).unwrap());
-        let mut descriptor: JsonValue = serde_json::from_slice(
-            &std::fs::read(
-                "conformance-suite/conformance/core/99-compatible-definition-upgrade/migration-descriptor.json",
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        descriptor["source_validated_bundle_fingerprint"] =
-            JsonValue::String(source_bundle.fingerprint.clone());
-        descriptor["target_validated_bundle_fingerprint"] =
-            JsonValue::String(target_bundle.fingerprint.clone());
-        descriptor["source_aggregate_shape_fingerprint"] = JsonValue::String(shape.clone());
-        descriptor["target_aggregate_shape_fingerprint"] = JsonValue::String(shape);
-        let mut digest_input = descriptor.clone();
-        digest_input
-            .as_object_mut()
-            .unwrap()
-            .remove("migration_descriptor_digest");
-        let digest = jcs_hash(&json!(["determa-migration-descriptor-1", digest_input])).unwrap();
-        descriptor["migration_descriptor_digest"] = JsonValue::String(digest.clone());
-        let descriptor_bytes = canonical_bytes(&descriptor).unwrap();
-
-        let created = create(
-            &source_bundle,
-            "job",
-            "large-version-root",
-            "large-version-create",
-            &Bindings::default(),
-        );
-        let source_state = created.state.unwrap();
-        let (_, aggregate_bytes) = encode_aggregate(&source_bundle, &source_state).unwrap();
-        let mut resolver = InMemoryDefinitionResolver::default();
-        assert!(resolver.insert(source_bundle, true));
-        assert!(resolver.insert(target_bundle.clone(), true));
-        assert!(resolver.insert_descriptor(digest.clone(), descriptor_bytes, true));
-        let request = MigrationRequest {
-            migration_route: vec![digest],
-            target_validated_bundle_fingerprint: target_bundle.fingerprint,
-            maintenance_mode: false,
-        };
-        let exact_limit = source_bytes.len().max(target_bytes.len());
-        let insufficient = ResourceLimits {
-            maximum_definition_bytes: Counter::from(exact_limit - 1),
-            ..ResourceLimits::default()
-        };
-        assert_eq!(
-            migrate_aggregate(&aggregate_bytes, &request, &resolver, &insufficient)
-                .unwrap_err()
-                .code,
-            PersistenceErrorCode::MigrationResourceLimitExceeded
-        );
-        let exact = ResourceLimits {
-            maximum_definition_bytes: Counter::from(exact_limit),
-            ..ResourceLimits::default()
-        };
-        migrate_aggregate(&aggregate_bytes, &request, &resolver, &exact).unwrap();
-    }
-
-    fn large_version_bundle(version: &str, extra: &str) -> Bundle {
-        load_bundle(&format!(
-            "format: 1\nnamespace: example.large_version\n{extra}machines:\n  - machine_id: job\n    version: {version}\n    root: {{}}\n"
-        ))
-        .unwrap()
-    }
-
-    fn assert_single_hop_case(
-        case: &str,
-        source_file: &str,
-        expected_file: &str,
-        audit_file: &str,
-    ) {
-        assert_single_hop_case_with_descriptor(
-            case,
-            source_file,
-            expected_file,
-            audit_file,
-            "migration-descriptor.json",
-        );
-    }
-
-    fn assert_single_hop_case_with_descriptor(
-        case: &str,
-        source_file: &str,
-        expected_file: &str,
-        audit_file: &str,
-        descriptor_file: &str,
-    ) {
-        let directory = format!("conformance-suite/conformance/core/{case}");
-        let (machine_file, target_file) = if descriptor_file.starts_with("shallow-") {
-            ("shallow-machine.yaml", "shallow-target.yaml")
-        } else {
-            ("machine.yaml", "target.yaml")
-        };
-        let source_bundle =
-            load_bundle(&std::fs::read_to_string(format!("{directory}/{machine_file}")).unwrap())
-                .unwrap();
-        let target_bundle =
-            load_bundle(&std::fs::read_to_string(format!("{directory}/{target_file}")).unwrap())
-                .unwrap();
-        let descriptor = std::fs::read(format!("{directory}/{descriptor_file}")).unwrap();
-        let descriptor_value: JsonValue = serde_json::from_slice(&descriptor).unwrap();
-        let digest = descriptor_value["migration_descriptor_digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let mut resolver = InMemoryDefinitionResolver::default();
-        assert!(resolver.insert(source_bundle, true));
-        assert!(resolver.insert(target_bundle.clone(), true));
-        assert!(resolver.insert_descriptor(digest.clone(), descriptor, true));
-        let result = migrate_aggregate(
-            &std::fs::read(format!("{directory}/{source_file}")).unwrap(),
-            &MigrationRequest {
-                migration_route: vec![digest],
-                target_validated_bundle_fingerprint: target_bundle.fingerprint,
-                maintenance_mode: false,
-            },
-            &resolver,
-            &ResourceLimits::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            result.aggregate_bytes,
-            std::fs::read(format!("{directory}/{expected_file}")).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(result.audit_records).unwrap(),
-            serde_json::from_slice::<JsonValue>(
-                &std::fs::read(format!("{directory}/{audit_file}")).unwrap()
-            )
-            .unwrap()
-        );
-    }
 }

@@ -1,259 +1,603 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://determa.dev/state/schema/aggregate-state-v2.schema.json",
-  "title": "Determa State portable aggregate-state envelope version 2",
-  "description": "Closed wire schema for aggregate_state_schema_version 2 with runtime-local mailboxes.",
+  "title": "Determa State portable aggregate state",
+  "description": "Closed wire schema for the sole supported queue-bearing aggregate state artifact.",
   "$ref": "#/$defs/aggregateState",
   "$defs": {
     "nonEmptyString": {
-      "$ref": "aggregate-state.schema.json#/$defs/nonEmptyString"
+      "type": "string",
+      "minLength": 1
     },
     "identifier": {
-      "$ref": "aggregate-state.schema.json#/$defs/identifier"
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
     },
     "namespace": {
-      "$ref": "aggregate-state.schema.json#/$defs/namespace"
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"
     },
     "canonicalDecimal": {
-      "$ref": "aggregate-state.schema.json#/$defs/canonicalDecimal"
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
     },
     "positiveCanonicalDecimal": {
-      "$ref": "aggregate-state.schema.json#/$defs/positiveCanonicalDecimal"
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
     },
     "signedCanonicalDecimal": {
-      "$ref": "aggregate-state.schema.json#/$defs/signedCanonicalDecimal"
+      "type": "string",
+      "pattern": "^(0|-?[1-9][0-9]*)$"
     },
     "sha256": {
-      "$ref": "aggregate-state.schema.json#/$defs/sha256"
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
     },
     "jsonPointer": {
-      "$ref": "aggregate-state.schema.json#/$defs/jsonPointer"
+      "type": "string",
+      "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
     },
     "sourceLocator": {
-      "$ref": "aggregate-state.schema.json#/$defs/sourceLocator"
+      "type": "string",
+      "pattern": "^(?:(?:/(?:[^~/]|~[01])*)+|system:[A-Za-z_][A-Za-z0-9_]*)$"
     },
     "typedValue": {
-      "$ref": "aggregate-state.schema.json#/$defs/typedValue"
-    },
-    "eventName": {
       "oneOf": [
         {
-          "$ref": "#/$defs/identifier"
-        },
-        {
-          "enum": [
-            "determa.component_completed",
-            "determa.component_failed",
-            "determa.spawned_instance_failed"
-          ]
-        }
-      ]
-    },
-    "typedMap": {
-      "type": "array",
-      "prefixItems": [
-        {
-          "const": "map"
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "null"
+            }
+          ],
+          "minItems": 1,
+          "maxItems": 1
         },
         {
           "type": "array",
-          "items": {
-            "type": "array",
-            "prefixItems": [
-              {
-                "type": "string"
-              },
-              {
+          "prefixItems": [
+            {
+              "const": "boolean"
+            },
+            {
+              "type": "boolean"
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "string"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "integer"
+            },
+            {
+              "$ref": "#/$defs/signedCanonicalDecimal"
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "float"
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{16}$"
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "list"
+            },
+            {
+              "type": "array",
+              "items": {
                 "$ref": "#/$defs/typedValue"
               }
-            ],
-            "minItems": 2,
-            "maxItems": 2
-          }
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "map"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "$ref": "#/$defs/typedValue"
+                  }
+                ],
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
         }
-      ],
-      "minItems": 2,
-      "maxItems": 2
+      ]
     },
     "machineIdentity": {
-      "$ref": "aggregate-state.schema.json#/$defs/machineIdentity"
+      "type": "object",
+      "required": [
+        "namespace",
+        "machine_id",
+        "machine_version",
+        "root_definition_pointer"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "namespace": {
+          "$ref": "#/$defs/namespace"
+        },
+        "machine_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "machine_version": {
+          "$ref": "#/$defs/positiveCanonicalDecimal"
+        },
+        "root_definition_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        }
+      }
     },
     "definitionBinding": {
-      "$ref": "aggregate-state.schema.json#/$defs/definitionBinding"
+      "type": "object",
+      "required": [
+        "validated_bundle_fingerprint",
+        "machine"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "validated_bundle_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "machine": {
+          "$ref": "#/$defs/machineIdentity"
+        }
+      }
     },
     "rootIdentityOrigin": {
-      "$ref": "aggregate-state.schema.json#/$defs/rootIdentityOrigin"
+      "type": "object",
+      "required": [
+        "kind",
+        "definition",
+        "root_instance_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "root"
+        },
+        "definition": {
+          "$ref": "#/$defs/definitionBinding"
+        },
+        "root_instance_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
     },
     "componentIdentityOrigin": {
-      "$ref": "aggregate-state.schema.json#/$defs/componentIdentityOrigin"
+      "type": "object",
+      "required": [
+        "kind",
+        "definition",
+        "owner_runtime_id",
+        "component_definition_pointer",
+        "activation_sequence",
+        "declaration_index"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "component"
+        },
+        "definition": {
+          "$ref": "#/$defs/definitionBinding"
+        },
+        "owner_runtime_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "component_definition_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "activation_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "declaration_index": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
     },
     "spawnedIdentityOrigin": {
-      "$ref": "aggregate-state.schema.json#/$defs/spawnedIdentityOrigin"
+      "type": "object",
+      "required": [
+        "kind",
+        "definition",
+        "owner_runtime_id",
+        "spawn_action_pointer",
+        "spawn_sequence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "owned_spawned_instance"
+        },
+        "definition": {
+          "$ref": "#/$defs/definitionBinding"
+        },
+        "owner_runtime_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "spawn_action_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "spawn_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
     },
     "identityOrigin": {
-      "$ref": "aggregate-state.schema.json#/$defs/identityOrigin"
+      "oneOf": [
+        {
+          "$ref": "#/$defs/rootIdentityOrigin"
+        },
+        {
+          "$ref": "#/$defs/componentIdentityOrigin"
+        },
+        {
+          "$ref": "#/$defs/spawnedIdentityOrigin"
+        }
+      ]
     },
     "instanceReference": {
-      "$ref": "aggregate-state.schema.json#/$defs/instanceReference"
+      "type": "object",
+      "required": [
+        "root_instance_id",
+        "instance_id",
+        "machine_id",
+        "machine_version"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "root_instance_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "instance_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "machine_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "machine_version": {
+          "$ref": "#/$defs/positiveCanonicalDecimal"
+        }
+      }
     },
     "targetIdentity": {
-      "$ref": "aggregate-state.schema.json#/$defs/targetIdentity"
-    },
-    "envelopeSource": {
       "oneOf": [
         {
           "type": "object",
           "required": [
-            "host"
+            "root"
           ],
           "additionalProperties": false,
           "properties": {
-            "host": {
-              "const": true
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "runtime"
-          ],
-          "additionalProperties": false,
-          "properties": {
-            "runtime": {
-              "$ref": "#/$defs/targetIdentity"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "system"
-          ],
-          "additionalProperties": false,
-          "properties": {
-            "system": {
-              "$ref": "#/$defs/sourceLocator"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "legacy_v1_internal"
-          ],
-          "additionalProperties": false,
-          "properties": {
-            "legacy_v1_internal": {
+            "root": {
               "type": "object",
               "required": [
-                "producing_receipt_sequence",
-                "emission_index"
+                "root_instance_id",
+                "root_runtime_id"
               ],
               "additionalProperties": false,
               "properties": {
-                "producing_receipt_sequence": {
-                  "$ref": "#/$defs/canonicalDecimal"
+                "root_instance_id": {
+                  "$ref": "#/$defs/nonEmptyString"
                 },
-                "emission_index": {
+                "root_runtime_id": {
+                  "$ref": "#/$defs/nonEmptyString"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "component"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "component": {
+              "type": "object",
+              "required": [
+                "root_instance_id",
+                "owner_runtime_id",
+                "component_id",
+                "component_runtime_id",
+                "activation_sequence"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "root_instance_id": {
+                  "$ref": "#/$defs/nonEmptyString"
+                },
+                "owner_runtime_id": {
+                  "$ref": "#/$defs/nonEmptyString"
+                },
+                "component_id": {
+                  "$ref": "#/$defs/identifier"
+                },
+                "component_runtime_id": {
+                  "$ref": "#/$defs/nonEmptyString"
+                },
+                "activation_sequence": {
                   "$ref": "#/$defs/canonicalDecimal"
                 }
               }
             }
           }
+        },
+        {
+          "type": "object",
+          "required": [
+            "spawned_instance"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "spawned_instance": {
+              "$ref": "#/$defs/instanceReference"
+            }
+          }
         }
       ]
     },
-    "envelope": {
+    "lifetimeHolder": {
       "type": "object",
       "required": [
-        "event",
-        "event_id",
-        "cause_id",
-        "source",
-        "target",
-        "payload"
+        "holder_runtime_id",
+        "variable_declaration_pointer",
+        "holder_state_activation_sequence"
       ],
       "additionalProperties": false,
       "properties": {
-        "event": {
-          "$ref": "#/$defs/eventName"
+        "holder_runtime_id": {
+          "$ref": "#/$defs/sha256"
         },
-        "event_id": {
-          "$ref": "#/$defs/nonEmptyString"
+        "variable_declaration_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "holder_state_activation_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "relation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "root"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "owner_runtime_id",
+            "component_id",
+            "current_component_definition_pointer",
+            "activation_sequence",
+            "declaration_index"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "component"
+            },
+            "owner_runtime_id": {
+              "$ref": "#/$defs/sha256"
+            },
+            "component_id": {
+              "$ref": "#/$defs/identifier"
+            },
+            "current_component_definition_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            },
+            "activation_sequence": {
+              "$ref": "#/$defs/canonicalDecimal"
+            },
+            "declaration_index": {
+              "$ref": "#/$defs/canonicalDecimal"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "owner_runtime_id",
+            "current_spawn_action_pointer",
+            "spawn_sequence",
+            "lifetime_holder"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "owned_spawned_instance"
+            },
+            "owner_runtime_id": {
+              "$ref": "#/$defs/sha256"
+            },
+            "current_spawn_action_pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            },
+            "spawn_sequence": {
+              "$ref": "#/$defs/canonicalDecimal"
+            },
+            "lifetime_holder": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/lifetimeHolder"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "stateActivation": {
+      "type": "object",
+      "required": [
+        "state_definition_pointer",
+        "activation_sequence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state_definition_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "activation_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "variable": {
+      "type": "object",
+      "required": [
+        "variable_declaration_pointer",
+        "declaring_state_activation_sequence",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "variable_declaration_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "declaring_state_activation_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "value": {
+          "$ref": "#/$defs/typedValue"
+        }
+      }
+    },
+    "history": {
+      "type": "object",
+      "required": [
+        "history_declaration_pointer",
+        "recorded_state_definition_pointers"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "history_declaration_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "recorded_state_definition_pointers": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/jsonPointer"
+              },
+              "uniqueItems": true
+            }
+          ]
+        }
+      }
+    },
+    "nextCounter": {
+      "type": "object",
+      "required": [
+        "definition_pointer",
+        "next_sequence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "definition_pointer": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "next_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "fault": {
+      "type": "object",
+      "required": [
+        "definition_fingerprint",
+        "runtime_id",
+        "cause_id",
+        "code",
+        "step_sequence",
+        "source_locator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "definition_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "runtime_id": {
+          "$ref": "#/$defs/sha256"
         },
         "cause_id": {
           "$ref": "#/$defs/nonEmptyString"
         },
-        "source": {
-          "$ref": "#/$defs/envelopeSource"
+        "code": {
+          "$ref": "#/$defs/identifier"
         },
-        "target": {
-          "$ref": "#/$defs/targetIdentity"
+        "step_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
         },
-        "payload": {
-          "$ref": "#/$defs/typedMap"
-        },
-        "correlation_id": {
-          "$ref": "#/$defs/nonEmptyString"
+        "source_locator": {
+          "$ref": "#/$defs/sourceLocator"
         }
       }
-    },
-    "mailboxEntry": {
-      "type": "object",
-      "required": [
-        "acceptance_sequence",
-        "queue_sequence",
-        "delivery_mode",
-        "envelope",
-        "envelope_digest",
-        "deferral_count"
-      ],
-      "additionalProperties": false,
-      "properties": {
-        "acceptance_sequence": {
-          "$ref": "#/$defs/canonicalDecimal"
-        },
-        "queue_sequence": {
-          "$ref": "#/$defs/canonicalDecimal"
-        },
-        "delivery_mode": {
-          "enum": [
-            "input",
-            "internal"
-          ]
-        },
-        "envelope": {
-          "$ref": "#/$defs/envelope"
-        },
-        "envelope_digest": {
-          "$ref": "#/$defs/sha256"
-        },
-        "deferral_count": {
-          "$ref": "#/$defs/canonicalDecimal"
-        }
-      }
-    },
-    "lifetimeHolder": {
-      "$ref": "aggregate-state.schema.json#/$defs/lifetimeHolder"
-    },
-    "relation": {
-      "$ref": "aggregate-state.schema.json#/$defs/relation"
-    },
-    "stateActivation": {
-      "$ref": "aggregate-state.schema.json#/$defs/stateActivation"
-    },
-    "variable": {
-      "$ref": "aggregate-state.schema.json#/$defs/variable"
-    },
-    "history": {
-      "$ref": "aggregate-state.schema.json#/$defs/history"
-    },
-    "nextCounter": {
-      "$ref": "aggregate-state.schema.json#/$defs/nextCounter"
-    },
-    "fault": {
-      "$ref": "aggregate-state.schema.json#/$defs/fault"
     },
     "runtime": {
       "type": "object",
@@ -440,6 +784,156 @@
         },
         "aggregate_state_digest": {
           "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "eventName": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "enum": [
+            "determa.component_completed",
+            "determa.component_failed",
+            "determa.spawned_instance_failed"
+          ]
+        }
+      ]
+    },
+    "typedMap": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "const": "map"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/typedValue"
+              }
+            ],
+            "minItems": 2,
+            "maxItems": 2
+          }
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "envelopeSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "host"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "const": true
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "runtime"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "runtime": {
+              "$ref": "#/$defs/targetIdentity"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "system"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "system": {
+              "$ref": "#/$defs/sourceLocator"
+            }
+          }
+        }
+      ]
+    },
+    "envelope": {
+      "type": "object",
+      "required": [
+        "event",
+        "event_id",
+        "cause_id",
+        "source",
+        "target",
+        "payload"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/eventName"
+        },
+        "event_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "cause_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "source": {
+          "$ref": "#/$defs/envelopeSource"
+        },
+        "target": {
+          "$ref": "#/$defs/targetIdentity"
+        },
+        "payload": {
+          "$ref": "#/$defs/typedMap"
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "mailboxEntry": {
+      "type": "object",
+      "required": [
+        "acceptance_sequence",
+        "queue_sequence",
+        "delivery_mode",
+        "envelope",
+        "envelope_digest",
+        "deferral_count"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "acceptance_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "queue_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "delivery_mode": {
+          "enum": [
+            "input",
+            "internal"
+          ]
+        },
+        "envelope": {
+          "$ref": "#/$defs/envelope"
+        },
+        "envelope_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "deferral_count": {
+          "$ref": "#/$defs/canonicalDecimal"
         }
       }
     }

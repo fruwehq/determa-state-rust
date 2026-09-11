@@ -79,7 +79,7 @@ impl ExecutionStore for SqliteExecutionStore {
                     CONSTRAINT determa_execution_store_metadata_singleton_check
                         CHECK (singleton = 1),
                     CONSTRAINT determa_execution_store_metadata_version_check
-                        CHECK (schema_version = 1),
+                        CHECK (schema_version = 2),
                     CONSTRAINT determa_execution_store_metadata_receipt_check
                         CHECK (receipt_retention IN ('bounded', 'permanent')),
                     CONSTRAINT determa_execution_store_metadata_outbox_check
@@ -124,7 +124,7 @@ impl ExecutionStore for SqliteExecutionStore {
                 "
                 INSERT OR IGNORE INTO determa_execution_store_metadata
                     (singleton, schema_version, receipt_retention, outbox_retention)
-                VALUES (1, 1, ?1, ?2)
+                VALUES (1, 2, ?1, ?2)
                 ",
                 params![
                     self.mode.receipt_retention.as_str(),
@@ -345,7 +345,7 @@ fn verify_schema_contract(
         .map_err(sql_error)?;
     if metadata
         != (
-            1,
+            2,
             mode.receipt_retention.as_str().to_string(),
             mode.outbox_retention.as_str().to_string(),
         )
@@ -370,7 +370,7 @@ fn verify_schema_contract(
             ]
     {
         return Err(StoreError::new(
-            "SQLite execution-store columns do not match schema version 1",
+            "SQLite execution-store columns do not match schema version 2",
         ));
     }
     let metadata_schema = schema_sql(connection, "table", "determa_execution_store_metadata")?;
@@ -393,7 +393,7 @@ fn verify_schema_contract(
                 CONSTRAINT determa_execution_store_metadata_singleton_check
                     CHECK (singleton = 1),
                 CONSTRAINT determa_execution_store_metadata_version_check
-                    CHECK (schema_version = 1),
+                    CHECK (schema_version = 2),
                 CONSTRAINT determa_execution_store_metadata_receipt_check
                     CHECK (receipt_retention IN ('bounded', 'permanent')),
                 CONSTRAINT determa_execution_store_metadata_outbox_check
@@ -444,7 +444,7 @@ fn verify_schema_contract(
             )
     {
         return Err(StoreError::new(
-            "SQLite execution-store constraints or deletion guard do not match schema version 1",
+            "SQLite execution-store constraints or deletion guard do not match schema version 2",
         ));
     }
     let journal_mode: String = connection

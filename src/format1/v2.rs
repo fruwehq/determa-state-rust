@@ -101,16 +101,10 @@ pub(crate) fn validate_admission_delivery_schema(
     validate_v2_schema(
         delivery,
         ADMISSION_DELIVERY_SCHEMA,
-        &[
-            (
-                "https://determa.dev/state/schema/aggregate-state-v2.schema.json",
-                include_str!("../../schema/aggregate-state-v2.schema.json"),
-            ),
-            (
-                "https://determa.dev/state/schema/aggregate-state.schema.json",
-                include_str!("../../schema/aggregate-state.schema.json"),
-            ),
-        ],
+        &[(
+            "https://determa.dev/state/schema/aggregate-state-v2.schema.json",
+            include_str!("../../schema/aggregate-state-v2.schema.json"),
+        )],
         "invalid_delivery_source",
     )
 }
@@ -165,10 +159,10 @@ pub(crate) fn create_v2_with_evidence(
     let state = result.state.ok_or_else(|| {
         Version2Error::new("invalid_aggregate_state", "creation returned no state")
     })?;
-    let (_, bytes) = super::wire::encode_aggregate(bundle, &state).map_err(map_persistence)?;
-    let mut value: JsonValue = serde_json::from_slice(&bytes)
+    let (_, bytes) =
+        super::wire::encode_aggregate(bundle, &state, None).map_err(map_persistence)?;
+    let value: JsonValue = serde_json::from_slice(&bytes)
         .map_err(|error| Version2Error::new("invalid_aggregate_state", error.to_string()))?;
-    upgrade_value(&mut value)?;
     let status = match result.status {
         ResultStatus::Running => "running",
         ResultStatus::Completed => "completed",
@@ -193,49 +187,6 @@ pub(crate) fn create_v2_with_evidence(
         lifecycle_dispositions,
         fault,
     })
-}
-
-pub fn upgrade_aggregate_v1_to_v2(
-    source: &[u8],
-    resolver: &(impl DefinitionResolver + ?Sized),
-) -> Result<QueueBearingAggregate, Version2Error> {
-    let state = super::wire::restore_aggregate(source, resolver).map_err(map_persistence)?;
-    let mut value = strict_json::parse(source)
-        .map_err(|error| Version2Error::new("invalid_aggregate_state", error.to_string()))?;
-    upgrade_value(&mut value)?;
-    restore_aggregate_v2_value(value, resolver).map(|mut aggregate| {
-        aggregate.state = state;
-        aggregate
-    })
-}
-
-pub fn downgrade_aggregate_v2_to_v1(
-    aggregate: &QueueBearingAggregate,
-) -> Result<Vec<u8>, Version2Error> {
-    let object = aggregate_object(&aggregate.value)?;
-    if object
-        .get("next_acceptance_sequence")
-        .and_then(JsonValue::as_str)
-        != Some("0")
-        || object
-            .get("next_queue_sequence")
-            .and_then(JsonValue::as_str)
-            != Some("0")
-        || runtimes(&aggregate.value)?.iter().any(|runtime| {
-            ["ready_mailbox", "deferred_mailbox"].iter().any(|field| {
-                runtime
-                    .get(*field)
-                    .and_then(JsonValue::as_array)
-                    .is_none_or(|entries| !entries.is_empty())
-            })
-        })
-    {
-        return Err(Version2Error::new(
-            "migration_totality_failure",
-            "a queue-bearing aggregate can be downgraded only before mailbox allocation",
-        ));
-    }
-    canonical_bytes(&project_v1(&aggregate.value)?)
 }
 
 pub fn migrate_aggregate_v2(
@@ -278,7 +229,7 @@ pub(crate) fn migrate_aggregate_v2_route_with_evidence(
             != aggregate.value["validated_bundle_fingerprint"]
         {
             return Err(Version2Error::new(
-                "migration_totality_failure",
+                "migration_route_missing",
                 "empty migration route requires the current bundle fingerprint",
             ));
         }
@@ -304,7 +255,7 @@ pub(crate) fn migrate_aggregate_v2_route_with_evidence(
             })?;
         if !descriptor.trusted {
             return Err(Version2Error::new(
-                "migration_descriptor_not_trusted",
+                "migration_descriptor_untrusted",
                 "migration descriptor is not trusted",
             ));
         }
@@ -321,9 +272,12 @@ pub(crate) fn migrate_aggregate_v2_route_with_evidence(
         let source = resolver
             .resolve_definition(source_fingerprint)
             .ok_or_else(|| {
-                Version2Error::new("definition_not_found", "source definition is unavailable")
+                Version2Error::new(
+                    "source_definition_unavailable",
+                    "source definition is unavailable",
+                )
             })?;
-        let target_fingerprint = decoded["base_descriptor"]["target_validated_bundle_fingerprint"]
+        let target_fingerprint = decoded["target_validated_bundle_fingerprint"]
             .as_str()
             .ok_or_else(|| {
                 Version2Error::new(
@@ -334,7 +288,10 @@ pub(crate) fn migrate_aggregate_v2_route_with_evidence(
         let target = resolver
             .resolve_definition(target_fingerprint)
             .ok_or_else(|| {
-                Version2Error::new("definition_not_found", "target definition is unavailable")
+                Version2Error::new(
+                    "target_definition_unavailable",
+                    "target definition is unavailable",
+                )
             })?;
         if !source.trusted
             || source.bundle.fingerprint != source_fingerprint
@@ -427,12 +384,11 @@ fn migrate_aggregate_v2_with_evidence_resolved(
         ));
     }
     let descriptor = decode_descriptor_v2(descriptor_source)?;
-    let base = descriptor["base_descriptor"].clone();
-    let base_digest = base["migration_descriptor_digest"]
+    let descriptor_digest = descriptor["migration_descriptor_digest"]
         .as_str()
-        .ok_or_else(|| Version2Error::new("invalid_migration_descriptor", "base digest is absent"))?
+        .ok_or_else(|| Version2Error::new("invalid_migration_descriptor", "digest is absent"))?
         .to_string();
-    let base_bytes = canonical_bytes(&base)?;
+    let descriptor_bytes = canonical_bytes(&descriptor)?;
     let mut resolver = InMemoryDefinitionResolver::default();
     resolver.insert(source_bundle.clone(), true);
     resolver.insert(target_bundle.clone(), true);
@@ -457,21 +413,23 @@ fn migrate_aggregate_v2_with_evidence_resolved(
             resolver.insert(resolved.bundle, true);
         }
     }
-    resolver.insert_descriptor(base_digest.clone(), base_bytes, true);
-    let source = canonical_bytes(&project_v1(&aggregate.value)?)?;
+    resolver.insert_descriptor(descriptor_digest.clone(), descriptor_bytes, true);
+    let source = canonical_bytes(&aggregate.value)?;
     let request = super::migration::MigrationRequest {
-        migration_route: vec![base_digest],
+        migration_route: vec![descriptor_digest.clone()],
         target_validated_bundle_fingerprint: target_bundle.fingerprint.clone(),
         maintenance_mode,
     };
     let outcome = super::migration::migrate_aggregate(&source, &request, &resolver, limits)
         .map_err(map_persistence)?;
     let id_map = runtime_id_map(&aggregate.state.root, &outcome.aggregate.root)?;
-    let mut value =
-        merge_migrated_state(target_bundle, &aggregate.value, &outcome.aggregate, &id_map)?;
-    let descriptor_digest = descriptor["migration_descriptor_digest"]
-        .as_str()
-        .ok_or_else(|| Version2Error::new("invalid_migration_descriptor", "digest is absent"))?;
+    let mut value = merge_migrated_state(
+        target_bundle,
+        &aggregate.value,
+        &outcome.aggregate,
+        &outcome.aggregate_envelope,
+        &id_map,
+    )?;
     let rules = descriptor["queued_event_rules"]
         .as_array()
         .ok_or_else(|| Version2Error::new("invalid_migration_descriptor", "rules are absent"))?;
@@ -480,7 +438,7 @@ fn migrate_aggregate_v2_with_evidence_resolved(
         &outcome.aggregate,
         target_bundle,
         rules,
-        descriptor_digest,
+        &descriptor_digest,
     )?;
     recall_deferred(&mut value, &outcome.aggregate)?;
     validate_migrated_capacity(&value, &outcome.aggregate)?;
@@ -551,10 +509,7 @@ pub(crate) fn decode_descriptor_v2(source: &[u8]) -> Result<JsonValue, Version2E
     validate_v2_schema(
         &value,
         include_str!("../../schema/migration-descriptor-v2.schema.json"),
-        &[(
-            "https://determa.dev/state/schema/migration-descriptor.schema.json",
-            include_str!("../../schema/migration-descriptor.schema.json"),
-        )],
+        &[],
         "invalid_migration_descriptor",
     )?;
     let mut unsigned = value.clone();
@@ -599,10 +554,7 @@ fn runtime_id_map(
         let new_component = new
             .components
             .iter()
-            .find(|candidate| {
-                candidate.component_id == old_component.component_id
-                    && candidate.activation_sequence == old_component.activation_sequence
-            })
+            .find(|candidate| candidate.runtime.runtime_id == old_component.runtime.runtime_id)
             .ok_or_else(|| {
                 Version2Error::new(
                     "migration_totality_failure",
@@ -618,7 +570,7 @@ fn runtime_id_map(
         let new_owned = new
             .owned_instances
             .iter()
-            .find(|candidate| candidate.spawn_sequence == old_owned.spawn_sequence)
+            .find(|candidate| candidate.runtime.runtime_id == old_owned.runtime.runtime_id)
             .ok_or_else(|| {
                 Version2Error::new(
                     "migration_totality_failure",
@@ -634,10 +586,11 @@ fn merge_migrated_state(
     target_bundle: &Bundle,
     old: &JsonValue,
     state: &AggregateState,
+    migrated: &AggregateEnvelope,
     id_map: &BTreeMap<String, String>,
 ) -> Result<JsonValue, Version2Error> {
-    let (_, bytes) =
-        super::wire::encode_aggregate(target_bundle, state).map_err(map_persistence)?;
+    let (_, bytes) = super::wire::encode_aggregate(target_bundle, state, Some(migrated))
+        .map_err(map_persistence)?;
     let mut value: JsonValue =
         serde_json::from_slice(&bytes).map_err(|error| invalid_aggregate(error.to_string()))?;
     value["aggregate_state_schema_version"] = json!(2);
@@ -1047,7 +1000,10 @@ fn merge_abstract_state(
     old: &JsonValue,
     state: &AggregateState,
 ) -> Result<JsonValue, Version2Error> {
-    let (_, bytes) = super::wire::encode_aggregate(bundle, state).map_err(map_persistence)?;
+    let retained: AggregateEnvelope = serde_json::from_value(old.clone())
+        .map_err(|error| invalid_aggregate(error.to_string()))?;
+    let (_, bytes) =
+        super::wire::encode_aggregate(bundle, state, Some(&retained)).map_err(map_persistence)?;
     let mut value: JsonValue =
         serde_json::from_slice(&bytes).map_err(|error| invalid_aggregate(error.to_string()))?;
     value["aggregate_state_schema_version"] = json!(2);
@@ -1464,57 +1420,11 @@ pub(crate) fn restore_aggregate_v2_value(
         ));
     }
     validate_mailbox_integrity(&value)?;
-    let projected = project_v1(&value)?;
-    let envelope: AggregateEnvelope =
-        serde_json::from_value(projected).map_err(|error| invalid_aggregate(error.to_string()))?;
+    let envelope: AggregateEnvelope = serde_json::from_value(value.clone())
+        .map_err(|error| invalid_aggregate(error.to_string()))?;
     let state = super::wire::restore_envelope(&envelope, resolver).map_err(map_persistence)?;
     validate_mailbox_semantics(&value, &state, resolver)?;
     Ok(QueueBearingAggregate { value, state })
-}
-
-fn upgrade_value(value: &mut JsonValue) -> Result<(), Version2Error> {
-    let object = aggregate_object_mut(value)?;
-    object.insert("aggregate_state_schema_version".to_string(), json!(2));
-    object.insert("next_acceptance_sequence".to_string(), json!("0"));
-    object.insert("next_queue_sequence".to_string(), json!("0"));
-    for runtime in object
-        .get_mut("runtimes")
-        .and_then(JsonValue::as_array_mut)
-        .ok_or_else(|| invalid_aggregate("aggregate runtimes are absent"))?
-    {
-        let runtime = runtime
-            .as_object_mut()
-            .ok_or_else(|| invalid_aggregate("runtime must be an object"))?;
-        runtime.insert("ready_mailbox".to_string(), json!([]));
-        runtime.insert("deferred_mailbox".to_string(), json!([]));
-    }
-    *value = seal_aggregate(value.clone())?;
-    Ok(())
-}
-
-fn project_v1(value: &JsonValue) -> Result<JsonValue, Version2Error> {
-    let mut projected = value.clone();
-    {
-        let object = aggregate_object_mut(&mut projected)?;
-        object.insert("aggregate_state_schema_version".to_string(), json!(1));
-        object.remove("next_acceptance_sequence");
-        object.remove("next_queue_sequence");
-        for runtime in object
-            .get_mut("runtimes")
-            .and_then(JsonValue::as_array_mut)
-            .ok_or_else(|| invalid_aggregate("aggregate runtimes are absent"))?
-        {
-            let runtime = runtime
-                .as_object_mut()
-                .ok_or_else(|| invalid_aggregate("runtime must be an object"))?;
-            runtime.remove("ready_mailbox");
-            runtime.remove("deferred_mailbox");
-        }
-    }
-    let digest = wire::aggregate_digest(&projected).map_err(map_persistence)?;
-    aggregate_object_mut(&mut projected)?
-        .insert("aggregate_state_digest".to_string(), json!(digest));
-    Ok(projected)
 }
 
 fn seal_aggregate(mut value: JsonValue) -> Result<JsonValue, Version2Error> {
@@ -1655,17 +1565,6 @@ fn valid_internal_source_shape(source: &serde_json::Map<String, JsonValue>) -> b
         Some(("system", value)) => value
             .as_str()
             .is_some_and(|locator| locator.starts_with("system:") && locator.len() > 7),
-        Some(("legacy_v1_internal", value)) => value.as_object().is_some_and(|legacy| {
-            legacy.len() == 2
-                && legacy
-                    .get("producing_receipt_sequence")
-                    .and_then(JsonValue::as_str)
-                    .is_some()
-                && legacy
-                    .get("emission_index")
-                    .and_then(JsonValue::as_str)
-                    .is_some()
-        }),
         _ => false,
     }
 }
@@ -1674,18 +1573,8 @@ fn validate_aggregate_schema(value: &JsonValue) -> Result<(), Version2Error> {
     let schema: JsonValue =
         serde_json::from_str(include_str!("../../schema/aggregate-state-v2.schema.json"))
             .expect("bundled aggregate v2 schema is valid");
-    let base: JsonValue =
-        serde_json::from_str(include_str!("../../schema/aggregate-state.schema.json"))
-            .expect("bundled aggregate v1 schema is valid");
-    let resource = jsonschema::Resource::from_contents(base)
-        .map_err(|error| invalid_aggregate(error.to_string()))?;
-    let validator = jsonschema::options()
-        .with_resource(
-            "https://determa.dev/state/schema/aggregate-state.schema.json",
-            resource,
-        )
-        .build(&schema)
-        .map_err(|error| invalid_aggregate(error.to_string()))?;
+    let validator =
+        jsonschema::validator_for(&schema).map_err(|error| invalid_aggregate(error.to_string()))?;
     validator
         .validate(value)
         .map_err(|error| invalid_aggregate(error.to_string()))
@@ -1848,12 +1737,6 @@ fn validate_restored_source(
                 .filter(|_| source.len() == 1)
             {
                 system_locator_matches_event(locator, &envelope.event)
-            } else if source
-                .get("legacy_v1_internal")
-                .filter(|_| source.len() == 1)
-                .is_some()
-            {
-                valid_internal_source_shape(source) && envelope.cause_id == envelope.event_id
             } else {
                 false
             }

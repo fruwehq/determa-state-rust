@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://determa.dev/state/schema/core-step-result-v2.schema.json",
-  "title": "Determa State queue-bearing core step result version 2",
-  "description": "Closed result for one explicitly targeted aggregate-state version-2 mailbox step.",
+  "title": "Determa State queue-bearing core step result",
+  "description": "Closed result for one explicitly targeted portable aggregate-state mailbox step.",
   "$ref": "#/$defs/coreStepResult",
   "$defs": {
     "canonicalDecimal": {
@@ -28,11 +28,21 @@
       ],
       "additionalProperties": false,
       "properties": {
-        "kind": { "const": "internal_mailbox" },
-        "emission_index": { "$ref": "#/$defs/canonicalDecimal" },
-        "event_id": { "$ref": "#/$defs/nonEmptyString" },
-        "acceptance_sequence": { "$ref": "#/$defs/canonicalDecimal" },
-        "queue_sequence": { "$ref": "#/$defs/canonicalDecimal" }
+        "kind": {
+          "const": "internal_mailbox"
+        },
+        "emission_index": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "event_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "acceptance_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "queue_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
       }
     },
     "internalDisposedEmission": {
@@ -46,18 +56,34 @@
       ],
       "additionalProperties": false,
       "properties": {
-        "kind": { "const": "internal_disposed" },
-        "emission_index": { "$ref": "#/$defs/canonicalDecimal" },
-        "event_id": { "$ref": "#/$defs/nonEmptyString" },
-        "acceptance_sequence": { "$ref": "#/$defs/canonicalDecimal" },
-        "lifecycle_disposition_index": { "$ref": "#/$defs/canonicalDecimal" }
+        "kind": {
+          "const": "internal_disposed"
+        },
+        "emission_index": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "event_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "acceptance_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "lifecycle_disposition_index": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
       }
     },
     "emission": {
       "oneOf": [
-        { "$ref": "#/$defs/internalMailboxEmission" },
-        { "$ref": "#/$defs/internalDisposedEmission" },
-        { "$ref": "execution-checkpoint.schema.json#/$defs/outboxIntent" }
+        {
+          "$ref": "#/$defs/internalMailboxEmission"
+        },
+        {
+          "$ref": "#/$defs/internalDisposedEmission"
+        },
+        {
+          "$ref": "execution-checkpoint-v2.schema.json#/$defs/outboxIntent"
+        }
       ]
     },
     "lifecycleDisposition": {
@@ -72,11 +98,21 @@
       ],
       "additionalProperties": false,
       "properties": {
-        "event_id": { "$ref": "#/$defs/nonEmptyString" },
-        "request_digest": { "$ref": "#/$defs/sha256" },
-        "acceptance_sequence": { "$ref": "#/$defs/canonicalDecimal" },
-        "final_queue_sequence": { "$ref": "#/$defs/canonicalDecimal" },
-        "target_runtime_id": { "$ref": "#/$defs/sha256" },
+        "event_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "acceptance_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "final_queue_sequence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "target_runtime_id": {
+          "$ref": "#/$defs/sha256"
+        },
         "reason": {
           "enum": [
             "runtime_cancelled",
@@ -88,7 +124,9 @@
     },
     "rejection": {
       "type": "object",
-      "required": ["code"],
+      "required": [
+        "code"
+      ],
       "additionalProperties": false,
       "properties": {
         "code": {
@@ -123,7 +161,11 @@
           "const": 2
         },
         "status": {
-          "enum": ["running", "completed", "faulted"]
+          "enum": [
+            "running",
+            "completed",
+            "faulted"
+          ]
         },
         "disposition": {
           "enum": [
@@ -140,22 +182,34 @@
         },
         "emissions": {
           "type": "array",
-          "items": { "$ref": "#/$defs/emission" }
+          "items": {
+            "$ref": "#/$defs/emission"
+          }
         },
         "lifecycle_dispositions": {
           "type": "array",
-          "items": { "$ref": "#/$defs/lifecycleDisposition" }
+          "items": {
+            "$ref": "#/$defs/lifecycleDisposition"
+          }
         },
         "fault": {
           "oneOf": [
-            { "type": "null" },
-            { "$ref": "aggregate-state-v2.schema.json#/$defs/fault" }
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "aggregate-state-v2.schema.json#/$defs/fault"
+            }
           ]
         },
         "rejection": {
           "oneOf": [
-            { "type": "null" },
-            { "$ref": "#/$defs/rejection" }
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/rejection"
+            }
           ]
         }
       },
@@ -163,21 +217,35 @@
         {
           "if": {
             "properties": {
-              "disposition": { "const": "rejected" }
+              "disposition": {
+                "const": "rejected"
+              }
             },
-            "required": ["disposition"]
+            "required": [
+              "disposition"
+            ]
           },
           "then": {
             "properties": {
-              "emissions": { "maxItems": 0 },
-              "lifecycle_dispositions": { "maxItems": 0 },
-              "fault": { "type": "null" },
-              "rejection": { "$ref": "#/$defs/rejection" }
+              "emissions": {
+                "maxItems": 0
+              },
+              "lifecycle_dispositions": {
+                "maxItems": 0
+              },
+              "fault": {
+                "type": "null"
+              },
+              "rejection": {
+                "$ref": "#/$defs/rejection"
+              }
             }
           },
           "else": {
             "properties": {
-              "rejection": { "type": "null" }
+              "rejection": {
+                "type": "null"
+              }
             }
           }
         }

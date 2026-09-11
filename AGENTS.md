@@ -16,8 +16,8 @@ workflow.
 The current draft is validated against the merged `0.2.0` metadata revisions at these
 exact immutable inputs:
 
-- specification: `e22f9db295d632f3f46a9d1260c63b5af92efa7e`;
-- conformance: `8f6a4d9101fd6554e9a51da72ca48160368d4e83`.
+- specification: `3f2dc4217971d5c6598436b19e415c53ec095dfe`;
+- conformance: `e72f72396fae44cbee323bf988d86966235dbd16`.
 
 The conformance suite is the arbiter of behavior. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
@@ -33,11 +33,9 @@ Never invent a release tag or weaken an exact revision check.
   store registry, capability profiles, and bundled adapters.
 - `src/value.rs`: portable values and nominal instance references.
 - `src/cli.rs`: nonportable validation utility only.
-- `tests/core_conformance.rs`: driver for all 114 `conformance/core` cases.
-- `tests/persistence_conformance.rs`: driver for all 108 persistence vectors.
-- `tests/persistence_profiles.rs`: driver for all six persistence host profiles.
-- `tests/checkpoint_conformance.rs`: driver for all 102 version-1 execution-checkpoint vectors.
-- `tests/checkpoint_v2_conformance.rs`: driver for all 60 queue-bearing checkpoint vectors.
+- `tests/core_conformance.rs`: driver for all 98 `conformance/core` cases.
+- `tests/native_v2_conformance.rs`: driver for all 162 applicable native schema-v2
+  aggregate, migration, package, and execution-checkpoint vectors.
 - `tests/checkpoint_adapters.rs`: shared memory/file/SQLite setup, restart, and CAS
   contracts.
 - `tests/checkpoint_postgresql.rs`: optional PostgreSQL exact-schema, retention-mode,
@@ -60,7 +58,7 @@ Never invent a release tag or weaken an exact revision check.
 ```sh
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
-  "8f6a4d9101fd6554e9a51da72ca48160368d4e83"
+  "e72f72396fae44cbee323bf988d86966235dbd16"
 cargo +1.86.0 build --release --locked --all-features
 cargo +1.86.0 test --locked --all-features
 cargo clippy --locked --all-features --all-targets -- -D warnings
@@ -69,11 +67,9 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 The declared MSRV is Rust `1.86`. CI must keep the locked default and all-features graph,
 including PostgreSQL, buildable and testable with that toolchain.
 
-CI runs the complete 114-case core suite, all 108 version-1 and 15 version-2
-persistence vectors, all 12 persistence-profile steps, and all 162 execution-checkpoint
-vectors. The version-2 harnesses cover 113 vectors and 164 artifacts in total. It also checks
-every local schema byte-for-byte against the exact specification commit and runs the
-optional PostgreSQL adapter against a service.
+CI runs the complete 98-case core suite and all 162 applicable native schema-v2 vectors.
+It also checks every local schema byte-for-byte against the exact specification commit
+and runs the optional PostgreSQL adapter against a service.
 
 ## Boundaries
 
@@ -83,8 +79,8 @@ migration-and-dispatch operations. The optional synchronous host wraps those unc
 operations with portable checkpoint transactions. It owns no broker, timer, worker,
 daemon, socket, subprocess protocol, package imports, or scheduling. Execution stores
 must be directly injected or explicitly registered; database schema setup is explicit,
-and schema-version-1 root/checkpoint deletion is unsupported. The CLI currently
-validates bundles only.
+and durable-host profiles remain optional host contracts. The CLI currently validates
+bundles only.
 
 ## Releases
 

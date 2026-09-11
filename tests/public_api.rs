@@ -1,9 +1,8 @@
 use determa_state::{
-    create, decode_selected_migration_descriptor, dispatch, load_bundle, Bindings, Counter,
-    CreationRejectionCode, Delivery, DispatchRejectionCode, Disposition, EngineFaultCode, Envelope,
-    PersistenceErrorCode, ResultStatus, Target, Value, CREATION_REJECTION_CODES,
-    DISPATCH_REJECTION_CODES, ENGINE_FAULT_CODES, FORMAT_1_CONFORMANCE_COMMIT,
-    FORMAT_1_SPECIFICATION_COMMIT,
+    create, dispatch, load_bundle, Bindings, Counter, CreationRejectionCode, Delivery,
+    DispatchRejectionCode, Disposition, EngineFaultCode, Envelope, ResultStatus, Target, Value,
+    CREATION_REJECTION_CODES, DISPATCH_REJECTION_CODES, ENGINE_FAULT_CODES,
+    FORMAT_1_CONFORMANCE_COMMIT, FORMAT_1_SPECIFICATION_COMMIT,
 };
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -714,11 +713,11 @@ fn examples_and_revision_metadata_are_current() {
     load_bundle(include_str!("../examples/full.yaml")).expect("full example loads");
     assert_eq!(
         FORMAT_1_SPECIFICATION_COMMIT,
-        "e22f9db295d632f3f46a9d1260c63b5af92efa7e"
+        "3f2dc4217971d5c6598436b19e415c53ec095dfe"
     );
     assert_eq!(
         FORMAT_1_CONFORMANCE_COMMIT,
-        "8f6a4d9101fd6554e9a51da72ca48160368d4e83"
+        "e72f72396fae44cbee323bf988d86966235dbd16"
     );
 }
 
@@ -744,20 +743,6 @@ fn runtime_closed_code_exports_are_public_and_compatible() {
             .map(|code| code.as_str())
             .collect::<Vec<_>>(),
         ENGINE_FAULT_CODES
-    );
-}
-
-#[test]
-fn selected_migration_descriptor_decoder_rejects_legacy_bytes() {
-    let source = std::fs::read(
-        "conformance-suite/conformance/core/113-migration-failure-completeness/legacy-0.0.6-snapshot.json",
-    )
-    .expect("legacy fixture is available");
-    assert_eq!(
-        decode_selected_migration_descriptor(&source)
-            .expect_err("legacy descriptor must be rejected")
-            .code,
-        PersistenceErrorCode::UnsupportedMigrationDescriptorFormat,
     );
 }
 
