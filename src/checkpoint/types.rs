@@ -1,5 +1,39 @@
-use crate::format1::{Counter, TypedValue};
+use crate::format1::{Counter, MigrationRequest, ResourceLimits, TypedValue};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdmissionSource {
+    Utf8Json(Vec<u8>),
+    JsonValue(Value),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessingRequest {
+    pub target_runtime_id: String,
+    pub event_id: String,
+    pub envelope_digest: String,
+    pub acceptance_sequence: String,
+    pub queue_sequence: String,
+    pub processing_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneRequest {
+    pub cutoff_receipt_sequence: String,
+    pub target_mode: String,
+    pub policy_identifier: Option<String>,
+    pub dependency_receipt_sequences: Vec<String>,
+    pub dependency_effect_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransactionalProcessRequest {
+    pub delivery: Value,
+    pub processing_mode: String,
+    pub migration: MigrationRequest,
+    pub migration_limits: ResourceLimits,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointErrorCode {

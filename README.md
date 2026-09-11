@@ -8,13 +8,14 @@ remains `0.1.0` until the coordinated `v0.2.0` tag runs the release workflow. Th
 branch is validated against the merged `0.2.0` metadata revisions at these exact
 normative inputs:
 
-- specification commit `3f2dc4217971d5c6598436b19e415c53ec095dfe`;
-- conformance commit `e72f72396fae44cbee323bf988d86966235dbd16`.
+- specification commit `ee38796d5e38e67e350a06548fd50faa530cbb12`;
+- conformance commit `99a4d9ad5256f7330e75b06d48f340cc7239a40d`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
-tests run all 98 format-1 core cases and all 162 applicable native artifact/checkpoint
-schema-v2 vectors. Durable host profiles remain optional host contracts; memory, file,
-SQLite, and PostgreSQL tests exercise the implemented transactional host surface.
+tests run all 162 applicable native artifact/checkpoint schema-v2 core vectors and all
+138 durable-host vectors. Durable host profiles remain
+optional host contracts; memory, file, SQLite, and PostgreSQL tests exercise the
+implemented transactional host surface.
 
 ## Implemented core
 
@@ -27,8 +28,8 @@ SQLite, and PostgreSQL tests exercise the implemented transactional host surface
 - Isolated synchronous components with explicit routing.
 - Owned spawned instances, nominal references, cancellation, completion, failure
   propagation, and deterministic lifecycle cleanup.
-- Pure `create` and `dispatch` operations with deterministic runtime, cause, event, and
-  external-effect identities.
+- Pure queue-bearing `create`, `admit`, and `step` operations with deterministic
+  runtime, cause, event, and external-effect identities.
 - Portable aggregate serialization and restoration with strict typed values, canonical
   JSON, content-addressed definitions, sole schema-v2 artifacts, and
   self-contained aggregate packages.
@@ -42,8 +43,7 @@ SQLite, and PostgreSQL tests exercise the implemented transactional host surface
   third-party factories.
 - Default `memory`, `file`, and bundled-SQLite adapters plus optional PostgreSQL,
   with explicit durable receipt/outbox modes and schema-contract health checks.
-- Inspection through the returned logical aggregate state, result disposition, fault,
-  rejection, configuration, variables, components, owned instances, and emissions.
+- Inspection through the returned native aggregate and core-step JSON values.
 - Immutable `PORTABLE_CODES` slices on public closed-code enums, including
   `CreationRejectionCode`, `DispatchRejectionCode`, and `EngineFaultCode`.
 
@@ -67,55 +67,33 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`e72f72396fae44cbee323bf988d86966235dbd16`. CI also checks that all bundled schemas
+`99a4d9ad5256f7330e75b06d48f340cc7239a40d`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
-`3f2dc4217971d5c6598436b19e415c53ec095dfe`. These exact merged commits are the
+`ee38796d5e38e67e350a06548fd50faa530cbb12`. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
 
 ## Library
 
 ```rust
-use determa_state::{
-    create, dispatch, load_bundle, Bindings, Delivery, Envelope, Target, Value,
-};
-use std::collections::BTreeMap;
+use determa_state::{create, load_bundle, Bindings};
 
 let source = std::fs::read_to_string("examples/minimal.yaml")?;
 let bundle = load_bundle(&source)?;
-let created = create(
+let aggregate = create(
     &bundle,
     "turnstile",
     "turnstile-1",
     "create-1",
     &Bindings::default(),
-);
-let state = created.state.expect("creation succeeds");
+)?;
 
-let result = dispatch(
-    &bundle,
-    &state,
-    Some(Delivery::Input(Envelope {
-        event: "coin".to_string(),
-        event_id: "input-1".to_string(),
-        target: Target::Root {
-            root_instance_id: state.root_instance_id.clone(),
-            root_runtime_id: state.root.runtime_id.clone(),
-        },
-        payload: BTreeMap::from([("amount".to_string(), Value::Int(100))]),
-        correlation_id: None,
-    })),
-);
-
-assert_eq!(
-    result.state.expect("dispatch succeeds").root.config(),
-    vec!["unlocked"]
-);
+assert_eq!(aggregate.value()["aggregate_state_schema_version"], 2);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Input and internal envelopes are caller-owned. Internal emissions may be delivered back
-through `dispatch` explicitly. External emissions are deterministic output intents for
-the host to persist and deliver.
+Input and internal envelopes are caller-owned. `admit` retains accepted work in the
+aggregate and `step` processes one ready event. External emissions are deterministic
+output intents for the host to persist and deliver.
 
 ## Execution-checkpoint host
 

@@ -97,8 +97,8 @@ pub struct StoreRecord {
 }
 
 impl StoreRecord {
-    pub fn from_checkpoint_v2(
-        checkpoint: &super::v2::ExecutionCheckpointV2,
+    pub fn from_checkpoint(
+        checkpoint: &super::v2::ExecutionCheckpoint,
     ) -> Result<Self, StoreError> {
         Ok(Self {
             root_instance_id: checkpoint.root_instance_id().to_string(),
@@ -404,7 +404,6 @@ pub fn validate_store_host_profile(
         HostProfile::StrictDurableOutbox => {
             durable
                 && root_retained
-                && atomic
                 && capabilities
                     .contains(&ExecutionStoreCapability::PermanentOutboxTerminalRetention)
                 && features.contains(&HostFeature::OutboxWorker)
@@ -414,7 +413,6 @@ pub fn validate_store_host_profile(
         HostProfile::CompactDurableOutbox => {
             durable
                 && root_retained
-                && atomic
                 && capabilities.contains(&ExecutionStoreCapability::CompactEffectIdentityRetention)
                 && features.contains(&HostFeature::OutboxWorker)
                 && features.contains(&HostFeature::TotalOutboxLifecycle)
@@ -423,7 +421,6 @@ pub fn validate_store_host_profile(
         HostProfile::SharedApplicationTransaction => {
             durable
                 && root_retained
-                && atomic
                 && capabilities.contains(&ExecutionStoreCapability::SharedApplicationTransaction)
                 && features.contains(&HostFeature::NativeSharedApplicationTransaction)
         }

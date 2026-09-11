@@ -2,17 +2,17 @@ use super::compile::Bundle;
 use super::counter::Counter;
 use super::migration::MigrationRequest;
 use super::model::{Bindings, Delivery, Envelope, Target};
+use super::native::{self, AggregateEnvelope, PersistenceErrorCode, TypedValue};
 use super::persistence::{
     DefinitionResolver, InMemoryDefinitionResolver, MigrationArtifactResolver,
 };
 use super::runtime::{
-    create, deferred_event_capacity, dispatch, fault_deferred_capacity, runtime_by_id,
-    structural_recall_eligible, validate_delivery_for_admission,
-    validate_queued_event_for_migration, AggregateState, DispatchRejectionCode, Disposition,
-    Emission, ResultStatus, RuntimeState, RuntimeStatus,
+    create_runtime_aggregate, deferred_event_capacity, dispatch_runtime_aggregate,
+    fault_deferred_capacity, runtime_by_id, structural_recall_eligible,
+    validate_delivery_for_admission, validate_queued_event_for_migration, AggregateState,
+    DispatchRejectionCode, Disposition, Emission, ResultStatus, RuntimeState, RuntimeStatus,
 };
 use super::strict_json;
-use super::wire::{self, AggregateEnvelope, PersistenceErrorCode, TypedValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,10 +53,6 @@ impl QueueBearingAggregate {
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, Version2Error> {
         canonical_bytes(&self.value)
-    }
-
-    pub fn abstract_state(&self) -> &AggregateState {
-        &self.state
     }
 }
 
@@ -133,6 +129,7 @@ pub(crate) struct CreateV2Evidence {
     pub aggregate: QueueBearingAggregate,
     pub status: String,
     pub emissions: Vec<JsonValue>,
+    pub emission_indexes: Vec<String>,
     pub lifecycle_dispositions: Vec<JsonValue>,
     pub fault: Option<JsonValue>,
 }
@@ -144,7 +141,8 @@ pub(crate) fn create_v2_with_evidence(
     creation_id: &str,
     bindings: &Bindings,
 ) -> Result<CreateV2Evidence, Version2Error> {
-    let result = create(bundle, machine_id, root_instance_id, creation_id, bindings);
+    let result =
+        create_runtime_aggregate(bundle, machine_id, root_instance_id, creation_id, bindings);
     if result.status == ResultStatus::Rejected {
         return Err(Version2Error::new(
             result
@@ -160,7 +158,7 @@ pub(crate) fn create_v2_with_evidence(
         Version2Error::new("invalid_aggregate_state", "creation returned no state")
     })?;
     let (_, bytes) =
-        super::wire::encode_aggregate(bundle, &state, None).map_err(map_persistence)?;
+        super::native::encode_aggregate(bundle, &state, None).map_err(map_persistence)?;
     let value: JsonValue = serde_json::from_slice(&bytes)
         .map_err(|error| Version2Error::new("invalid_aggregate_state", error.to_string()))?;
     let status = match result.status {
@@ -177,13 +175,14 @@ pub(crate) fn create_v2_with_evidence(
         .transpose()
         .map_err(|error| invalid_aggregate(error.to_string()))?;
     let mut aggregate = QueueBearingAggregate { value, state };
-    let (emissions, lifecycle_dispositions) =
+    let (emissions, emission_indexes, lifecycle_dispositions) =
         append_internal_emissions(&mut aggregate, &result.emissions)?;
     aggregate.value = seal_aggregate(aggregate.value)?;
     Ok(CreateV2Evidence {
         aggregate,
         status,
         emissions,
+        emission_indexes,
         lifecycle_dispositions,
         fault,
     })
@@ -517,7 +516,7 @@ pub(crate) fn decode_descriptor_v2(source: &[u8]) -> Result<JsonValue, Version2E
         .as_object_mut()
         .expect("schema requires object")
         .remove("migration_descriptor_digest");
-    let expected = wire::jcs_hash(&json!(["determa-migration-descriptor-2", unsigned]))
+    let expected = native::jcs_hash(&json!(["determa-migration-descriptor-2", unsigned]))
         .map_err(map_persistence)?;
     if value["migration_descriptor_digest"].as_str() != Some(expected.as_str()) {
         return Err(Version2Error::new(
@@ -589,7 +588,7 @@ fn merge_migrated_state(
     migrated: &AggregateEnvelope,
     id_map: &BTreeMap<String, String>,
 ) -> Result<JsonValue, Version2Error> {
-    let (_, bytes) = super::wire::encode_aggregate(target_bundle, state, Some(migrated))
+    let (_, bytes) = super::native::encode_aggregate(target_bundle, state, Some(migrated))
         .map_err(map_persistence)?;
     let mut value: JsonValue =
         serde_json::from_slice(&bytes).map_err(|error| invalid_aggregate(error.to_string()))?;
@@ -774,17 +773,7 @@ pub fn admit_v2(
             replay.push((delivery, existing));
             continue;
         }
-        if delivery.envelope_digest != computed {
-            return Err(Version2Error::new(
-                "delivery_digest_mismatch",
-                "supplied envelope digest does not match canonical content",
-            ));
-        }
-        validate_source(delivery, &aggregate.value)?;
-        let core_delivery = core_delivery(delivery)?;
-        let runtime_id = validate_delivery_for_admission(bundle, &aggregate.state, &core_delivery)
-            .map_err(map_dispatch_rejection)?;
-        fresh.push((delivery, runtime_id));
+        fresh.push((delivery, computed));
     }
 
     if !replay.is_empty() && fresh.is_empty() && replay.len() == 1 {
@@ -800,9 +789,49 @@ pub fn admit_v2(
         }));
     }
 
+    for (delivery, _) in &fresh {
+        if !matches!(delivery.delivery_mode.as_str(), "input" | "internal") {
+            return Err(Version2Error::new(
+                "invalid_delivery_mode",
+                "invalid delivery mode",
+            ));
+        }
+    }
+    for (delivery, _) in &fresh {
+        validate_source(delivery, &aggregate.value)?;
+    }
+    let mut validated = Vec::with_capacity(fresh.len());
+    let mut validation_failure = None;
+    for (delivery, computed) in fresh {
+        let core_delivery = core_delivery(delivery)?;
+        match validate_delivery_for_admission(bundle, &aggregate.state, &core_delivery) {
+            Ok(runtime_id) => validated.push((delivery, computed, runtime_id)),
+            Err(code) => {
+                let rank = admission_failure_rank(code);
+                if validation_failure
+                    .as_ref()
+                    .is_none_or(|(prior, _)| rank < *prior)
+                {
+                    validation_failure = Some((rank, code));
+                }
+            }
+        }
+    }
+    if let Some((_, code)) = validation_failure {
+        return Err(map_dispatch_rejection(code));
+    }
+    for (delivery, computed, _) in &validated {
+        if delivery.envelope_digest != *computed {
+            return Err(Version2Error::new(
+                "delivery_digest_mismatch",
+                "supplied envelope digest does not match canonical content",
+            ));
+        }
+    }
+
     let mut value = aggregate.value.clone();
     let mut accepted = Vec::new();
-    for (delivery, runtime_id) in fresh {
+    for (delivery, _, runtime_id) in validated {
         let acceptance_sequence = allocate_counter(&mut value, "next_acceptance_sequence")?;
         let queue_sequence = allocate_counter(&mut value, "next_queue_sequence")?;
         let entry = json!({
@@ -834,10 +863,45 @@ pub fn admit_v2(
     }))
 }
 
+fn admission_failure_rank(code: DispatchRejectionCode) -> u8 {
+    match code {
+        DispatchRejectionCode::InvalidInstanceTarget
+        | DispatchRejectionCode::InactiveComponentTarget => 0,
+        DispatchRejectionCode::InvalidEvent => 1,
+        DispatchRejectionCode::InvalidPayload => 2,
+        DispatchRejectionCode::InvalidCorrelation => 3,
+        _ => 4,
+    }
+}
+
 pub fn step_v2(
     bundle: &Bundle,
     aggregate: &QueueBearingAggregate,
     target_runtime_id: &str,
+) -> Result<JsonValue, Version2Error> {
+    step_v2_impl(bundle, aggregate, target_runtime_id, None)
+}
+
+pub(crate) fn step_v2_with_emission_indexes(
+    bundle: &Bundle,
+    aggregate: &QueueBearingAggregate,
+    target_runtime_id: &str,
+) -> Result<(JsonValue, Vec<String>), Version2Error> {
+    let mut emission_indexes = Vec::new();
+    let result = step_v2_impl(
+        bundle,
+        aggregate,
+        target_runtime_id,
+        Some(&mut emission_indexes),
+    )?;
+    Ok((result, emission_indexes))
+}
+
+fn step_v2_impl(
+    bundle: &Bundle,
+    aggregate: &QueueBearingAggregate,
+    target_runtime_id: &str,
+    mut evidence_indexes: Option<&mut Vec<String>>,
 ) -> Result<JsonValue, Version2Error> {
     let root_status = aggregate_status(&aggregate.value)?;
     if aggregate.value["validated_bundle_fingerprint"].as_str() != Some(bundle.fingerprint.as_str())
@@ -883,7 +947,7 @@ pub fn step_v2(
     let envelope = match &core_delivery {
         Delivery::Input(envelope) | Delivery::Internal(envelope) => envelope.clone(),
     };
-    let result = dispatch(bundle, &aggregate.state, Some(core_delivery));
+    let result = dispatch_runtime_aggregate(bundle, &aggregate.state, Some(core_delivery));
 
     if result.disposition == Some(Disposition::Deferred) {
         let runtime_state = runtime_by_id(&aggregate.state.root, target_runtime_id)
@@ -900,8 +964,9 @@ pub fn step_v2(
                 .state
                 .as_ref()
                 .ok_or_else(|| invalid_aggregate("capacity fault returned no state"))?;
-            let mut value = merge_abstract_state(bundle, &aggregate.value, state)?;
-            remove_ready_head(&mut value, target_runtime_id)?;
+            let mut retained = aggregate.value.clone();
+            remove_ready_head(&mut retained, target_runtime_id)?;
+            let mut value = merge_abstract_state(bundle, &retained, state)?;
             let mut lifecycle = dispose_removed_mailboxes(
                 &aggregate.value,
                 &mut value,
@@ -915,6 +980,13 @@ pub fn step_v2(
                 &faulted.emissions,
                 &mut lifecycle,
             )?;
+            if let Some(indexes) = evidence_indexes.as_mut() {
+                **indexes = faulted
+                    .emissions
+                    .iter()
+                    .map(|emission| emission.emission_index.to_string())
+                    .collect();
+            }
             value = seal_aggregate(value)?;
             return core_step_result(
                 value,
@@ -950,8 +1022,9 @@ pub fn step_v2(
         .state
         .as_ref()
         .ok_or_else(|| invalid_aggregate("core step returned no aggregate state"))?;
-    let mut value = merge_abstract_state(bundle, &aggregate.value, state)?;
-    remove_ready_head(&mut value, target_runtime_id)?;
+    let mut retained = aggregate.value.clone();
+    remove_ready_head(&mut retained, target_runtime_id)?;
+    let mut value = merge_abstract_state(bundle, &retained, state)?;
     let mut lifecycle = dispose_removed_mailboxes(
         &aggregate.value,
         &mut value,
@@ -965,6 +1038,13 @@ pub fn step_v2(
         &result.emissions,
         &mut lifecycle,
     )?;
+    if let Some(indexes) = evidence_indexes.as_mut() {
+        **indexes = result
+            .emissions
+            .iter()
+            .map(|emission| emission.emission_index.to_string())
+            .collect();
+    }
     if result.disposition == Some(Disposition::Handled)
         && state.root.status == RuntimeStatus::Running
     {
@@ -1003,7 +1083,7 @@ fn merge_abstract_state(
     let retained: AggregateEnvelope = serde_json::from_value(old.clone())
         .map_err(|error| invalid_aggregate(error.to_string()))?;
     let (_, bytes) =
-        super::wire::encode_aggregate(bundle, state, Some(&retained)).map_err(map_persistence)?;
+        super::native::encode_aggregate(bundle, state, Some(&retained)).map_err(map_persistence)?;
     let mut value: JsonValue =
         serde_json::from_slice(&bytes).map_err(|error| invalid_aggregate(error.to_string()))?;
     value["aggregate_state_schema_version"] = json!(2);
@@ -1139,7 +1219,7 @@ fn append_step_emissions(
     lifecycle: &mut Vec<JsonValue>,
 ) -> Result<Vec<JsonValue>, Version2Error> {
     let mut results = Vec::new();
-    for (index, emission) in emissions.iter().enumerate() {
+    for emission in emissions {
         if matches!(emission.target, Target::External) {
             results.push(json!({
                 "effect_id": emission.effect_id,
@@ -1198,7 +1278,7 @@ fn append_step_emissions(
                 .push(entry);
             results.push(json!({
                 "kind": "internal_mailbox",
-                "emission_index": index.to_string(),
+                "emission_index": emission.emission_index.to_string(),
                 "event_id": event_id,
                 "acceptance_sequence": acceptance.to_string(),
                 "queue_sequence": queue.to_string()
@@ -1219,7 +1299,7 @@ fn append_step_emissions(
             lifecycle.push(lifecycle_disposition(&entry, target_id, reason)?);
             results.push(json!({
                 "kind": "internal_disposed",
-                "emission_index": index.to_string(),
+                "emission_index": emission.emission_index.to_string(),
                 "event_id": event_id,
                 "acceptance_sequence": acceptance.to_string(),
                 "lifecycle_disposition_index": disposition_index.to_string()
@@ -1422,7 +1502,7 @@ pub(crate) fn restore_aggregate_v2_value(
     validate_mailbox_integrity(&value)?;
     let envelope: AggregateEnvelope = serde_json::from_value(value.clone())
         .map_err(|error| invalid_aggregate(error.to_string()))?;
-    let state = super::wire::restore_envelope(&envelope, resolver).map_err(map_persistence)?;
+    let state = super::native::restore_envelope(&envelope, resolver).map_err(map_persistence)?;
     validate_mailbox_semantics(&value, &state, resolver)?;
     Ok(QueueBearingAggregate { value, state })
 }
@@ -1453,7 +1533,8 @@ fn seal_aggregate(mut value: JsonValue) -> Result<JsonValue, Version2Error> {
 fn aggregate_digest(value: &JsonValue) -> Result<String, Version2Error> {
     let mut unsigned = value.clone();
     aggregate_object_mut(&mut unsigned)?.remove("aggregate_state_digest");
-    wire::jcs_hash(&json!(["determa-aggregate-state-digest-2", unsigned])).map_err(map_persistence)
+    native::jcs_hash(&json!(["determa-aggregate-state-digest-2", unsigned]))
+        .map_err(map_persistence)
 }
 
 pub(crate) fn envelope_digest(
@@ -1461,7 +1542,7 @@ pub(crate) fn envelope_digest(
     delivery_mode: &str,
     envelope: &QueueEnvelope,
 ) -> Result<String, Version2Error> {
-    wire::jcs_hash(&json!([
+    native::jcs_hash(&json!([
         "determa-inbox-envelope-digest-2",
         "2",
         root_instance_id,
@@ -1750,22 +1831,28 @@ fn validate_restored_source(
     }
 }
 
+type InternalEmissionEvidence = (Vec<JsonValue>, Vec<String>, Vec<JsonValue>);
+
 fn append_internal_emissions(
     aggregate: &mut QueueBearingAggregate,
     emissions: &[Emission],
-) -> Result<(Vec<JsonValue>, Vec<JsonValue>), Version2Error> {
+) -> Result<InternalEmissionEvidence, Version2Error> {
     let before = aggregate.value.clone();
     let mut lifecycle = Vec::new();
     let references =
         append_step_emissions(&mut aggregate.value, &before, emissions, &mut lifecycle)?;
-    Ok((references, lifecycle))
+    let indexes = emissions
+        .iter()
+        .map(|emission| emission.emission_index.to_string())
+        .collect();
+    Ok((references, indexes, lifecycle))
 }
 
 fn map_dispatch_rejection(code: DispatchRejectionCode) -> Version2Error {
     Version2Error::new(code.as_str(), "delivery is not admissible")
 }
 
-fn map_persistence(error: super::wire::PersistenceError) -> Version2Error {
+fn map_persistence(error: super::native::PersistenceError) -> Version2Error {
     Version2Error::new(error.code.as_str(), error.message)
 }
 
@@ -1777,7 +1864,7 @@ fn invalid_aggregate(message: impl Into<String>) -> Version2Error {
 }
 
 pub(crate) fn canonical_bytes(value: &JsonValue) -> Result<Vec<u8>, Version2Error> {
-    wire::canonical_bytes(value)
+    native::canonical_bytes(value)
         .map_err(|error| Version2Error::new("invalid_aggregate_state", error.to_string()))
 }
 

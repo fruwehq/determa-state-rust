@@ -33,12 +33,17 @@ pub use store::{
     StoreRecord, StoreWriteResult,
 };
 pub use types::{
-    CheckpointErrorCode, OutboxIntent, PendingOutboxState, PreAcceptanceFailureCode,
-    TerminalOutboxOutcome,
+    AdmissionSource, CheckpointErrorCode, OutboxIntent, PendingOutboxState,
+    PreAcceptanceFailureCode, ProcessingRequest, PruneRequest, TerminalOutboxOutcome,
+    TransactionalProcessRequest,
 };
 pub use v2::{
-    checkpoint_admit_v2, checkpoint_compact_outbox_v2, checkpoint_prune_v2, checkpoint_step_v2,
-    checkpoint_terminalize_outbox_v2, checkpoint_tombstone_root_v2,
-    checkpoint_update_pending_outbox_v2, create_execution_checkpoint_v2,
-    creation_request_digest_v2, restore_execution_checkpoint_v2, ExecutionCheckpointV2,
+    checkpoint_admit_v2 as admit, checkpoint_compact_outbox as compact_outbox,
+    checkpoint_process as process, checkpoint_process_with_migration as process_with_migration,
+    checkpoint_prune_v2 as prune, checkpoint_step_v2 as step,
+    checkpoint_terminalize_outbox as terminalize_outbox,
+    checkpoint_tombstone_root as tombstone_root,
+    checkpoint_update_pending_outbox as update_pending_outbox,
+    create_execution_checkpoint_v2 as create, creation_request_digest,
+    restore_execution_checkpoint as restore, ExecutionCheckpoint,
 };

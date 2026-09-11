@@ -7,8 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  SPECIFICATION_COMMIT: 3f2dc4217971d5c6598436b19e415c53ec095dfe
-  CONFORMANCE_COMMIT: e72f72396fae44cbee323bf988d86966235dbd16
+  SPECIFICATION_COMMIT: ee38796d5e38e67e350a06548fd50faa530cbb12
+  CONFORMANCE_COMMIT: 99a4d9ad5256f7330e75b06d48f340cc7239a40d
 
 jobs:
   msrv:
@@ -106,11 +106,11 @@ jobs:
       - name: Documentation tests
         run: cargo test --locked --doc
 
-      - name: All 98 format 1 core conformance cases
-        run: cargo test --locked --test core_conformance -- --nocapture
-
       - name: All 162 native artifact/checkpoint schema-v2 vectors
         run: cargo test --locked --test native_v2_conformance -- --nocapture
+
+      - name: All 138 durable-host vectors
+        run: cargo test --locked --test durable_host_conformance -- --nocapture
 
   postgresql:
     name: PostgreSQL execution-store integration

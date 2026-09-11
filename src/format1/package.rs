@@ -1,6 +1,6 @@
+use super::native::TypedValue;
 use super::persistence::InMemoryDefinitionResolver;
 use super::source::load_bundle_from_json;
-use super::wire::TypedValue;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 

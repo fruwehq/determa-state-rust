@@ -215,21 +215,11 @@ pub struct Emission {
     pub effect_id: Option<String>,
     pub sequence: Option<Counter>,
     #[serde(skip)]
+    pub emission_index: usize,
+    #[serde(skip)]
     pub cause_id: Option<String>,
     #[serde(skip)]
     pub system_source: Option<String>,
-}
-
-impl Emission {
-    pub fn envelope(&self) -> Option<Envelope> {
-        Some(Envelope {
-            event: self.event.clone(),
-            event_id: self.event_id.clone()?,
-            target: self.target.clone(),
-            payload: self.payload.clone(),
-            correlation_id: self.correlation_id.clone(),
-        })
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -251,7 +241,7 @@ pub enum ResultStatus {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct AggregateState {
+pub(crate) struct AggregateState {
     pub validated_bundle_fingerprint: String,
     pub namespace: String,
     pub root_instance_id: String,
@@ -355,7 +345,7 @@ struct StepContext<'a> {
     emissions: &'a mut Vec<Emission>,
 }
 
-pub fn create(
+pub(crate) fn create_runtime_aggregate(
     bundle: &Bundle,
     machine_id: &str,
     root_instance_id: &str,
@@ -465,7 +455,7 @@ pub fn create(
     }
 }
 
-pub fn dispatch(
+pub(crate) fn dispatch_runtime_aggregate(
     bundle: &Bundle,
     prior_state: &AggregateState,
     delivery: Option<Delivery>,
@@ -665,7 +655,7 @@ pub(crate) fn validate_delivery_for_admission(
         });
     }
     let normalized = validate_envelope(bundle, runtime, mode, envelope)?;
-    if normalized != *envelope {
+    if !envelopes_wire_equivalent(&normalized, envelope) {
         return Err(DispatchRejectionCode::InvalidPayload);
     }
     Ok(runtime.runtime_id.clone())
@@ -694,7 +684,7 @@ pub(crate) fn validate_queued_event_for_migration(
     let runtime = runtime_by_id(&aggregate.root, runtime_id)
         .ok_or(DispatchRejectionCode::InvalidInstanceTarget)?;
     let normalized = validate_envelope(bundle, runtime, mode, envelope)?;
-    if normalized != *envelope {
+    if !envelopes_wire_equivalent(&normalized, envelope) {
         return Err(DispatchRejectionCode::InvalidPayload);
     }
     Ok(())
@@ -836,15 +826,6 @@ impl RuntimeState {
             .collect::<Vec<_>>();
         leaves.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         leaves
-    }
-
-    pub fn visible_variables(&self) -> BTreeMap<String, Value> {
-        let scope = self
-            .config()
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "root".to_string());
-        visible_variables(self, &scope)
     }
 }
 
@@ -2278,6 +2259,8 @@ fn validate_envelope(
             return Err(DispatchRejectionCode::InvalidEvent);
         }
     }
+    let payload = normalize_payload(declaration, &envelope.payload)
+        .map_err(|_| DispatchRejectionCode::InvalidPayload)?;
     if envelope
         .correlation_id
         .as_ref()
@@ -2286,12 +2269,19 @@ fn validate_envelope(
     {
         return Err(DispatchRejectionCode::InvalidCorrelation);
     }
-    let payload = normalize_payload(declaration, &envelope.payload)
-        .map_err(|_| DispatchRejectionCode::InvalidPayload)?;
     Ok(Envelope {
         payload,
         ..envelope.clone()
     })
+}
+
+fn envelopes_wire_equivalent(left: &Envelope, right: &Envelope) -> bool {
+    left.event == right.event
+        && left.event_id == right.event_id
+        && left.target == right.target
+        && left.correlation_id == right.correlation_id
+        && super::native::TypedValue::from_value(&Value::Map(left.payload.clone()))
+            == super::native::TypedValue::from_value(&Value::Map(right.payload.clone()))
 }
 
 fn normalize_payload(
@@ -3200,6 +3190,7 @@ fn execute_send(
                     ordinal,
                 )),
                 sequence: Some(sequence),
+                emission_index: ordinal,
                 cause_id: None,
                 system_source: None,
             });
@@ -3223,6 +3214,7 @@ fn execute_send(
                 correlation_id: correlation_id.clone(),
                 effect_id: None,
                 sequence: None,
+                emission_index: ordinal,
                 cause_id: Some(context.cause_id.clone()),
                 system_source: None,
             });
@@ -4134,6 +4126,7 @@ fn push_system_emission(
         correlation_id: None,
         effect_id: None,
         sequence: None,
+        emission_index: ordinal,
         cause_id: Some(cause_id.to_string()),
         system_source: Some(locator.to_string()),
     });
@@ -4256,6 +4249,7 @@ fn push_parallel_done(
         correlation_id: None,
         effect_id: None,
         sequence: None,
+        emission_index: 1,
         cause_id: Some(cause_id.to_string()),
         system_source: Some("system:component_completion".to_string()),
     });
@@ -4353,6 +4347,7 @@ fn direct_child_path(leaf: &str, parent: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{create_runtime_aggregate as create, dispatch_runtime_aggregate as dispatch};
     use crate::format1::load_bundle;
 
     const IDENTITY_VECTOR_BUNDLE: &str = r#"

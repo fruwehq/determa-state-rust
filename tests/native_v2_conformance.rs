@@ -3,9 +3,9 @@ use determa_state::checkpoint::{
     MutationGuard, StoreRecord, StoreWriteResult,
 };
 use determa_state::{
-    admit_v2, create_v2, load_bundle, migrate_aggregate_v2_route, restore_aggregate_v2,
-    restore_package_v2, step_v2, AdmissionDelivery, Bindings, InMemoryDefinitionResolver,
-    MigrationRequest, ResourceLimits, Version2Error,
+    admit, create, load_bundle, migrate_aggregate_route, restore_aggregate, restore_package, step,
+    ArtifactError, Bindings, Delivery, InMemoryDefinitionResolver, MigrationRequest,
+    ResourceLimits,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -143,7 +143,7 @@ fn run_checkpoint_vector(directory: &Path, requests: &Value, vector: &Value) -> 
                 .and_then(|receipt| receipt["source_aggregate_state_digest"].as_str())
         })
         .unwrap();
-    let actual = host.maintenance_migration_v2(&MaintenanceMigrationRequest {
+    let actual = host.maintenance_migration(&MaintenanceMigrationRequest {
         root_instance_id: root_instance_id.to_string(),
         operation_id: operation_id.to_string(),
         source_aggregate_state_digest: source_digest.to_string(),
@@ -201,7 +201,7 @@ fn run_vector(directory: &Path, vector: &Value) -> Result<(), String> {
         .map(|file| fs::read(directory.join(file)).unwrap());
     let before_copy = before.clone();
     let operation = vector["operation"].as_str().unwrap();
-    let actual = (|| -> Result<Value, Version2Error> {
+    let actual = (|| -> Result<Value, ArtifactError> {
         match operation {
             "create_v2" => {
                 let bundle_file = vector["bundle"]
@@ -210,7 +210,7 @@ fn run_vector(directory: &Path, vector: &Value) -> Result<(), String> {
                     .unwrap();
                 let bundle = load_bundle(&fs::read_to_string(directory.join(bundle_file)).unwrap())
                     .map_err(invalid)?;
-                create_v2(
+                create(
                     &bundle,
                     request["machine_id"].as_str().unwrap(),
                     request["root_instance_id"].as_str().unwrap(),
@@ -219,25 +219,23 @@ fn run_vector(directory: &Path, vector: &Value) -> Result<(), String> {
                 )
                 .map(|aggregate| aggregate.value().clone())
             }
-            "round_trip_aggregate_v2" => restore_aggregate_v2(
+            "round_trip_aggregate_v2" => restore_aggregate(
                 before.as_deref().expect("round trip requires state_before"),
                 &resolver,
             )
             .map(|aggregate| aggregate.value().clone()),
-            "restore_package_v2" => {
-                restore_package_operation(directory, request, vector, &mut resolver)
-            }
+            "restore_package_v2" => restore_package_operation(directory, request, &mut resolver),
             "admit_v2" => {
                 let bundle = vector_bundle(directory, vector)?;
-                let aggregate = restore_aggregate_v2(before.as_deref().unwrap(), &resolver)?;
-                let deliveries: Vec<AdmissionDelivery> =
+                let aggregate = restore_aggregate(before.as_deref().unwrap(), &resolver)?;
+                let deliveries: Vec<Delivery> =
                     serde_json::from_value(request["deliveries"].clone()).map_err(invalid)?;
-                admit_v2(&bundle, &aggregate, &deliveries)
+                admit(&bundle, &aggregate, &deliveries)
             }
             "step_v2" => {
                 let bundle = vector_bundle(directory, vector)?;
-                let aggregate = restore_aggregate_v2(before.as_deref().unwrap(), &resolver)?;
-                step_v2(
+                let aggregate = restore_aggregate(before.as_deref().unwrap(), &resolver)?;
+                step(
                     &bundle,
                     &aggregate,
                     request["target_runtime_id"].as_str().unwrap(),
@@ -249,7 +247,7 @@ fn run_vector(directory: &Path, vector: &Value) -> Result<(), String> {
             "migrate_then_process_v2" => {
                 migrate_then_process(directory, request, before.as_deref().unwrap(), &resolver)
             }
-            other => Err(Version2Error::new("unsupported_operation", other)),
+            other => Err(ArtifactError::new("unsupported_operation", other)),
         }
     })();
     let assertion = assert_result(directory, vector, actual);
@@ -262,40 +260,60 @@ fn run_vector(directory: &Path, vector: &Value) -> Result<(), String> {
 fn restore_package_operation(
     directory: &Path,
     request: &Value,
-    vector: &Value,
     resolver: &mut InMemoryDefinitionResolver,
-) -> Result<Value, Version2Error> {
-    let package = restore_package_v2(
+) -> Result<Value, ArtifactError> {
+    let package = restore_package(
         &fs::read(directory.join(request["package_file"].as_str().unwrap())).unwrap(),
         resolver,
     )?;
-    let drives_route = vector["covers"].as_array().unwrap().iter().any(|cover| {
-        matches!(
-            cover.as_str(),
-            Some("attachments_seed_empty_resolver_and_drive_route")
-                | Some("put_if_absent_is_idempotent")
-        )
-    });
-    if !drives_route {
-        return Ok(package.aggregate.value().clone());
+    match request["intent"].as_str() {
+        Some("restore_aggregate") => Ok(package.aggregate.value().clone()),
+        Some("restore_and_apply_migration_route") => {
+            let target_validated_bundle_fingerprint = package
+                .migration_route
+                .last()
+                .map(|digest| {
+                    let descriptor = resolver.descriptor(digest).ok_or_else(|| {
+                        ArtifactError::new(
+                            "migration_descriptor_not_found",
+                            "package route descriptor is unavailable after restoration",
+                        )
+                    })?;
+                    let value: Value =
+                        serde_json::from_slice(&descriptor.bytes).map_err(invalid)?;
+                    value["target_validated_bundle_fingerprint"]
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            ArtifactError::new(
+                                "invalid_migration_descriptor",
+                                "package route descriptor has no target fingerprint",
+                            )
+                        })
+                })
+                .transpose()?
+                .unwrap_or_else(|| {
+                    package.aggregate.value()["validated_bundle_fingerprint"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                });
+            migrate_aggregate_route(
+                &package.aggregate,
+                &MigrationRequest {
+                    migration_route: package.migration_route,
+                    target_validated_bundle_fingerprint,
+                    maintenance_mode: request["maintenance_mode"].as_bool().unwrap(),
+                },
+                resolver,
+                &ResourceLimits::default(),
+            )
+        }
+        _ => Err(ArtifactError::new(
+            "invalid_aggregate_state_package",
+            "package restoration intent is invalid",
+        )),
     }
-    let final_descriptor = resolver
-        .descriptor(package.migration_route.last().unwrap())
-        .ok_or_else(|| Version2Error::new("migration_descriptor_not_found", "route is absent"))?;
-    let descriptor: Value = serde_json::from_slice(&final_descriptor.bytes).map_err(invalid)?;
-    migrate_aggregate_v2_route(
-        &package.aggregate,
-        &MigrationRequest {
-            migration_route: package.migration_route,
-            target_validated_bundle_fingerprint: descriptor["target_validated_bundle_fingerprint"]
-                .as_str()
-                .unwrap()
-                .to_string(),
-            maintenance_mode: request["maintenance_mode"].as_bool().unwrap(),
-        },
-        resolver,
-        &ResourceLimits::default(),
-    )
 }
 
 fn migrate_operation(
@@ -303,20 +321,19 @@ fn migrate_operation(
     request: &Value,
     before: &[u8],
     resolver: &InMemoryDefinitionResolver,
-) -> Result<Value, Version2Error> {
-    let aggregate = restore_aggregate_v2(before, resolver)?;
+) -> Result<Value, ArtifactError> {
+    let aggregate = restore_aggregate(before, resolver)?;
     let migration_request = migration_request(request)?;
     let limits = request
         .get("resource_limits")
         .map(|value| serde_json::from_value(value.clone()).map_err(invalid))
         .transpose()?
         .unwrap_or_default();
-    let result = migrate_aggregate_v2_route(&aggregate, &migration_request, resolver, &limits)?;
+    let result = migrate_aggregate_route(&aggregate, &migration_request, resolver, &limits)?;
     for _ in 1..request["repeat_count"].as_u64().unwrap_or(1) {
-        let repeated =
-            migrate_aggregate_v2_route(&aggregate, &migration_request, resolver, &limits)?;
+        let repeated = migrate_aggregate_route(&aggregate, &migration_request, resolver, &limits)?;
         if repeated != result {
-            return Err(Version2Error::new(
+            return Err(ArtifactError::new(
                 "migration_route_mismatch",
                 "identical migration retry produced a different result",
             ));
@@ -330,18 +347,18 @@ fn migrate_then_process(
     request: &Value,
     before: &[u8],
     resolver: &InMemoryDefinitionResolver,
-) -> Result<Value, Version2Error> {
+) -> Result<Value, ArtifactError> {
     let migrated = migrate_operation(directory, request, before, resolver)?;
     let target_file = request["target_bundle"]["bundle_file"].as_str().unwrap();
     let target = load_bundle(&fs::read_to_string(directory.join(target_file)).unwrap())
-        .map_err(|error| Version2Error::new("invalid_definition", error.to_string()))?;
-    let aggregate = restore_aggregate_v2(
+        .map_err(|error| ArtifactError::new("invalid_definition", error.to_string()))?;
+    let aggregate = restore_aggregate(
         &serde_json_canonicalizer::to_vec(&migrated["aggregate_state"]).map_err(invalid)?,
         resolver,
     )?;
-    let delivery: AdmissionDelivery =
+    let delivery: Delivery =
         serde_json::from_value(request["delivery"].clone()).map_err(invalid)?;
-    let admitted = match admit_v2(&target, &aggregate, std::slice::from_ref(&delivery)) {
+    let admitted = match admit(&target, &aggregate, std::slice::from_ref(&delivery)) {
         Ok(admitted) => admitted,
         Err(error) => {
             let root = aggregate.value()["runtimes"]
@@ -367,12 +384,12 @@ fn migrate_then_process(
             }));
         }
     };
-    let admitted_aggregate = restore_aggregate_v2(
+    let admitted_aggregate = restore_aggregate(
         &serde_json_canonicalizer::to_vec(&admitted["state"]).map_err(invalid)?,
         resolver,
     )?;
     let runtime_id = target_runtime_id(&delivery.envelope.target)?;
-    let processing = step_v2(&target, &admitted_aggregate, runtime_id)?;
+    let processing = step(&target, &admitted_aggregate, runtime_id)?;
     Ok(json!({
         "result": "migrated_and_processed",
         "migration_audit_records": migrated["audit_records"],
@@ -380,14 +397,14 @@ fn migrate_then_process(
     }))
 }
 
-fn migration_request(request: &Value) -> Result<MigrationRequest, Version2Error> {
+fn migration_request(request: &Value) -> Result<MigrationRequest, ArtifactError> {
     let target = request["target_bundle"]["validated_bundle_fingerprint"].clone();
     MigrationRequest::from_json(&json!({
         "migration_route": request["migration_descriptor_digest_route"],
         "target_validated_bundle_fingerprint": target,
         "maintenance_mode": request["maintenance_mode"]
     }))
-    .map_err(|error| Version2Error::new(error.code.as_str(), error.message))
+    .map_err(|error| ArtifactError::new(error.code.as_str(), error.message))
 }
 
 fn resolver_from(directory: &Path, request: &Value) -> Result<InMemoryDefinitionResolver, String> {
@@ -449,12 +466,12 @@ fn resolver_from(directory: &Path, request: &Value) -> Result<InMemoryDefinition
     Ok(resolver)
 }
 
-fn vector_bundle(directory: &Path, vector: &Value) -> Result<determa_state::Bundle, Version2Error> {
+fn vector_bundle(directory: &Path, vector: &Value) -> Result<determa_state::Bundle, ArtifactError> {
     load_bundle(&fs::read_to_string(directory.join(vector["bundle"].as_str().unwrap())).unwrap())
         .map_err(invalid)
 }
 
-fn target_runtime_id(target: &Value) -> Result<&str, Version2Error> {
+fn target_runtime_id(target: &Value) -> Result<&str, ArtifactError> {
     target
         .get("root")
         .and_then(|value| value["root_runtime_id"].as_str())
@@ -468,13 +485,13 @@ fn target_runtime_id(target: &Value) -> Result<&str, Version2Error> {
                 .get("spawned_instance")
                 .and_then(|value| value["instance_id"].as_str())
         })
-        .ok_or_else(|| Version2Error::new("invalid_instance_target", "target is malformed"))
+        .ok_or_else(|| ArtifactError::new("invalid_instance_target", "target is malformed"))
 }
 
 fn assert_result(
     directory: &Path,
     vector: &Value,
-    actual: Result<Value, Version2Error>,
+    actual: Result<Value, ArtifactError>,
 ) -> Result<(), String> {
     let expected = &vector["expect"];
     if expected["result"] == "failure" {
@@ -529,8 +546,8 @@ fn first_difference(expected: &Value, actual: &Value, path: &str) -> String {
     }
 }
 
-fn invalid(error: impl std::fmt::Display) -> Version2Error {
-    Version2Error::new("invalid_aggregate_state", error.to_string())
+fn invalid(error: impl std::fmt::Display) -> ArtifactError {
+    ArtifactError::new("invalid_aggregate_state", error.to_string())
 }
 
 fn parse_yaml(source: &str) -> Value {

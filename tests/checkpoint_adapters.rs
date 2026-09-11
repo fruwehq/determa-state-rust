@@ -1,12 +1,15 @@
 use determa_state::checkpoint::{
     CheckpointHost, ExecutionStore, FileExecutionStore, MaintenanceMigrationRequest,
-    MemoryExecutionStore, MutationGuard, PendingOutboxState, StoreRecord, StoreWriteResult,
-    TerminalOutboxOutcome,
+    MemoryExecutionStore, MutationGuard, PendingOutboxState, ProcessingRequest, PruneRequest,
+    StoreRecord, StoreWriteResult, TerminalOutboxOutcome, TransactionalProcessRequest,
 };
 #[cfg(feature = "sqlite")]
 use determa_state::checkpoint::{DurableStoreMode, SqliteExecutionStore};
-use determa_state::{load_bundle, Bindings, InMemoryDefinitionResolver, ResourceLimits};
+use determa_state::{
+    load_bundle, Bindings, InMemoryDefinitionResolver, MigrationRequest, ResourceLimits,
+};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -118,7 +121,7 @@ machines:
     });
 
     let mismatch = host
-        .create_checkpoint_v2(
+        .create_checkpoint(
             &bundle,
             "transaction_server",
             "digest-mismatch",
@@ -132,7 +135,7 @@ machines:
     assert!(store.load("digest-mismatch").unwrap().is_none());
 
     let created = host
-        .create_checkpoint_v2(
+        .create_checkpoint(
             &bundle,
             "transaction_server",
             "server-1",
@@ -145,20 +148,18 @@ machines:
     let inputs: Value =
         serde_json::from_slice(&fs::read(core.join("operation-inputs.json")).unwrap()).unwrap();
     let admitted = host
-        .admit_checkpoint_v2(
+        .admit_checkpoint(
             "server-1",
             inputs["admit_two"]["deliveries"].as_array().unwrap(),
             &MutationGuard::new(created.revision(), created.digest()),
         )
         .unwrap();
     let admitted_checkpoint = &admitted["checkpoint"];
-    let root_runtime_id = admitted_checkpoint["root_record"]["aggregate_state"]["root_runtime_id"]
-        .as_str()
-        .unwrap();
+    let first_processing = processing_for(admitted_checkpoint);
     let stepped = host
-        .step_checkpoint_v2(
+        .step_checkpoint(
             "server-1",
-            root_runtime_id,
+            &first_processing,
             &MutationGuard::new(
                 admitted_checkpoint["revision"].as_str().unwrap(),
                 admitted_checkpoint["execution_checkpoint_digest"]
@@ -167,10 +168,11 @@ machines:
             ),
         )
         .unwrap();
+    let second_processing = processing_for(&stepped);
     let stepped_again = host
-        .step_checkpoint_v2(
+        .step_checkpoint(
             "server-1",
-            root_runtime_id,
+            &second_processing,
             &MutationGuard::new(
                 stepped["revision"].as_str().unwrap(),
                 stepped["execution_checkpoint_digest"].as_str().unwrap(),
@@ -178,9 +180,15 @@ machines:
         )
         .unwrap();
     let pruned = host
-        .prune_checkpoint_v2(
+        .prune_checkpoint(
             "server-1",
-            "4",
+            &PruneRequest {
+                cutoff_receipt_sequence: "4".to_string(),
+                target_mode: "bounded".to_string(),
+                policy_identifier: Some("native-v2-test".to_string()),
+                dependency_receipt_sequences: Vec::new(),
+                dependency_effect_ids: Vec::new(),
+            },
             &MutationGuard::new(
                 stepped_again["revision"].as_str().unwrap(),
                 stepped_again["execution_checkpoint_digest"]
@@ -212,17 +220,50 @@ machines:
         ),
         limits: ResourceLimits::default(),
     };
-    let maintained = host.maintenance_migration_v2(&maintenance).unwrap();
+    let maintained = host.maintenance_migration(&maintenance).unwrap();
     assert_eq!(
         maintained["receipt"]["result_code"],
         "migration_no_operation"
     );
     assert_eq!(
-        host.maintenance_migration_v2(&maintenance).unwrap(),
+        host.maintenance_migration(&maintenance).unwrap(),
         maintained
     );
+
+    let transactional_created = host
+        .create_checkpoint(
+            &bundle,
+            "transaction_server",
+            "transactional-process-root",
+            "create-transactional-process-root",
+            &Bindings::default(),
+            None,
+            retention.clone(),
+        )
+        .unwrap();
+    let transactional = host
+        .transactional_process(
+            "transactional-process-root",
+            &TransactionalProcessRequest {
+                migration: MigrationRequest {
+                    migration_route: Vec::new(),
+                    target_validated_bundle_fingerprint: bundle.fingerprint.clone(),
+                    maintenance_mode: false,
+                },
+                migration_limits: ResourceLimits::default(),
+                delivery: input_delivery(&transactional_created, "transactional-event"),
+                processing_mode: "delayed".to_string(),
+            },
+            &MutationGuard::new(
+                transactional_created.revision(),
+                transactional_created.digest(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(transactional["revision"], "1");
+    assert_eq!(transactional["migration_audit_records"], json!([]));
     let terminal = host
-        .create_checkpoint_v2(
+        .create_checkpoint(
             &terminal_bundle,
             "terminal",
             "terminal-root",
@@ -233,7 +274,7 @@ machines:
         )
         .unwrap();
     let tombstoned = host
-        .tombstone_root_v2(
+        .tombstone_root(
             "terminal-root",
             "native-v2-tombstone",
             &MutationGuard::new(terminal.revision(), terminal.digest()),
@@ -242,7 +283,7 @@ machines:
     assert_eq!(tombstoned["root_record"]["status"], "tombstone");
 
     let outbox = host
-        .create_checkpoint_v2(
+        .create_checkpoint(
             &outbox_bundle,
             "publisher",
             "outbox-root",
@@ -256,7 +297,7 @@ machines:
         .as_str()
         .unwrap();
     let pending = host
-        .update_pending_outbox_v2(
+        .update_pending_outbox(
             "outbox-root",
             effect_id,
             PendingOutboxState::RetryableFailure {
@@ -266,7 +307,7 @@ machines:
         )
         .unwrap();
     let terminal = host
-        .terminalize_outbox_v2(
+        .terminalize_outbox(
             "outbox-root",
             effect_id,
             TerminalOutboxOutcome::Confirmed,
@@ -274,12 +315,58 @@ machines:
         )
         .unwrap();
     let compacted = host
-        .compact_outbox_v2("outbox-root", effect_id, &guard_for(&terminal))
+        .compact_outbox("outbox-root", effect_id, &guard_for(&terminal))
         .unwrap();
     assert_eq!(
         compacted["outbox_effect_tombstones"][0]["effect_id"],
         effect_id
     );
+}
+
+fn input_delivery(
+    checkpoint: &determa_state::checkpoint::ExecutionCheckpoint,
+    event_id: &str,
+) -> Value {
+    let envelope = json!({
+        "event": "received",
+        "event_id": event_id,
+        "cause_id": event_id,
+        "source": {"host": true},
+        "target": checkpoint.value()["root_record"]["aggregate_state"]["runtimes"][0]
+            ["target_identity"],
+        "payload": ["map", []]
+    });
+    let bytes = serde_json_canonicalizer::to_vec(&json!([
+        "determa-inbox-envelope-digest-2",
+        "2",
+        checkpoint.root_instance_id(),
+        "input",
+        envelope
+    ]))
+    .unwrap();
+    json!({
+        "delivery_mode": "input",
+        "envelope": envelope,
+        "envelope_digest": format!("sha256:{:x}", Sha256::digest(bytes))
+    })
+}
+
+fn processing_for(checkpoint: &Value) -> ProcessingRequest {
+    let runtime = checkpoint["root_record"]["aggregate_state"]["runtimes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|runtime| !runtime["ready_mailbox"].as_array().unwrap().is_empty())
+        .unwrap();
+    let entry = &runtime["ready_mailbox"][0];
+    ProcessingRequest {
+        target_runtime_id: runtime["runtime_id"].as_str().unwrap().to_string(),
+        event_id: entry["envelope"]["event_id"].as_str().unwrap().to_string(),
+        envelope_digest: entry["envelope_digest"].as_str().unwrap().to_string(),
+        acceptance_sequence: entry["acceptance_sequence"].as_str().unwrap().to_string(),
+        queue_sequence: entry["queue_sequence"].as_str().unwrap().to_string(),
+        processing_mode: "delayed".to_string(),
+    }
 }
 
 fn guard_for(value: &Value) -> MutationGuard {

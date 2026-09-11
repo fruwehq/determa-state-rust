@@ -3,13 +3,13 @@ use super::compile::{
     Bundle, CompiledActionKind, CompiledStateKind, ComponentDefinition, Machine, State,
 };
 use super::counter::Counter;
-use super::persistence::MigrationArtifactResolver;
-use super::wire::{
+use super::native::{
     canonical_bytes, find_machine_by_root_pointer, find_variable_by_pointer, jcs_hash,
     parse_aggregate_envelope, restore_envelope, AggregateEnvelope, PersistenceError,
     PersistenceErrorCode, TypedValue, WireDefinitionBinding, WireHistory, WireLifetimeHolder,
     WireNextCounter, WireRelation, WireVariable,
 };
+use super::persistence::MigrationArtifactResolver;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeSet, HashSet};
@@ -353,7 +353,7 @@ fn decode_descriptor(
             ));
         }
     }
-    super::wire::validate_schema(
+    super::native::validate_schema(
         &value,
         include_str!("../../schema/migration-descriptor-v2.schema.json"),
         PersistenceErrorCode::InvalidMigrationDescriptor,
@@ -806,7 +806,7 @@ fn transform_runtimes(
         let old_runtime = runtime.clone();
         runtime.current_definition = WireDefinitionBinding {
             validated_bundle_fingerprint: target_bundle.fingerprint.clone(),
-            machine: super::wire::WireMachineIdentity {
+            machine: super::native::WireMachineIdentity {
                 namespace: target_bundle.namespace.clone(),
                 machine_id: target_machine.machine_id.clone(),
                 machine_version: target_machine.version.to_string(),
@@ -821,7 +821,7 @@ fn transform_runtimes(
             .active_state_activations
             .iter()
             .map(|activation| {
-                Ok(super::wire::WireStateActivation {
+                Ok(super::native::WireStateActivation {
                     state_definition_pointer: map_counter_pointer(
                         array(mappings, "counters")?,
                         &activation.state_definition_pointer,
@@ -894,7 +894,7 @@ fn map_machine_root(
 }
 
 fn migrate_relation(
-    runtime: &mut super::wire::WireRuntime,
+    runtime: &mut super::native::WireRuntime,
     mappings: &serde_json::Map<String, JsonValue>,
 ) -> Result<(), PersistenceError> {
     match &mut runtime.relation {
@@ -992,8 +992,8 @@ fn map_active_leaves(
 }
 
 fn migrate_variables(
-    runtime: &super::wire::WireRuntime,
-    target_activations: &[super::wire::WireStateActivation],
+    runtime: &super::native::WireRuntime,
+    target_activations: &[super::native::WireStateActivation],
     target_machine: &super::compile::Machine,
     rules: &[JsonValue],
     limits: &ResourceLimits,

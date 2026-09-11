@@ -6,16 +6,19 @@ use super::store::{
     validate_store_host_profile, AdapterError, ExecutionStore, HostFeature, HostProfile,
     StoreError, StoreErrorCode, StoreRecord, StoreWriteResult,
 };
-use super::types::{PendingOutboxState, TerminalOutboxOutcome};
+use super::types::{
+    AdmissionSource, PendingOutboxState, ProcessingRequest, PruneRequest, TerminalOutboxOutcome,
+    TransactionalProcessRequest,
+};
 use super::v2::{
-    checkpoint_admit_v2_with_optional_bundle, checkpoint_compact_outbox_v2,
-    checkpoint_maintenance_migration_v2_route, checkpoint_prune_v2, checkpoint_step_v2,
-    checkpoint_terminalize_outbox_v2, checkpoint_tombstone_root_v2,
-    checkpoint_update_pending_outbox_v2, create_execution_checkpoint_v2,
-    creation_request_digest_v2, restore_execution_checkpoint_v2, ExecutionCheckpointV2,
+    checkpoint_admit_v2_with_optional_bundle, checkpoint_compact_outbox,
+    checkpoint_maintenance_migration_route, checkpoint_process, checkpoint_process_with_migration,
+    checkpoint_prune_v2, checkpoint_step_v2, checkpoint_terminalize_outbox,
+    checkpoint_tombstone_root, checkpoint_update_pending_outbox, create_execution_checkpoint_v2,
+    creation_request_digest, restore_execution_checkpoint, ExecutionCheckpoint,
 };
 use crate::format1::{
-    Bindings, Bundle, MigrationArtifactResolver, MigrationRequest, ResourceLimits, Version2Error,
+    ArtifactError, Bindings, Bundle, MigrationArtifactResolver, MigrationRequest, ResourceLimits,
 };
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
@@ -260,12 +263,23 @@ pub enum PostgresqlHostMutation<'a> {
     },
     Step {
         root_instance_id: &'a str,
-        target_runtime_id: &'a str,
+        request: &'a ProcessingRequest,
+        guard: &'a MutationGuard,
+    },
+    Process {
+        root_instance_id: &'a str,
+        delivery: &'a JsonValue,
+        processing_mode: &'a str,
+        guard: &'a MutationGuard,
+    },
+    TransactionalProcess {
+        root_instance_id: &'a str,
+        request: &'a TransactionalProcessRequest,
         guard: &'a MutationGuard,
     },
     Prune {
         root_instance_id: &'a str,
-        cutoff_receipt_sequence: &'a str,
+        request: &'a PruneRequest,
         guard: &'a MutationGuard,
     },
     MaintenanceMigration(&'a MaintenanceMigrationRequest),
@@ -306,6 +320,12 @@ impl PostgresqlHostMutation<'_> {
             | Self::Step {
                 root_instance_id, ..
             }
+            | Self::Process {
+                root_instance_id, ..
+            }
+            | Self::TransactionalProcess {
+                root_instance_id, ..
+            }
             | Self::Prune {
                 root_instance_id, ..
             }
@@ -329,9 +349,11 @@ impl PostgresqlHostMutation<'_> {
 #[cfg(feature = "postgresql")]
 #[derive(Debug, Clone, PartialEq)]
 pub enum PostgresqlHostMutationResult {
-    Creation(Box<ExecutionCheckpointV2>),
+    Creation(Box<ExecutionCheckpoint>),
     Admission(JsonValue),
     Step(JsonValue),
+    Process(JsonValue),
+    TransactionalProcess(JsonValue),
     Prune(JsonValue),
     MaintenanceMigration(JsonValue),
     PendingOutbox(JsonValue),
@@ -500,7 +522,7 @@ where
                 supplied_request_digest,
                 replay_retention,
             } => PostgresqlHostMutationResult::Creation(Box::new(
-                self.create_checkpoint_v2_with_store(
+                self.create_checkpoint_with_store(
                     &mut store,
                     bundle,
                     machine_id,
@@ -517,43 +539,51 @@ where
                 deliveries,
                 guard,
             } => PostgresqlHostMutationResult::Admission(
-                self.admit_checkpoint_v2_with_store(
-                    &mut store,
-                    root_instance_id,
-                    deliveries,
-                    guard,
-                )
-                .map_err(v2_host_failure)?,
+                self.admit_checkpoint_with_store(&mut store, root_instance_id, deliveries, guard)
+                    .map_err(v2_host_failure)?,
             ),
             PostgresqlHostMutation::Step {
                 root_instance_id,
-                target_runtime_id,
+                request,
                 guard,
             } => PostgresqlHostMutationResult::Step(
-                self.step_checkpoint_v2_with_store(
+                self.step_checkpoint_with_store(&mut store, root_instance_id, request, guard)
+                    .map_err(v2_host_failure)?,
+            ),
+            PostgresqlHostMutation::Process {
+                root_instance_id,
+                delivery,
+                processing_mode,
+                guard,
+            } => PostgresqlHostMutationResult::Process(
+                self.process_checkpoint_with_store(
                     &mut store,
                     root_instance_id,
-                    target_runtime_id,
+                    delivery,
+                    processing_mode,
                     guard,
                 )
                 .map_err(v2_host_failure)?,
+            ),
+            PostgresqlHostMutation::TransactionalProcess {
+                root_instance_id,
+                request,
+                guard,
+            } => PostgresqlHostMutationResult::TransactionalProcess(
+                self.transactional_process_with_store(&mut store, root_instance_id, request, guard)
+                    .map_err(v2_host_failure)?,
             ),
             PostgresqlHostMutation::Prune {
                 root_instance_id,
-                cutoff_receipt_sequence,
+                request,
                 guard,
             } => PostgresqlHostMutationResult::Prune(
-                self.prune_checkpoint_v2_with_store(
-                    &mut store,
-                    root_instance_id,
-                    cutoff_receipt_sequence,
-                    guard,
-                )
-                .map_err(v2_host_failure)?,
+                self.prune_checkpoint_with_store(&mut store, root_instance_id, request, guard)
+                    .map_err(v2_host_failure)?,
             ),
             PostgresqlHostMutation::MaintenanceMigration(request) => {
                 PostgresqlHostMutationResult::MaintenanceMigration(
-                    self.maintenance_migration_v2_with_store(&mut store, request)
+                    self.maintenance_migration_with_store(&mut store, request)
                         .map_err(v2_host_failure)?,
                 )
             }
@@ -563,7 +593,7 @@ where
                 desired,
                 guard,
             } => PostgresqlHostMutationResult::PendingOutbox(
-                self.update_pending_outbox_v2_with_store(
+                self.update_pending_outbox_with_store(
                     &mut store,
                     root_instance_id,
                     effect_id,
@@ -578,7 +608,7 @@ where
                 outcome,
                 guard,
             } => PostgresqlHostMutationResult::Outbox(
-                self.terminalize_outbox_v2_with_store(
+                self.terminalize_outbox_with_store(
                     &mut store,
                     root_instance_id,
                     effect_id,
@@ -592,7 +622,7 @@ where
                 effect_id,
                 guard,
             } => PostgresqlHostMutationResult::CompactedOutbox(
-                self.compact_outbox_v2_with_store(&mut store, root_instance_id, effect_id, guard)
+                self.compact_outbox_with_store(&mut store, root_instance_id, effect_id, guard)
                     .map_err(v2_host_failure)?,
             ),
             PostgresqlHostMutation::TombstoneRoot {
@@ -600,13 +630,8 @@ where
                 operation_id,
                 guard,
             } => PostgresqlHostMutationResult::RootTombstone(
-                self.tombstone_root_v2_with_store(
-                    &mut store,
-                    root_instance_id,
-                    operation_id,
-                    guard,
-                )
-                .map_err(v2_host_failure)?,
+                self.tombstone_root_with_store(&mut store, root_instance_id, operation_id, guard)
+                    .map_err(v2_host_failure)?,
             ),
         };
         transaction.staged_result = Some(result);
@@ -618,10 +643,10 @@ where
         Arc::as_ptr(&self.store) as *const () as usize
     }
 
-    pub fn load_checkpoint_v2(
+    pub fn load_checkpoint(
         &self,
         root_instance_id: &str,
-    ) -> Result<Option<ExecutionCheckpointV2>, Version2Error> {
+    ) -> Result<Option<ExecutionCheckpoint>, ArtifactError> {
         self.store
             .load(root_instance_id)
             .map_err(v2_store_error)?
@@ -630,7 +655,7 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn create_checkpoint_v2(
+    pub fn create_checkpoint(
         &self,
         bundle: &Bundle,
         machine_id: &str,
@@ -639,11 +664,11 @@ where
         bindings: &Bindings,
         supplied_request_digest: Option<&str>,
         replay_retention: JsonValue,
-    ) -> Result<ExecutionCheckpointV2, Version2Error> {
+    ) -> Result<ExecutionCheckpoint, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
-        self.create_checkpoint_v2_with_store(
+        self.create_checkpoint_with_store(
             &mut store,
             bundle,
             machine_id,
@@ -656,7 +681,7 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_checkpoint_v2_with_store(
+    fn create_checkpoint_with_store(
         &self,
         store: &mut dyn StoreAccess,
         bundle: &Bundle,
@@ -666,14 +691,12 @@ where
         bindings: &Bindings,
         supplied_request_digest: Option<&str>,
         replay_retention: JsonValue,
-    ) -> Result<ExecutionCheckpointV2, Version2Error> {
-        let request_digest = creation_request_digest_v2(
-            bundle,
-            machine_id,
-            root_instance_id,
-            creation_id,
-            bindings,
-        )?;
+    ) -> Result<ExecutionCheckpoint, ArtifactError> {
+        let request_digest =
+            creation_request_digest(bundle, machine_id, root_instance_id, creation_id, bindings)?;
+        if let Some(current) = store.load(root_instance_id).map_err(v2_store_error)? {
+            return self.replay_or_reject_creation(current, creation_id, &request_digest);
+        }
         let candidate = create_execution_checkpoint_v2(
             bundle,
             machine_id,
@@ -682,28 +705,19 @@ where
             bindings,
             supplied_request_digest,
             replay_retention,
-        )?;
-        let record = StoreRecord::from_checkpoint_v2(&candidate).map_err(v2_store_error)?;
+        )
+        .map_err(|error| {
+            if crate::format1::CREATION_REJECTION_CODES.contains(&error.code.as_str()) {
+                v2_failure("creation_rejected", &error.message)
+            } else {
+                error
+            }
+        })?;
+        let record = StoreRecord::from_checkpoint(&candidate).map_err(v2_store_error)?;
         match store.insert_if_absent(record).map_err(v2_store_error)? {
             StoreWriteResult::Committed => Ok(candidate),
             StoreWriteResult::Conflict(Some(current)) => {
-                let current = self.restore_record_v2(current)?;
-                let receipt = current.value()["operation_receipts"]
-                    .as_array()
-                    .and_then(|receipts| receipts.first())
-                    .ok_or_else(|| {
-                        v2_failure("invalid_execution_checkpoint", "creation receipt is absent")
-                    })?;
-                if receipt["creation_id"].as_str() == Some(creation_id)
-                    && receipt["request_digest"].as_str() == Some(request_digest.as_str())
-                {
-                    Ok(current)
-                } else {
-                    Err(v2_failure(
-                        "creation_id_conflict",
-                        "root identity already has different creation evidence",
-                    ))
-                }
+                self.replay_or_reject_creation(current, creation_id, &request_digest)
             }
             StoreWriteResult::Conflict(None) => Err(v2_failure(
                 "checkpoint_revision_conflict",
@@ -712,25 +726,67 @@ where
         }
     }
 
-    pub fn admit_checkpoint_v2(
+    fn replay_or_reject_creation(
+        &self,
+        current: StoreRecord,
+        creation_id: &str,
+        request_digest: &str,
+    ) -> Result<ExecutionCheckpoint, ArtifactError> {
+        let current = self.restore_record_v2(current)?;
+        let receipt = current.value()["operation_receipts"]
+            .as_array()
+            .and_then(|receipts| receipts.first())
+            .ok_or_else(|| {
+                v2_failure("invalid_execution_checkpoint", "creation receipt is absent")
+            })?;
+        if receipt["creation_id"].as_str() == Some(creation_id)
+            && receipt["request_digest"].as_str() == Some(request_digest)
+        {
+            Ok(current)
+        } else {
+            Err(v2_failure(
+                "creation_id_conflict",
+                "root identity already has different creation evidence",
+            ))
+        }
+    }
+
+    pub fn admit_checkpoint(
         &self,
         root_instance_id: &str,
         deliveries: &[JsonValue],
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
-        self.admit_checkpoint_v2_with_store(&mut store, root_instance_id, deliveries, guard)
+        self.admit_checkpoint_with_store(&mut store, root_instance_id, deliveries, guard)
     }
 
-    fn admit_checkpoint_v2_with_store(
+    pub fn admit_checkpoint_sources(
+        &self,
+        root_instance_id: &str,
+        sources: &[AdmissionSource],
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let deliveries = sources
+            .iter()
+            .map(|source| match source {
+                AdmissionSource::JsonValue(value) => Ok(value.clone()),
+                AdmissionSource::Utf8Json(source) => crate::format1::strict_json::parse(source)
+                    .map_err(|error| ArtifactError::new("malformed_delivery", error.to_string())),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.admit_checkpoint(root_instance_id, &deliveries, guard)
+    }
+
+    fn admit_checkpoint_with_store(
         &self,
         store: &mut dyn StoreAccess,
         root_instance_id: &str,
         deliveries: &[JsonValue],
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let (record, checkpoint) =
             self.require_checkpoint_v2_with_store(store, root_instance_id)?;
         let bundle = checkpoint
@@ -748,32 +804,32 @@ where
         Ok(result)
     }
 
-    pub fn step_checkpoint_v2(
+    pub fn step_checkpoint(
         &self,
         root_instance_id: &str,
-        target_runtime_id: &str,
+        request: &ProcessingRequest,
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
-        self.step_checkpoint_v2_with_store(&mut store, root_instance_id, target_runtime_id, guard)
+        self.step_checkpoint_with_store(&mut store, root_instance_id, request, guard)
     }
 
-    fn step_checkpoint_v2_with_store(
+    fn step_checkpoint_with_store(
         &self,
         store: &mut dyn StoreAccess,
         root_instance_id: &str,
-        target_runtime_id: &str,
+        request: &ProcessingRequest,
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let (record, checkpoint) =
             self.require_checkpoint_v2_with_store(store, root_instance_id)?;
         let bundle = self.checkpoint_v2_bundle(&checkpoint)?;
         let result = checkpoint_step_v2(
             &bundle,
             &checkpoint,
-            target_runtime_id,
+            request,
             Some(&guard.expected_revision),
             Some(&guard.expected_checkpoint_digest),
         )?;
@@ -781,35 +837,41 @@ where
         Ok(result)
     }
 
-    pub fn prune_checkpoint_v2(
+    pub fn process_checkpoint(
         &self,
         root_instance_id: &str,
-        cutoff_receipt_sequence: &str,
+        delivery: &JsonValue,
+        processing_mode: &str,
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
-        self.prune_checkpoint_v2_with_store(
+        self.process_checkpoint_with_store(
             &mut store,
             root_instance_id,
-            cutoff_receipt_sequence,
+            delivery,
+            processing_mode,
             guard,
         )
     }
 
-    fn prune_checkpoint_v2_with_store(
+    fn process_checkpoint_with_store(
         &self,
         store: &mut dyn StoreAccess,
         root_instance_id: &str,
-        cutoff_receipt_sequence: &str,
+        delivery: &JsonValue,
+        processing_mode: &str,
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let (record, checkpoint) =
             self.require_checkpoint_v2_with_store(store, root_instance_id)?;
-        let result = checkpoint_prune_v2(
+        let bundle = self.checkpoint_v2_bundle(&checkpoint)?;
+        let result = checkpoint_process(
+            &bundle,
             &checkpoint,
-            cutoff_receipt_sequence,
+            delivery.clone(),
+            processing_mode,
             Some(&guard.expected_revision),
             Some(&guard.expected_checkpoint_digest),
         )?;
@@ -817,21 +879,108 @@ where
         Ok(result)
     }
 
-    pub fn maintenance_migration_v2(
+    pub fn transactional_process(
         &self,
-        request: &MaintenanceMigrationRequest,
-    ) -> Result<JsonValue, Version2Error> {
+        root_instance_id: &str,
+        request: &TransactionalProcessRequest,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
-        self.maintenance_migration_v2_with_store(&mut store, request)
+        self.transactional_process_with_store(&mut store, root_instance_id, request, guard)
     }
 
-    fn maintenance_migration_v2_with_store(
+    fn transactional_process_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        root_instance_id: &str,
+        request: &TransactionalProcessRequest,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let result = checkpoint_process_with_migration(
+            &checkpoint,
+            &request.migration,
+            self.resolver.as_ref(),
+            &request.migration_limits,
+            request.delivery.clone(),
+            &request.processing_mode,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
+    }
+
+    pub fn prune_checkpoint(
+        &self,
+        root_instance_id: &str,
+        request: &PruneRequest,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.prune_checkpoint_with_store(&mut store, root_instance_id, request, guard)
+    }
+
+    fn prune_checkpoint_with_store(
+        &self,
+        store: &mut dyn StoreAccess,
+        root_instance_id: &str,
+        request: &PruneRequest,
+        guard: &MutationGuard,
+    ) -> Result<JsonValue, ArtifactError> {
+        let (record, checkpoint) =
+            self.require_checkpoint_v2_with_store(store, root_instance_id)?;
+        let result = checkpoint_prune_v2(
+            &checkpoint,
+            request,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )?;
+        self.commit_v2_result_with_store(store, &record, &result)?;
+        Ok(result)
+    }
+
+    pub fn delete_retained_record(
+        &self,
+        root_instance_id: &str,
+        guard: &MutationGuard,
+    ) -> Result<(), ArtifactError> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        let (_, checkpoint) =
+            self.require_checkpoint_v2_with_store(&mut store, root_instance_id)?;
+        crate::checkpoint::v2::validate_mutation_guard(
+            &checkpoint,
+            &guard.expected_revision,
+            &guard.expected_checkpoint_digest,
+        )?;
+        Err(v2_failure(
+            "invalid_execution_checkpoint",
+            "physical deletion of retained checkpoint evidence is unsupported",
+        ))
+    }
+
+    pub fn maintenance_migration(
+        &self,
+        request: &MaintenanceMigrationRequest,
+    ) -> Result<JsonValue, ArtifactError> {
+        let mut store = DirectStoreAccess {
+            store: self.store.as_ref(),
+        };
+        self.maintenance_migration_with_store(&mut store, request)
+    }
+
+    fn maintenance_migration_with_store(
         &self,
         store: &mut dyn StoreAccess,
         request: &MaintenanceMigrationRequest,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         if request.operation_id.is_empty() {
             return Err(v2_failure(
                 "invalid_execution_checkpoint",
@@ -839,7 +988,7 @@ where
             ));
         }
         let request_digest = maintenance_request_digest(&request.root_instance_id, request)
-            .map_err(|error| Version2Error::new(error.code.as_str(), error.message))?;
+            .map_err(|error| ArtifactError::new(error.code.as_str(), error.message))?;
         if request
             .supplied_request_digest
             .as_ref()
@@ -891,7 +1040,7 @@ where
                 "maintenance source digest differs from checkpoint aggregate",
             ));
         }
-        let result = checkpoint_maintenance_migration_v2_route(
+        let result = checkpoint_maintenance_migration_route(
             &checkpoint,
             &MigrationRequest {
                 migration_route: request.migration_descriptor_digest_route.clone(),
@@ -925,17 +1074,17 @@ where
         Ok(json!({"result": "committed", "receipt": receipt}))
     }
 
-    pub fn update_pending_outbox_v2(
+    pub fn update_pending_outbox(
         &self,
         root_instance_id: &str,
         effect_id: &str,
         desired: PendingOutboxState,
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
-        self.update_pending_outbox_v2_with_store(
+        self.update_pending_outbox_with_store(
             &mut store,
             root_instance_id,
             effect_id,
@@ -944,17 +1093,17 @@ where
         )
     }
 
-    fn update_pending_outbox_v2_with_store(
+    fn update_pending_outbox_with_store(
         &self,
         store: &mut dyn StoreAccess,
         root_instance_id: &str,
         effect_id: &str,
         desired: PendingOutboxState,
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let (record, checkpoint) =
             self.require_checkpoint_v2_with_store(store, root_instance_id)?;
-        let result = checkpoint_update_pending_outbox_v2(
+        let result = checkpoint_update_pending_outbox(
             &checkpoint,
             effect_id,
             desired,
@@ -965,36 +1114,30 @@ where
         Ok(result)
     }
 
-    pub fn terminalize_outbox_v2(
+    pub fn terminalize_outbox(
         &self,
         root_instance_id: &str,
         effect_id: &str,
         outcome: TerminalOutboxOutcome,
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
-        self.terminalize_outbox_v2_with_store(
-            &mut store,
-            root_instance_id,
-            effect_id,
-            outcome,
-            guard,
-        )
+        self.terminalize_outbox_with_store(&mut store, root_instance_id, effect_id, outcome, guard)
     }
 
-    fn terminalize_outbox_v2_with_store(
+    fn terminalize_outbox_with_store(
         &self,
         store: &mut dyn StoreAccess,
         root_instance_id: &str,
         effect_id: &str,
         outcome: TerminalOutboxOutcome,
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let (record, checkpoint) =
             self.require_checkpoint_v2_with_store(store, root_instance_id)?;
-        let result = checkpoint_terminalize_outbox_v2(
+        let result = checkpoint_terminalize_outbox(
             &checkpoint,
             effect_id,
             outcome,
@@ -1005,28 +1148,28 @@ where
         Ok(result)
     }
 
-    pub fn compact_outbox_v2(
+    pub fn compact_outbox(
         &self,
         root_instance_id: &str,
         effect_id: &str,
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
-        self.compact_outbox_v2_with_store(&mut store, root_instance_id, effect_id, guard)
+        self.compact_outbox_with_store(&mut store, root_instance_id, effect_id, guard)
     }
 
-    fn compact_outbox_v2_with_store(
+    fn compact_outbox_with_store(
         &self,
         store: &mut dyn StoreAccess,
         root_instance_id: &str,
         effect_id: &str,
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let (record, checkpoint) =
             self.require_checkpoint_v2_with_store(store, root_instance_id)?;
-        let result = checkpoint_compact_outbox_v2(
+        let result = checkpoint_compact_outbox(
             &checkpoint,
             effect_id,
             Some(&guard.expected_revision),
@@ -1036,28 +1179,28 @@ where
         Ok(result)
     }
 
-    pub fn tombstone_root_v2(
+    pub fn tombstone_root(
         &self,
         root_instance_id: &str,
         operation_id: &str,
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
-        self.tombstone_root_v2_with_store(&mut store, root_instance_id, operation_id, guard)
+        self.tombstone_root_with_store(&mut store, root_instance_id, operation_id, guard)
     }
 
-    fn tombstone_root_v2_with_store(
+    fn tombstone_root_with_store(
         &self,
         store: &mut dyn StoreAccess,
         root_instance_id: &str,
         operation_id: &str,
         guard: &MutationGuard,
-    ) -> Result<JsonValue, Version2Error> {
+    ) -> Result<JsonValue, ArtifactError> {
         let (record, checkpoint) =
             self.require_checkpoint_v2_with_store(store, root_instance_id)?;
-        let result = checkpoint_tombstone_root_v2(
+        let result = checkpoint_tombstone_root(
             &checkpoint,
             operation_id,
             Some(&guard.expected_revision),
@@ -1067,11 +1210,8 @@ where
         Ok(result)
     }
 
-    fn restore_record_v2(
-        &self,
-        record: StoreRecord,
-    ) -> Result<ExecutionCheckpointV2, Version2Error> {
-        let checkpoint = restore_execution_checkpoint_v2(&record.bytes, self.resolver.as_ref())?;
+    fn restore_record_v2(&self, record: StoreRecord) -> Result<ExecutionCheckpoint, ArtifactError> {
+        let checkpoint = restore_execution_checkpoint(&record.bytes, self.resolver.as_ref())?;
         if checkpoint.root_instance_id() != record.root_instance_id
             || checkpoint.revision() != record.revision
             || checkpoint.digest() != record.execution_checkpoint_digest
@@ -1088,7 +1228,7 @@ where
         &self,
         store: &mut dyn StoreAccess,
         root_instance_id: &str,
-    ) -> Result<(StoreRecord, ExecutionCheckpointV2), Version2Error> {
+    ) -> Result<(StoreRecord, ExecutionCheckpoint), ArtifactError> {
         let record = store
             .load(root_instance_id)
             .map_err(v2_store_error)?
@@ -1104,8 +1244,8 @@ where
 
     fn checkpoint_v2_bundle(
         &self,
-        checkpoint: &ExecutionCheckpointV2,
-    ) -> Result<Bundle, Version2Error> {
+        checkpoint: &ExecutionCheckpoint,
+    ) -> Result<Bundle, ArtifactError> {
         let fingerprint = checkpoint.bundle_fingerprint().ok_or_else(|| {
             v2_failure(
                 "terminal_root",
@@ -1132,7 +1272,7 @@ where
         store: &mut dyn StoreAccess,
         current: &StoreRecord,
         result: &JsonValue,
-    ) -> Result<(), Version2Error> {
+    ) -> Result<(), ArtifactError> {
         let candidate = if result["execution_checkpoint_format"] == "determa.execution_checkpoint" {
             Some(result)
         } else if result["result"] == "batch"
@@ -1146,13 +1286,13 @@ where
             return Ok(());
         };
         let bytes = crate::format1::v2::canonical_bytes(candidate)?;
-        let checkpoint = restore_execution_checkpoint_v2(&bytes, self.resolver.as_ref())?;
+        let checkpoint = restore_execution_checkpoint(&bytes, self.resolver.as_ref())?;
         if checkpoint.revision() == current.revision
             && checkpoint.digest() == current.execution_checkpoint_digest
         {
             return Ok(());
         }
-        let replacement = StoreRecord::from_checkpoint_v2(&checkpoint).map_err(v2_store_error)?;
+        let replacement = StoreRecord::from_checkpoint(&checkpoint).map_err(v2_store_error)?;
         self.commit_record_v2_with_store(store, current, replacement)
     }
 
@@ -1161,7 +1301,7 @@ where
         store: &mut dyn StoreAccess,
         current: &StoreRecord,
         replacement: StoreRecord,
-    ) -> Result<(), Version2Error> {
+    ) -> Result<(), ArtifactError> {
         match store
             .compare_and_swap(
                 &current.root_instance_id,
@@ -1183,8 +1323,8 @@ where
 fn maintenance_request_digest(
     root_instance_id: &str,
     request: &MaintenanceMigrationRequest,
-) -> Result<String, Version2Error> {
-    crate::format1::wire::jcs_hash(&json!([
+) -> Result<String, ArtifactError> {
+    crate::format1::native::jcs_hash(&json!([
         "determa-maintenance-migration-request-digest-2",
         "2",
         root_instance_id,
@@ -1197,18 +1337,18 @@ fn maintenance_request_digest(
     .map_err(|error| v2_failure("invalid_execution_checkpoint", &error.to_string()))
 }
 
-fn v2_store_error(error: StoreError) -> Version2Error {
-    Version2Error::new(error.code.as_str(), error.message)
+fn v2_store_error(error: StoreError) -> ArtifactError {
+    ArtifactError::new(error.code.as_str(), error.message)
 }
 
 #[cfg(feature = "postgresql")]
-fn v2_host_failure(error: Version2Error) -> HostFailure {
+fn v2_host_failure(error: ArtifactError) -> HostFailure {
     HostFailure::new(
         HostFailureCode::InvalidExecutionCheckpoint,
         format!("{}: {}", error.code, error.message),
     )
 }
 
-fn v2_failure(code: &str, message: &str) -> Version2Error {
-    Version2Error::new(code, message)
+fn v2_failure(code: &str, message: &str) -> ArtifactError {
+    ArtifactError::new(code, message)
 }

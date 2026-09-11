@@ -3,11 +3,15 @@
 use determa_state::checkpoint::{
     CheckpointHost, DurableStoreMode, ExecutionStore, MaintenanceMigrationRequest, MutationGuard,
     PendingOutboxState, PostgresqlExecutionStore, PostgresqlHostMutation,
-    PostgresqlHostMutationResult, StoreError, TerminalOutboxOutcome,
+    PostgresqlHostMutationResult, ProcessingRequest, PruneRequest, StoreError,
+    TerminalOutboxOutcome, TransactionalProcessRequest,
 };
-use determa_state::{load_bundle, Bindings, InMemoryDefinitionResolver, ResourceLimits};
+use determa_state::{
+    load_bundle, Bindings, InMemoryDefinitionResolver, MigrationRequest, ResourceLimits,
+};
 use postgres::{Client, NoTls};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -114,9 +118,7 @@ machines:
     };
 
     let admitted_checkpoint = &admitted["checkpoint"];
-    let root_runtime_id = admitted_checkpoint["root_record"]["aggregate_state"]["root_runtime_id"]
-        .as_str()
-        .unwrap();
+    let first_processing = processing_for(admitted_checkpoint);
     let admission_guard = guard_for(admitted_checkpoint);
     let stepped = host
         .with_postgresql_transaction("server-1", |transaction| {
@@ -125,7 +127,7 @@ machines:
                 transaction,
                 PostgresqlHostMutation::Step {
                     root_instance_id: "server-1",
-                    target_runtime_id: root_runtime_id,
+                    request: &first_processing,
                     guard: &admission_guard,
                 },
             )
@@ -136,6 +138,7 @@ machines:
     };
 
     let step_guard = guard_for(&stepped);
+    let second_processing = processing_for(&stepped);
     let stepped_again = host
         .with_postgresql_transaction("server-1", |transaction| {
             application_row(transaction.transaction(), "server-1", "step-again")?;
@@ -143,7 +146,7 @@ machines:
                 transaction,
                 PostgresqlHostMutation::Step {
                     root_instance_id: "server-1",
-                    target_runtime_id: root_runtime_id,
+                    request: &second_processing,
                     guard: &step_guard,
                 },
             )
@@ -160,7 +163,13 @@ machines:
                 transaction,
                 PostgresqlHostMutation::Prune {
                     root_instance_id: "server-1",
-                    cutoff_receipt_sequence: "4",
+                    request: &PruneRequest {
+                        cutoff_receipt_sequence: "4".to_string(),
+                        target_mode: "bounded".to_string(),
+                        policy_identifier: Some("postgresql-native-v2-test".to_string()),
+                        dependency_receipt_sequences: Vec::new(),
+                        dependency_effect_ids: Vec::new(),
+                    },
                     guard: &step_guard,
                 },
             )
@@ -198,6 +207,86 @@ machines:
     else {
         panic!("unexpected maintenance result")
     };
+
+    let process_created = create_transaction_root(
+        &host,
+        &bundle,
+        &bindings,
+        &retention,
+        "process-root",
+        "create-process-root",
+    );
+    let process_delivery = input_delivery(&process_created, "process-event");
+    let processed = host
+        .with_postgresql_transaction("process-root", |transaction| {
+            application_row(transaction.transaction(), "process-root", "process")?;
+            host.stage_postgresql_mutation(
+                transaction,
+                PostgresqlHostMutation::Process {
+                    root_instance_id: "process-root",
+                    delivery: &process_delivery,
+                    processing_mode: "delayed",
+                    guard: &MutationGuard::new(
+                        process_created.revision(),
+                        process_created.digest(),
+                    ),
+                },
+            )
+        })
+        .unwrap();
+    assert!(matches!(
+        processed.host_result,
+        PostgresqlHostMutationResult::Process(_)
+    ));
+    assert_eq!(application_count(&concrete, "process"), 1);
+
+    let transactional_created = create_transaction_root(
+        &host,
+        &bundle,
+        &bindings,
+        &retention,
+        "transactional-process-root",
+        "create-transactional-process-root",
+    );
+    let transactional_delivery = input_delivery(&transactional_created, "transactional-event");
+    let transactional_request = TransactionalProcessRequest {
+        migration: MigrationRequest {
+            migration_route: Vec::new(),
+            target_validated_bundle_fingerprint: bundle.fingerprint.clone(),
+            maintenance_mode: false,
+        },
+        migration_limits: ResourceLimits::default(),
+        delivery: transactional_delivery,
+        processing_mode: "delayed".to_string(),
+    };
+    let transactional = host
+        .with_postgresql_transaction("transactional-process-root", |transaction| {
+            application_row(
+                transaction.transaction(),
+                "transactional-process-root",
+                "transactional-process",
+            )?;
+            host.stage_postgresql_mutation(
+                transaction,
+                PostgresqlHostMutation::TransactionalProcess {
+                    root_instance_id: "transactional-process-root",
+                    request: &transactional_request,
+                    guard: &MutationGuard::new(
+                        transactional_created.revision(),
+                        transactional_created.digest(),
+                    ),
+                },
+            )
+        })
+        .unwrap();
+    let PostgresqlHostMutationResult::TransactionalProcess(transactional) =
+        transactional.host_result
+    else {
+        panic!("unexpected transactional process result")
+    };
+    assert_eq!(transactional["revision"], "1");
+    assert_eq!(transactional["migration_audit_records"], json!([]));
+    assert_eq!(application_count(&concrete, "transactional-process"), 1);
 
     let terminal_created = host
         .with_postgresql_transaction("terminal-root", |transaction| {
@@ -345,6 +434,88 @@ machines:
         PostgresqlHostMutationResult::CompactedOutbox(_)
     ));
     assert_eq!(application_count(&concrete, "compact"), 1);
+}
+
+fn create_transaction_root(
+    host: &CheckpointHost<InMemoryDefinitionResolver>,
+    bundle: &determa_state::Bundle,
+    bindings: &Bindings,
+    retention: &Value,
+    root_instance_id: &str,
+    creation_id: &str,
+) -> determa_state::checkpoint::ExecutionCheckpoint {
+    let created = host
+        .with_postgresql_transaction(root_instance_id, |transaction| {
+            application_row(
+                transaction.transaction(),
+                root_instance_id,
+                "create-process",
+            )?;
+            host.stage_postgresql_mutation(
+                transaction,
+                PostgresqlHostMutation::Create {
+                    bundle,
+                    machine_id: "transaction_server",
+                    root_instance_id,
+                    creation_id,
+                    bindings,
+                    supplied_request_digest: None,
+                    replay_retention: retention,
+                },
+            )
+        })
+        .unwrap();
+    let PostgresqlHostMutationResult::Creation(created) = created.host_result else {
+        panic!("unexpected process-root creation result")
+    };
+    *created
+}
+
+fn input_delivery(
+    checkpoint: &determa_state::checkpoint::ExecutionCheckpoint,
+    event_id: &str,
+) -> Value {
+    let envelope = json!({
+        "event": "received",
+        "event_id": event_id,
+        "cause_id": event_id,
+        "source": {"host": true},
+        "target": checkpoint.value()["root_record"]["aggregate_state"]["runtimes"][0]
+            ["target_identity"],
+        "payload": ["map", []]
+    });
+    let root_instance_id = checkpoint.root_instance_id();
+    let bytes = serde_json_canonicalizer::to_vec(&json!([
+        "determa-inbox-envelope-digest-2",
+        "2",
+        root_instance_id,
+        "input",
+        envelope
+    ]))
+    .unwrap();
+    json!({
+        "delivery_mode": "input",
+        "envelope": envelope,
+        "envelope_digest": format!("sha256:{:x}", Sha256::digest(bytes))
+    })
+}
+
+fn processing_for(checkpoint: &Value) -> ProcessingRequest {
+    let runtime = checkpoint["root_record"]["aggregate_state"]["runtimes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|runtime| !runtime["ready_mailbox"].as_array().unwrap().is_empty())
+        .unwrap();
+    let entry = &runtime["ready_mailbox"][0];
+    ProcessingRequest {
+        target_runtime_id: runtime["runtime_id"].as_str().unwrap().to_string(),
+        event_id: entry["envelope"]["event_id"].as_str().unwrap().to_string(),
+        envelope_digest: entry["envelope_digest"].as_str().unwrap().to_string(),
+        acceptance_sequence: entry["acceptance_sequence"].as_str().unwrap().to_string(),
+        queue_sequence: entry["queue_sequence"].as_str().unwrap().to_string(),
+        processing_mode: "delayed".to_string(),
+    }
 }
 
 fn retention() -> Value {

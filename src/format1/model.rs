@@ -361,7 +361,7 @@ pub enum Target {
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Envelope {
+pub(crate) struct Envelope {
     pub event: String,
     pub event_id: String,
     pub target: Target,
@@ -372,7 +372,7 @@ pub struct Envelope {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Delivery {
+pub(crate) enum Delivery {
     Input(Envelope),
     Internal(Envelope),
 }

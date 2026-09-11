@@ -1,31 +1,33 @@
+use crate::format1::native::jcs_hash;
 use crate::format1::strict_json;
 use crate::format1::v2::{
-    canonical_bytes, migrate_aggregate_v2_route_with_evidence, validate_admission_delivery_schema,
-    validate_v2_schema,
+    canonical_bytes, migrate_aggregate_v2_route_with_evidence, step_v2_with_emission_indexes,
+    validate_admission_delivery_schema, validate_v2_schema,
 };
-use crate::format1::wire::jcs_hash;
 use crate::format1::{
-    admit_v2, restore_aggregate_v2, step_v2, AdmissionDelivery, Bindings, Bundle, Counter,
-    DefinitionResolver, MigrationArtifactResolver, MigrationRequest, QueueBearingAggregate,
-    ResourceLimits, TypedValue, Version2Error,
+    admit, restore_aggregate, Aggregate, ArtifactError, Bindings, Bundle, Counter,
+    DefinitionResolver, Delivery, MigrationArtifactResolver, MigrationRequest, ResourceLimits,
+    TypedValue,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::types::{OutboxIntent, PendingOutboxState, TerminalOutboxOutcome};
+use super::types::{
+    OutboxIntent, PendingOutboxState, ProcessingRequest, PruneRequest, TerminalOutboxOutcome,
+};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ExecutionCheckpointV2 {
+pub struct ExecutionCheckpoint {
     value: Value,
-    aggregate: Option<QueueBearingAggregate>,
+    aggregate: Option<Aggregate>,
 }
 
-impl ExecutionCheckpointV2 {
+impl ExecutionCheckpoint {
     pub fn value(&self) -> &Value {
         &self.value
     }
 
-    pub fn canonical_bytes(&self) -> Result<Vec<u8>, Version2Error> {
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ArtifactError> {
         canonical_bytes(&self.value)
     }
 
@@ -62,9 +64,9 @@ pub fn create_execution_checkpoint_v2(
     bindings: &Bindings,
     supplied_request_digest: Option<&str>,
     replay_retention: Value,
-) -> Result<ExecutionCheckpointV2, Version2Error> {
+) -> Result<ExecutionCheckpoint, ArtifactError> {
     let request_digest =
-        creation_request_digest_v2(bundle, machine_id, root_instance_id, creation_id, bindings)?;
+        creation_request_digest(bundle, machine_id, root_instance_id, creation_id, bindings)?;
     if supplied_request_digest.is_some_and(|supplied| supplied != request_digest) {
         return Err(invalid(
             "supplied creation request digest does not match canonical content",
@@ -100,6 +102,7 @@ pub fn create_execution_checkpoint_v2(
     let references = append_checkpoint_emissions(
         &mut value,
         &created.emissions,
+        &created.emission_indexes,
         &lifecycle_sequences,
         &json!("0"),
     )?;
@@ -139,15 +142,15 @@ pub fn create_execution_checkpoint_v2(
     restore_value(value, &resolver)
 }
 
-pub fn creation_request_digest_v2(
+pub fn creation_request_digest(
     bundle: &Bundle,
     machine_id: &str,
     root_instance_id: &str,
     creation_id: &str,
     bindings: &Bindings,
-) -> Result<String, Version2Error> {
+) -> Result<String, ArtifactError> {
     let machine = bundle.machines.get(machine_id).ok_or_else(|| {
-        Version2Error::new("invalid_machine", "creation machine is absent from bundle")
+        ArtifactError::new("invalid_machine", "creation machine is absent from bundle")
     })?;
     let bindings = crate::value::Value::Map(BTreeMap::from([
         (
@@ -173,21 +176,21 @@ pub fn creation_request_digest_v2(
     .map_err(|error| invalid(error.to_string()))
 }
 
-pub fn restore_execution_checkpoint_v2(
+pub fn restore_execution_checkpoint(
     source: &[u8],
     resolver: &(impl DefinitionResolver + ?Sized),
-) -> Result<ExecutionCheckpointV2, Version2Error> {
+) -> Result<ExecutionCheckpoint, ArtifactError> {
     let value = strict_json::parse(source).map_err(invalid)?;
     restore_value(value, resolver)
 }
 
 pub fn checkpoint_admit_v2(
     bundle: &Bundle,
-    checkpoint: &ExecutionCheckpointV2,
+    checkpoint: &ExecutionCheckpoint,
     deliveries: &[Value],
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
-) -> Result<Value, Version2Error> {
+) -> Result<Value, ArtifactError> {
     checkpoint_admit_v2_with_optional_bundle(
         Some(bundle),
         checkpoint,
@@ -199,11 +202,11 @@ pub fn checkpoint_admit_v2(
 
 pub(super) fn checkpoint_admit_v2_with_optional_bundle(
     bundle: Option<&Bundle>,
-    checkpoint: &ExecutionCheckpointV2,
+    checkpoint: &ExecutionCheckpoint,
     deliveries: &[Value],
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
-) -> Result<Value, Version2Error> {
+) -> Result<Value, ArtifactError> {
     let tombstoned = checkpoint.value["root_record"]["status"] == "tombstone";
     let root_instance_id = checkpoint.value["root_instance_id"].as_str().unwrap();
     let parsed = deliveries
@@ -211,7 +214,7 @@ pub(super) fn checkpoint_admit_v2_with_optional_bundle(
         .map(|delivery| {
             validate_admission_delivery_schema(delivery)
                 .map_err(|_| failure("malformed_delivery"))?;
-            serde_json::from_value::<AdmissionDelivery>(delivery.clone())
+            serde_json::from_value::<Delivery>(delivery.clone())
                 .map_err(|_| failure("malformed_delivery"))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -285,7 +288,7 @@ pub(super) fn checkpoint_admit_v2_with_optional_bundle(
         .iter()
         .map(|(_, delivery)| delivery.clone())
         .collect::<Vec<_>>();
-    let core = admit_v2(bundle, aggregate, &fresh_deliveries)?;
+    let core = admit(bundle, aggregate, &fresh_deliveries)?;
     let state = core["state"].clone();
     let mut value = checkpoint.value.clone();
     let new_revision = incremented(&value["revision"])?;
@@ -329,12 +332,47 @@ pub(super) fn checkpoint_admit_v2_with_optional_bundle(
 
 pub fn checkpoint_step_v2(
     bundle: &Bundle,
-    checkpoint: &ExecutionCheckpointV2,
-    target_runtime_id: &str,
+    checkpoint: &ExecutionCheckpoint,
+    request: &ProcessingRequest,
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
-) -> Result<Value, Version2Error> {
+) -> Result<Value, ArtifactError> {
+    if !matches!(request.processing_mode.as_str(), "delayed" | "foreground") {
+        return Err(failure("invalid_execution_checkpoint"));
+    }
     guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
+    if let Some(receipt) = checkpoint.value["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|receipt| {
+            receipt["operation_kind"] == "event_terminal"
+                && receipt["event_id"].as_str() == Some(&request.event_id)
+        })
+    {
+        return if receipt["request_digest"].as_str() == Some(&request.envelope_digest)
+            && receipt["acceptance_sequence"].as_str() == Some(&request.acceptance_sequence)
+            && receipt["final_queue_sequence"].as_str() == Some(&request.queue_sequence)
+        {
+            Ok(receipt.clone())
+        } else {
+            Err(failure("event_id_conflict"))
+        };
+    }
+    if let Some(tombstone) = checkpoint.value["event_identity_tombstones"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["event_id"].as_str() == Some(&request.event_id))
+    {
+        return if tombstone["request_digest"].as_str() == Some(&request.envelope_digest)
+            && tombstone["acceptance_sequence"].as_str() == Some(&request.acceptance_sequence)
+        {
+            Ok(tombstone.clone())
+        } else {
+            Err(failure("event_id_conflict"))
+        };
+    }
     let aggregate = checkpoint
         .aggregate
         .as_ref()
@@ -344,12 +382,29 @@ pub fn checkpoint_step_v2(
     {
         return Err(failure("incompatible_bundle"));
     }
-    let causal = ready_head(aggregate.value(), target_runtime_id)?.clone();
-    let core = step_v2(bundle, aggregate, target_runtime_id)?;
+    let causal = ready_head(aggregate.value(), &request.target_runtime_id)?.clone();
+    if causal["envelope"]["event_id"].as_str() != Some(&request.event_id)
+        || causal["envelope_digest"].as_str() != Some(&request.envelope_digest)
+        || causal["acceptance_sequence"].as_str() != Some(&request.acceptance_sequence)
+        || causal["queue_sequence"].as_str() != Some(&request.queue_sequence)
+    {
+        return Err(failure("invalid_execution_checkpoint"));
+    }
+    let (core, emission_indexes) =
+        step_v2_with_emission_indexes(bundle, aggregate, &request.target_runtime_id)?;
+    apply_step_result(&checkpoint.value, &causal, core, emission_indexes)
+}
+
+fn apply_step_result(
+    checkpoint: &Value,
+    causal: &Value,
+    core: Value,
+    emission_indexes: Vec<String>,
+) -> Result<Value, ArtifactError> {
     if core["disposition"] == "not_runnable" || core["disposition"] == "rejected" {
         return Ok(core);
     }
-    let mut value = checkpoint.value.clone();
+    let mut value = checkpoint.clone();
     let new_revision = incremented(&value["revision"])?;
     value["revision"] = new_revision.clone();
     let resulting_state = core["state"].clone();
@@ -371,6 +426,7 @@ pub fn checkpoint_step_v2(
         core["emissions"]
             .as_array()
             .ok_or_else(|| invalid("core emissions are absent"))?,
+        &emission_indexes,
         &lifecycle_sequences,
         &new_revision,
     )?;
@@ -394,7 +450,7 @@ pub fn checkpoint_step_v2(
             },
             "emission_references": references
         }));
-    rewrite_producer_reference(&mut value, &causal, &terminal_sequence)?;
+    rewrite_producer_reference(&mut value, causal, &terminal_sequence)?;
     for (disposition, receipt_sequence) in lifecycle.iter().zip(lifecycle_sequences) {
         let receipt = lifecycle_receipt(
             disposition,
@@ -417,14 +473,232 @@ pub fn checkpoint_step_v2(
     Ok(value)
 }
 
+pub fn checkpoint_process(
+    bundle: &Bundle,
+    checkpoint: &ExecutionCheckpoint,
+    delivery: Value,
+    processing_mode: &str,
+    expected_revision: Option<&str>,
+    expected_checkpoint_digest: Option<&str>,
+) -> Result<Value, ArtifactError> {
+    let resolver = single_bundle_resolver(bundle);
+    checkpoint_process_resolved(
+        bundle,
+        checkpoint,
+        delivery,
+        processing_mode,
+        expected_revision,
+        expected_checkpoint_digest,
+        &resolver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_process_resolved(
+    bundle: &Bundle,
+    checkpoint: &ExecutionCheckpoint,
+    delivery: Value,
+    processing_mode: &str,
+    expected_revision: Option<&str>,
+    expected_checkpoint_digest: Option<&str>,
+    resolver: &(impl DefinitionResolver + ?Sized),
+) -> Result<Value, ArtifactError> {
+    if !matches!(processing_mode, "delayed" | "foreground") {
+        return Err(failure("invalid_execution_checkpoint"));
+    }
+    guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
+    let event_id = delivery["envelope"]["event_id"]
+        .as_str()
+        .ok_or_else(|| failure("malformed_delivery"))?
+        .to_string();
+    let admitted = checkpoint_admit_v2(
+        bundle,
+        checkpoint,
+        &[delivery],
+        expected_revision,
+        expected_checkpoint_digest,
+    )?;
+    if admitted["execution_checkpoint_format"] != "determa.execution_checkpoint" {
+        return Ok(admitted);
+    }
+    let admitted_value = admitted;
+    let aggregate = restore_aggregate(
+        &canonical_bytes(&admitted_value["root_record"]["aggregate_state"])?,
+        resolver,
+    )
+    .map_err(|error| invalid(error.message))?;
+    let mut selected = None;
+    for runtime in aggregate.value()["runtimes"].as_array().unwrap() {
+        if let Some(entry) = runtime["ready_mailbox"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["envelope"]["event_id"].as_str() == Some(&event_id))
+        {
+            selected = Some((runtime, entry));
+            break;
+        }
+    }
+    let (runtime, causal) = selected.ok_or_else(|| invalid("admitted event is not runnable"))?;
+    let causal = causal.clone();
+    let (core, emission_indexes) =
+        step_v2_with_emission_indexes(bundle, &aggregate, runtime["runtime_id"].as_str().unwrap())?;
+    let stepped = apply_step_result(&admitted_value, &causal, core, emission_indexes)?;
+    if stepped["execution_checkpoint_format"] != "determa.execution_checkpoint" {
+        return Ok(stepped);
+    }
+    collapse_process_revision(checkpoint, stepped)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn checkpoint_process_with_migration(
+    checkpoint: &ExecutionCheckpoint,
+    migration: &MigrationRequest,
+    resolver: &impl MigrationArtifactResolver,
+    limits: &ResourceLimits,
+    delivery: Value,
+    processing_mode: &str,
+    expected_revision: Option<&str>,
+    expected_checkpoint_digest: Option<&str>,
+) -> Result<Value, ArtifactError> {
+    guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
+    let aggregate = checkpoint
+        .aggregate
+        .as_ref()
+        .ok_or_else(|| failure("terminal_root"))?;
+    let migrated =
+        migrate_aggregate_v2_route_with_evidence(aggregate, migration, resolver, limits)?;
+    let prepared = apply_transaction_migration(checkpoint, migrated)?;
+    let prepared = restore_value(prepared, resolver)?;
+    let target = resolver
+        .resolve_definition(&migration.target_validated_bundle_fingerprint)
+        .filter(|resolved| {
+            resolved.trusted
+                && resolved.bundle.fingerprint == migration.target_validated_bundle_fingerprint
+        })
+        .ok_or_else(|| failure("target_definition_unavailable"))?;
+    let processed = checkpoint_process_resolved(
+        &target.bundle,
+        &prepared,
+        delivery,
+        processing_mode,
+        Some(prepared.revision()),
+        Some(prepared.digest()),
+        resolver,
+    )?;
+    collapse_process_revision(checkpoint, processed)
+}
+
+fn apply_transaction_migration(
+    checkpoint: &ExecutionCheckpoint,
+    migrated: Value,
+) -> Result<Value, ArtifactError> {
+    let mut value = checkpoint.value.clone();
+    value["revision"] = incremented(&value["revision"])?;
+    let revision = value["revision"].clone();
+    let aggregate = migrated["aggregate_state"].clone();
+    let status = aggregate["runtimes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|runtime| runtime["runtime_id"] == aggregate["root_runtime_id"])
+        .and_then(|runtime| runtime["status"].as_str())
+        .ok_or_else(|| invalid("migrated root runtime status is absent"))?
+        .to_string();
+    value["root_record"]["aggregate_state"] = aggregate.clone();
+    for disposition in migrated["dispositions"]
+        .as_array()
+        .ok_or_else(|| invalid("migration dispositions are absent"))?
+    {
+        let receipt_sequence = allocate(&mut value, "next_operation_receipt_sequence")?;
+        value["operation_receipts"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "operation_kind": "event_terminal",
+                "receipt_sequence": receipt_sequence,
+                "event_id": disposition["event_id"],
+                "request_digest": disposition["request_digest"],
+                "acceptance_sequence": disposition["acceptance_sequence"],
+                "final_queue_sequence": disposition["final_queue_sequence"],
+                "committed_revision": revision,
+                "resulting_aggregate_state_digest": aggregate["aggregate_state_digest"],
+                "outcome": {
+                    "status": status,
+                    "disposition": "migration_disposed",
+                    "reason": disposition["reason"],
+                    "migration_descriptor_digest": disposition["migration_descriptor_digest"],
+                    "fault": null,
+                    "rejection": null
+                },
+                "emission_references": []
+            }));
+        rewrite_producer_event_reference(
+            &mut value,
+            disposition["event_id"].as_str().unwrap(),
+            &receipt_sequence,
+        )?;
+    }
+    value["migration_audit_records"]
+        .as_array_mut()
+        .unwrap()
+        .extend(
+            migrated["audit_records"]
+                .as_array()
+                .ok_or_else(|| invalid("migration audit records are absent"))?
+                .iter()
+                .cloned(),
+        );
+    seal_and_validate_checkpoint(&mut value)?;
+    Ok(value)
+}
+
+fn collapse_process_revision(
+    checkpoint: &ExecutionCheckpoint,
+    mut value: Value,
+) -> Result<Value, ArtifactError> {
+    let committed_revision = incremented(&checkpoint.value["revision"])?;
+    let prior_next = counter(&checkpoint.value, "next_operation_receipt_sequence")?;
+    value["revision"] = committed_revision.clone();
+    for receipt in value["operation_receipts"].as_array_mut().unwrap() {
+        if counter(receipt, "receipt_sequence")? < prior_next {
+            continue;
+        }
+        if receipt["operation_kind"] == "acceptance" {
+            receipt["accepted_revision"] = committed_revision.clone();
+        } else if receipt.get("committed_revision").is_some() {
+            receipt["committed_revision"] = committed_revision.clone();
+        }
+    }
+    for pending in value["pending_outbox_intents"].as_array_mut().unwrap() {
+        if Counter::from_decimal(pending["state_revision"].as_str().unwrap()).map_err(invalid)?
+            > counter(&checkpoint.value, "revision")?
+        {
+            pending["state_revision"] = committed_revision.clone();
+        }
+    }
+    seal_and_validate_checkpoint(&mut value)?;
+    Ok(value)
+}
+
+fn single_bundle_resolver(bundle: &Bundle) -> crate::format1::InMemoryDefinitionResolver {
+    let mut resolver = crate::format1::InMemoryDefinitionResolver::default();
+    resolver.insert(bundle.clone(), true);
+    resolver
+}
+
 fn append_checkpoint_emissions(
     value: &mut Value,
     emissions: &[Value],
+    emission_indexes: &[String],
     lifecycle_sequences: &[String],
     committed_revision: &Value,
-) -> Result<Vec<Value>, Version2Error> {
+) -> Result<Vec<Value>, ArtifactError> {
+    if emissions.len() != emission_indexes.len() {
+        return Err(invalid("core emission ordinal evidence is incomplete"));
+    }
     let mut references = Vec::with_capacity(emissions.len());
-    for (index, emission) in emissions.iter().enumerate() {
+    for (emission, emission_index) in emissions.iter().zip(emission_indexes) {
         match emission["kind"].as_str() {
             Some("internal_mailbox") => references.push(emission.clone()),
             Some("internal_disposed") => {
@@ -461,7 +735,7 @@ fn append_checkpoint_emissions(
                     }));
                 references.push(json!({
                     "kind": "external_outbox",
-                    "emission_index": index.to_string(),
+                    "emission_index": emission_index,
                     "effect_id": effect_id
                 }));
             }
@@ -499,12 +773,28 @@ fn lifecycle_receipt(
 }
 
 pub fn checkpoint_prune_v2(
-    checkpoint: &ExecutionCheckpointV2,
-    cutoff: &str,
+    checkpoint: &ExecutionCheckpoint,
+    request: &PruneRequest,
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
-) -> Result<Value, Version2Error> {
-    let requested = Counter::from_decimal(cutoff).map_err(invalid)?;
+) -> Result<Value, ArtifactError> {
+    let requested = Counter::from_decimal(&request.cutoff_receipt_sequence).map_err(invalid)?;
+    let current_mode = checkpoint.value["replay_retention"]["mode"]
+        .as_str()
+        .ok_or_else(|| invalid("retention mode is absent"))?;
+    if request.target_mode != "bounded"
+        || request
+            .policy_identifier
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || !request.dependency_receipt_sequences.is_empty()
+        || !request.dependency_effect_ids.is_empty()
+        || current_mode == "bounded"
+            && checkpoint.value["replay_retention"]["policy_identifier"].as_str()
+                != request.policy_identifier.as_deref()
+    {
+        return Err(failure("invalid_execution_checkpoint"));
+    }
     let prior = checkpoint.value["replay_retention"]["pruned_through_receipt_sequence"]
         .as_str()
         .map(Counter::from_decimal)
@@ -570,15 +860,20 @@ pub fn checkpoint_prune_v2(
         Counter::from_decimal(item["terminal_receipt_sequence"].as_str().unwrap()).unwrap()
     });
     value["event_identity_tombstones"] = json!(tombstones);
-    value["replay_retention"]["pruned_through_receipt_sequence"] = json!(cutoff);
+    value["replay_retention"] = json!({
+        "mode": "bounded",
+        "permanent_replay_eligible": false,
+        "pruned_through_receipt_sequence": request.cutoff_receipt_sequence,
+        "policy_identifier": request.policy_identifier.as_ref().unwrap()
+    });
     value["revision"] = incremented(&value["revision"])?;
     seal_checkpoint(&mut value)?;
     Ok(value)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn checkpoint_maintenance_migration_v2_route(
-    checkpoint: &ExecutionCheckpointV2,
+pub(crate) fn checkpoint_maintenance_migration_route(
+    checkpoint: &ExecutionCheckpoint,
     request: &MigrationRequest,
     operation_id: &str,
     request_digest: &str,
@@ -586,7 +881,7 @@ pub(crate) fn checkpoint_maintenance_migration_v2_route(
     limits: &ResourceLimits,
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
-) -> Result<Value, Version2Error> {
+) -> Result<Value, ArtifactError> {
     guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
     let aggregate = checkpoint
         .aggregate
@@ -603,12 +898,12 @@ pub(crate) fn checkpoint_maintenance_migration_v2_route(
 }
 
 fn apply_checkpoint_migration_v2(
-    checkpoint: &ExecutionCheckpointV2,
+    checkpoint: &ExecutionCheckpoint,
     migrated: Value,
     operation_id: &str,
     request_digest: &str,
     target_validated_bundle_fingerprint: &str,
-) -> Result<Value, Version2Error> {
+) -> Result<Value, ArtifactError> {
     let mut value = checkpoint.value.clone();
     value["revision"] = incremented(&value["revision"])?;
     let revision = value["revision"].clone();
@@ -694,13 +989,13 @@ fn apply_checkpoint_migration_v2(
     Ok(value)
 }
 
-pub fn checkpoint_update_pending_outbox_v2(
-    checkpoint: &ExecutionCheckpointV2,
+pub fn checkpoint_update_pending_outbox(
+    checkpoint: &ExecutionCheckpoint,
     effect_id: &str,
     delivery_state: PendingOutboxState,
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
-) -> Result<Value, Version2Error> {
+) -> Result<Value, ArtifactError> {
     let delivery_state = serde_json::to_value(delivery_state).map_err(invalid)?;
     let existing = checkpoint.value["pending_outbox_intents"]
         .as_array()
@@ -727,13 +1022,13 @@ pub fn checkpoint_update_pending_outbox_v2(
     Ok(value)
 }
 
-pub fn checkpoint_terminalize_outbox_v2(
-    checkpoint: &ExecutionCheckpointV2,
+pub fn checkpoint_terminalize_outbox(
+    checkpoint: &ExecutionCheckpoint,
     effect_id: &str,
     outcome: TerminalOutboxOutcome,
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
-) -> Result<Value, Version2Error> {
+) -> Result<Value, ArtifactError> {
     let outcome = serde_json::to_value(outcome).map_err(invalid)?;
     if let Some(record) = checkpoint.value["terminal_outbox_records"]
         .as_array()
@@ -787,12 +1082,12 @@ pub fn checkpoint_terminalize_outbox_v2(
     Ok(value)
 }
 
-pub fn checkpoint_compact_outbox_v2(
-    checkpoint: &ExecutionCheckpointV2,
+pub fn checkpoint_compact_outbox(
+    checkpoint: &ExecutionCheckpoint,
     effect_id: &str,
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
-) -> Result<Value, Version2Error> {
+) -> Result<Value, ArtifactError> {
     if checkpoint.value["outbox_effect_tombstones"]
         .as_array()
         .unwrap()
@@ -837,12 +1132,12 @@ pub fn checkpoint_compact_outbox_v2(
     Ok(value)
 }
 
-pub fn checkpoint_tombstone_root_v2(
-    checkpoint: &ExecutionCheckpointV2,
+pub fn checkpoint_tombstone_root(
+    checkpoint: &ExecutionCheckpoint,
     operation_id: &str,
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
-) -> Result<Value, Version2Error> {
+) -> Result<Value, ArtifactError> {
     if operation_id.is_empty() {
         return Err(invalid("tombstone operation id is empty"));
     }
@@ -928,7 +1223,7 @@ struct Identity {
     replay: Value,
 }
 
-fn retained_identity(value: &Value) -> Result<BTreeMap<String, Identity>, Version2Error> {
+fn retained_identity(value: &Value) -> Result<BTreeMap<String, Identity>, ArtifactError> {
     let mut result = BTreeMap::new();
     if value["root_record"]["status"] == "retained" {
         for runtime in value["root_record"]["aggregate_state"]["runtimes"]
@@ -987,7 +1282,7 @@ fn retained_identity(value: &Value) -> Result<BTreeMap<String, Identity>, Versio
 fn restore_value(
     value: Value,
     resolver: &(impl DefinitionResolver + ?Sized),
-) -> Result<ExecutionCheckpointV2, Version2Error> {
+) -> Result<ExecutionCheckpoint, ArtifactError> {
     validate_v2_schema(
         &value,
         include_str!("../../schema/execution-checkpoint-v2.schema.json"),
@@ -999,7 +1294,7 @@ fn restore_value(
     )?;
     let aggregate = if value["root_record"]["status"] == "retained" {
         Some(
-            restore_aggregate_v2(
+            restore_aggregate(
                 &canonical_bytes(&value["root_record"]["aggregate_state"])?,
                 resolver,
             )
@@ -1010,16 +1305,16 @@ fn restore_value(
     };
     let expected = checkpoint_digest(&value)?;
     if value["execution_checkpoint_digest"].as_str() != Some(expected.as_str()) {
-        return Err(Version2Error::new(
+        return Err(ArtifactError::new(
             "execution_checkpoint_digest_mismatch",
             "checkpoint digest does not match content",
         ));
     }
     validate_semantics(&value)?;
-    Ok(ExecutionCheckpointV2 { value, aggregate })
+    Ok(ExecutionCheckpoint { value, aggregate })
 }
 
-fn validate_semantics(value: &Value) -> Result<(), Version2Error> {
+fn validate_semantics(value: &Value) -> Result<(), ArtifactError> {
     let revision = counter(value, "revision")?;
     let next_receipt = counter(value, "next_operation_receipt_sequence")?;
     let receipts = value["operation_receipts"].as_array().unwrap();
@@ -1188,7 +1483,7 @@ fn validate_receipt_retention(
     checkpoint: &Value,
     receipts: &[Value],
     next_receipt: &Counter,
-) -> Result<(), Version2Error> {
+) -> Result<(), ArtifactError> {
     let cutoff = checkpoint["replay_retention"]["pruned_through_receipt_sequence"]
         .as_str()
         .map(Counter::from_decimal)
@@ -1214,7 +1509,7 @@ fn validate_receipt_retention(
 fn validate_maintenance_receipts(
     checkpoint: &Value,
     aggregate: Option<&Value>,
-) -> Result<(), Version2Error> {
+) -> Result<(), ArtifactError> {
     let audits = checkpoint["migration_audit_records"].as_array().unwrap();
     let audits_by_sequence = audits
         .iter()
@@ -1314,13 +1609,6 @@ fn validate_maintenance_receipts(
             _ => return Err(invalid("maintenance result code is invalid")),
         }
     }
-    if checkpoint["replay_retention"]["mode"] == "permanent"
-        && referenced_sequences.len() != audits.len()
-    {
-        return Err(invalid(
-            "permanent migration audit lacks maintenance receipt",
-        ));
-    }
     Ok(())
 }
 
@@ -1330,7 +1618,7 @@ fn maintenance_request_digest_matches(
     operation_id: &str,
     target_fingerprint: &str,
     descriptor_route: &[Value],
-) -> Result<bool, Version2Error> {
+) -> Result<bool, ArtifactError> {
     for maintenance_mode in [false, true] {
         let expected = jcs_hash(&json!([
             "determa-maintenance-migration-request-digest-2",
@@ -1350,13 +1638,14 @@ fn maintenance_request_digest_matches(
     Ok(false)
 }
 
-fn validate_migration_audits(checkpoint: &Value, aggregate: &Value) -> Result<(), Version2Error> {
+fn validate_migration_audits(checkpoint: &Value, aggregate: &Value) -> Result<(), ArtifactError> {
     let root_instance_id = checkpoint["root_instance_id"].as_str().unwrap();
     let root_runtime_id = aggregate["root_runtime_id"].as_str().unwrap();
     let aggregate_migration_sequence = counter(aggregate, "migration_sequence")?;
     let mut observed_sequence = Counter::zero();
     let mut prior_target_digest = None;
     let mut prior_target_fingerprint = None;
+    let mut first_source_digest = None;
     for audit in checkpoint["migration_audit_records"].as_array().unwrap() {
         let sequence = counter(audit, "migration_sequence")?;
         observed_sequence.allocate();
@@ -1374,13 +1663,23 @@ fn validate_migration_audits(checkpoint: &Value, aggregate: &Value) -> Result<()
                 "migration audit chronology or provenance is invalid",
             ));
         }
+        if first_source_digest.is_none() {
+            first_source_digest = audit["source_aggregate_state_digest"].as_str();
+        }
         prior_target_digest = audit["target_aggregate_state_digest"].as_str();
         prior_target_fingerprint = audit["target_validated_bundle_fingerprint"].as_str();
     }
+    let final_digest_is_attested = prior_target_digest
+        == aggregate["aggregate_state_digest"].as_str()
+        || migration_precedes_same_revision_processing(
+            checkpoint,
+            first_source_digest,
+            aggregate["aggregate_state_digest"].as_str().unwrap(),
+        )?;
     if observed_sequence != aggregate_migration_sequence
         || (aggregate_migration_sequence != Counter::zero()
             && (prior_target_fingerprint != aggregate["validated_bundle_fingerprint"].as_str()
-                || prior_target_digest != aggregate["aggregate_state_digest"].as_str()))
+                || !final_digest_is_attested))
     {
         return Err(invalid(
             "migration audit history is incomplete or does not attest the retained aggregate",
@@ -1389,13 +1688,68 @@ fn validate_migration_audits(checkpoint: &Value, aggregate: &Value) -> Result<()
     Ok(())
 }
 
+fn migration_precedes_same_revision_processing(
+    checkpoint: &Value,
+    source_digest: Option<&str>,
+    current_digest: &str,
+) -> Result<bool, ArtifactError> {
+    let Some(source_digest) = source_digest else {
+        return Ok(false);
+    };
+    let receipts = checkpoint["operation_receipts"].as_array().unwrap();
+    let source_revision = receipts
+        .iter()
+        .filter(|receipt| {
+            receipt["resulting_aggregate_state_digest"].as_str() == Some(source_digest)
+        })
+        .filter_map(|receipt| {
+            receipt
+                .get("committed_revision")
+                .and_then(Value::as_str)
+                .or_else(|| receipt.get("accepted_revision").and_then(Value::as_str))
+        })
+        .map(Counter::from_decimal)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(invalid)?
+        .into_iter()
+        .max();
+    let Some(source_revision) = source_revision else {
+        return Ok(false);
+    };
+    let current_revision = counter(checkpoint, "revision")?;
+    if source_revision >= current_revision {
+        return Ok(false);
+    }
+    for terminal in receipts.iter().filter(|receipt| {
+        receipt["operation_kind"] == "event_terminal"
+            && receipt["resulting_aggregate_state_digest"].as_str() == Some(current_digest)
+            && receipt["committed_revision"] == checkpoint["revision"]
+    }) {
+        let event_id = terminal["event_id"].as_str().unwrap();
+        let terminal_sequence = counter(terminal, "receipt_sequence")?;
+        let matching_acceptance = receipts.iter().any(|acceptance| {
+            acceptance["operation_kind"] == "acceptance"
+                && acceptance["event_id"].as_str() == Some(event_id)
+                && acceptance["request_digest"] == terminal["request_digest"]
+                && acceptance["acceptance_sequence"] == terminal["acceptance_sequence"]
+                && acceptance["accepted_revision"] == checkpoint["revision"]
+                && counter(acceptance, "receipt_sequence")
+                    .is_ok_and(|sequence| sequence < terminal_sequence)
+        });
+        if matching_acceptance {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn validate_mailboxes<'a>(
     checkpoint: &Value,
     aggregate: &'a Value,
     acceptances: &BTreeMap<&str, &'a Value>,
     receipts: &[Value],
     mailbox_events: &mut BTreeMap<&'a str, &'a Value>,
-) -> Result<(), Version2Error> {
+) -> Result<(), ArtifactError> {
     let root_instance_id = checkpoint["root_instance_id"].as_str().unwrap();
     let next_acceptance = counter(aggregate, "next_acceptance_sequence")?;
     let next_queue = counter(aggregate, "next_queue_sequence")?;
@@ -1434,7 +1788,7 @@ fn validate_mailboxes<'a>(
                     ));
                 }
                 prior_queue = Some(queue);
-                let parsed: crate::format1::QueueEnvelope =
+                let parsed: crate::format1::Envelope =
                     serde_json::from_value(envelope.clone()).map_err(invalid)?;
                 let expected = crate::format1::v2::envelope_digest(
                     root_instance_id,
@@ -1523,7 +1877,7 @@ fn validate_terminal_relationships(
     acceptances: &BTreeMap<&str, &Value>,
     terminals: &BTreeMap<&str, &Value>,
     mailboxes: &BTreeMap<&str, &Value>,
-) -> Result<(), Version2Error> {
+) -> Result<(), ArtifactError> {
     for (event_id, terminal) in terminals {
         if mailboxes.contains_key(event_id) {
             return Err(invalid("event has both live and terminal locations"));
@@ -1567,7 +1921,7 @@ fn validate_emission_and_outbox_relationships(
     checkpoint: &Value,
     receipts: &[Value],
     terminals: &BTreeMap<&str, &Value>,
-) -> Result<(), Version2Error> {
+) -> Result<(), ArtifactError> {
     let pending = checkpoint["pending_outbox_intents"].as_array().unwrap();
     let terminal_outbox = checkpoint["terminal_outbox_records"].as_array().unwrap();
     let effect_tombstones = checkpoint["outbox_effect_tombstones"].as_array().unwrap();
@@ -1618,10 +1972,7 @@ fn validate_emission_and_outbox_relationships(
         let Some(references) = receipt["emission_references"].as_array() else {
             continue;
         };
-        for (index, reference) in references.iter().enumerate() {
-            if reference["emission_index"].as_str() != Some(index.to_string().as_str()) {
-                return Err(invalid("emission reference order is invalid"));
-            }
+        for reference in references {
             match reference["kind"].as_str().unwrap() {
                 "internal_mailbox" => {}
                 "internal_terminal" => {
@@ -1654,7 +2005,7 @@ fn validate_prune_dependencies(
     receipts: &[Value],
     removed: &[&Value],
     prior: Option<&Counter>,
-) -> Result<(), Version2Error> {
+) -> Result<(), ArtifactError> {
     for receipt in removed {
         if receipt["operation_kind"] == "acceptance" {
             let event = receipt["event_id"].as_str().unwrap();
@@ -1702,7 +2053,7 @@ fn rewrite_producer_reference(
     value: &mut Value,
     causal: &Value,
     terminal: &str,
-) -> Result<(), Version2Error> {
+) -> Result<(), ArtifactError> {
     let source = &causal["envelope"]["source"];
     if source.get("runtime").is_some() || source.get("system").is_some() {
         let event_id = causal["envelope"]["event_id"].as_str().unwrap();
@@ -1715,7 +2066,7 @@ fn rewrite_producer_event_reference(
     value: &mut Value,
     event_id: &str,
     terminal: &str,
-) -> Result<(), Version2Error> {
+) -> Result<(), ArtifactError> {
     let mut matches = 0;
     for receipt in value["operation_receipts"].as_array_mut().unwrap() {
         if let Some(references) = receipt
@@ -1761,7 +2112,7 @@ fn retained_effect_ids(value: &Value) -> BTreeSet<&str> {
         .collect()
 }
 
-fn ready_head<'a>(aggregate: &'a Value, runtime_id: &str) -> Result<&'a Value, Version2Error> {
+fn ready_head<'a>(aggregate: &'a Value, runtime_id: &str) -> Result<&'a Value, ArtifactError> {
     let runtime = aggregate["runtimes"]
         .as_array()
         .unwrap()
@@ -1774,7 +2125,7 @@ fn ready_head<'a>(aggregate: &'a Value, runtime_id: &str) -> Result<&'a Value, V
         .ok_or_else(|| failure("not_runnable"))
 }
 
-fn target_runtime_id(target: &Value) -> Result<&str, Version2Error> {
+fn target_runtime_id(target: &Value) -> Result<&str, ArtifactError> {
     target
         .get("root")
         .and_then(|v| v["root_runtime_id"].as_str())
@@ -1808,10 +2159,10 @@ fn target_root_instance_id(target: &Value) -> Option<&str> {
 }
 
 fn guard(
-    checkpoint: &ExecutionCheckpointV2,
+    checkpoint: &ExecutionCheckpoint,
     revision: Option<&str>,
     digest: Option<&str>,
-) -> Result<(), Version2Error> {
+) -> Result<(), ArtifactError> {
     if revision.is_some_and(|expected| checkpoint.value["revision"].as_str() != Some(expected))
         || digest.is_some_and(|expected| {
             checkpoint.value["execution_checkpoint_digest"].as_str() != Some(expected)
@@ -1822,7 +2173,19 @@ fn guard(
     Ok(())
 }
 
-fn seal_checkpoint(value: &mut Value) -> Result<(), Version2Error> {
+pub(crate) fn validate_mutation_guard(
+    checkpoint: &ExecutionCheckpoint,
+    expected_revision: &str,
+    expected_checkpoint_digest: &str,
+) -> Result<(), ArtifactError> {
+    guard(
+        checkpoint,
+        Some(expected_revision),
+        Some(expected_checkpoint_digest),
+    )
+}
+
+fn seal_checkpoint(value: &mut Value) -> Result<(), ArtifactError> {
     value["operation_receipts"]
         .as_array_mut()
         .unwrap()
@@ -1831,7 +2194,7 @@ fn seal_checkpoint(value: &mut Value) -> Result<(), Version2Error> {
     Ok(())
 }
 
-fn seal_and_validate_checkpoint(value: &mut Value) -> Result<(), Version2Error> {
+fn seal_and_validate_checkpoint(value: &mut Value) -> Result<(), ArtifactError> {
     seal_checkpoint(value)?;
     validate_v2_schema(
         value,
@@ -1845,7 +2208,7 @@ fn seal_and_validate_checkpoint(value: &mut Value) -> Result<(), Version2Error> 
     validate_semantics(value)
 }
 
-fn checkpoint_digest(value: &Value) -> Result<String, Version2Error> {
+fn checkpoint_digest(value: &Value) -> Result<String, ArtifactError> {
     let mut unsigned = value.clone();
     unsigned
         .as_object_mut()
@@ -1858,7 +2221,7 @@ fn checkpoint_digest(value: &Value) -> Result<String, Version2Error> {
 fn outbox_intent_digest(
     root_instance_id: &str,
     intent: &OutboxIntent,
-) -> Result<String, Version2Error> {
+) -> Result<String, ArtifactError> {
     jcs_hash(&json!([
         "determa-outbox-intent-digest-2",
         "2",
@@ -1868,7 +2231,7 @@ fn outbox_intent_digest(
     .map_err(invalid)
 }
 
-fn counter(value: &Value, field: &str) -> Result<Counter, Version2Error> {
+fn counter(value: &Value, field: &str) -> Result<Counter, ArtifactError> {
     Counter::from_decimal(
         value[field]
             .as_str()
@@ -1876,21 +2239,21 @@ fn counter(value: &Value, field: &str) -> Result<Counter, Version2Error> {
     )
     .map_err(invalid)
 }
-fn allocate(value: &mut Value, field: &str) -> Result<String, Version2Error> {
+fn allocate(value: &mut Value, field: &str) -> Result<String, ArtifactError> {
     let mut c = counter(value, field)?;
     let a = c.allocate().to_string();
     value[field] = json!(c.to_string());
     Ok(a)
 }
-fn incremented(value: &Value) -> Result<Value, Version2Error> {
+fn incremented(value: &Value) -> Result<Value, ArtifactError> {
     let mut c = Counter::from_decimal(value.as_str().ok_or_else(|| invalid("counter is absent"))?)
         .map_err(invalid)?;
     c.allocate();
     Ok(json!(c.to_string()))
 }
-fn invalid(message: impl ToString) -> Version2Error {
-    Version2Error::new("invalid_execution_checkpoint", message.to_string())
+fn invalid(message: impl ToString) -> ArtifactError {
+    ArtifactError::new("invalid_execution_checkpoint", message.to_string())
 }
-fn failure(code: &str) -> Version2Error {
-    Version2Error::new(code, "checkpoint operation was rejected")
+fn failure(code: &str) -> ArtifactError {
+    ArtifactError::new(code, "checkpoint operation was rejected")
 }
