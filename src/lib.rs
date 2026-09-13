@@ -20,10 +20,11 @@ pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "99a4d9ad5256f7330e75b06d48f340cc7
 
 pub use format1::{
     admit, create, load_bundle, load_bundle_from_json, migrate_aggregate, migrate_aggregate_route,
-    restore_aggregate, restore_package, step, validate_migration_descriptor, Aggregate,
-    ArtifactError, Bindings, Bundle, Counter, CreationRejectionCode, DefinitionResolver, Delivery,
-    DispatchRejectionCode, Disposition, EngineFaultCode, Envelope, InMemoryDefinitionResolver,
-    LoadError, LoadErrorCode, MigrationArtifactResolver, MigrationRequest, PersistenceError,
-    PersistenceErrorCode, ResourceLimits, RestoredPackage, Target, TypedValue,
+    restore_aggregate, restore_package, step, validate_artifact, validate_contract_artifact,
+    validate_migration_descriptor, AdmissionDelivery, Aggregate, ArtifactError, Bindings, Bundle,
+    Counter, CreationRejectionCode, DefinitionResolver, DispatchRejectionCode, Disposition,
+    EngineFaultCode, InMemoryDefinitionResolver, LoadError, LoadErrorCode,
+    MigrationArtifactResolver, MigrationRequest, PersistenceError, PersistenceErrorCode,
+    QueueEnvelope, ResourceLimits, RestoredPackage, Target, TypedValue,
 };
 pub use value::{string_from_utf16, InstanceReference, InvalidUnicodeString, Value};

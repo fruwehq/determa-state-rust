@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/schemas/conformance/durable-host-store-v2.schema.json",
+  "title": "Determa State durable host store snapshot",
+  "type": "object",
+  "required": [
+    "durable_host_store_format",
+    "durable_host_store_schema_version",
+    "checkpoint",
+    "inbox",
+    "application_rows",
+    "quarantine"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "durable_host_store_format": { "const": "determa.durable_host.store" },
+    "durable_host_store_schema_version": { "const": 2 },
+    "checkpoint": { "$ref": "https://determa.dev/state/schema/execution-checkpoint-v2.schema.json" },
+    "inbox": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["event_id", "request_digest", "disposition"],
+        "additionalProperties": false,
+        "properties": {
+          "event_id": { "type": "string", "minLength": 1 },
+          "request_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+          "disposition": { "enum": ["committed", "quarantined"] }
+        }
+      }
+    },
+    "application_rows": { "type": "object" },
+    "quarantine": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["event_id", "reason_code", "released"],
+          "additionalProperties": false,
+          "properties": {
+            "event_id": { "type": "string", "minLength": 1 },
+            "reason_code": { "type": "string", "minLength": 1 },
+            "released": { "type": "boolean" }
+          }
+        }
+      ]
+    }
+  }
+}

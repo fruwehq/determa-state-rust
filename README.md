@@ -12,8 +12,9 @@ normative inputs:
 - conformance commit `99a4d9ad5256f7330e75b06d48f340cc7239a40d`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
-tests run all 162 applicable native artifact/checkpoint schema-v2 core vectors and all
-138 durable-host vectors, plus semantic validation of all 381 declared artifact documents.
+tests run all 75 mailbox-neutral runtime traces through the shared private RTC kernel,
+all 162 applicable native artifact/checkpoint schema-v2 core vectors, and all 138
+durable-host vectors, plus semantic validation of all 381 declared artifact documents.
 Durable host profiles remain
 optional host contracts; memory, file, SQLite, and PostgreSQL tests exercise the
 implemented transactional host surface.

@@ -1,6 +1,6 @@
 use determa_state::{
-    admit, create, load_bundle, restore_aggregate, step, Bindings, Delivery, Envelope,
-    InMemoryDefinitionResolver, TypedValue, FORMAT_1_CONFORMANCE_COMMIT,
+    admit, create, load_bundle, restore_aggregate, step, AdmissionDelivery, Bindings,
+    InMemoryDefinitionResolver, QueueEnvelope, TypedValue, FORMAT_1_CONFORMANCE_COMMIT,
     FORMAT_1_SPECIFICATION_COMMIT,
 };
 use serde_json::json;
@@ -45,7 +45,7 @@ fn queue_bearing_public_operations_create_admit_step_and_restore() {
         .as_str()
         .unwrap()
         .to_string();
-    let envelope = Envelope {
+    let envelope = QueueEnvelope {
         event: "coin".to_string(),
         event_id: "coin-1".to_string(),
         cause_id: "coin-1".to_string(),
@@ -58,7 +58,7 @@ fn queue_bearing_public_operations_create_admit_step_and_restore() {
     let admitted = admit(
         &bundle,
         &aggregate,
-        &[Delivery {
+        &[AdmissionDelivery {
             delivery_mode: "input".to_string(),
             envelope,
             envelope_digest,
@@ -149,7 +149,7 @@ fn command_line_surface_is_validation_only_for_both_executable_names() {
     }
 }
 
-fn inbox_digest(root_instance_id: &str, delivery_mode: &str, envelope: &Envelope) -> String {
+fn inbox_digest(root_instance_id: &str, delivery_mode: &str, envelope: &QueueEnvelope) -> String {
     let bytes = serde_json_canonicalizer::to_vec(&json!([
         "determa-inbox-envelope-digest-2",
         "2",

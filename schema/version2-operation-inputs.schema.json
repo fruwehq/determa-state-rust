@@ -1,0 +1,247 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/schemas/conformance/version2-operation-inputs.schema.json",
+  "title": "Determa State version-2 operation inputs",
+  "type": "object",
+  "minProperties": 1,
+  "additionalProperties": { "$ref": "#/$defs/operationInput" },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "canonicalDecimal": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "nonEmptyString": { "type": "string", "minLength": 1 },
+    "expectedRevision": { "$ref": "#/$defs/canonicalDecimal" },
+    "expectedCheckpointDigest": { "$ref": "#/$defs/sha256" },
+    "jsonFile": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*\\.(?:json|yaml)$" },
+    "migrationMaintenanceMode": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "const": "not-a-boolean" }
+      ]
+    },
+    "artifactResolver": {
+      "type": "object",
+      "required": ["definitions", "migration_descriptors"],
+      "additionalProperties": false,
+      "properties": {
+        "definitions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["validated_bundle_fingerprint", "bundle_file", "trusted"],
+            "additionalProperties": false,
+            "properties": {
+              "validated_bundle_fingerprint": { "$ref": "#/$defs/sha256" },
+              "bundle_file": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*\\.yaml$" },
+              "trusted": { "type": "boolean" }
+            }
+          }
+        },
+        "migration_descriptors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["migration_descriptor_digest", "descriptor_file", "trusted"],
+            "additionalProperties": false,
+            "properties": {
+              "migration_descriptor_digest": { "$ref": "#/$defs/sha256" },
+              "descriptor_file": { "$ref": "#/$defs/jsonFile" },
+              "trusted": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    "resourceLimits": {
+      "type": "object",
+      "required": [
+        "maximum_aggregate_bytes", "maximum_definition_bytes", "maximum_descriptor_bytes",
+        "maximum_transformed_output_bytes", "maximum_chain_length",
+        "maximum_cel_expression_length", "maximum_cel_ast_nodes",
+        "maximum_cel_evaluation_steps", "maximum_json_nesting_depth",
+        "maximum_runtimes", "maximum_active_states_per_runtime",
+        "maximum_variables_per_runtime", "maximum_map_members", "maximum_list_members",
+        "maximum_string_utf8_bytes", "maximum_descriptor_rules"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "maximum_aggregate_bytes": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_definition_bytes": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_descriptor_bytes": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_transformed_output_bytes": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_chain_length": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_cel_expression_length": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_cel_ast_nodes": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_cel_evaluation_steps": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_json_nesting_depth": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_runtimes": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_active_states_per_runtime": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_variables_per_runtime": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_map_members": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_list_members": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_string_utf8_bytes": { "$ref": "#/$defs/canonicalDecimal" },
+        "maximum_descriptor_rules": { "$ref": "#/$defs/canonicalDecimal" }
+      }
+    },
+    "bundleBinding": {
+      "type": "object",
+      "required": ["bundle_file", "bundle_source_digest", "validated_bundle_fingerprint"],
+      "additionalProperties": false,
+      "properties": {
+        "bundle_file": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*\\.yaml$" },
+        "bundle_source_digest": { "$ref": "#/$defs/sha256" },
+        "validated_bundle_fingerprint": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "delivery": {
+      "oneOf": [
+        { "$ref": "#/$defs/nativeDelivery" },
+        { "$ref": "#/$defs/invalidModeDelivery" },
+        { "$ref": "#/$defs/malformedDelivery" }
+      ]
+    },
+    "malformedDelivery": {
+      "type": "object",
+      "maxProperties": 0
+    },
+    "invalidModeDelivery": {
+      "type": "object",
+      "required": ["delivery_mode", "envelope", "envelope_digest"],
+      "additionalProperties": false,
+      "properties": {
+        "delivery_mode": {
+          "type": "string",
+          "minLength": 1,
+          "not": { "enum": ["input", "internal"] }
+        },
+        "envelope": { "$ref": "https://determa.dev/state/schema/aggregate-state-v2.schema.json#/$defs/envelope" },
+        "envelope_digest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "nativeDelivery": {
+      "type": "object",
+      "required": ["delivery_mode", "envelope", "envelope_digest"],
+      "additionalProperties": false,
+      "properties": {
+        "delivery_mode": { "enum": ["input", "internal"] },
+        "envelope": { "$ref": "https://determa.dev/state/schema/aggregate-state-v2.schema.json#/$defs/envelope" },
+        "envelope_digest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "create": {
+      "type": "object",
+      "required": ["operation", "bundle", "machine_id", "machine_version", "root_instance_id", "creation_id", "bindings"],
+      "additionalProperties": false,
+      "properties": {
+        "operation": { "const": "create_v2" },
+        "bundle": { "$ref": "#/$defs/bundleBinding" },
+        "machine_id": { "$ref": "#/$defs/nonEmptyString" },
+        "machine_version": { "$ref": "#/$defs/canonicalDecimal" },
+        "root_instance_id": { "$ref": "#/$defs/nonEmptyString" },
+        "creation_id": { "$ref": "#/$defs/nonEmptyString" },
+        "bindings": {
+          "type": "object",
+          "required": ["input", "external"],
+          "additionalProperties": false,
+          "properties": {
+            "input": { "type": "object" },
+            "external": { "type": "object" }
+          }
+        }
+      }
+    },
+    "admit": {
+      "type": "object",
+      "required": ["operation", "deliveries"],
+      "additionalProperties": false,
+      "properties": {
+        "operation": { "const": "admit_v2" },
+        "deliveries": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/delivery" } }
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": ["operation", "target_runtime_id"],
+      "additionalProperties": false,
+      "properties": {
+        "operation": { "const": "step_v2" },
+        "target_runtime_id": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "roundTrip": {
+      "type": "object",
+      "required": ["operation", "definition_resolver"],
+      "additionalProperties": false,
+      "properties": {
+        "operation": { "const": "round_trip_aggregate_v2" },
+        "definition_resolver": { "$ref": "#/$defs/artifactResolver" }
+      }
+    },
+    "restorePackage": {
+      "type": "object",
+      "required": ["operation", "intent", "package_file", "artifact_resolver", "maintenance_mode"],
+      "additionalProperties": false,
+      "properties": {
+        "operation": { "const": "restore_package_v2" },
+        "intent": { "enum": ["restore_aggregate", "restore_and_apply_migration_route"] },
+        "package_file": { "$ref": "#/$defs/jsonFile" },
+        "artifact_resolver": { "$ref": "#/$defs/artifactResolver" },
+        "maintenance_mode": { "type": "boolean" }
+      }
+    },
+    "migration": {
+      "type": "object",
+      "required": ["operation", "source_bundle", "target_bundle", "migration_descriptor_digest_route"],
+      "additionalProperties": false,
+      "properties": {
+        "operation": { "enum": ["migrate_aggregate_v2", "migrate_then_process_v2", "checkpoint_migrate_v2"] },
+        "source_bundle": { "$ref": "#/$defs/bundleBinding" },
+        "target_bundle": { "$ref": "#/$defs/bundleBinding" },
+        "migration_descriptor_file": { "$ref": "#/$defs/jsonFile" },
+        "migration_descriptor_files": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/jsonFile" }
+        },
+        "migration_descriptor_digest_route": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sha256" }
+        },
+        "maintenance_mode": { "$ref": "#/$defs/migrationMaintenanceMode" },
+        "artifact_resolver": { "$ref": "#/$defs/artifactResolver" },
+        "resource_limits": { "$ref": "#/$defs/resourceLimits" },
+        "repeat_count": { "type": "integer", "minimum": 2 },
+        "delivery": { "$ref": "#/$defs/nativeDelivery" },
+        "operation_id": { "type": "string", "minLength": 1 },
+        "request_digest": { "$ref": "#/$defs/sha256" },
+        "expected_revision": { "$ref": "#/$defs/expectedRevision" },
+        "expected_checkpoint_digest": { "$ref": "#/$defs/expectedCheckpointDigest" }
+      },
+      "allOf": [{
+        "if": { "properties": { "operation": { "const": "checkpoint_migrate_v2" } } },
+        "then": { "required": ["operation_id", "request_digest", "expected_revision", "expected_checkpoint_digest"] }
+      }, {
+        "if": { "properties": { "operation": { "const": "migrate_then_process_v2" } } },
+        "then": { "required": ["delivery"] }
+      }],
+      "oneOf": [
+        {
+          "required": ["migration_descriptor_file"],
+          "not": { "required": ["migration_descriptor_files"] }
+        },
+        {
+          "required": ["migration_descriptor_files"],
+          "not": { "required": ["migration_descriptor_file"] }
+        }
+      ]
+    },
+    "operationInput": {
+      "oneOf": [
+        { "$ref": "#/$defs/create" },
+        { "$ref": "#/$defs/roundTrip" },
+        { "$ref": "#/$defs/restorePackage" },
+        { "$ref": "#/$defs/admit" },
+        { "$ref": "#/$defs/step" },
+        { "$ref": "#/$defs/migration" }
+      ]
+    }
+  }
+}

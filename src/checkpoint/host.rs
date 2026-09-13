@@ -11,7 +11,8 @@ use super::store::{
 use super::types::{
     AdmissionSource, DurableFailurePolicy, DurableHostExecution, DurableHostResult,
     DurableProcessRequest, DurableQuarantineReleaseRequest, PendingOutboxState, ProcessingRequest,
-    PruneRequest, TerminalOutboxOutcome, TransactionalProcessRequest,
+    PruneRequest, ScopedStoreRecord, StoreScope, TerminalOutboxOutcome,
+    TransactionalProcessRequest,
 };
 use super::v2::{
     checkpoint_admit_v2_with_optional_bundle, checkpoint_compact_outbox,
@@ -842,6 +843,60 @@ where
             .transpose()
     }
 
+    pub fn injected_store_result(&self) -> DurableHostResult {
+        DurableHostResult::validated()
+    }
+
+    pub fn validate_scope_operation(
+        &self,
+        scope: &StoreScope,
+        records: &[ScopedStoreRecord],
+        portable_identity: &str,
+        effect_id: &str,
+    ) -> DurableHostResult {
+        let matches = records
+            .iter()
+            .filter(|record| {
+                record.scope_id == scope.scope_id
+                    && record.ownership_binding == scope.ownership_binding
+                    && record.portable_identity == portable_identity
+                    && record.effect_id == effect_id
+            })
+            .count();
+        if scope.authorized && matches == 1 {
+            DurableHostResult::validated()
+        } else {
+            DurableHostResult::validation_rejected("invalid_store_scope")
+        }
+    }
+
+    pub fn validate_backup_restore(
+        &self,
+        source: &[u8],
+        trusted_artifact_digests: &[String],
+        checkpoint_digests: &[String],
+        retention_mode: &str,
+    ) -> DurableHostResult {
+        let valid =
+            restore_execution_checkpoint(source, self.resolver.as_ref()).is_ok_and(|checkpoint| {
+                let retained_definition_is_available = checkpoint.value()["root_record"]["status"]
+                    != "retained"
+                    || trusted_artifact_digests
+                        .iter()
+                        .any(|digest| Some(digest.as_str()) == checkpoint.bundle_fingerprint());
+                retained_definition_is_available
+                    && checkpoint_digests
+                        .iter()
+                        .any(|digest| digest == checkpoint.digest())
+                    && checkpoint.value()["replay_retention"]["mode"] == retention_mode
+            });
+        if valid {
+            DurableHostResult::validated()
+        } else {
+            DurableHostResult::validation_rejected("invalid_execution_checkpoint")
+        }
+    }
+
     pub fn execute_checkpoint_operation(
         &self,
         operation: DurableCheckpointOperation<'_>,
@@ -1010,7 +1065,7 @@ where
         .map_err(|error| ArtifactError::new(error.code.as_str(), error.message))?;
 
         if request.failure_policy == DurableFailurePolicy::PermanentQuarantine {
-            sqlite
+            let retained_result = sqlite
                 .with_immediate_transaction(|transaction| {
                     let current = super::adapters::sqlite::load_record(
                         transaction,
@@ -1018,6 +1073,41 @@ where
                     )?
                     .ok_or_else(|| StoreError::new("checkpoint is absent"))?;
                     validate_durable_guard(&current, &request.guard)?;
+                    let retained = transaction
+                        .query_row(
+                            "SELECT request_digest, disposition
+                             FROM determa_durable_inbox
+                             WHERE root_instance_id = ?1 AND event_id = ?2",
+                            params![request.root_instance_id, request.event_id],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .optional()
+                        .map_err(sqlite_error)?;
+                    let quarantine_released = transaction
+                        .query_row(
+                            "SELECT released FROM determa_durable_quarantine
+                             WHERE root_instance_id = ?1 AND event_id = ?2",
+                            params![request.root_instance_id, request.event_id],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .optional()
+                        .map_err(sqlite_error)?
+                        .unwrap_or(false);
+                    if let Some((digest, disposition)) = retained {
+                        if disposition != "quarantined" || !quarantine_released {
+                            return Ok(Some(if digest == request.envelope_digest {
+                                DurableHostResult::new("replayed", "none", 0, true, None)
+                            } else {
+                                DurableHostResult::new(
+                                    "rejected",
+                                    "none",
+                                    0,
+                                    false,
+                                    Some("event_id_conflict"),
+                                )
+                            }));
+                        }
+                    }
                     transaction
                         .execute(
                             "INSERT OR REPLACE INTO determa_durable_inbox
@@ -1038,9 +1128,12 @@ where
                             params![request.root_instance_id, request.event_id],
                         )
                         .map_err(sqlite_error)?;
-                    Ok(())
+                    Ok(None)
                 })
                 .map_err(v2_store_error)?;
+            if let Some(result) = retained_result {
+                return Ok(DurableHostExecution { result, calls });
+            }
             calls.push("quarantine".to_string());
             return Ok(DurableHostExecution {
                 result: DurableHostResult::new(

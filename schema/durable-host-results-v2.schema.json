@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/schemas/conformance/durable-host-results-v2.schema.json",
+  "title": "Determa State durable host operation results",
+  "type": "object",
+  "required": ["durable_host_results_format", "durable_host_results_schema_version", "results"],
+  "additionalProperties": false,
+  "properties": {
+    "durable_host_results_format": { "const": "determa.durable_host.results" },
+    "durable_host_results_schema_version": { "const": 2 },
+    "results": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]*$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["result", "mutation", "core_calls", "broker_acknowledged"],
+        "additionalProperties": false,
+        "properties": {
+          "result": {
+            "enum": ["committed", "replayed", "rejected", "crashed", "quarantined", "released", "validated"]
+          },
+          "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+          "mutation": { "enum": ["none", "atomic"] },
+          "core_calls": { "type": "integer", "minimum": 0, "maximum": 1 },
+          "broker_acknowledged": { "type": "boolean" }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "result": { "enum": ["rejected", "crashed", "quarantined"] } } },
+            "then": { "required": ["code"] }
+          },
+          {
+            "if": { "properties": { "result": { "enum": ["committed", "replayed", "released", "validated"] } } },
+            "then": { "not": { "required": ["code"] } }
+          }
+        ]
+      }
+    }
+  }
+}

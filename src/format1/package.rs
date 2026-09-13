@@ -10,10 +10,9 @@ pub struct RestoredPackageV2 {
     pub migration_route: Vec<String>,
 }
 
-pub fn restore_package_v2(
+pub(crate) fn validate_package_artifact_v2(
     source: &[u8],
-    resolver: &mut InMemoryDefinitionResolver,
-) -> Result<RestoredPackageV2, super::v2::Version2Error> {
+) -> Result<JsonValue, super::v2::Version2Error> {
     let value =
         super::strict_json::parse(source).map_err(|error| invalid_package_v2(error.to_string()))?;
     if value["aggregate_state_package_format"] != "determa.aggregate_state_package" {
@@ -43,6 +42,14 @@ pub fn restore_package_v2(
         ],
         "invalid_aggregate_state_package",
     )?;
+    Ok(value)
+}
+
+pub fn restore_package_v2(
+    source: &[u8],
+    resolver: &mut InMemoryDefinitionResolver,
+) -> Result<RestoredPackageV2, super::v2::Version2Error> {
+    let value = validate_package_artifact_v2(source)?;
     load_definition_attachments(&value, resolver)?;
     let mut descriptors = BTreeSet::new();
     for descriptor in value["migration_descriptors"].as_array().unwrap() {

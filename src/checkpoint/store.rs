@@ -1,4 +1,3 @@
-#[cfg(any(feature = "sqlite", feature = "postgresql"))]
 use serde_json::{json, Value};
 #[cfg(any(feature = "sqlite", feature = "postgresql"))]
 use sha2::{Digest, Sha256};
@@ -348,6 +347,31 @@ impl AdapterRegistry {
             ));
         }
         Ok(store)
+    }
+
+    pub fn resolve_configured(
+        &self,
+        uri: &str,
+        configuration_schema: &Value,
+        configuration: &Value,
+        requested_capabilities: &BTreeSet<ExecutionStoreCapability>,
+    ) -> Result<Arc<dyn ExecutionStore>, AdapterError> {
+        jsonschema::options()
+            .build(configuration_schema)
+            .map_err(|error| {
+                AdapterError::new(
+                    AdapterErrorCode::InvalidAdapterConfiguration,
+                    format!("invalid adapter configuration schema: {error}"),
+                )
+            })?
+            .validate(configuration)
+            .map_err(|error| {
+                AdapterError::new(
+                    AdapterErrorCode::InvalidAdapterConfiguration,
+                    format!("adapter configuration is invalid: {error}"),
+                )
+            })?;
+        self.resolve(uri, requested_capabilities)
     }
 }
 

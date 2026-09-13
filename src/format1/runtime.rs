@@ -642,6 +642,9 @@ pub(crate) fn validate_delivery_for_admission(
             DispatchRejectionCode::InvalidInstanceTarget
         });
     }
+    if matches!(mode, DeliveryMode::Input) && matches!(envelope.target, Target::Component { .. }) {
+        return Err(DispatchRejectionCode::InvalidInstanceTarget);
+    }
     let normalized = validate_envelope(bundle, runtime, mode, envelope)?;
     if !envelopes_wire_equivalent(&normalized, envelope) {
         return Err(DispatchRejectionCode::InvalidPayload);

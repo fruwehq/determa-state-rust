@@ -4,7 +4,7 @@ use determa_state::checkpoint::{
 };
 use determa_state::{
     admit, create, load_bundle, migrate_aggregate_route, restore_aggregate, restore_package, step,
-    ArtifactError, Bindings, Delivery, InMemoryDefinitionResolver, MigrationRequest,
+    AdmissionDelivery, ArtifactError, Bindings, InMemoryDefinitionResolver, MigrationRequest,
     ResourceLimits,
 };
 use serde_json::{json, Value};
@@ -228,7 +228,7 @@ fn run_vector(directory: &Path, vector: &Value) -> Result<(), String> {
             "admit_v2" => {
                 let bundle = vector_bundle(directory, vector)?;
                 let aggregate = restore_aggregate(before.as_deref().unwrap(), &resolver)?;
-                let deliveries: Vec<Delivery> =
+                let deliveries: Vec<AdmissionDelivery> =
                     serde_json::from_value(request["deliveries"].clone()).map_err(invalid)?;
                 admit(&bundle, &aggregate, &deliveries)
             }
@@ -356,7 +356,7 @@ fn migrate_then_process(
         &serde_json_canonicalizer::to_vec(&migrated["aggregate_state"]).map_err(invalid)?,
         resolver,
     )?;
-    let delivery: Delivery =
+    let delivery: AdmissionDelivery =
         serde_json::from_value(request["delivery"].clone()).map_err(invalid)?;
     let admitted = match admit(&target, &aggregate, std::slice::from_ref(&delivery)) {
         Ok(admitted) => admitted,

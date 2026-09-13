@@ -35,8 +35,11 @@ Never invent a release tag or weaken an exact revision check.
 - `src/cli.rs`: nonportable validation utility only.
 - `tests/native_v2_conformance.rs`: driver for all 162 applicable native schema-v2
   aggregate, migration, package, and execution-checkpoint vectors.
+- `src/format1/runtime_conformance.rs`: all 75 mailbox-neutral runtime traces through
+  the private RTC kernel shared by the sole queue-bearing public API.
 - `tests/artifact_manifest.rs`: schema and semantic routing gate for all 381 declared
-  conformance artifact documents.
+  conformance artifact documents. Operation admissibility is checked separately by
+  the native schema-v2 vectors through public operations.
 - `tests/durable_host_conformance.rs`: production-host driver for all 138 optional
   durable-host vectors, including SQLite shared transactions.
 - `tests/checkpoint_adapters.rs`: shared memory/file/SQLite setup, restart, and CAS

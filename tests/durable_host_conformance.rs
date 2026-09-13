@@ -4,8 +4,8 @@ use determa_state::checkpoint::{
     DurableProcessRequest, DurableQuarantineReleaseRequest, DurableStoreMode, ExecutionStore,
     ExecutionStoreCapability, ExecutionStoreFactory, HealthStatus, HostFeature, HostProfile,
     MemoryExecutionStore, MutationGuard, OutboxRetentionMode, PendingOutboxState,
-    ProcessingRequest, PruneRequest, ReceiptRetentionMode, SqliteExecutionStore, StoreError,
-    StoreRecord, StoreWriteResult, TerminalOutboxOutcome,
+    ProcessingRequest, PruneRequest, ReceiptRetentionMode, ScopedStoreRecord, SqliteExecutionStore,
+    StoreError, StoreRecord, StoreScope, StoreWriteResult, TerminalOutboxOutcome,
 };
 use determa_state::{
     load_bundle, Bindings, InMemoryDefinitionResolver, MigrationRequest, ResourceLimits,
@@ -21,7 +21,6 @@ use std::sync::{Arc, OnceLock};
 fn all_138_durable_host_vectors_execute_exactly() {
     let mut count = 0;
     let mut failures = Vec::new();
-    let selected = std::env::var("DETERMA_DURABLE_VECTOR").ok();
     for directory in profile_directories() {
         let manifest = yaml(&fs::read_to_string(directory.join("test.yaml")).unwrap());
         let Some(vectors) = manifest["durable_host_vectors"].as_array() else {
@@ -29,12 +28,6 @@ fn all_138_durable_host_vectors_execute_exactly() {
         };
         for vector in vectors {
             count += 1;
-            if selected
-                .as_deref()
-                .is_some_and(|name| vector["name"].as_str() != Some(name))
-            {
-                continue;
-            }
             if let Err(error) = run_vector(&directory, vector) {
                 failures.push(format!(
                     "{}/{}: {error}",
@@ -51,6 +44,64 @@ fn all_138_durable_host_vectors_execute_exactly() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+#[test]
+fn permanent_quarantine_obeys_retained_replay_and_conflict_precedence() {
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "conformance-suite/conformance/profiles/persistence/persistence-05-permanent-quarantine-release",
+    );
+    let inputs = json_bytes(&fs::read(directory.join("inputs-v2.json")).unwrap());
+    let committed = json_bytes(&fs::read(directory.join("committed-store-v2.json")).unwrap());
+    let request = inputs.pointer("/requests/replay").unwrap();
+    let database = std::env::temp_dir().join(format!(
+        "determa-durable-quarantine-precedence-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&database);
+    let sqlite = Arc::new(
+        SqliteExecutionStore::open(
+            &database,
+            DurableStoreMode::new(
+                ReceiptRetentionMode::Permanent,
+                OutboxRetentionMode::Bounded,
+            ),
+        )
+        .unwrap(),
+    );
+    sqlite.initialize_schema().unwrap();
+    sqlite.import_durable_host_snapshot(&committed).unwrap();
+    let host = CheckpointHost::new(sqlite.clone(), Arc::new(resolver(&directory)));
+
+    let mut replay = process_request(request);
+    replay.failure_policy = DurableFailurePolicy::PermanentQuarantine;
+    let replayed = host.execute_durable_process(&replay).unwrap();
+    assert_eq!(replayed.result.result, "replayed");
+    assert_eq!(replayed.result.mutation, "none");
+    assert_eq!(
+        sqlite
+            .export_durable_host_snapshot(&replay.root_instance_id)
+            .unwrap(),
+        committed
+    );
+
+    let mut conflict = replay;
+    conflict.envelope_digest =
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
+    conflict.delivery["envelope_digest"] = json!(conflict.envelope_digest);
+    let rejected = host.execute_durable_process(&conflict).unwrap();
+    assert_eq!(rejected.result.result, "rejected");
+    assert_eq!(rejected.result.code.as_deref(), Some("event_id_conflict"));
+    assert_eq!(rejected.result.mutation, "none");
+    assert_eq!(
+        sqlite
+            .export_durable_host_snapshot(&conflict.root_instance_id)
+            .unwrap(),
+        committed
+    );
+    drop(host);
+    drop(sqlite);
+    let _ = fs::remove_file(database);
 }
 
 fn run_vector(directory: &Path, vector: &Value) -> Result<(), String> {
@@ -240,108 +291,96 @@ fn run_checkpoint(directory: &Path, vector: &Value, request: &Value) -> Result<V
 }
 
 fn run_contract(directory: &Path, vector: &Value, request: &Value) -> Value {
-    let result = invoke_contract(directory, vector, request);
-    match result {
-        Ok(()) => result_value("validated", None, "none", 0, false),
-        Err(code) => result_value("rejected", Some(&code), "none", 0, false),
-    }
+    serde_json::to_value(invoke_contract(directory, vector, request)).unwrap()
 }
 
-fn invoke_contract(directory: &Path, vector: &Value, request: &Value) -> Result<(), String> {
+fn invoke_contract(directory: &Path, vector: &Value, request: &Value) -> DurableHostResult {
     match vector["operation"].as_str().unwrap() {
         "checkpoint_inject_store_v2" => {
-            let _: CheckpointHost<InMemoryDefinitionResolver> = CheckpointHost::new(
+            let host: CheckpointHost<InMemoryDefinitionResolver> = CheckpointHost::new(
                 Arc::new(StaticStore::new(capabilities(&request["capabilities"]))),
                 Arc::new(InMemoryDefinitionResolver::default()),
             );
-            Ok(())
+            host.injected_store_result()
         }
         "checkpoint_register_adapter_v2" => {
             let registry = AdapterRegistry::new();
-            register_all(&registry, &request["existing_registrations"])?;
-            register_all(&registry, &json!([request["registration"].clone()]))
+            adapter_result(
+                register_all(&registry, &request["existing_registrations"]).and_then(|_| {
+                    register_all(&registry, &json!([request["registration"].clone()]))
+                }),
+            )
         }
         "checkpoint_resolve_adapter_v2" => {
             let registry = AdapterRegistry::new();
-            register_all(&registry, &request["registrations"])?;
+            if let Err(code) = register_all(&registry, &request["registrations"]) {
+                return DurableHostResult::validation_rejected(&code);
+            }
             let scheme = request["uri"].as_str().unwrap().split_once(':').unwrap().0;
-            if let Some(registration) = request["registrations"]
+            let result = request["registrations"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|item| item["uri_scheme"] == scheme)
-            {
-                if !valid_configuration(
-                    &registration["configuration_schema"],
-                    &request["configuration"],
-                ) {
-                    return Err("invalid_adapter_configuration".to_string());
-                }
-            }
-            registry
-                .resolve(
-                    request["uri"].as_str().unwrap(),
-                    &capabilities(&request["requested_capabilities"]),
-                )
-                .map(|_| ())
-                .map_err(|e| e.code.as_str().to_string())
+                .map_or_else(
+                    || {
+                        registry.resolve(
+                            request["uri"].as_str().unwrap(),
+                            &capabilities(&request["requested_capabilities"]),
+                        )
+                    },
+                    |registration| {
+                        registry.resolve_configured(
+                            request["uri"].as_str().unwrap(),
+                            &registration["configuration_schema"],
+                            &request["configuration"],
+                            &capabilities(&request["requested_capabilities"]),
+                        )
+                    },
+                );
+            adapter_result(
+                result
+                    .map(|_| ())
+                    .map_err(|error| error.code.as_str().to_string()),
+            )
         }
-        "checkpoint_validate_capabilities_v2" => validate_store_host_profile(
-            &StaticStore::new(capabilities(&request["store_capabilities"])),
-            profile(request["host_profile"].as_str().unwrap()),
-            &features(&request["host_guarantees"]),
-            request["retention_mode"] == "permanent",
-        )
-        .map_err(|e| e.code.as_str().to_string()),
+        "checkpoint_validate_capabilities_v2" => adapter_result(
+            validate_store_host_profile(
+                &StaticStore::new(capabilities(&request["store_capabilities"])),
+                profile(request["host_profile"].as_str().unwrap()),
+                &features(&request["host_guarantees"]),
+                request["retention_mode"] == "permanent",
+            )
+            .map_err(|error| error.code.as_str().to_string()),
+        ),
         "checkpoint_scope_operation_v2" => {
-            let scope = &request["scope"];
-            let matches = request["store_records"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|record| {
-                    record["scope_id"] == scope["scope_id"]
-                        && record["ownership_binding"] == scope["ownership_binding"]
-                        && record["portable_identity"] == request["portable_identity"]
-                        && record["effect_id"] == request["effect_id"]
-                })
-                .count();
-            if scope["authorization"] == "authorized" && matches == 1 {
-                Ok(())
-            } else {
-                Err("invalid_store_scope".to_string())
-            }
+            let host: CheckpointHost<InMemoryDefinitionResolver> = CheckpointHost::new(
+                Arc::new(StaticStore::new(BTreeSet::new())),
+                Arc::new(InMemoryDefinitionResolver::default()),
+            );
+            host.validate_scope_operation(
+                &store_scope(&request["scope"]),
+                &scoped_records(&request["store_records"]),
+                request["portable_identity"].as_str().unwrap(),
+                request["effect_id"].as_str().unwrap(),
+            )
         }
         "checkpoint_backup_restore_v2" => {
             let Some(file) = vector["checkpoint_before"].as_str() else {
-                return Err("invalid_execution_checkpoint".to_string());
+                return DurableHostResult::validation_rejected("invalid_execution_checkpoint");
             };
-            let checkpoint = determa_state::checkpoint::restore(
+            let host = CheckpointHost::new(
+                Arc::new(StaticStore::new(BTreeSet::new())),
+                Arc::new(resolver(directory)),
+            );
+            host.validate_backup_restore(
                 &fs::read(directory.join(file)).unwrap(),
-                &resolver(directory),
+                &string_array(&request["trusted_artifact_digests"]),
+                &string_array(&request["checkpoint_digests"]),
+                request["retention_mode"].as_str().unwrap(),
             )
-            .map_err(|e| e.code)?;
-            let retained_definition_is_available = checkpoint.value()["root_record"]["status"]
-                != "retained"
-                || request["trusted_artifact_digests"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|digest| digest.as_str() == checkpoint.bundle_fingerprint());
-            if retained_definition_is_available
-                && request["checkpoint_digests"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|digest| digest.as_str() == Some(checkpoint.digest()))
-                && checkpoint.value()["replay_retention"]["mode"] == request["retention_mode"]
-            {
-                Ok(())
-            } else {
-                Err("invalid_execution_checkpoint".to_string())
-            }
         }
-        other => Err(format!("unsupported operation {other}")),
+        other => DurableHostResult::validation_rejected(&format!("unsupported operation {other}")),
     }
 }
 
@@ -395,44 +434,8 @@ fn run_persistence(directory: &Path, vector: &Value, request: &Value) -> Result<
         })
         .map_err(load_error)?
     } else {
-        let transaction = &request["transaction_inputs"];
-        host.execute_durable_process(&DurableProcessRequest {
-            root_instance_id: request["expected_checkpoint"]["root_instance_id"]
-                .as_str()
-                .unwrap()
-                .to_string(),
-            event_id: request["presented_envelope"]["event_id"]
-                .as_str()
-                .unwrap()
-                .to_string(),
-            envelope_digest: request["envelope_digest"].as_str().unwrap().to_string(),
-            delivery: json!({
-                "delivery_mode": "input",
-                "envelope": request["presented_envelope"],
-                "envelope_digest": request["envelope_digest"]
-            }),
-            processing_mode: "delayed".to_string(),
-            migration: MigrationRequest {
-                target_validated_bundle_fingerprint: transaction
-                    ["target_validated_bundle_fingerprint"]
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-                migration_route: string_array(&transaction["migration_descriptor_digest_route"]),
-                maintenance_mode: false,
-            },
-            migration_limits: ResourceLimits::default(),
-            application_writes: transaction["application_writes"]
-                .as_object()
-                .unwrap()
-                .clone(),
-            failure_policy: failure_policy(transaction["failure_policy"].as_str().unwrap()),
-            guard: checkpoint_guard(request),
-            profile: profile(request["host_profile"].as_str().unwrap()),
-            host_features: features(&request["host_guarantees"]),
-            permanent_retention: request["retention_mode"] == "permanent",
-        })
-        .map_err(load_error)?
+        host.execute_durable_process(&process_request(request))
+            .map_err(load_error)?
     };
     let store = sqlite
         .export_durable_host_snapshot(
@@ -465,23 +468,72 @@ fn run_persistence(directory: &Path, vector: &Value, request: &Value) -> Result<
     .map_err(load_error)
 }
 
-fn result_value(
-    kind: &str,
-    code: Option<&str>,
-    mutation: &str,
-    core_calls: usize,
-    broker: bool,
-) -> Value {
-    let mut value = json!({
-        "result": kind,
-        "mutation": mutation,
-        "core_calls": core_calls,
-        "broker_acknowledged": broker
-    });
-    if let Some(code) = code {
-        value["code"] = json!(code);
+fn process_request(request: &Value) -> DurableProcessRequest {
+    let transaction = &request["transaction_inputs"];
+    DurableProcessRequest {
+        root_instance_id: request["expected_checkpoint"]["root_instance_id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        event_id: request["presented_envelope"]["event_id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        envelope_digest: request["envelope_digest"].as_str().unwrap().to_string(),
+        delivery: json!({
+            "delivery_mode": "input",
+            "envelope": request["presented_envelope"],
+            "envelope_digest": request["envelope_digest"]
+        }),
+        processing_mode: "delayed".to_string(),
+        migration: MigrationRequest {
+            target_validated_bundle_fingerprint: transaction["target_validated_bundle_fingerprint"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            migration_route: string_array(&transaction["migration_descriptor_digest_route"]),
+            maintenance_mode: false,
+        },
+        migration_limits: ResourceLimits::default(),
+        application_writes: transaction["application_writes"]
+            .as_object()
+            .unwrap()
+            .clone(),
+        failure_policy: failure_policy(transaction["failure_policy"].as_str().unwrap()),
+        guard: checkpoint_guard(request),
+        profile: profile(request["host_profile"].as_str().unwrap()),
+        host_features: features(&request["host_guarantees"]),
+        permanent_retention: request["retention_mode"] == "permanent",
     }
+}
+
+fn adapter_result(result: Result<(), String>) -> DurableHostResult {
+    match result {
+        Ok(()) => DurableHostResult::validated(),
+        Err(code) => DurableHostResult::validation_rejected(&code),
+    }
+}
+
+fn store_scope(value: &Value) -> StoreScope {
+    StoreScope {
+        scope_id: value["scope_id"].as_str().unwrap().to_string(),
+        ownership_binding: value["ownership_binding"].as_str().unwrap().to_string(),
+        authorized: value["authorization"] == "authorized",
+    }
+}
+
+fn scoped_records(value: &Value) -> Vec<ScopedStoreRecord> {
     value
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| ScopedStoreRecord {
+            scope_id: record["scope_id"].as_str().unwrap().to_string(),
+            ownership_binding: record["ownership_binding"].as_str().unwrap().to_string(),
+            portable_identity: record["portable_identity"].as_str().unwrap().to_string(),
+            effect_id: record["effect_id"].as_str().unwrap().to_string(),
+        })
+        .collect()
 }
 
 fn admission_sources(request: &Value) -> Vec<AdmissionSource> {
@@ -727,36 +779,6 @@ fn register_all(registry: &AdapterRegistry, registrations: &Value) -> Result<(),
     }
     Ok(())
 }
-fn valid_configuration(schema: &Value, configuration: &Value) -> bool {
-    let Some(object) = configuration.as_object() else {
-        return false;
-    };
-    if schema["additionalProperties"] == false {
-        let declared = schema["properties"].as_object();
-        if object
-            .keys()
-            .any(|key| !declared.is_some_and(|items| items.contains_key(key)))
-        {
-            return false;
-        }
-    }
-    if schema["required"].as_array().is_some_and(|required| {
-        required
-            .iter()
-            .any(|key| !object.contains_key(key.as_str().unwrap()))
-    }) {
-        return false;
-    }
-    object.iter().all(
-        |(key, value)| match schema["properties"][key]["type"].as_str() {
-            Some("string") => value.is_string(),
-            Some("object") => value.is_object(),
-            Some("integer") => value.is_i64() || value.is_u64(),
-            _ => true,
-        },
-    )
-}
-
 struct DeclaredFactory {
     capabilities: BTreeSet<ExecutionStoreCapability>,
     valid: bool,

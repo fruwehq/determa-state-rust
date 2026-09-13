@@ -87,6 +87,12 @@ jobs:
           cmp schema/migration-descriptor-v2.schema.json authoritative-spec/schema/migration-descriptor-v2.schema.json
           cmp schema/core-step-result-v2.schema.json authoritative-spec/schema/core-step-result-v2.schema.json
           cmp schema/execution-checkpoint-v2.schema.json authoritative-spec/schema/execution-checkpoint-v2.schema.json
+          cmp schema/durable-host-call-log-v2.schema.json conformance-suite/scripts/schemas/durable-host-call-log-v2.schema.json
+          cmp schema/durable-host-inputs-v2.schema.json conformance-suite/scripts/schemas/durable-host-inputs-v2.schema.json
+          cmp schema/durable-host-results-v2.schema.json conformance-suite/scripts/schemas/durable-host-results-v2.schema.json
+          cmp schema/durable-host-store-v2.schema.json conformance-suite/scripts/schemas/durable-host-store-v2.schema.json
+          cmp schema/version2-operation-inputs.schema.json conformance-suite/scripts/schemas/version2-operation-inputs.schema.json
+          cmp schema/version2-operation-result.schema.json conformance-suite/scripts/schemas/version2-operation-result.schema.json
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-03
 
@@ -102,6 +108,9 @@ jobs:
 
       - name: Unit and public API tests
         run: cargo test --locked --lib --bins --test public_api --test closed_code_registry --test checkpoint_adapters
+
+      - name: All 75 authoritative mailbox-neutral RTC scenarios
+        run: cargo test --locked --lib format1::runtime_conformance::all_75_format_1_runtime_scenarios -- --nocapture
 
       - name: Documentation tests
         run: cargo test --locked --doc

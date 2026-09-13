@@ -93,9 +93,32 @@ pub fn restore_aggregate_v2(
     source: &[u8],
     resolver: &(impl DefinitionResolver + ?Sized),
 ) -> Result<NativeAggregate, Version2Error> {
-    let value = strict_json::parse(source)
-        .map_err(|error| Version2Error::new("invalid_aggregate_state", error.to_string()))?;
+    let value = strict_json::parse(source).map_err(|error| {
+        let code = match error.code {
+            strict_json::StrictJsonErrorCode::DuplicateKey => "duplicate_key",
+            strict_json::StrictJsonErrorCode::InvalidUtf8
+            | strict_json::StrictJsonErrorCode::InvalidUnicode => "invalid_unicode",
+            strict_json::StrictJsonErrorCode::InvalidNumber
+            | strict_json::StrictJsonErrorCode::InvalidJson => "invalid_aggregate_state",
+        };
+        Version2Error::new(code, error.to_string())
+    })?;
     restore_aggregate_v2_value(value, resolver)
+}
+
+pub(crate) fn validate_aggregate_artifact(source: &[u8]) -> Result<JsonValue, Version2Error> {
+    let value = strict_json::parse(source).map_err(|error| {
+        let code = match error.code {
+            strict_json::StrictJsonErrorCode::DuplicateKey => "duplicate_key",
+            strict_json::StrictJsonErrorCode::InvalidUtf8
+            | strict_json::StrictJsonErrorCode::InvalidUnicode => "invalid_unicode",
+            strict_json::StrictJsonErrorCode::InvalidNumber
+            | strict_json::StrictJsonErrorCode::InvalidJson => "invalid_aggregate_state",
+        };
+        Version2Error::new(code, error.to_string())
+    })?;
+    validate_aggregate_artifact_value(&value)?;
+    Ok(value)
 }
 
 pub fn create_v2(
@@ -1491,7 +1514,18 @@ pub(crate) fn restore_aggregate_v2_value(
     value: JsonValue,
     resolver: &(impl DefinitionResolver + ?Sized),
 ) -> Result<NativeAggregate, Version2Error> {
-    let object = aggregate_object(&value)?;
+    validate_aggregate_artifact_value(&value)?;
+    let envelope: AggregateEnvelope = serde_json::from_value(value.clone())
+        .map_err(|error| invalid_aggregate(error.to_string()))?;
+    let mut state =
+        super::native::restore_envelope(&envelope, resolver).map_err(map_persistence)?;
+    validate_mailbox_semantics(&value, &state, resolver)?;
+    state.document = value;
+    Ok(state)
+}
+
+fn validate_aggregate_artifact_value(value: &JsonValue) -> Result<(), Version2Error> {
+    let object = aggregate_object(value)?;
     if object
         .get("aggregate_state_format")
         .and_then(JsonValue::as_str)
@@ -1512,8 +1546,8 @@ pub(crate) fn restore_aggregate_v2_value(
             "unsupported queue-bearing aggregate-state schema version",
         ));
     }
-    validate_aggregate_schema(&value)?;
-    let expected = aggregate_digest(&value)?;
+    validate_aggregate_schema(value)?;
+    let expected = aggregate_digest(value)?;
     if object
         .get("aggregate_state_digest")
         .and_then(JsonValue::as_str)
@@ -1524,14 +1558,101 @@ pub(crate) fn restore_aggregate_v2_value(
             "queue-bearing aggregate-state digest does not match content",
         ));
     }
-    validate_mailbox_integrity(&value)?;
-    let envelope: AggregateEnvelope = serde_json::from_value(value.clone())
-        .map_err(|error| invalid_aggregate(error.to_string()))?;
-    let mut state =
-        super::native::restore_envelope(&envelope, resolver).map_err(map_persistence)?;
-    validate_mailbox_semantics(&value, &state, resolver)?;
-    state.document = value;
-    Ok(state)
+    validate_mailbox_integrity(value)?;
+    validate_wire_runtime_relations(value)
+}
+
+fn validate_wire_runtime_relations(value: &JsonValue) -> Result<(), Version2Error> {
+    let root_instance_id = aggregate_root_instance_id(value)?;
+    let root_runtime_id = value["root_runtime_id"]
+        .as_str()
+        .ok_or_else(|| invalid_aggregate("root runtime id is absent"))?;
+    let runtimes = runtimes(value)?;
+    let runtime_ids = runtimes
+        .iter()
+        .filter_map(|runtime| runtime["runtime_id"].as_str())
+        .collect::<BTreeSet<_>>();
+    for runtime in runtimes {
+        let runtime_id = runtime["runtime_id"]
+            .as_str()
+            .ok_or_else(|| invalid_aggregate("runtime id is absent"))?;
+        let relation = runtime["relation"]["kind"]
+            .as_str()
+            .ok_or_else(|| invalid_aggregate("runtime relation kind is absent"))?;
+        let target = runtime["target_identity"]
+            .as_object()
+            .ok_or_else(|| invalid_aggregate("runtime target identity is absent"))?;
+        match relation {
+            "root" => {
+                let root = target
+                    .get("root")
+                    .and_then(JsonValue::as_object)
+                    .ok_or_else(|| {
+                        invalid_aggregate("root relation requires a root target identity")
+                    })?;
+                if runtime_id != root_runtime_id
+                    || root.get("root_runtime_id").and_then(JsonValue::as_str) != Some(runtime_id)
+                    || root.get("root_instance_id").and_then(JsonValue::as_str)
+                        != Some(root_instance_id)
+                {
+                    return Err(invalid_aggregate("root relation identity is inconsistent"));
+                }
+            }
+            "component" => {
+                let component = target
+                    .get("component")
+                    .and_then(JsonValue::as_object)
+                    .ok_or_else(|| {
+                        invalid_aggregate("component relation requires a component target identity")
+                    })?;
+                let owner = runtime["relation"]["owner_runtime_id"]
+                    .as_str()
+                    .ok_or_else(|| invalid_aggregate("component owner is absent"))?;
+                if !runtime_ids.contains(owner)
+                    || component
+                        .get("component_runtime_id")
+                        .and_then(JsonValue::as_str)
+                        != Some(runtime_id)
+                    || component
+                        .get("owner_runtime_id")
+                        .and_then(JsonValue::as_str)
+                        != Some(owner)
+                    || component
+                        .get("root_instance_id")
+                        .and_then(JsonValue::as_str)
+                        != Some(root_instance_id)
+                    || component.get("activation_sequence")
+                        != runtime["relation"].get("activation_sequence")
+                {
+                    return Err(invalid_aggregate(
+                        "component relation identity is inconsistent",
+                    ));
+                }
+            }
+            "owned_spawned_instance" => {
+                let spawned = target
+                    .get("spawned_instance")
+                    .and_then(JsonValue::as_object)
+                    .ok_or_else(|| {
+                        invalid_aggregate("spawned relation requires a spawned target identity")
+                    })?;
+                let owner = runtime["relation"]["owner_runtime_id"]
+                    .as_str()
+                    .ok_or_else(|| invalid_aggregate("spawned owner is absent"))?;
+                if !runtime_ids.contains(owner)
+                    || spawned.get("instance_id").and_then(JsonValue::as_str) != Some(runtime_id)
+                    || spawned.get("root_instance_id").and_then(JsonValue::as_str)
+                        != Some(root_instance_id)
+                {
+                    return Err(invalid_aggregate(
+                        "spawned relation identity is inconsistent",
+                    ));
+                }
+            }
+            _ => return Err(invalid_aggregate("runtime relation kind is invalid")),
+        }
+    }
+    Ok(())
 }
 
 fn seal_aggregate(mut value: JsonValue) -> Result<JsonValue, Version2Error> {
@@ -1584,7 +1705,7 @@ fn core_delivery(delivery: &AdmissionDelivery) -> Result<Delivery, Version2Error
         .envelope
         .payload
         .to_value(None)
-        .map_err(map_persistence)?;
+        .map_err(|error| Version2Error::new("invalid_payload", error.to_string()))?;
     let crate::value::Value::Map(payload) = payload else {
         return Err(Version2Error::new(
             "invalid_payload",

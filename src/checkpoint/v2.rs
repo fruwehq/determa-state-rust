@@ -5,8 +5,8 @@ use crate::format1::v2::{
     validate_admission_delivery_schema, validate_v2_schema,
 };
 use crate::format1::{
-    admit, restore_aggregate, Aggregate, ArtifactError, Bindings, Bundle, Counter,
-    DefinitionResolver, Delivery, MigrationArtifactResolver, MigrationRequest, ResourceLimits,
+    admit, restore_aggregate, AdmissionDelivery, Aggregate, ArtifactError, Bindings, Bundle,
+    Counter, DefinitionResolver, MigrationArtifactResolver, MigrationRequest, ResourceLimits,
     TypedValue,
 };
 use serde_json::{json, Value};
@@ -214,7 +214,7 @@ pub(super) fn checkpoint_admit_v2_with_optional_bundle(
         .map(|delivery| {
             validate_admission_delivery_schema(delivery)
                 .map_err(|_| failure("malformed_delivery"))?;
-            serde_json::from_value::<Delivery>(delivery.clone())
+            serde_json::from_value::<AdmissionDelivery>(delivery.clone())
                 .map_err(|_| failure("malformed_delivery"))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1788,7 +1788,7 @@ fn validate_mailboxes<'a>(
                     ));
                 }
                 prior_queue = Some(queue);
-                let parsed: crate::format1::Envelope =
+                let parsed: crate::format1::QueueEnvelope =
                     serde_json::from_value(envelope.clone()).map_err(invalid)?;
                 let expected = crate::format1::v2::envelope_digest(
                     root_instance_id,

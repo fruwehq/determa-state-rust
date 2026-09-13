@@ -64,6 +64,29 @@ impl DurableHostResult {
             code: code.map(str::to_string),
         }
     }
+
+    pub fn validated() -> Self {
+        Self::new("validated", "none", 0, false, None)
+    }
+
+    pub fn validation_rejected(code: &str) -> Self {
+        Self::new("rejected", "none", 0, false, Some(code))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreScope {
+    pub scope_id: String,
+    pub ownership_binding: String,
+    pub authorized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedStoreRecord {
+    pub scope_id: String,
+    pub ownership_binding: String,
+    pub portable_identity: String,
+    pub effect_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

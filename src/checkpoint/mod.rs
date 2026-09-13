@@ -37,7 +37,7 @@ pub use types::{
     AdmissionSource, CheckpointErrorCode, DurableFailurePolicy, DurableHostExecution,
     DurableHostResult, DurableProcessRequest, DurableQuarantineReleaseRequest, OutboxIntent,
     PendingOutboxState, PreAcceptanceFailureCode, ProcessingRequest, PruneRequest,
-    TerminalOutboxOutcome, TransactionalProcessRequest,
+    ScopedStoreRecord, StoreScope, TerminalOutboxOutcome, TransactionalProcessRequest,
 };
 pub use v2::{
     checkpoint_admit_v2 as admit, checkpoint_compact_outbox as compact_outbox,
