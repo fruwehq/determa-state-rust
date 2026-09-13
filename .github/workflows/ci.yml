@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: 1
   SPECIFICATION_COMMIT: ee38796d5e38e67e350a06548fd50faa530cbb12
   CONFORMANCE_COMMIT: 99a4d9ad5256f7330e75b06d48f340cc7239a40d
 
@@ -46,6 +47,7 @@ jobs:
 
       - name: Test the generated crate without repository fixtures
         run: |
+          test -z "$(git status --porcelain)"
           cargo package --locked
           package_dir="$(mktemp -d)"
           tar -xzf target/package/determa-state-0.2.0.crate -C "$package_dir"
