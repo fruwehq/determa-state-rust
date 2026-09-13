@@ -5,7 +5,7 @@ use super::model::{
 };
 use super::persistence::DefinitionResolver;
 use super::runtime::{
-    AggregateState, ComponentRuntime, FaultRecord, OwnedRuntime, RuntimeRelation, RuntimeState,
+    ComponentRuntime, FaultRecord, NativeAggregate, OwnedRuntime, RuntimeRelation, RuntimeState,
     RuntimeStatus, VariableSlot,
 };
 use super::strict_json;
@@ -534,8 +534,7 @@ impl AggregateEnvelope {
 
 pub fn encode_aggregate(
     bundle: &Bundle,
-    state: &AggregateState,
-    retained: Option<&AggregateEnvelope>,
+    state: &NativeAggregate,
 ) -> Result<(AggregateEnvelope, Vec<u8>), PersistenceError> {
     if !super::runtime::aggregate_is_valid_for_bundle(state, bundle) {
         return Err(invalid_state(
@@ -543,7 +542,7 @@ pub fn encode_aggregate(
         ));
     }
     let mut runtimes = Vec::new();
-    flatten_runtime(&state.root, retained, &mut runtimes)?;
+    flatten_runtime(&state.root, &mut runtimes)?;
     if state.wire_runtime_order.len() == runtimes.len()
         && state.wire_runtime_order.iter().collect::<BTreeSet<_>>()
             == runtimes
@@ -575,14 +574,8 @@ pub fn encode_aggregate(
         migration_sequence: state.migration_sequence.to_string(),
         next_logical_step_sequence: state.next_logical_step_sequence.to_string(),
         next_output_sequence: state.next_output_sequence.to_string(),
-        next_acceptance_sequence: retained.map_or_else(
-            || "0".to_string(),
-            |value| value.next_acceptance_sequence.clone(),
-        ),
-        next_queue_sequence: retained.map_or_else(
-            || "0".to_string(),
-            |value| value.next_queue_sequence.clone(),
-        ),
+        next_acceptance_sequence: state.next_acceptance_sequence.to_string(),
+        next_queue_sequence: state.next_queue_sequence.to_string(),
         runtimes,
         aggregate_state_digest: String::new(),
     };
@@ -595,7 +588,7 @@ pub fn encode_aggregate(
 pub(crate) fn restore_envelope(
     envelope: &AggregateEnvelope,
     resolver: &(impl DefinitionResolver + ?Sized),
-) -> Result<AggregateState, PersistenceError> {
+) -> Result<NativeAggregate, PersistenceError> {
     let mut definitions = BTreeMap::new();
     for runtime in &envelope.runtimes {
         collect_definition(&runtime.current_definition, resolver, &mut definitions)?;
@@ -637,7 +630,9 @@ pub(crate) fn restore_envelope(
         return Err(invalid_state("runtime ownership graph is disconnected"));
     }
     validate_root_header(envelope, &root)?;
-    let aggregate = AggregateState {
+    let aggregate = NativeAggregate {
+        document: serde_json::to_value(envelope)
+            .map_err(|error| invalid_state(error.to_string()))?,
         validated_bundle_fingerprint: envelope.validated_bundle_fingerprint.clone(),
         namespace: envelope.namespace.clone(),
         root_instance_id: envelope.root_instance_id.clone(),
@@ -653,6 +648,10 @@ pub(crate) fn restore_envelope(
         next_logical_step_sequence: Counter::from_decimal(&envelope.next_logical_step_sequence)
             .map_err(invalid_state)?,
         next_output_sequence: Counter::from_decimal(&envelope.next_output_sequence)
+            .map_err(invalid_state)?,
+        next_acceptance_sequence: Counter::from_decimal(&envelope.next_acceptance_sequence)
+            .map_err(invalid_state)?,
+        next_queue_sequence: Counter::from_decimal(&envelope.next_queue_sequence)
             .map_err(invalid_state)?,
     };
     let current = definitions
@@ -1053,6 +1052,8 @@ fn restore_runtime(
         active_state_activation_sequence,
         fault,
         relation,
+        ready_mailbox: wire.ready_mailbox.clone(),
+        deferred_mailbox: wire.deferred_mailbox.clone(),
     })
 }
 
@@ -1608,26 +1609,15 @@ fn relation_to_wire(relation: &RuntimeRelation) -> WireRelation {
 
 fn flatten_runtime(
     runtime: &RuntimeState,
-    retained: Option<&AggregateEnvelope>,
     output: &mut Vec<WireRuntime>,
 ) -> Result<(), PersistenceError> {
     for component in &runtime.components {
-        flatten_runtime(&component.runtime, retained, output)?;
+        flatten_runtime(&component.runtime, output)?;
     }
     for owned in &runtime.owned_instances {
-        flatten_runtime(&owned.runtime, retained, output)?;
+        flatten_runtime(&owned.runtime, output)?;
     }
-    let mut wire = runtime_to_wire(runtime)?;
-    if let Some(previous) = retained.and_then(|aggregate| {
-        aggregate
-            .runtimes
-            .iter()
-            .find(|candidate| candidate.runtime_id == runtime.runtime_id)
-    }) {
-        wire.ready_mailbox.clone_from(&previous.ready_mailbox);
-        wire.deferred_mailbox.clone_from(&previous.deferred_mailbox);
-    }
-    output.push(wire);
+    output.push(runtime_to_wire(runtime)?);
     Ok(())
 }
 
@@ -1748,8 +1738,8 @@ fn runtime_to_wire(runtime: &RuntimeState) -> Result<WireRuntime, PersistenceErr
         next_spawn_sequence: runtime.next_spawn_sequence.to_string(),
         next_state_activation_sequences: next_state,
         next_component_activation_sequences: next_component,
-        ready_mailbox: Vec::new(),
-        deferred_mailbox: Vec::new(),
+        ready_mailbox: runtime.ready_mailbox.clone(),
+        deferred_mailbox: runtime.deferred_mailbox.clone(),
         fault: runtime.fault.as_ref().map(|fault| WireFault {
             definition_fingerprint: fault.definition_fingerprint.clone(),
             runtime_id: fault.runtime_id.clone(),

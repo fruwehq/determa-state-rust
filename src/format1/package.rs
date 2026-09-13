@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 #[derive(Debug, Clone)]
 pub struct RestoredPackageV2 {
-    pub aggregate: super::v2::QueueBearingAggregate,
+    pub aggregate: super::runtime::NativeAggregate,
     pub migration_route: Vec<String>,
 }
 

@@ -122,7 +122,7 @@ fn examples_and_revision_metadata_are_current() {
 }
 
 #[test]
-fn command_line_surface_is_validation_only_and_aliases_match() {
+fn command_line_surface_is_validation_only_for_both_executable_names() {
     for binary in [
         env!("CARGO_BIN_EXE_determa-state"),
         env!("CARGO_BIN_EXE_determa-state-rust"),

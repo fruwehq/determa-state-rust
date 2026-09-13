@@ -2,6 +2,76 @@ use crate::format1::{Counter, MigrationRequest, ResourceLimits, TypedValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableFailurePolicy {
+    Commit,
+    InjectPreCommit,
+    InjectPostCommitResponseLoss,
+    TransientRetry,
+    PermanentQuarantine,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DurableProcessRequest {
+    pub root_instance_id: String,
+    pub event_id: String,
+    pub envelope_digest: String,
+    pub delivery: Value,
+    pub processing_mode: String,
+    pub migration: MigrationRequest,
+    pub migration_limits: ResourceLimits,
+    pub application_writes: serde_json::Map<String, Value>,
+    pub failure_policy: DurableFailurePolicy,
+    pub guard: super::host::MutationGuard,
+    pub profile: super::store::HostProfile,
+    pub host_features: std::collections::BTreeSet<super::store::HostFeature>,
+    pub permanent_retention: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableQuarantineReleaseRequest {
+    pub root_instance_id: String,
+    pub event_id: String,
+    pub envelope_digest: String,
+    pub reason_code: String,
+    pub release_authorization: String,
+    pub guard: super::host::MutationGuard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DurableHostResult {
+    pub result: String,
+    pub mutation: String,
+    pub core_calls: u8,
+    pub broker_acknowledged: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+impl DurableHostResult {
+    pub(crate) fn new(
+        result: &str,
+        mutation: &str,
+        core_calls: u8,
+        broker_acknowledged: bool,
+        code: Option<&str>,
+    ) -> Self {
+        Self {
+            result: result.to_string(),
+            mutation: mutation.to_string(),
+            core_calls,
+            broker_acknowledged,
+            code: code.map(str::to_string),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableHostExecution {
+    pub result: DurableHostResult,
+    pub calls: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AdmissionSource {
     Utf8Json(Vec<u8>),

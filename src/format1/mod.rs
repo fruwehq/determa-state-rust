@@ -23,12 +23,13 @@ pub use persistence::{
 };
 pub use runtime::{
     CreationRejectionCode, DispatchRejectionCode, Disposition, EngineFaultCode,
-    CREATION_REJECTION_CODES, DISPATCH_REJECTION_CODES, ENGINE_FAULT_CODES,
+    NativeAggregate as Aggregate,
 };
 pub use source::{load_bundle, load_bundle_from_json, parse_document, LoadError, LoadErrorCode};
 pub use v2::{
     admit_v2 as admit, create_v2 as create, migrate_aggregate_v2 as migrate_aggregate,
     migrate_aggregate_v2_route as migrate_aggregate_route,
-    restore_aggregate_v2 as restore_aggregate, step_v2 as step, AdmissionDelivery as Delivery,
-    QueueBearingAggregate as Aggregate, QueueEnvelope as Envelope, Version2Error as ArtifactError,
+    restore_aggregate_v2 as restore_aggregate, step_v2 as step,
+    validate_migration_descriptor_v2 as validate_migration_descriptor,
+    AdmissionDelivery as Delivery, QueueEnvelope as Envelope, Version2Error as ArtifactError,
 };

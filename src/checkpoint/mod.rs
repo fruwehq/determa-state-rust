@@ -19,7 +19,8 @@ pub use adapters::{PostgresqlExecutionStore, PostgresqlExecutionStoreFactory};
 #[cfg(feature = "sqlite")]
 pub use adapters::{SqliteExecutionStore, SqliteExecutionStoreFactory};
 pub use host::{
-    CheckpointHost, HostFailure, HostFailureCode, MaintenanceMigrationRequest, MutationGuard,
+    CheckpointHost, DurableCheckpointOperation, HostFailure, HostFailureCode,
+    MaintenanceMigrationRequest, MutationGuard,
 };
 #[cfg(feature = "postgresql")]
 pub use host::{
@@ -33,9 +34,10 @@ pub use store::{
     StoreRecord, StoreWriteResult,
 };
 pub use types::{
-    AdmissionSource, CheckpointErrorCode, OutboxIntent, PendingOutboxState,
-    PreAcceptanceFailureCode, ProcessingRequest, PruneRequest, TerminalOutboxOutcome,
-    TransactionalProcessRequest,
+    AdmissionSource, CheckpointErrorCode, DurableFailurePolicy, DurableHostExecution,
+    DurableHostResult, DurableProcessRequest, DurableQuarantineReleaseRequest, OutboxIntent,
+    PendingOutboxState, PreAcceptanceFailureCode, ProcessingRequest, PruneRequest,
+    TerminalOutboxOutcome, TransactionalProcessRequest,
 };
 pub use v2::{
     checkpoint_admit_v2 as admit, checkpoint_compact_outbox as compact_outbox,

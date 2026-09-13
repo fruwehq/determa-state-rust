@@ -35,6 +35,10 @@ Never invent a release tag or weaken an exact revision check.
 - `src/cli.rs`: nonportable validation utility only.
 - `tests/native_v2_conformance.rs`: driver for all 162 applicable native schema-v2
   aggregate, migration, package, and execution-checkpoint vectors.
+- `tests/artifact_manifest.rs`: schema and semantic routing gate for all 381 declared
+  conformance artifact documents.
+- `tests/durable_host_conformance.rs`: production-host driver for all 138 optional
+  durable-host vectors, including SQLite shared transactions.
 - `tests/checkpoint_adapters.rs`: shared memory/file/SQLite setup, restart, and CAS
   contracts.
 - `tests/checkpoint_postgresql.rs`: optional PostgreSQL exact-schema, retention-mode,
@@ -66,8 +70,8 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 The declared MSRV is Rust `1.86`. CI must keep the locked default and all-features graph,
 including PostgreSQL, buildable and testable with that toolchain.
 
-CI runs all 162 applicable native schema-v2 core vectors and all 138 durable-host
-vectors.
+CI runs all 162 applicable native schema-v2 core vectors, all 138 durable-host vectors,
+and all 381 declared artifact documents.
 It also checks every local schema byte-for-byte against the exact specification commit
 and runs the optional PostgreSQL adapter against a service.
 

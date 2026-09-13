@@ -141,7 +141,7 @@ pub struct MigrationAuditRecord {
 
 #[derive(Debug, Clone)]
 pub struct MigrationOutcome {
-    pub aggregate: super::runtime::AggregateState,
+    pub aggregate: super::runtime::NativeAggregate,
     pub aggregate_envelope: AggregateEnvelope,
     pub audit_records: Vec<MigrationAuditRecord>,
 }

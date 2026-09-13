@@ -13,7 +13,8 @@ normative inputs:
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 162 applicable native artifact/checkpoint schema-v2 core vectors and all
-138 durable-host vectors. Durable host profiles remain
+138 durable-host vectors, plus semantic validation of all 381 declared artifact documents.
+Durable host profiles remain
 optional host contracts; memory, file, SQLite, and PostgreSQL tests exercise the
 implemented transactional host surface.
 
@@ -28,7 +29,8 @@ implemented transactional host surface.
 - Isolated synchronous components with explicit routing.
 - Owned spawned instances, nominal references, cancellation, completion, failure
   propagation, and deterministic lifecycle cleanup.
-- Pure queue-bearing `create`, `admit`, and `step` operations with deterministic
+- Pure queue-bearing `create`, `admit`, and `step` operations over one native aggregate
+  model that owns runtime mailboxes and their allocation counters, with deterministic
   runtime, cause, event, and external-effect identities.
 - Portable aggregate serialization and restoration with strict typed values, canonical
   JSON, content-addressed definitions, sole schema-v2 artifacts, and
@@ -42,13 +44,15 @@ implemented transactional host surface.
   registry. Bundled adapters use only the same public registration route available to
   third-party factories.
 - Default `memory`, `file`, and bundled-SQLite adapters plus optional PostgreSQL,
-  with explicit durable receipt/outbox modes and schema-contract health checks.
+  with explicit durable receipt/outbox modes, schema-contract health checks, and a
+  SQLite native transaction spanning checkpoint, inbox, quarantine, and application rows.
 - Inspection through the returned native aggregate and core-step JSON values.
 - Immutable `PORTABLE_CODES` slices on public closed-code enums, including
   `CreationRejectionCode`, `DispatchRejectionCode`, and `EngineFaultCode`.
 
-The portable core remains a pure foreground transform and does not own queues, broker
-acknowledgement, timers, package imports, or a background scheduler. The optional host
+The portable core remains a pure foreground transform. Its aggregate owns only the
+portable runtime mailboxes; it owns no broker queue, acknowledgement, timer, package
+import, or background scheduler. The optional host
 persists SPEC section 17 state around those unchanged operations. Broker adapters,
 workers, transport integration, and application response data remain application
 concerns. The command-line binary still provides bundle validation only.

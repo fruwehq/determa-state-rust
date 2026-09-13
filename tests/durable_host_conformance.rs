@@ -1,13 +1,14 @@
 use determa_state::checkpoint::{
     validate_store_host_profile, AdapterError, AdapterErrorCode, AdapterRegistry, AdmissionSource,
-    CheckpointHost, ExecutionStore, ExecutionStoreCapability, ExecutionStoreFactory, HealthStatus,
-    HostFeature, HostProfile, MemoryExecutionStore, MutationGuard, PendingOutboxState,
-    ProcessingRequest, PruneRequest, StoreError, StoreRecord, StoreWriteResult,
-    TerminalOutboxOutcome,
+    CheckpointHost, DurableCheckpointOperation, DurableFailurePolicy, DurableHostResult,
+    DurableProcessRequest, DurableQuarantineReleaseRequest, DurableStoreMode, ExecutionStore,
+    ExecutionStoreCapability, ExecutionStoreFactory, HealthStatus, HostFeature, HostProfile,
+    MemoryExecutionStore, MutationGuard, OutboxRetentionMode, PendingOutboxState,
+    ProcessingRequest, PruneRequest, ReceiptRetentionMode, SqliteExecutionStore, StoreError,
+    StoreRecord, StoreWriteResult, TerminalOutboxOutcome,
 };
 use determa_state::{
-    load_bundle, ArtifactError, Bindings, InMemoryDefinitionResolver, MigrationRequest,
-    ResourceLimits,
+    load_bundle, Bindings, InMemoryDefinitionResolver, MigrationRequest, ResourceLimits,
 };
 use serde_json::{json, Value};
 use std::any::Any;
@@ -114,63 +115,103 @@ fn run_checkpoint(directory: &Path, vector: &Value, request: &Value) -> Result<V
         },
     );
     let operation = vector["operation"].as_str().unwrap();
-    let attempted_core = matches!(
-        operation,
-        "checkpoint_create_v2" | "checkpoint_admit_v2" | "checkpoint_step_v2"
-    );
-    let result: Result<(), ArtifactError> = match operation {
+    let acknowledge_after_commit =
+        directory.file_name().unwrap() == "checkpoint-01-native-lifecycle";
+    let result = match operation {
         "checkpoint_create_v2" => {
             let bundle = load_bundle(
                 &fs::read_to_string(directory.join(request["bundle"]["file"].as_str().unwrap()))
                     .unwrap(),
             )
             .map_err(load_error)?;
-            host.create_checkpoint(
-                &bundle,
-                request["machine"]["machine_id"].as_str().unwrap(),
-                request["root_instance_id"].as_str().unwrap(),
-                request["creation_id"].as_str().unwrap(),
-                &bindings(&request["bindings"]),
-                None,
-                json!({"mode":"permanent","permanent_replay_eligible":true,"pruned_through_receipt_sequence":null,"policy_identifier":null}),
-            ).map(|_| ())
+            let bindings = bindings(&request["bindings"]);
+            host.execute_checkpoint_operation(
+                DurableCheckpointOperation::Create {
+                    bundle: &bundle,
+                    machine_id: request["machine"]["machine_id"].as_str().unwrap(),
+                    root_instance_id: request["root_instance_id"].as_str().unwrap(),
+                    creation_id: request["creation_id"].as_str().unwrap(),
+                    bindings: &bindings,
+                    supplied_request_digest: None,
+                    replay_retention: json!({"mode":"permanent","permanent_replay_eligible":true,"pruned_through_receipt_sequence":null,"policy_identifier":null}),
+                },
+                acknowledge_after_commit,
+            )
         }
-        "checkpoint_admit_v2" => host
-            .admit_checkpoint_sources(&root, &admission_sources(request), &guard)
-            .map(|_| ()),
-        "checkpoint_step_v2" => host
-            .step_checkpoint(&root, &processing_request(request), &guard)
-            .map(|_| ()),
-        "checkpoint_update_outbox_v2" => host
-            .update_pending_outbox(
-                &root,
-                request["effect_id"].as_str().unwrap(),
-                pending_state(request),
-                &guard,
+        "checkpoint_admit_v2" => {
+            let sources = admission_sources(request);
+            host.execute_checkpoint_operation(
+                DurableCheckpointOperation::Admit {
+                    root_instance_id: &root,
+                    sources: &sources,
+                    guard: &guard,
+                },
+                acknowledge_after_commit,
             )
-            .map(|_| ()),
-        "checkpoint_terminalize_outbox_v2" => host
-            .terminalize_outbox(
-                &root,
-                request["effect_id"].as_str().unwrap(),
-                terminal_outcome(request),
-                &guard,
+        }
+        "checkpoint_step_v2" => {
+            let processing = processing_request(request);
+            host.execute_checkpoint_operation(
+                DurableCheckpointOperation::Step {
+                    root_instance_id: &root,
+                    request: &processing,
+                    guard: &guard,
+                },
+                acknowledge_after_commit,
             )
-            .map(|_| ()),
-        "checkpoint_compact_outbox_v2" => host
-            .compact_outbox(&root, request["effect_id"].as_str().unwrap(), &guard)
-            .map(|_| ()),
-        "checkpoint_prune_v2" => host
-            .prune_checkpoint(&root, &prune_request(request), &guard)
-            .map(|_| ()),
-        "checkpoint_tombstone_v2" => host
-            .tombstone_root(
-                &root,
-                request["tombstone_operation_id"].as_str().unwrap(),
-                &guard,
+        }
+        "checkpoint_update_outbox_v2" => host.execute_checkpoint_operation(
+            DurableCheckpointOperation::UpdatePendingOutbox {
+                root_instance_id: &root,
+                effect_id: request["effect_id"].as_str().unwrap(),
+                desired: pending_state(request),
+                guard: &guard,
+            },
+            acknowledge_after_commit,
+        ),
+        "checkpoint_terminalize_outbox_v2" => host.execute_checkpoint_operation(
+            DurableCheckpointOperation::TerminalizeOutbox {
+                root_instance_id: &root,
+                effect_id: request["effect_id"].as_str().unwrap(),
+                outcome: terminal_outcome(request),
+                guard: &guard,
+            },
+            acknowledge_after_commit,
+        ),
+        "checkpoint_compact_outbox_v2" => host.execute_checkpoint_operation(
+            DurableCheckpointOperation::CompactOutbox {
+                root_instance_id: &root,
+                effect_id: request["effect_id"].as_str().unwrap(),
+                guard: &guard,
+            },
+            acknowledge_after_commit,
+        ),
+        "checkpoint_prune_v2" => {
+            let prune = prune_request(request);
+            host.execute_checkpoint_operation(
+                DurableCheckpointOperation::Prune {
+                    root_instance_id: &root,
+                    request: &prune,
+                    guard: &guard,
+                },
+                acknowledge_after_commit,
             )
-            .map(|_| ()),
-        "checkpoint_delete_retained_record_v2" => host.delete_retained_record(&root, &guard),
+        }
+        "checkpoint_tombstone_v2" => host.execute_checkpoint_operation(
+            DurableCheckpointOperation::Tombstone {
+                root_instance_id: &root,
+                operation_id: request["tombstone_operation_id"].as_str().unwrap(),
+                guard: &guard,
+            },
+            acknowledge_after_commit,
+        ),
+        "checkpoint_delete_retained_record_v2" => host.execute_checkpoint_operation(
+            DurableCheckpointOperation::DeleteRetainedRecord {
+                root_instance_id: &root,
+                guard: &guard,
+            },
+            acknowledge_after_commit,
+        ),
         other => return Err(format!("unsupported checkpoint operation {other}")),
     };
     let stored = memory.load(&root).unwrap().map(|item| item.bytes);
@@ -187,68 +228,22 @@ fn run_checkpoint(directory: &Path, vector: &Value, request: &Value) -> Result<V
         remove_state_digests(&mut actual_semantics);
         return Err(format!(
             "checkpoint_after differs after {}: {}; semantic difference: {}",
-            match &result {
-                Ok(()) => "successful operation".to_string(),
-                Err(error) => format!("{} ({})", error.code, error.message),
-            },
+            serde_json::to_string(&result).unwrap(),
             first_difference(&expected, &actual, ""),
             first_difference(&expected_semantics, &actual_semantics, "")
         ));
     }
-    if vector["expect"]["mutation"] == "none" && stored != initial {
-        return Err("non-mutating vector changed checkpoint bytes".to_string());
-    }
-    let operation_error = result
-        .as_ref()
-        .err()
-        .map(|error| format!("{} ({})", error.code, error.message));
-    let (kind, code) = match result {
-        Ok(()) if stored == initial => ("replayed", None),
-        Ok(()) => ("committed", None),
-        Err(error)
-            if matches!(
-                error.code.as_str(),
-                "injected_pre_commit_failure" | "response_lost_after_commit"
-            ) =>
-        {
-            ("crashed", Some(error.code))
-        }
-        Err(error) => ("rejected", Some(error.code)),
-    };
-    let core_calls = if attempted_core
-        && !(initial.is_some() && operation == "checkpoint_create_v2")
-        && (kind == "committed"
-            || boundary == Some("before_commit")
-            || (operation == "checkpoint_create_v2"
-                && code.as_deref() == Some("creation_rejected")))
-    {
-        1
-    } else {
-        0
-    };
-    let actual = result_value(
-        vector,
-        kind,
-        code.as_deref(),
-        core_calls,
-        directory.file_name().unwrap() == "checkpoint-01-native-lifecycle"
-            && matches!(kind, "committed" | "replayed"),
-    );
+    let actual = serde_json::to_value(result).map_err(load_error)?;
     (actual == pointer_file(directory, &vector["result"]))
         .then_some(actual)
-        .ok_or_else(|| {
-            format!(
-                "operation result mismatch{}",
-                operation_error.map_or_else(String::new, |error| format!(": {error}"))
-            )
-        })
+        .ok_or_else(|| "operation result mismatch".to_string())
 }
 
 fn run_contract(directory: &Path, vector: &Value, request: &Value) -> Value {
     let result = invoke_contract(directory, vector, request);
     match result {
-        Ok(()) => result_value(vector, "validated", None, 0, false),
-        Err(code) => result_value(vector, "rejected", Some(&code), 0, false),
+        Ok(()) => result_value("validated", None, "none", 0, false),
+        Err(code) => result_value("rejected", Some(&code), "none", 0, false),
     }
 }
 
@@ -351,193 +346,141 @@ fn invoke_contract(directory: &Path, vector: &Value, request: &Value) -> Result<
 }
 
 fn run_persistence(directory: &Path, vector: &Value, request: &Value) -> Result<Value, String> {
-    let mut store =
+    let before =
         json_bytes(&fs::read(directory.join(vector["store_before"].as_str().unwrap())).unwrap());
-    let before = store.clone();
     let expected_after =
         json_bytes(&fs::read(directory.join(vector["store_after"].as_str().unwrap())).unwrap());
     let expected_calls =
         json_bytes(&fs::read(directory.join(vector["call_log"].as_str().unwrap())).unwrap())
             ["calls"]
             .clone();
-    let mut calls = vec![
-        json!("select_scope"),
-        json!("resolve_artifacts"),
-        json!("validate_capabilities"),
-    ];
-    let mut core_calls = 0;
-    let mut code = None;
-    let mut broker_acknowledged = false;
-    let mut kind = vector["expect"]["result"].as_str().unwrap();
-    if vector["operation"] == "persistence_release_quarantine_v2" {
-        if store["quarantine"]["event_id"] == request["event_id"] {
-            store["quarantine"]["released"] = json!(true);
-            calls.push(json!("release_quarantine"));
+    let database = std::env::temp_dir().join(format!(
+        "determa-durable-{}-{}-{}.sqlite",
+        std::process::id(),
+        directory.file_name().unwrap().to_string_lossy(),
+        vector["name"].as_str().unwrap()
+    ));
+    let _ = fs::remove_file(&database);
+    let mode = DurableStoreMode::new(
+        if request["retention_mode"] == "permanent" {
+            ReceiptRetentionMode::Permanent
         } else {
-            code = Some("invalid_execution_checkpoint".to_string());
-            kind = "rejected";
-        }
-    } else {
-        let event_id = request["presented_envelope"]["event_id"].as_str().unwrap();
-        let policy = request["transaction_inputs"]["failure_policy"]
-            .as_str()
-            .unwrap();
-        if policy == "permanent_quarantine" {
-            store["quarantine"] = json!({"event_id":event_id,"reason_code":"permanent_processing_failure","released":false});
-            store["inbox"].as_array_mut().unwrap().push(json!({"event_id":event_id,"request_digest":request["envelope_digest"],"disposition":"quarantined"}));
-            calls.push(json!("quarantine"));
-            code = Some("permanent_processing_failure".to_string());
-            kind = "quarantined";
-            if store != expected_after {
-                return Err(format!(
-                    "store_after differs: {}",
-                    first_difference(&expected_after, &store, "")
-                ));
-            }
-            if Value::Array(calls) != expected_calls {
-                return Err("call log differs".to_string());
-            }
-            return Ok(result_value(vector, kind, code.as_deref(), 0, false));
-        }
-        calls.extend([
-            json!("begin_transaction"),
-            json!("read_checkpoint"),
-            json!("check_replay"),
-        ]);
-        let replay = store["inbox"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|record| record["event_id"] == event_id)
-            .filter(|record| {
-                record["disposition"] != "quarantined" || store["quarantine"]["released"] != true
-            });
-        if let Some(prior) = replay {
-            if prior["request_digest"] != request["envelope_digest"] {
-                code = Some("event_id_conflict".to_string());
-                kind = "rejected";
-            } else {
-                broker_acknowledged = true;
-                calls.push(json!("acknowledge"));
-                kind = "replayed";
-            }
-        } else if policy == "transient_retry" {
-            calls.push(json!("rollback"));
-            code = Some("transient_processing_failure".to_string());
-            kind = "rejected";
-        } else {
-            core_calls = 1;
-            calls.push(json!("call_core"));
-            execute_persistence_core(directory, request, &mut store)?;
-            store["inbox"]
-                .as_array_mut()
+            ReceiptRetentionMode::Bounded
+        },
+        OutboxRetentionMode::Bounded,
+    );
+    let sqlite = Arc::new(SqliteExecutionStore::open(&database, mode).map_err(load_error)?);
+    sqlite.initialize_schema().map_err(load_error)?;
+    sqlite
+        .import_durable_host_snapshot(&before)
+        .map_err(load_error)?;
+    let host = CheckpointHost::new(sqlite.clone(), Arc::new(resolver(directory)));
+    let execution = if vector["operation"] == "persistence_release_quarantine_v2" {
+        host.release_durable_quarantine(&DurableQuarantineReleaseRequest {
+            root_instance_id: request["expected_checkpoint"]["root_instance_id"]
+                .as_str()
                 .unwrap()
-                .retain(|record| record["event_id"] != event_id);
-            store["inbox"].as_array_mut().unwrap().push(json!({"event_id":event_id,"request_digest":request["envelope_digest"],"disposition":"committed"}));
-            store["quarantine"] = Value::Null;
-            if let Some(rows) = request["transaction_inputs"]["application_writes"].as_object() {
-                for (key, value) in rows {
-                    store["application_rows"][key] = value.clone();
-                }
-            }
-            calls.extend([
-                json!("stage_checkpoint"),
-                json!("stage_inbox"),
-                json!("stage_outbox"),
-                json!("stage_audit"),
-            ]);
-            if policy == "inject_pre_commit" {
-                store = before.clone();
-                calls.push(json!("rollback"));
-                code = Some("injected_pre_commit_failure".to_string());
-                kind = "crashed";
-            } else {
-                if request["transaction_inputs"]["application_writes"]
-                    .as_object()
-                    .is_some_and(|v| !v.is_empty())
-                {
-                    calls.push(json!("stage_application_rows"));
-                }
-                calls.push(json!("commit"));
-                if policy == "inject_post_commit_response_loss" {
-                    code = Some("response_lost_after_commit".to_string());
-                    kind = "crashed";
-                } else {
-                    broker_acknowledged = true;
-                    calls.push(json!("acknowledge"));
-                }
-            }
-        }
-    }
+                .to_string(),
+            event_id: request["event_id"].as_str().unwrap().to_string(),
+            envelope_digest: request["envelope_digest"].as_str().unwrap().to_string(),
+            reason_code: request["quarantine_reason_code"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            release_authorization: request["release_authorization"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            guard: checkpoint_guard(request),
+        })
+        .map_err(load_error)?
+    } else {
+        let transaction = &request["transaction_inputs"];
+        host.execute_durable_process(&DurableProcessRequest {
+            root_instance_id: request["expected_checkpoint"]["root_instance_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            event_id: request["presented_envelope"]["event_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            envelope_digest: request["envelope_digest"].as_str().unwrap().to_string(),
+            delivery: json!({
+                "delivery_mode": "input",
+                "envelope": request["presented_envelope"],
+                "envelope_digest": request["envelope_digest"]
+            }),
+            processing_mode: "delayed".to_string(),
+            migration: MigrationRequest {
+                target_validated_bundle_fingerprint: transaction
+                    ["target_validated_bundle_fingerprint"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                migration_route: string_array(&transaction["migration_descriptor_digest_route"]),
+                maintenance_mode: false,
+            },
+            migration_limits: ResourceLimits::default(),
+            application_writes: transaction["application_writes"]
+                .as_object()
+                .unwrap()
+                .clone(),
+            failure_policy: failure_policy(transaction["failure_policy"].as_str().unwrap()),
+            guard: checkpoint_guard(request),
+            profile: profile(request["host_profile"].as_str().unwrap()),
+            host_features: features(&request["host_guarantees"]),
+            permanent_retention: request["retention_mode"] == "permanent",
+        })
+        .map_err(load_error)?
+    };
+    let store = sqlite
+        .export_durable_host_snapshot(
+            request["expected_checkpoint"]["root_instance_id"]
+                .as_str()
+                .unwrap(),
+        )
+        .map_err(load_error)?;
+    let _ = fs::remove_file(&database);
     if store != expected_after {
         return Err(format!(
             "store_after differs: {}",
             first_difference(&expected_after, &store, "")
         ));
     }
-    if Value::Array(calls) != expected_calls {
-        return Err("call log differs".to_string());
+    let calls = Value::Array(execution.calls.into_iter().map(Value::String).collect());
+    if calls != expected_calls {
+        return Err(format!(
+            "call log differs: {}",
+            first_difference(&expected_calls, &calls, "")
+        ));
     }
-    Ok(result_value(
-        vector,
-        kind,
-        code.as_deref(),
-        core_calls,
-        broker_acknowledged,
-    ))
-}
-
-fn execute_persistence_core(
-    directory: &Path,
-    request: &Value,
-    store: &mut Value,
-) -> Result<(), String> {
-    let resolver = resolver(directory);
-    let checkpoint = determa_state::checkpoint::restore(
-        &serde_json_canonicalizer::to_vec(&store["checkpoint"]).unwrap(),
-        &resolver,
-    )
-    .map_err(|e| e.to_string())?;
-    let delivery = json!({"delivery_mode":"input","envelope":request["presented_envelope"],"envelope_digest":request["envelope_digest"]});
-    let expected = &request["expected_checkpoint"];
-    let migration = MigrationRequest {
-        target_validated_bundle_fingerprint: request["transaction_inputs"]
-            ["target_validated_bundle_fingerprint"]
-            .as_str()
-            .unwrap()
-            .to_string(),
-        migration_route: string_array(
-            &request["transaction_inputs"]["migration_descriptor_digest_route"],
-        ),
-        maintenance_mode: false,
-    };
-    store["checkpoint"] = determa_state::checkpoint::process_with_migration(
-        &checkpoint,
-        &migration,
-        &resolver,
-        &ResourceLimits::default(),
-        delivery,
-        "delayed",
-        Some(expected["revision"].as_str().unwrap()),
-        Some(expected["digest"].as_str().unwrap()),
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    serde_json::to_value(DurableHostResult {
+        result: execution.result.result,
+        mutation: execution.result.mutation,
+        core_calls: execution.result.core_calls,
+        broker_acknowledged: execution.result.broker_acknowledged,
+        code: execution.result.code,
+    })
+    .map_err(load_error)
 }
 
 fn result_value(
-    vector: &Value,
     kind: &str,
     code: Option<&str>,
+    mutation: &str,
     core_calls: usize,
     broker: bool,
 ) -> Value {
-    let mut value =
-        json!({"result":kind,"mutation":vector["expect"]["mutation"],"core_calls":core_calls});
+    let mut value = json!({
+        "result": kind,
+        "mutation": mutation,
+        "core_calls": core_calls,
+        "broker_acknowledged": broker
+    });
     if let Some(code) = code {
         value["code"] = json!(code);
     }
-    value["broker_acknowledged"] = json!(broker);
     value
 }
 
@@ -580,6 +523,24 @@ fn string_array(value: &Value) -> Vec<String> {
         .iter()
         .map(|item| item.as_str().unwrap().to_string())
         .collect()
+}
+
+fn checkpoint_guard(request: &Value) -> MutationGuard {
+    MutationGuard::new(
+        request["expected_checkpoint"]["revision"].as_str().unwrap(),
+        request["expected_checkpoint"]["digest"].as_str().unwrap(),
+    )
+}
+
+fn failure_policy(value: &str) -> DurableFailurePolicy {
+    match value {
+        "commit" => DurableFailurePolicy::Commit,
+        "inject_pre_commit" => DurableFailurePolicy::InjectPreCommit,
+        "inject_post_commit_response_loss" => DurableFailurePolicy::InjectPostCommitResponseLoss,
+        "transient_retry" => DurableFailurePolicy::TransientRetry,
+        "permanent_quarantine" => DurableFailurePolicy::PermanentQuarantine,
+        value => panic!("unknown durable failure policy {value}"),
+    }
 }
 
 fn prune_request(request: &Value) -> PruneRequest {

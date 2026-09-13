@@ -109,6 +109,9 @@ jobs:
       - name: All 162 native artifact/checkpoint schema-v2 vectors
         run: cargo test --locked --test native_v2_conformance -- --nocapture
 
+      - name: All 381 declared artifact documents
+        run: cargo test --locked --test artifact_manifest -- --nocapture
+
       - name: All 138 durable-host vectors
         run: cargo test --locked --test durable_host_conformance -- --nocapture
 

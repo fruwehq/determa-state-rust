@@ -1,5 +1,7 @@
 #[cfg(feature = "postgresql")]
 use super::adapters::PostgresqlExecutionStore;
+#[cfg(feature = "sqlite")]
+use super::adapters::SqliteExecutionStore;
 #[cfg(feature = "postgresql")]
 use super::store::DurableStoreMode;
 use super::store::{
@@ -7,8 +9,9 @@ use super::store::{
     StoreError, StoreErrorCode, StoreRecord, StoreWriteResult,
 };
 use super::types::{
-    AdmissionSource, PendingOutboxState, ProcessingRequest, PruneRequest, TerminalOutboxOutcome,
-    TransactionalProcessRequest,
+    AdmissionSource, DurableFailurePolicy, DurableHostExecution, DurableHostResult,
+    DurableProcessRequest, DurableQuarantineReleaseRequest, PendingOutboxState, ProcessingRequest,
+    PruneRequest, TerminalOutboxOutcome, TransactionalProcessRequest,
 };
 use super::v2::{
     checkpoint_admit_v2_with_optional_bundle, checkpoint_compact_outbox,
@@ -22,6 +25,9 @@ use crate::format1::{
 };
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
+
+#[cfg(feature = "sqlite")]
+use rusqlite::{params, OptionalExtension};
 
 trait StoreAccess {
     fn load(&mut self, root_instance_id: &str) -> Result<Option<StoreRecord>, StoreError>;
@@ -118,6 +124,94 @@ impl StoreAccess for PostgresqlTransactionStore<'_, '_> {
             expected_checkpoint_digest,
             &replacement,
         )
+    }
+}
+
+#[cfg(feature = "sqlite")]
+struct SqliteTransactionStore<'transaction, 'connection> {
+    transaction: &'transaction rusqlite::Transaction<'connection>,
+    mode: super::store::DurableStoreMode,
+    root_instance_id: &'transaction str,
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteTransactionStore<'_, '_> {
+    fn require_root(&self, root_instance_id: &str) -> Result<(), StoreError> {
+        if root_instance_id == self.root_instance_id {
+            Ok(())
+        } else {
+            Err(StoreError::new(
+                "SQLite host transaction is bound to another root",
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl StoreAccess for SqliteTransactionStore<'_, '_> {
+    fn load(&mut self, root_instance_id: &str) -> Result<Option<StoreRecord>, StoreError> {
+        self.require_root(root_instance_id)?;
+        super::adapters::sqlite::load_record(self.transaction, root_instance_id)
+    }
+
+    fn insert_if_absent(&mut self, record: StoreRecord) -> Result<StoreWriteResult, StoreError> {
+        self.require_root(&record.root_instance_id)?;
+        if super::adapters::sqlite::load_record(self.transaction, &record.root_instance_id)?
+            .is_some()
+        {
+            return Ok(StoreWriteResult::Conflict(
+                super::adapters::sqlite::load_record(self.transaction, &record.root_instance_id)?,
+            ));
+        }
+        super::store::validate_policy_insert(self.mode, &record)?;
+        self.transaction
+            .execute(
+                "INSERT INTO determa_execution_checkpoints
+                 (root_instance_id, revision, checkpoint_digest, checkpoint_bytes)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    record.root_instance_id,
+                    record.revision,
+                    record.execution_checkpoint_digest,
+                    record.bytes
+                ],
+            )
+            .map_err(sqlite_error)?;
+        Ok(StoreWriteResult::Committed)
+    }
+
+    fn compare_and_swap(
+        &mut self,
+        root_instance_id: &str,
+        expected_revision: &str,
+        expected_checkpoint_digest: &str,
+        replacement: StoreRecord,
+    ) -> Result<StoreWriteResult, StoreError> {
+        self.require_root(root_instance_id)?;
+        let current = super::adapters::sqlite::load_record(self.transaction, root_instance_id)?;
+        let Some(current) = current else {
+            return Ok(StoreWriteResult::Conflict(None));
+        };
+        if current.revision != expected_revision
+            || current.execution_checkpoint_digest != expected_checkpoint_digest
+        {
+            return Ok(StoreWriteResult::Conflict(Some(current)));
+        }
+        super::store::validate_policy_replacement(self.mode, &current, &replacement)?;
+        self.transaction
+            .execute(
+                "UPDATE determa_execution_checkpoints
+                 SET revision = ?1, checkpoint_digest = ?2, checkpoint_bytes = ?3
+                 WHERE root_instance_id = ?4",
+                params![
+                    replacement.revision,
+                    replacement.execution_checkpoint_digest,
+                    replacement.bytes,
+                    root_instance_id
+                ],
+            )
+            .map_err(sqlite_error)?;
+        Ok(StoreWriteResult::Committed)
     }
 }
 
@@ -243,6 +337,100 @@ pub struct MaintenanceMigrationRequest {
     pub supplied_request_digest: Option<String>,
     pub guard: MutationGuard,
     pub limits: ResourceLimits,
+}
+
+pub enum DurableCheckpointOperation<'a> {
+    Create {
+        bundle: &'a Bundle,
+        machine_id: &'a str,
+        root_instance_id: &'a str,
+        creation_id: &'a str,
+        bindings: &'a Bindings,
+        supplied_request_digest: Option<&'a str>,
+        replay_retention: JsonValue,
+    },
+    Admit {
+        root_instance_id: &'a str,
+        sources: &'a [AdmissionSource],
+        guard: &'a MutationGuard,
+    },
+    Step {
+        root_instance_id: &'a str,
+        request: &'a ProcessingRequest,
+        guard: &'a MutationGuard,
+    },
+    UpdatePendingOutbox {
+        root_instance_id: &'a str,
+        effect_id: &'a str,
+        desired: PendingOutboxState,
+        guard: &'a MutationGuard,
+    },
+    TerminalizeOutbox {
+        root_instance_id: &'a str,
+        effect_id: &'a str,
+        outcome: TerminalOutboxOutcome,
+        guard: &'a MutationGuard,
+    },
+    CompactOutbox {
+        root_instance_id: &'a str,
+        effect_id: &'a str,
+        guard: &'a MutationGuard,
+    },
+    Prune {
+        root_instance_id: &'a str,
+        request: &'a PruneRequest,
+        guard: &'a MutationGuard,
+    },
+    Tombstone {
+        root_instance_id: &'a str,
+        operation_id: &'a str,
+        guard: &'a MutationGuard,
+    },
+    DeleteRetainedRecord {
+        root_instance_id: &'a str,
+        guard: &'a MutationGuard,
+    },
+}
+
+impl DurableCheckpointOperation<'_> {
+    fn root_instance_id(&self) -> &str {
+        match self {
+            Self::Create {
+                root_instance_id, ..
+            }
+            | Self::Admit {
+                root_instance_id, ..
+            }
+            | Self::Step {
+                root_instance_id, ..
+            }
+            | Self::UpdatePendingOutbox {
+                root_instance_id, ..
+            }
+            | Self::TerminalizeOutbox {
+                root_instance_id, ..
+            }
+            | Self::CompactOutbox {
+                root_instance_id, ..
+            }
+            | Self::Prune {
+                root_instance_id, ..
+            }
+            | Self::Tombstone {
+                root_instance_id, ..
+            }
+            | Self::DeleteRetainedRecord {
+                root_instance_id, ..
+            } => root_instance_id,
+        }
+    }
+
+    fn is_core_operation(&self) -> bool {
+        matches!(
+            self,
+            Self::Create { .. } | Self::Admit { .. } | Self::Step { .. }
+        )
+    }
 }
 
 #[cfg(feature = "postgresql")]
@@ -654,6 +842,517 @@ where
             .transpose()
     }
 
+    pub fn execute_checkpoint_operation(
+        &self,
+        operation: DurableCheckpointOperation<'_>,
+        acknowledge_after_commit: bool,
+    ) -> DurableHostResult {
+        let root_instance_id = operation.root_instance_id().to_string();
+        let before = match self.store.load(&root_instance_id) {
+            Ok(record) => record,
+            Err(_) => {
+                return DurableHostResult::new(
+                    "rejected",
+                    "none",
+                    0,
+                    false,
+                    Some("execution_store_failure"),
+                );
+            }
+        };
+        let core_operation = operation.is_core_operation();
+        let creation_without_checkpoint =
+            matches!(operation, DurableCheckpointOperation::Create { .. }) && before.is_none();
+        let result: Result<(), ArtifactError> = match operation {
+            DurableCheckpointOperation::Create {
+                bundle,
+                machine_id,
+                root_instance_id,
+                creation_id,
+                bindings,
+                supplied_request_digest,
+                replay_retention,
+            } => self
+                .create_checkpoint(
+                    bundle,
+                    machine_id,
+                    root_instance_id,
+                    creation_id,
+                    bindings,
+                    supplied_request_digest,
+                    replay_retention,
+                )
+                .map(|_| ()),
+            DurableCheckpointOperation::Admit {
+                root_instance_id,
+                sources,
+                guard,
+            } => self
+                .admit_checkpoint_sources(root_instance_id, sources, guard)
+                .map(|_| ()),
+            DurableCheckpointOperation::Step {
+                root_instance_id,
+                request,
+                guard,
+            } => self
+                .step_checkpoint(root_instance_id, request, guard)
+                .map(|_| ()),
+            DurableCheckpointOperation::UpdatePendingOutbox {
+                root_instance_id,
+                effect_id,
+                desired,
+                guard,
+            } => self
+                .update_pending_outbox(root_instance_id, effect_id, desired, guard)
+                .map(|_| ()),
+            DurableCheckpointOperation::TerminalizeOutbox {
+                root_instance_id,
+                effect_id,
+                outcome,
+                guard,
+            } => self
+                .terminalize_outbox(root_instance_id, effect_id, outcome, guard)
+                .map(|_| ()),
+            DurableCheckpointOperation::CompactOutbox {
+                root_instance_id,
+                effect_id,
+                guard,
+            } => self
+                .compact_outbox(root_instance_id, effect_id, guard)
+                .map(|_| ()),
+            DurableCheckpointOperation::Prune {
+                root_instance_id,
+                request,
+                guard,
+            } => self
+                .prune_checkpoint(root_instance_id, request, guard)
+                .map(|_| ()),
+            DurableCheckpointOperation::Tombstone {
+                root_instance_id,
+                operation_id,
+                guard,
+            } => self
+                .tombstone_root(root_instance_id, operation_id, guard)
+                .map(|_| ()),
+            DurableCheckpointOperation::DeleteRetainedRecord {
+                root_instance_id,
+                guard,
+            } => self.delete_retained_record(root_instance_id, guard),
+        };
+        let after = match self.store.load(&root_instance_id) {
+            Ok(record) => record,
+            Err(_) => {
+                return DurableHostResult::new(
+                    "crashed",
+                    "none",
+                    u8::from(core_operation),
+                    false,
+                    Some("execution_store_failure"),
+                );
+            }
+        };
+        let changed = before != after;
+        let code = result.as_ref().err().map(|error| error.code.as_str());
+        let crashed = matches!(
+            code,
+            Some("injected_pre_commit_failure" | "response_lost_after_commit")
+        );
+        let committed = result.is_ok() && changed;
+        let replayed = result.is_ok() && !changed;
+        let core_calls = u8::from(
+            creation_without_checkpoint
+                || (core_operation
+                    && (committed
+                        || matches!(code, Some("injected_pre_commit_failure"))
+                        || matches!(code, Some("creation_rejected")))),
+        );
+        DurableHostResult::new(
+            if crashed {
+                "crashed"
+            } else if committed {
+                "committed"
+            } else if replayed {
+                "replayed"
+            } else {
+                "rejected"
+            },
+            if changed { "atomic" } else { "none" },
+            core_calls,
+            acknowledge_after_commit && (committed || replayed),
+            code,
+        )
+    }
+
+    #[cfg(feature = "sqlite")]
+    pub fn execute_durable_process(
+        &self,
+        request: &DurableProcessRequest,
+    ) -> Result<DurableHostExecution, ArtifactError> {
+        let sqlite = self
+            .store
+            .as_any()
+            .downcast_ref::<SqliteExecutionStore>()
+            .ok_or_else(|| {
+                v2_failure(
+                    "invalid_store_scope",
+                    "durable process requires the injected SQLite execution store",
+                )
+            })?;
+        let mut calls = vec!["select_scope".to_string(), "resolve_artifacts".to_string()];
+        self.resolve_durable_process_artifacts(request)?;
+        calls.push("validate_capabilities".to_string());
+        validate_store_host_profile(
+            sqlite,
+            request.profile,
+            &request.host_features,
+            request.permanent_retention,
+        )
+        .map_err(|error| ArtifactError::new(error.code.as_str(), error.message))?;
+
+        if request.failure_policy == DurableFailurePolicy::PermanentQuarantine {
+            sqlite
+                .with_immediate_transaction(|transaction| {
+                    let current = super::adapters::sqlite::load_record(
+                        transaction,
+                        &request.root_instance_id,
+                    )?
+                    .ok_or_else(|| StoreError::new("checkpoint is absent"))?;
+                    validate_durable_guard(&current, &request.guard)?;
+                    transaction
+                        .execute(
+                            "INSERT OR REPLACE INTO determa_durable_inbox
+                             (root_instance_id, event_id, request_digest, disposition)
+                             VALUES (?1, ?2, ?3, 'quarantined')",
+                            params![
+                                request.root_instance_id,
+                                request.event_id,
+                                request.envelope_digest
+                            ],
+                        )
+                        .map_err(sqlite_error)?;
+                    transaction
+                        .execute(
+                            "INSERT OR REPLACE INTO determa_durable_quarantine
+                             (root_instance_id, event_id, reason_code, released)
+                             VALUES (?1, ?2, 'permanent_processing_failure', 0)",
+                            params![request.root_instance_id, request.event_id],
+                        )
+                        .map_err(sqlite_error)?;
+                    Ok(())
+                })
+                .map_err(v2_store_error)?;
+            calls.push("quarantine".to_string());
+            return Ok(DurableHostExecution {
+                result: DurableHostResult::new(
+                    "quarantined",
+                    "atomic",
+                    0,
+                    false,
+                    Some("permanent_processing_failure"),
+                ),
+                calls,
+            });
+        }
+
+        calls.extend([
+            "begin_transaction".to_string(),
+            "read_checkpoint".to_string(),
+            "check_replay".to_string(),
+        ]);
+        let mut execution = sqlite
+            .with_controlled_transaction(|transaction| {
+                let current =
+                    super::adapters::sqlite::load_record(transaction, &request.root_instance_id)?
+                        .ok_or_else(|| StoreError::new("checkpoint is absent"))?;
+                validate_durable_guard(&current, &request.guard)?;
+                let retained = transaction
+                    .query_row(
+                        "SELECT request_digest, disposition
+                         FROM determa_durable_inbox
+                         WHERE root_instance_id = ?1 AND event_id = ?2",
+                        params![request.root_instance_id, request.event_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?;
+                let quarantine_released = transaction
+                    .query_row(
+                        "SELECT released FROM determa_durable_quarantine
+                         WHERE root_instance_id = ?1 AND event_id = ?2",
+                        params![request.root_instance_id, request.event_id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?
+                    .unwrap_or(false);
+                if let Some((digest, disposition)) = retained {
+                    if disposition != "quarantined" || !quarantine_released {
+                        let result = if digest == request.envelope_digest {
+                            DurableHostResult::new("replayed", "none", 0, true, None)
+                        } else {
+                            DurableHostResult::new(
+                                "rejected",
+                                "none",
+                                0,
+                                false,
+                                Some("event_id_conflict"),
+                            )
+                        };
+                        return Ok((
+                            DurableHostExecution {
+                                result,
+                                calls: Vec::new(),
+                            },
+                            true,
+                        ));
+                    }
+                }
+                if request.failure_policy == DurableFailurePolicy::TransientRetry {
+                    return Ok((
+                        DurableHostExecution {
+                            result: DurableHostResult::new(
+                                "rejected",
+                                "none",
+                                0,
+                                false,
+                                Some("transient_processing_failure"),
+                            ),
+                            calls: Vec::new(),
+                        },
+                        false,
+                    ));
+                }
+
+                let mut transactional_store = SqliteTransactionStore {
+                    transaction,
+                    mode: sqlite.mode(),
+                    root_instance_id: &request.root_instance_id,
+                };
+                let process = TransactionalProcessRequest {
+                    delivery: request.delivery.clone(),
+                    processing_mode: request.processing_mode.clone(),
+                    migration: request.migration.clone(),
+                    migration_limits: request.migration_limits.clone(),
+                };
+                let result = self.transactional_process_with_store(
+                    &mut transactional_store,
+                    &request.root_instance_id,
+                    &process,
+                    &request.guard,
+                );
+                let checkpoint = match result {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => {
+                        return Ok((
+                            DurableHostExecution {
+                                result: DurableHostResult::new(
+                                    "rejected",
+                                    "none",
+                                    1,
+                                    false,
+                                    Some(&error.code),
+                                ),
+                                calls: Vec::new(),
+                            },
+                            false,
+                        ));
+                    }
+                };
+                transaction
+                    .execute(
+                        "INSERT OR REPLACE INTO determa_durable_inbox
+                         (root_instance_id, event_id, request_digest, disposition)
+                         VALUES (?1, ?2, ?3, 'committed')",
+                        params![
+                            request.root_instance_id,
+                            request.event_id,
+                            request.envelope_digest
+                        ],
+                    )
+                    .map_err(sqlite_error)?;
+                transaction
+                    .execute(
+                        "DELETE FROM determa_durable_quarantine WHERE root_instance_id = ?1",
+                        params![request.root_instance_id],
+                    )
+                    .map_err(sqlite_error)?;
+                for (key, value) in &request.application_writes {
+                    let bytes = serde_json_canonicalizer::to_vec(value)
+                        .map_err(|error| StoreError::new(error.to_string()))?;
+                    let value = String::from_utf8(bytes)
+                        .map_err(|error| StoreError::new(error.to_string()))?;
+                    transaction
+                        .execute(
+                            "INSERT OR REPLACE INTO determa_durable_application_rows
+                             (root_instance_id, row_key, row_value) VALUES (?1, ?2, ?3)",
+                            params![request.root_instance_id, key, value],
+                        )
+                        .map_err(sqlite_error)?;
+                }
+                let _ = checkpoint;
+                let post_commit_loss =
+                    request.failure_policy == DurableFailurePolicy::InjectPostCommitResponseLoss;
+                Ok((
+                    DurableHostExecution {
+                        result: DurableHostResult::new(
+                            if post_commit_loss {
+                                "crashed"
+                            } else {
+                                "committed"
+                            },
+                            "atomic",
+                            1,
+                            !post_commit_loss,
+                            post_commit_loss.then_some("response_lost_after_commit"),
+                        ),
+                        calls: Vec::new(),
+                    },
+                    request.failure_policy != DurableFailurePolicy::InjectPreCommit,
+                ))
+            })
+            .map_err(v2_store_error)?;
+
+        match execution.result.result.as_str() {
+            "replayed" => calls.push("acknowledge".to_string()),
+            "rejected"
+                if execution.result.code.as_deref() == Some("transient_processing_failure") =>
+            {
+                calls.push("rollback".to_string());
+            }
+            "committed" | "crashed" => {
+                calls.extend([
+                    "call_core".to_string(),
+                    "stage_checkpoint".to_string(),
+                    "stage_inbox".to_string(),
+                    "stage_outbox".to_string(),
+                    "stage_audit".to_string(),
+                ]);
+                if request.failure_policy == DurableFailurePolicy::InjectPreCommit {
+                    execution.result = DurableHostResult::new(
+                        "crashed",
+                        "none",
+                        1,
+                        false,
+                        Some("injected_pre_commit_failure"),
+                    );
+                    calls.push("rollback".to_string());
+                } else {
+                    if !request.application_writes.is_empty() {
+                        calls.push("stage_application_rows".to_string());
+                    }
+                    calls.push("commit".to_string());
+                    if execution.result.broker_acknowledged {
+                        calls.push("acknowledge".to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        execution.calls = calls;
+        Ok(execution)
+    }
+
+    #[cfg(feature = "sqlite")]
+    pub fn release_durable_quarantine(
+        &self,
+        request: &DurableQuarantineReleaseRequest,
+    ) -> Result<DurableHostExecution, ArtifactError> {
+        let sqlite = self
+            .store
+            .as_any()
+            .downcast_ref::<SqliteExecutionStore>()
+            .ok_or_else(|| v2_failure("invalid_store_scope", "SQLite execution store required"))?;
+        sqlite
+            .with_immediate_transaction(|transaction| {
+                let current =
+                    super::adapters::sqlite::load_record(transaction, &request.root_instance_id)?
+                        .ok_or_else(|| StoreError::new("checkpoint is absent"))?;
+                validate_durable_guard(&current, &request.guard)?;
+                let retained = transaction
+                    .query_row(
+                        "SELECT i.request_digest, q.reason_code, q.released
+                         FROM determa_durable_inbox i
+                         JOIN determa_durable_quarantine q
+                           ON q.root_instance_id = i.root_instance_id
+                          AND q.event_id = i.event_id
+                         WHERE i.root_instance_id = ?1 AND i.event_id = ?2",
+                        params![request.root_instance_id, request.event_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, bool>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?;
+                let Some((digest, reason, released)) = retained else {
+                    return Err(StoreError::new("quarantine identity is absent"));
+                };
+                if digest != request.envelope_digest
+                    || reason != request.reason_code
+                    || request.release_authorization.is_empty()
+                {
+                    return Err(StoreError::new("quarantine release identity is invalid"));
+                }
+                if !released {
+                    transaction
+                        .execute(
+                            "UPDATE determa_durable_quarantine SET released = 1
+                             WHERE root_instance_id = ?1",
+                            params![request.root_instance_id],
+                        )
+                        .map_err(sqlite_error)?;
+                }
+                Ok(())
+            })
+            .map_err(v2_store_error)?;
+        Ok(DurableHostExecution {
+            result: DurableHostResult::new("released", "atomic", 0, false, None),
+            calls: vec![
+                "select_scope".to_string(),
+                "resolve_artifacts".to_string(),
+                "validate_capabilities".to_string(),
+                "release_quarantine".to_string(),
+            ],
+        })
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn resolve_durable_process_artifacts(
+        &self,
+        request: &DurableProcessRequest,
+    ) -> Result<(), ArtifactError> {
+        let target = self
+            .resolver
+            .resolve_definition(&request.migration.target_validated_bundle_fingerprint)
+            .ok_or_else(|| v2_failure("source_definition_unavailable", "target unavailable"))?;
+        if !target.trusted
+            || target.bundle.fingerprint != request.migration.target_validated_bundle_fingerprint
+        {
+            return Err(v2_failure(
+                "definition_not_trusted",
+                "target definition is not trusted",
+            ));
+        }
+        for digest in &request.migration.migration_route {
+            let descriptor = self
+                .resolver
+                .resolve_migration_descriptor(digest)
+                .ok_or_else(|| {
+                    v2_failure("migration_descriptor_not_found", "descriptor unavailable")
+                })?;
+            if !descriptor.trusted {
+                return Err(v2_failure(
+                    "migration_descriptor_untrusted",
+                    "descriptor is not trusted",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_checkpoint(
         &self,
@@ -707,7 +1406,10 @@ where
             replay_retention,
         )
         .map_err(|error| {
-            if crate::format1::CREATION_REJECTION_CODES.contains(&error.code.as_str()) {
+            if crate::format1::CreationRejectionCode::PORTABLE_CODES
+                .iter()
+                .any(|code| code.as_str() == error.code)
+            {
                 v2_failure("creation_rejected", &error.message)
             } else {
                 error
@@ -1339,6 +2041,22 @@ fn maintenance_request_digest(
 
 fn v2_store_error(error: StoreError) -> ArtifactError {
     ArtifactError::new(error.code.as_str(), error.message)
+}
+
+#[cfg(feature = "sqlite")]
+fn validate_durable_guard(record: &StoreRecord, guard: &MutationGuard) -> Result<(), StoreError> {
+    if record.revision == guard.expected_revision
+        && record.execution_checkpoint_digest == guard.expected_checkpoint_digest
+    {
+        Ok(())
+    } else {
+        Err(StoreError::new("checkpoint compare-and-swap guard differs"))
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn sqlite_error(error: rusqlite::Error) -> StoreError {
+    StoreError::new(error.to_string())
 }
 
 #[cfg(feature = "postgresql")]

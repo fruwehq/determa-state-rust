@@ -11,6 +11,7 @@ use super::model::{
 };
 use crate::value::{InstanceReference, Value};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,13 +80,6 @@ impl CreationRejectionCode {
     }
 }
 
-/// Complete creation-rejection set defined by the portable registry.
-pub const CREATION_REJECTION_CODES: &[&str] = &[
-    CreationRejectionCode::InvalidBinding.as_str(),
-    CreationRejectionCode::InvalidCreationRequest.as_str(),
-    CreationRejectionCode::InvalidMachineTarget.as_str(),
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Portable rejection codes emitted while dispatching a delivery.
 pub enum DispatchRejectionCode {
@@ -121,17 +115,6 @@ impl DispatchRejectionCode {
         }
     }
 }
-
-/// Complete dispatch-rejection set defined by the portable registry.
-pub const DISPATCH_REJECTION_CODES: &[&str] = &[
-    DispatchRejectionCode::InactiveComponentTarget.as_str(),
-    DispatchRejectionCode::IncompatibleBundle.as_str(),
-    DispatchRejectionCode::InvalidCorrelation.as_str(),
-    DispatchRejectionCode::InvalidEvent.as_str(),
-    DispatchRejectionCode::InvalidInstanceTarget.as_str(),
-    DispatchRejectionCode::InvalidPayload.as_str(),
-    DispatchRejectionCode::InvalidPriorState.as_str(),
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Portable fault codes recorded by format-1 engine execution.
@@ -175,19 +158,6 @@ impl EngineFaultCode {
     }
 }
 
-/// Complete engine-fault set defined by the portable registry.
-pub const ENGINE_FAULT_CODES: &[&str] = &[
-    EngineFaultCode::ActionFault.as_str(),
-    EngineFaultCode::BindingNotEmpty.as_str(),
-    EngineFaultCode::CascadeFault.as_str(),
-    EngineFaultCode::ContainedRuntimeFault.as_str(),
-    EngineFaultCode::DeferredEventCapacityExceeded.as_str(),
-    EngineFaultCode::GuardFault.as_str(),
-    EngineFaultCode::InactiveComponentTarget.as_str(),
-    EngineFaultCode::InvalidInstanceTarget.as_str(),
-    EngineFaultCode::InvariantFault.as_str(),
-];
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rejection {
     pub code: String,
@@ -226,7 +196,7 @@ pub struct Emission {
 pub struct CoreResult {
     pub status: ResultStatus,
     pub disposition: Option<Disposition>,
-    pub state: Option<AggregateState>,
+    pub state: Option<NativeAggregate>,
     pub emissions: Vec<Emission>,
     pub fault: Option<FaultRecord>,
     pub rejection: Option<Rejection>,
@@ -241,7 +211,8 @@ pub enum ResultStatus {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct AggregateState {
+pub struct NativeAggregate {
+    pub(crate) document: JsonValue,
     pub validated_bundle_fingerprint: String,
     pub namespace: String,
     pub root_instance_id: String,
@@ -251,6 +222,18 @@ pub(crate) struct AggregateState {
     pub root: RuntimeState,
     pub next_logical_step_sequence: Counter,
     pub next_output_sequence: Counter,
+    pub next_acceptance_sequence: Counter,
+    pub next_queue_sequence: Counter,
+}
+
+impl NativeAggregate {
+    pub fn value(&self) -> &JsonValue {
+        &self.document
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, super::v2::Version2Error> {
+        super::v2::canonical_bytes(&self.document)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -275,6 +258,8 @@ pub struct RuntimeState {
     pub active_state_activation_sequence: BTreeMap<String, Counter>,
     pub fault: Option<FaultRecord>,
     pub relation: RuntimeRelation,
+    pub(crate) ready_mailbox: Vec<JsonValue>,
+    pub(crate) deferred_mailbox: Vec<JsonValue>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -345,7 +330,7 @@ struct StepContext<'a> {
     emissions: &'a mut Vec<Emission>,
 }
 
-pub(crate) fn create_runtime_aggregate(
+pub(crate) fn create_native_aggregate(
     bundle: &Bundle,
     machine_id: &str,
     root_instance_id: &str,
@@ -364,7 +349,8 @@ pub(crate) fn create_runtime_aggregate(
         root_instance_id: root_instance_id.to_string(),
         root_runtime_id: root_runtime_id.clone(),
     };
-    let mut aggregate = AggregateState {
+    let mut aggregate = NativeAggregate {
+        document: JsonValue::Null,
         validated_bundle_fingerprint: bundle.fingerprint.clone(),
         namespace: bundle.namespace.clone(),
         root_instance_id: root_instance_id.to_string(),
@@ -385,6 +371,8 @@ pub(crate) fn create_runtime_aggregate(
         ),
         next_logical_step_sequence: Counter::zero(),
         next_output_sequence: Counter::zero(),
+        next_acceptance_sequence: Counter::zero(),
+        next_queue_sequence: Counter::zero(),
     };
     if initialize_root_variables(&mut aggregate.root, bindings).is_err() {
         return rejected_creation(CreationRejectionCode::InvalidBinding);
@@ -455,9 +443,9 @@ pub(crate) fn create_runtime_aggregate(
     }
 }
 
-pub(crate) fn dispatch_runtime_aggregate(
+pub(crate) fn step_native_aggregate(
     bundle: &Bundle,
-    prior_state: &AggregateState,
+    prior_state: &NativeAggregate,
     delivery: Option<Delivery>,
 ) -> CoreResult {
     if !validate_prior_state(prior_state) {
@@ -620,7 +608,7 @@ enum DeliveryMode {
 
 pub(crate) fn validate_delivery_for_admission(
     bundle: &Bundle,
-    aggregate: &AggregateState,
+    aggregate: &NativeAggregate,
     delivery: &Delivery,
 ) -> Result<String, DispatchRejectionCode> {
     let (mode, envelope) = match delivery {
@@ -663,7 +651,7 @@ pub(crate) fn validate_delivery_for_admission(
 
 pub(crate) fn validate_queued_event_for_migration(
     bundle: &Bundle,
-    aggregate: &AggregateState,
+    aggregate: &NativeAggregate,
     delivery: &Delivery,
 ) -> Result<(), DispatchRejectionCode> {
     let (mode, envelope) = match delivery {
@@ -746,7 +734,7 @@ pub(crate) fn deferred_event_capacity(runtime: &RuntimeState) -> Option<i64> {
 
 pub(crate) fn fault_deferred_capacity(
     bundle: &Bundle,
-    aggregate: &AggregateState,
+    aggregate: &NativeAggregate,
     envelope: &Envelope,
 ) -> CoreResult {
     let address = resolve_delivery_target(aggregate, &envelope.target)
@@ -808,6 +796,8 @@ impl RuntimeState {
             active_state_activation_sequence: BTreeMap::new(),
             fault: None,
             relation,
+            ready_mailbox: Vec::new(),
+            deferred_mailbox: Vec::new(),
         }
     }
 
@@ -850,7 +840,7 @@ fn rejected_creation(code: CreationRejectionCode) -> CoreResult {
     }
 }
 
-fn rejected_dispatch(prior_state: &AggregateState, code: DispatchRejectionCode) -> CoreResult {
+fn rejected_dispatch(prior_state: &NativeAggregate, code: DispatchRejectionCode) -> CoreResult {
     CoreResult {
         status: result_status(prior_state.root.status),
         disposition: Some(Disposition::Rejected),
@@ -865,7 +855,7 @@ fn rejected_dispatch(prior_state: &AggregateState, code: DispatchRejectionCode) 
 
 fn fault_dispatch(
     _bundle: &Bundle,
-    prior_state: &AggregateState,
+    prior_state: &NativeAggregate,
     address: &RuntimeAddress,
     envelope: &Envelope,
     fault: StepFault,
@@ -913,7 +903,7 @@ fn fault_dispatch(
     }
 }
 
-fn validate_prior_state(state: &AggregateState) -> bool {
+fn validate_prior_state(state: &NativeAggregate) -> bool {
     if state.validated_bundle_fingerprint.is_empty()
         || state.namespace.is_empty()
         || state.root_instance_id.is_empty()
@@ -926,7 +916,7 @@ fn validate_prior_state(state: &AggregateState) -> bool {
     validate_runtime_shape(state, &state.root, &state.root.definition)
 }
 
-fn validate_root_identity(state: &AggregateState) -> bool {
+fn validate_root_identity(state: &NativeAggregate) -> bool {
     let IdentityOrigin::Root {
         definition,
         root_instance_id,
@@ -954,7 +944,7 @@ fn validate_root_identity(state: &AggregateState) -> bool {
             }
 }
 
-fn validate_runtime_identity(aggregate: &AggregateState, runtime: &RuntimeState) -> bool {
+fn validate_runtime_identity(aggregate: &NativeAggregate, runtime: &RuntimeState) -> bool {
     match (
         &runtime.identity_origin,
         &runtime.target_identity,
@@ -1065,7 +1055,7 @@ fn validate_runtime_identity(aggregate: &AggregateState, runtime: &RuntimeState)
     }
 }
 
-fn validate_prior_state_bundle_binding(state: &AggregateState, bundle: &Bundle) -> bool {
+fn validate_prior_state_bundle_binding(state: &NativeAggregate, bundle: &Bundle) -> bool {
     if state.namespace != bundle.namespace {
         return false;
     }
@@ -1075,14 +1065,14 @@ fn validate_prior_state_bundle_binding(state: &AggregateState, bundle: &Bundle) 
     validate_runtime_bundle_binding(&state.root, machine, bundle)
 }
 
-pub(crate) fn aggregate_is_valid_for_bundle(state: &AggregateState, bundle: &Bundle) -> bool {
+pub(crate) fn aggregate_is_valid_for_bundle(state: &NativeAggregate, bundle: &Bundle) -> bool {
     validate_prior_state(state)
         && state.validated_bundle_fingerprint == bundle.fingerprint
         && validate_prior_state_bundle_binding(state, bundle)
 }
 
 fn validate_runtime_shape(
-    aggregate: &AggregateState,
+    aggregate: &NativeAggregate,
     runtime: &RuntimeState,
     expected_definition: &Machine,
 ) -> bool {
@@ -1814,7 +1804,7 @@ fn initialize_root_variables(runtime: &mut RuntimeState, bindings: &Bindings) ->
 }
 
 fn resolve_delivery_target(
-    aggregate: &AggregateState,
+    aggregate: &NativeAggregate,
     target: &Target,
 ) -> Result<RuntimeAddress, DispatchRejectionCode> {
     match target {
@@ -4164,7 +4154,7 @@ fn dispose_completed_spawned_at_path(runtime: &mut RuntimeState, address: &[Addr
 }
 
 fn append_parallel_done_if_needed(
-    aggregate: &mut AggregateState,
+    aggregate: &mut NativeAggregate,
     address: &[AddressSegment],
     cause_id: &str,
     step_sequence: Counter,
@@ -4347,7 +4337,7 @@ fn direct_child_path(leaf: &str, parent: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::{create_runtime_aggregate as create, dispatch_runtime_aggregate as dispatch};
+    use super::{create_native_aggregate as create, step_native_aggregate as dispatch};
     use crate::format1::load_bundle;
 
     const IDENTITY_VECTOR_BUNDLE: &str = r#"
