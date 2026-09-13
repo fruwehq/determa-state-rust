@@ -8,7 +8,7 @@ pub(crate) mod native;
 mod package;
 mod persistence;
 mod runtime;
-#[cfg(test)]
+#[cfg(all(test, determa_repository_conformance))]
 mod runtime_conformance;
 mod source;
 pub(crate) mod strict_json;

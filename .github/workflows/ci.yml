@@ -44,6 +44,15 @@ jobs:
           cargo build --release --locked --all-features
           cargo test --locked --all-features
 
+      - name: Test the generated crate without repository fixtures
+        run: |
+          cargo package --locked
+          package_dir="$(mktemp -d)"
+          tar -xzf target/package/determa-state-0.2.0.crate -C "$package_dir"
+          cd "$package_dir/determa-state-0.2.0"
+          cargo test --locked
+          cargo test --locked --all-features
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest
@@ -110,6 +119,8 @@ jobs:
         run: cargo test --locked --lib --bins --test public_api --test closed_code_registry --test checkpoint_adapters
 
       - name: All 75 authoritative mailbox-neutral RTC scenarios
+        env:
+          RUSTFLAGS: --cfg determa_repository_conformance
         run: cargo test --locked --lib format1::runtime_conformance::all_75_format_1_runtime_scenarios -- --nocapture
 
       - name: Documentation tests
