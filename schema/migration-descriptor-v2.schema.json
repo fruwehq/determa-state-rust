@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://determa.dev/state/schema/migration-descriptor.schema.json",
+  "$id": "https://determa.dev/state/schema/migration-descriptor-v2.schema.json",
   "title": "Determa State aggregate migration descriptor",
-  "description": "Closed declarative migration schema for migration_descriptor_schema_version 1.",
+  "description": "Closed declarative migration schema for the sole supported queue-bearing aggregate artifact.",
   "$ref": "#/$defs/migrationDescriptor",
   "$defs": {
     "identifier": {
@@ -474,6 +474,8 @@
         "mappings",
         "terminal_policy",
         "resource_requirements",
+        "queued_event_default",
+        "queued_event_rules",
         "migration_descriptor_digest"
       ],
       "additionalProperties": false,
@@ -482,7 +484,7 @@
           "const": "determa.aggregate_migration"
         },
         "migration_descriptor_schema_version": {
-          "const": 1
+          "const": 2
         },
         "source_machine_format": {
           "const": 1
@@ -519,6 +521,15 @@
         },
         "migration_descriptor_digest": {
           "$ref": "#/$defs/sha256"
+        },
+        "queued_event_default": {
+          "const": "preserve_if_compatible"
+        },
+        "queued_event_rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/queuedEventRule"
+          }
         }
       },
       "allOf": [
@@ -583,6 +594,55 @@
           }
         }
       ]
+    },
+    "eventName": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "enum": [
+            "determa.component_completed",
+            "determa.component_failed",
+            "determa.spawned_instance_failed"
+          ]
+        }
+      ]
+    },
+    "disposeRule": {
+      "type": "object",
+      "required": [
+        "machine_id",
+        "event",
+        "delivery_mode",
+        "action",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "machine_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "event": {
+          "$ref": "#/$defs/eventName"
+        },
+        "delivery_mode": {
+          "enum": [
+            "input",
+            "internal"
+          ]
+        },
+        "action": {
+          "const": "dispose"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "queuedEventRule": {
+      "$ref": "#/$defs/disposeRule"
     }
   }
 }

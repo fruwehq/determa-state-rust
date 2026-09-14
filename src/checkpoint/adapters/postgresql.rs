@@ -226,7 +226,7 @@ impl ExecutionStore for PostgresqlExecutionStore {
                     CONSTRAINT determa_execution_store_metadata_singleton_check
                         CHECK (singleton),
                     CONSTRAINT determa_execution_store_metadata_version_check
-                        CHECK (schema_version = 1),
+                        CHECK (schema_version = 2),
                     CONSTRAINT determa_execution_store_metadata_receipt_check
                         CHECK (receipt_retention IN ('bounded', 'permanent')),
                     CONSTRAINT determa_execution_store_metadata_outbox_check
@@ -267,7 +267,7 @@ impl ExecutionStore for PostgresqlExecutionStore {
                 "
                 INSERT INTO determa_execution_store_metadata
                     (singleton, schema_version, receipt_retention, outbox_retention)
-                VALUES (TRUE, 1, $1, $2)
+                VALUES (TRUE, 2, $1, $2)
                 ON CONFLICT (singleton) DO NOTHING
                 ",
                 &[
@@ -430,7 +430,7 @@ fn verify_schema_contract(
     );
     if metadata
         != (
-            1,
+            2,
             mode.receipt_retention.as_str().to_string(),
             mode.outbox_retention.as_str().to_string(),
         )
@@ -455,7 +455,7 @@ fn verify_schema_contract(
             ]
     {
         return Err(StoreError::new(
-            "PostgreSQL execution-store columns do not match schema version 1",
+            "PostgreSQL execution-store columns do not match schema version 2",
         ));
     }
     if table_constraints(client, "determa_execution_store_metadata")?
@@ -464,7 +464,7 @@ fn verify_schema_contract(
             "determa_execution_store_metadata_primary_key|p|PRIMARY KEY (singleton)",
             "determa_execution_store_metadata_receipt_check|c|CHECK (receipt_retention = ANY (ARRAY['bounded', 'permanent']))",
             "determa_execution_store_metadata_singleton_check|c|CHECK (singleton)",
-            "determa_execution_store_metadata_version_check|c|CHECK (schema_version = 1)",
+            "determa_execution_store_metadata_version_check|c|CHECK (schema_version = 2)",
         ]
         || table_constraints(client, "determa_execution_checkpoints")?
             != [
@@ -476,7 +476,7 @@ fn verify_schema_contract(
             ]
     {
         return Err(StoreError::new(
-            "PostgreSQL execution-store constraints do not match schema version 1",
+            "PostgreSQL execution-store constraints do not match schema version 2",
         ));
     }
     let triggers = client
@@ -500,7 +500,7 @@ fn verify_schema_contract(
         .map_err(pg_error)?;
     if triggers.len() != 1 {
         return Err(StoreError::new(
-            "PostgreSQL checkpoint deletion trigger does not match schema version 1",
+            "PostgreSQL checkpoint deletion trigger does not match schema version 2",
         ));
     }
     let trigger = &triggers[0];
@@ -518,7 +518,7 @@ fn verify_schema_contract(
         != "determa_execution_checkpoints_no_delete|O|true|true|true|determa_reject_checkpoint_delete|BEGIN RAISE EXCEPTION 'physical checkpoint deletion is unsupported'; END"
     {
         return Err(StoreError::new(
-            "PostgreSQL checkpoint deletion trigger does not match schema version 1",
+            "PostgreSQL checkpoint deletion trigger does not match schema version 2",
         ));
     }
     Ok(())

@@ -4,6 +4,7 @@ use super::super::store::{
     ExecutionStoreFactory, HealthStatus, StoreError, StoreRecord, StoreWriteResult,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde_json::{json, Map, Value};
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -45,6 +46,131 @@ impl SqliteExecutionStore {
             .lock()
             .map_err(|_| StoreError::new("SQLite connection lock is poisoned"))
     }
+
+    pub(crate) fn with_immediate_transaction<T>(
+        &self,
+        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let result = operation(&transaction)?;
+        transaction.commit().map_err(sql_error)?;
+        Ok(result)
+    }
+
+    pub(crate) fn with_controlled_transaction<T>(
+        &self,
+        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<(T, bool), StoreError>,
+    ) -> Result<T, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let (result, commit) = operation(&transaction)?;
+        if commit {
+            transaction.commit().map_err(sql_error)?;
+        } else {
+            transaction.rollback().map_err(sql_error)?;
+        }
+        Ok(result)
+    }
+
+    pub fn import_durable_host_snapshot(&self, value: &Value) -> Result<(), StoreError> {
+        let checkpoint = value
+            .get("checkpoint")
+            .ok_or_else(|| StoreError::new("durable host snapshot checkpoint is absent"))?;
+        let root_instance_id = checkpoint["root_instance_id"]
+            .as_str()
+            .ok_or_else(|| StoreError::new("snapshot checkpoint root is absent"))?;
+        let record = StoreRecord {
+            root_instance_id: root_instance_id.to_string(),
+            revision: checkpoint["revision"]
+                .as_str()
+                .ok_or_else(|| StoreError::new("snapshot checkpoint revision is absent"))?
+                .to_string(),
+            execution_checkpoint_digest: checkpoint["execution_checkpoint_digest"]
+                .as_str()
+                .ok_or_else(|| StoreError::new("snapshot checkpoint digest is absent"))?
+                .to_string(),
+            bytes: serde_json_canonicalizer::to_vec(checkpoint)
+                .map_err(|error| StoreError::new(error.to_string()))?,
+        };
+        validate_policy_insert(self.mode, &record)?;
+        self.with_immediate_transaction(|transaction| {
+            if load_record(transaction, root_instance_id)?.is_some() {
+                return Err(StoreError::new("durable host snapshot root already exists"));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO determa_execution_checkpoints
+                     (root_instance_id, revision, checkpoint_digest, checkpoint_bytes)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        record.root_instance_id,
+                        record.revision,
+                        record.execution_checkpoint_digest,
+                        record.bytes
+                    ],
+                )
+                .map_err(sql_error)?;
+            for inbox in value["inbox"]
+                .as_array()
+                .ok_or_else(|| StoreError::new("snapshot inbox is not an array"))?
+            {
+                transaction
+                    .execute(
+                        "INSERT INTO determa_durable_inbox
+                         (root_instance_id, event_id, request_digest, disposition)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            root_instance_id,
+                            inbox["event_id"].as_str(),
+                            inbox["request_digest"].as_str(),
+                            inbox["disposition"].as_str()
+                        ],
+                    )
+                    .map_err(sql_error)?;
+            }
+            for (key, application_value) in value["application_rows"]
+                .as_object()
+                .ok_or_else(|| StoreError::new("snapshot application rows are not an object"))?
+            {
+                transaction
+                    .execute(
+                        "INSERT INTO determa_durable_application_rows
+                         (root_instance_id, row_key, row_value) VALUES (?1, ?2, ?3)",
+                        params![root_instance_id, key, canonical_json(application_value)?],
+                    )
+                    .map_err(sql_error)?;
+            }
+            if !value["quarantine"].is_null() {
+                transaction
+                    .execute(
+                        "INSERT INTO determa_durable_quarantine
+                         (root_instance_id, event_id, reason_code, released)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            root_instance_id,
+                            value["quarantine"]["event_id"].as_str(),
+                            value["quarantine"]["reason_code"].as_str(),
+                            value["quarantine"]["released"].as_bool()
+                        ],
+                    )
+                    .map_err(sql_error)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn export_durable_host_snapshot(
+        &self,
+        root_instance_id: &str,
+    ) -> Result<Value, StoreError> {
+        let connection = self.connection()?;
+        durable_snapshot(&connection, root_instance_id)
+    }
 }
 
 impl ExecutionStore for SqliteExecutionStore {
@@ -56,6 +182,7 @@ impl ExecutionStore for SqliteExecutionStore {
         let mut capabilities = BTreeSet::from([
             ExecutionStoreCapability::DurableSingleWriter,
             ExecutionStoreCapability::RootIdentityRetention,
+            ExecutionStoreCapability::SharedApplicationTransaction,
         ]);
         self.mode.add_capabilities(&mut capabilities);
         capabilities
@@ -79,7 +206,7 @@ impl ExecutionStore for SqliteExecutionStore {
                     CONSTRAINT determa_execution_store_metadata_singleton_check
                         CHECK (singleton = 1),
                     CONSTRAINT determa_execution_store_metadata_version_check
-                        CHECK (schema_version = 1),
+                        CHECK (schema_version = 2),
                     CONSTRAINT determa_execution_store_metadata_receipt_check
                         CHECK (receipt_retention IN ('bounded', 'permanent')),
                     CONSTRAINT determa_execution_store_metadata_outbox_check
@@ -116,6 +243,26 @@ impl ExecutionStore for SqliteExecutionStore {
                 BEGIN
                     SELECT RAISE(ABORT, 'physical checkpoint deletion is unsupported');
                 END;
+                CREATE TABLE IF NOT EXISTS determa_durable_inbox (
+                    root_instance_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    disposition TEXT NOT NULL,
+                    PRIMARY KEY (root_instance_id, event_id),
+                    CHECK (disposition IN ('committed', 'quarantined'))
+                );
+                CREATE TABLE IF NOT EXISTS determa_durable_application_rows (
+                    root_instance_id TEXT NOT NULL,
+                    row_key TEXT NOT NULL,
+                    row_value TEXT NOT NULL,
+                    PRIMARY KEY (root_instance_id, row_key)
+                );
+                CREATE TABLE IF NOT EXISTS determa_durable_quarantine (
+                    root_instance_id TEXT NOT NULL PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    released INTEGER NOT NULL CHECK (released IN (0, 1))
+                );
                 ",
             )
             .map_err(sql_error)?;
@@ -124,7 +271,7 @@ impl ExecutionStore for SqliteExecutionStore {
                 "
                 INSERT OR IGNORE INTO determa_execution_store_metadata
                     (singleton, schema_version, receipt_retention, outbox_retention)
-                VALUES (1, 1, ?1, ?2)
+                VALUES (1, 2, ?1, ?2)
                 ",
                 params![
                     self.mode.receipt_retention.as_str(),
@@ -297,7 +444,7 @@ impl ExecutionStoreFactory for SqliteExecutionStoreFactory {
     }
 }
 
-fn load_record(
+pub(crate) fn load_record(
     connection: &Connection,
     root_instance_id: &str,
 ) -> Result<Option<StoreRecord>, StoreError> {
@@ -320,6 +467,85 @@ fn load_record(
         )
         .optional()
         .map_err(sql_error)
+}
+
+fn canonical_json(value: &Value) -> Result<String, StoreError> {
+    let bytes = serde_json_canonicalizer::to_vec(value)
+        .map_err(|error| StoreError::new(error.to_string()))?;
+    String::from_utf8(bytes).map_err(|error| StoreError::new(error.to_string()))
+}
+
+fn durable_snapshot(connection: &Connection, root_instance_id: &str) -> Result<Value, StoreError> {
+    let checkpoint = load_record(connection, root_instance_id)?
+        .ok_or_else(|| StoreError::new("durable host checkpoint is absent"))?;
+    let checkpoint: Value = serde_json::from_slice(&checkpoint.bytes)
+        .map_err(|error| StoreError::new(error.to_string()))?;
+    let mut inbox_statement = connection
+        .prepare(
+            "SELECT event_id, request_digest, disposition
+             FROM determa_durable_inbox
+             WHERE root_instance_id = ?1
+             ORDER BY rowid",
+        )
+        .map_err(sql_error)?;
+    let inbox = inbox_statement
+        .query_map([root_instance_id], |row| {
+            Ok(json!({
+                "event_id": row.get::<_, String>(0)?,
+                "request_digest": row.get::<_, String>(1)?,
+                "disposition": row.get::<_, String>(2)?,
+            }))
+        })
+        .map_err(sql_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql_error)?;
+    let mut rows_statement = connection
+        .prepare(
+            "SELECT row_key, row_value
+             FROM determa_durable_application_rows
+             WHERE root_instance_id = ?1
+             ORDER BY row_key",
+        )
+        .map_err(sql_error)?;
+    let rows = rows_statement
+        .query_map([root_instance_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sql_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql_error)?;
+    let mut application_rows = Map::new();
+    for (key, value) in rows {
+        application_rows.insert(
+            key,
+            serde_json::from_str(&value).map_err(|error| StoreError::new(error.to_string()))?,
+        );
+    }
+    let quarantine = connection
+        .query_row(
+            "SELECT event_id, reason_code, released
+             FROM determa_durable_quarantine
+             WHERE root_instance_id = ?1",
+            [root_instance_id],
+            |row| {
+                Ok(json!({
+                    "event_id": row.get::<_, String>(0)?,
+                    "reason_code": row.get::<_, String>(1)?,
+                    "released": row.get::<_, bool>(2)?,
+                }))
+            },
+        )
+        .optional()
+        .map_err(sql_error)?
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "durable_host_store_format": "determa.durable_host.store",
+        "durable_host_store_schema_version": 2,
+        "checkpoint": checkpoint,
+        "inbox": inbox,
+        "application_rows": application_rows,
+        "quarantine": quarantine,
+    }))
 }
 
 fn verify_schema_contract(
@@ -345,7 +571,7 @@ fn verify_schema_contract(
         .map_err(sql_error)?;
     if metadata
         != (
-            1,
+            2,
             mode.receipt_retention.as_str().to_string(),
             mode.outbox_retention.as_str().to_string(),
         )
@@ -370,7 +596,7 @@ fn verify_schema_contract(
             ]
     {
         return Err(StoreError::new(
-            "SQLite execution-store columns do not match schema version 1",
+            "SQLite execution-store columns do not match schema version 2",
         ));
     }
     let metadata_schema = schema_sql(connection, "table", "determa_execution_store_metadata")?;
@@ -393,7 +619,7 @@ fn verify_schema_contract(
                 CONSTRAINT determa_execution_store_metadata_singleton_check
                     CHECK (singleton = 1),
                 CONSTRAINT determa_execution_store_metadata_version_check
-                    CHECK (schema_version = 1),
+                    CHECK (schema_version = 2),
                 CONSTRAINT determa_execution_store_metadata_receipt_check
                     CHECK (receipt_retention IN ('bounded', 'permanent')),
                 CONSTRAINT determa_execution_store_metadata_outbox_check
@@ -444,7 +670,7 @@ fn verify_schema_contract(
             )
     {
         return Err(StoreError::new(
-            "SQLite execution-store constraints or deletion guard do not match schema version 1",
+            "SQLite execution-store constraints or deletion guard do not match schema version 2",
         ));
     }
     let journal_mode: String = connection

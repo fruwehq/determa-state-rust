@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-const SCHEMA_MARKER: &str = ".determa-execution-checkpoint-v1";
+const SCHEMA_MARKER: &str = ".determa-execution-checkpoint-v2";
 const LOCK_FILE: &str = ".determa-execution-checkpoint.lock";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -120,7 +120,7 @@ impl ExecutionStore for FileExecutionStore {
         let marker = self.directory.join(SCHEMA_MARKER);
         if marker.exists() {
             let contents = fs::read_to_string(marker).map_err(io_error)?;
-            if contents != "1\n" {
+            if contents != "2\n" {
                 return Err(StoreError::new("unsupported file store schema marker"));
             }
             return Ok(());
@@ -130,7 +130,7 @@ impl ExecutionStore for FileExecutionStore {
             .write(true)
             .open(marker)
             .map_err(io_error)?;
-        file.write_all(b"1\n").map_err(io_error)?;
+        file.write_all(b"2\n").map_err(io_error)?;
         file.sync_all().map_err(io_error)?;
         Ok(())
     }

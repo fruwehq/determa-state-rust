@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/schemas/conformance/durable-host-inputs-v2.schema.json",
+  "title": "Determa State durable host operation inputs",
+  "type": "object",
+  "required": ["durable_host_inputs_format", "durable_host_inputs_schema_version", "requests"],
+  "additionalProperties": false,
+  "properties": {
+    "durable_host_inputs_format": { "const": "determa.durable_host.inputs" },
+    "durable_host_inputs_schema_version": { "const": 2 },
+    "requests": { "type": "object", "minProperties": 1, "propertyNames": { "pattern": "^[a-z][a-z0-9_]*$" }, "additionalProperties": { "$ref": "#/$defs/request" } }
+  },
+  "$defs": {
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+    "adapterScheme": { "type": "string", "pattern": "^[a-z][a-z0-9+.-]*$" },
+    "adapterUri": { "type": "string", "pattern": "^[a-z][a-z0-9+.-]*:" },
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "canonicalDecimal": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "expectedCheckpoint": {
+      "type": "object", "required": ["root_instance_id", "revision", "digest"], "additionalProperties": false,
+      "properties": { "root_instance_id": { "$ref": "#/$defs/nonEmpty" }, "revision": { "$ref": "#/$defs/canonicalDecimal" }, "digest": { "$ref": "#/$defs/sha256" } }
+    },
+    "writerCheckpointContext": {
+      "type": "object", "required": ["presented_checkpoint", "stored_checkpoint"], "additionalProperties": false,
+      "properties": { "presented_checkpoint": { "$ref": "#/$defs/expectedCheckpoint" }, "stored_checkpoint": { "$ref": "#/$defs/expectedCheckpoint" } }
+    },
+    "scopeSelection": {
+      "type": "object", "required": ["scope_id", "ownership_binding", "principal", "authorization"], "additionalProperties": false,
+      "properties": { "scope_id": { "$ref": "#/$defs/nonEmpty" }, "ownership_binding": { "$ref": "#/$defs/nonEmpty" }, "principal": { "$ref": "#/$defs/nonEmpty" }, "authorization": { "enum": ["authorized", "missing", "ambiguous", "mismatched", "unauthorized"] } }
+    },
+    "target": { "$ref": "https://determa.dev/state/schema/aggregate-state-v2.schema.json#/$defs/targetIdentity" },
+    "source": { "$ref": "https://determa.dev/state/schema/aggregate-state-v2.schema.json#/$defs/envelopeSource" },
+    "envelope": { "$ref": "https://determa.dev/state/schema/aggregate-state-v2.schema.json#/$defs/envelope" },
+    "bundle": {
+      "type": "object", "required": ["file", "validated_bundle_fingerprint"], "additionalProperties": false,
+      "properties": { "file": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*\\.yaml$" }, "validated_bundle_fingerprint": { "$ref": "#/$defs/sha256" } }
+    },
+    "machine": {
+      "type": "object", "required": ["namespace", "machine_id", "machine_version", "root_definition_pointer"], "additionalProperties": false,
+      "properties": { "namespace": { "$ref": "#/$defs/nonEmpty" }, "machine_id": { "$ref": "#/$defs/nonEmpty" }, "machine_version": { "$ref": "#/$defs/nonEmpty" }, "root_definition_pointer": { "$ref": "#/$defs/nonEmpty" } }
+    },
+    "bindings": { "type": "object", "required": ["input", "external"], "additionalProperties": false, "properties": { "input": { "type": "object" }, "external": { "type": "object" } } },
+    "storeCapability": { "enum": ["ephemeral", "restart_persistent", "durable_single_writer", "durable_concurrent", "shared_application_transaction", "permanent_receipt_retention", "root_identity_retention", "permanent_outbox_terminal_retention", "compact_effect_identity_retention"] },
+    "capabilities": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/storeCapability" } },
+    "hostGuarantee": { "enum": ["atomic_accept_process", "ingress_ack_after_commit", "durable_redelivery", "outbox_worker", "total_outbox_lifecycle", "retain_unresolved_outbox", "retain_receipt_references", "native_shared_transaction_used"] },
+    "hostGuarantees": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/hostGuarantee" } },
+    "transactionInputs": {
+      "type": "object", "required": ["target_validated_bundle_fingerprint", "migration_descriptor_digest_route", "application_writes", "failure_policy"], "additionalProperties": false,
+      "properties": { "target_validated_bundle_fingerprint": { "$ref": "#/$defs/sha256" }, "migration_descriptor_digest_route": { "type": "array", "items": { "$ref": "#/$defs/sha256" } }, "application_writes": { "type": "object" }, "failure_policy": { "enum": ["commit", "inject_pre_commit", "inject_post_commit_response_loss", "transient_retry", "permanent_quarantine"] } }
+    },
+    "request": { "oneOf": [
+      { "$ref": "#/$defs/createRequest" }, { "$ref": "#/$defs/admitRequest" }, { "$ref": "#/$defs/processRequest" },
+      { "$ref": "#/$defs/outboxRequest" }, { "$ref": "#/$defs/compactRequest" }, { "$ref": "#/$defs/deletionProbeRequest" }, { "$ref": "#/$defs/pruneRequest" },
+      { "$ref": "#/$defs/tombstoneRequest" }, { "$ref": "#/$defs/registerAdapterRequest" }, { "$ref": "#/$defs/resolveAdapterRequest" },
+      { "$ref": "#/$defs/capabilityRequest" }, { "$ref": "#/$defs/scopeRequest" }, { "$ref": "#/$defs/backupRequest" },
+      { "$ref": "#/$defs/injectStoreRequest" }, { "$ref": "#/$defs/persistenceRequest" }, { "$ref": "#/$defs/releaseRequest" }
+    ] },
+    "createRequest": {
+      "type": "object", "required": ["operation", "request_id", "scope", "bundle", "machine", "bindings", "root_instance_id", "creation_id", "retention_mode"], "additionalProperties": false,
+      "properties": { "operation": { "const": "checkpoint_create_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "scope": { "$ref": "#/$defs/scopeSelection" }, "bundle": { "$ref": "#/$defs/bundle" }, "machine": { "$ref": "#/$defs/machine" }, "bindings": { "$ref": "#/$defs/bindings" }, "root_instance_id": { "$ref": "#/$defs/nonEmpty" }, "creation_id": { "$ref": "#/$defs/nonEmpty" }, "retention_mode": { "enum": ["permanent", "bounded"] }, "existing_checkpoint": { "$ref": "#/$defs/expectedCheckpoint" } }
+    },
+    "admitRequest": {
+      "type": "object", "required": ["operation", "request_id", "scope", "expected_checkpoint", "envelopes"], "additionalProperties": false,
+      "properties": { "operation": { "const": "checkpoint_admit_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "scope": { "$ref": "#/$defs/scopeSelection" }, "expected_checkpoint": { "$ref": "#/$defs/expectedCheckpoint" }, "writer_checkpoint_context": { "$ref": "#/$defs/writerCheckpointContext" }, "envelopes": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/admissionEnvelope" } } }
+    },
+    "admissionEnvelope": { "type": "object", "required": ["delivery_mode", "envelope", "envelope_digest"], "additionalProperties": false, "properties": { "delivery_mode": { "type": "string", "minLength": 1 }, "envelope": { "$ref": "#/$defs/envelope" }, "envelope_digest": { "$ref": "#/$defs/sha256" } } },
+    "processRequest": {
+      "type": "object", "required": ["operation", "request_id", "scope", "expected_checkpoint", "event_id", "envelope_digest", "target", "processing_mode", "acceptance_sequence", "queue_sequence"], "additionalProperties": false,
+      "properties": { "operation": { "const": "checkpoint_step_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "scope": { "$ref": "#/$defs/scopeSelection" }, "expected_checkpoint": { "$ref": "#/$defs/expectedCheckpoint" }, "writer_checkpoint_context": { "$ref": "#/$defs/writerCheckpointContext" }, "event_id": { "$ref": "#/$defs/nonEmpty" }, "envelope_digest": { "$ref": "#/$defs/sha256" }, "target": { "$ref": "#/$defs/target" }, "processing_mode": { "enum": ["foreground", "delayed"] }, "acceptance_sequence": { "$ref": "#/$defs/canonicalDecimal" }, "queue_sequence": { "$ref": "#/$defs/canonicalDecimal" } }
+    },
+    "outboxRequest": {
+      "type": "object", "required": ["operation", "request_id", "scope", "expected_checkpoint", "effect_id", "target_disposition", "outcome"], "additionalProperties": false,
+      "properties": { "operation": { "enum": ["checkpoint_update_outbox_v2", "checkpoint_terminalize_outbox_v2"] }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "scope": { "$ref": "#/$defs/scopeSelection" }, "expected_checkpoint": { "$ref": "#/$defs/expectedCheckpoint" }, "effect_id": { "$ref": "#/$defs/sha256" }, "target_disposition": { "enum": ["retryable_failure", "ambiguous", "confirmed", "permanently_rejected", "operator_cancelled", "discarded", "dead_lettered"] }, "outcome": { "type": "object", "required": ["reason_code", "durable_acceptance"], "additionalProperties": false, "properties": { "reason_code": { "type": ["string", "null"] }, "durable_acceptance": { "type": "boolean" } } }
+      }
+    },
+    "compactRequest": { "type": "object", "required": ["operation", "request_id", "scope", "expected_checkpoint", "effect_id", "intent_digest", "retention_mode"], "additionalProperties": false, "properties": { "operation": { "const": "checkpoint_compact_outbox_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "scope": { "$ref": "#/$defs/scopeSelection" }, "expected_checkpoint": { "$ref": "#/$defs/expectedCheckpoint" }, "effect_id": { "$ref": "#/$defs/sha256" }, "intent_digest": { "$ref": "#/$defs/sha256" }, "retention_mode": { "enum": ["permanent", "bounded"] } } },
+    "deletionProbeRequest": {
+      "type": "object", "required": ["operation", "request_id", "deletion_operation_id", "scope", "expected_checkpoint", "target"], "additionalProperties": false,
+      "properties": {
+        "operation": { "const": "checkpoint_delete_retained_record_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "deletion_operation_id": { "$ref": "#/$defs/nonEmpty" }, "scope": { "$ref": "#/$defs/scopeSelection" }, "expected_checkpoint": { "$ref": "#/$defs/expectedCheckpoint" },
+        "target": { "oneOf": [
+          { "type": "object", "required": ["kind", "effect_id"], "additionalProperties": false, "properties": { "kind": { "const": "outbox_effect_tombstone" }, "effect_id": { "$ref": "#/$defs/sha256" } } },
+          { "type": "object", "required": ["kind", "root_instance_id"], "additionalProperties": false, "properties": { "kind": { "const": "root_identity" }, "root_instance_id": { "$ref": "#/$defs/nonEmpty" } } }
+        ] }
+      }
+    },
+    "pruneRequest": { "type": "object", "required": ["operation", "request_id", "scope", "expected_checkpoint", "cutoff_receipt_sequence", "target_mode", "policy_identifier", "dependency_receipt_sequences", "dependency_effect_ids"], "additionalProperties": false, "properties": { "operation": { "const": "checkpoint_prune_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "scope": { "$ref": "#/$defs/scopeSelection" }, "expected_checkpoint": { "$ref": "#/$defs/expectedCheckpoint" }, "cutoff_receipt_sequence": { "$ref": "#/$defs/canonicalDecimal" }, "target_mode": { "enum": ["permanent", "bounded"] }, "policy_identifier": { "type": ["string", "null"] }, "dependency_receipt_sequences": { "type": "array", "items": { "$ref": "#/$defs/canonicalDecimal" } }, "dependency_effect_ids": { "type": "array", "items": { "$ref": "#/$defs/sha256" } } } },
+    "tombstoneRequest": { "type": "object", "required": ["operation", "request_id", "scope", "expected_checkpoint", "tombstone_operation_id", "terminal_status", "retention_mode"], "additionalProperties": false, "properties": { "operation": { "const": "checkpoint_tombstone_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "scope": { "$ref": "#/$defs/scopeSelection" }, "expected_checkpoint": { "$ref": "#/$defs/expectedCheckpoint" }, "writer_checkpoint_context": { "$ref": "#/$defs/writerCheckpointContext" }, "tombstone_operation_id": { "$ref": "#/$defs/nonEmpty" }, "terminal_status": { "enum": ["completed", "faulted"] }, "retention_mode": { "enum": ["permanent", "bounded"] } } },
+    "registration": { "type": "object", "required": ["adapter_identifier", "uri_scheme", "source", "configuration_schema", "capabilities"], "additionalProperties": false, "properties": { "adapter_identifier": { "$ref": "#/$defs/adapterScheme" }, "uri_scheme": { "$ref": "#/$defs/adapterScheme" }, "source": { "enum": ["bundled", "third_party"] }, "configuration_schema": { "type": "object" }, "capabilities": { "$ref": "#/$defs/capabilities" } } },
+    "registerAdapterRequest": { "type": "object", "required": ["operation", "request_id", "registration", "existing_registrations"], "additionalProperties": false, "properties": { "operation": { "const": "checkpoint_register_adapter_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "registration": { "$ref": "#/$defs/registration" }, "existing_registrations": { "type": "array", "items": { "$ref": "#/$defs/registration" } } } },
+    "resolveAdapterRequest": { "type": "object", "required": ["operation", "request_id", "adapter_identifier", "uri", "configuration", "requested_capabilities", "registrations"], "additionalProperties": false, "properties": { "operation": { "const": "checkpoint_resolve_adapter_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "adapter_identifier": { "$ref": "#/$defs/adapterScheme" }, "uri": { "$ref": "#/$defs/adapterUri" }, "configuration": { "type": "object" }, "requested_capabilities": { "$ref": "#/$defs/capabilities" }, "registrations": { "type": "array", "items": { "$ref": "#/$defs/registration" } } } },
+    "capabilityRequest": { "type": "object", "required": ["operation", "request_id", "adapter_identifier", "store_capabilities", "host_profile", "host_guarantees", "retention_mode"], "additionalProperties": false, "properties": { "operation": { "const": "checkpoint_validate_capabilities_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "adapter_identifier": { "$ref": "#/$defs/adapterScheme" }, "store_capabilities": { "$ref": "#/$defs/capabilities" }, "host_profile": { "enum": ["durable_embedded_processing", "exactly_once_committed_processing", "broker_integrated", "strict_durable_outbox", "compact_durable_outbox", "shared_application_transaction"] }, "host_guarantees": { "$ref": "#/$defs/hostGuarantees" }, "retention_mode": { "enum": ["permanent", "bounded"] } } },
+    "scopeRecord": { "type": "object", "required": ["scope_id", "ownership_binding", "portable_identity", "effect_id"], "additionalProperties": false, "properties": { "scope_id": { "$ref": "#/$defs/nonEmpty" }, "ownership_binding": { "$ref": "#/$defs/nonEmpty" }, "portable_identity": { "$ref": "#/$defs/nonEmpty" }, "effect_id": { "$ref": "#/$defs/sha256" } } },
+    "scopeRequest": {
+      "type": "object", "required": ["operation", "request_id", "scope", "portable_identity", "effect_id", "operation_context", "store_records"], "additionalProperties": false,
+      "properties": { "operation": { "const": "checkpoint_scope_operation_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "scope": { "$ref": "#/$defs/scopeSelection" }, "portable_identity": { "$ref": "#/$defs/nonEmpty" }, "effect_id": { "$ref": "#/$defs/sha256" }, "operation_context": { "enum": ["create", "admit", "step", "outbox", "migration"] }, "store_records": { "type": "array", "maxItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/scopeRecord" } } },
+      "allOf": [
+        {
+          "if": { "properties": { "scope": { "properties": { "authorization": { "const": "authorized" } }, "required": ["authorization"] } } },
+          "then": { "properties": { "store_records": { "minItems": 1, "maxItems": 1 } } },
+          "else": { "properties": { "store_records": { "maxItems": 0 } } }
+        }
+      ]
+    },
+    "backupRequest": { "type": "object", "required": ["operation", "request_id", "scope", "action", "checkpoint_digests", "trusted_artifact_digests", "adapter_metadata_digest", "retention_mode"], "additionalProperties": false, "properties": { "operation": { "const": "checkpoint_backup_restore_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "scope": { "$ref": "#/$defs/scopeSelection" }, "action": { "enum": ["backup", "restore"] }, "checkpoint_digests": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/sha256" } }, "trusted_artifact_digests": { "type": "array", "items": { "$ref": "#/$defs/sha256" } }, "adapter_metadata_digest": { "$ref": "#/$defs/sha256" }, "retention_mode": { "enum": ["permanent", "bounded"] } } },
+    "injectStoreRequest": { "type": "object", "required": ["operation", "request_id", "scope", "store_adapter_identifier", "store_uri", "configuration", "capabilities"], "additionalProperties": false, "properties": { "operation": { "const": "checkpoint_inject_store_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "scope": { "$ref": "#/$defs/scopeSelection" }, "store_adapter_identifier": { "$ref": "#/$defs/adapterScheme" }, "store_uri": { "$ref": "#/$defs/adapterUri" }, "configuration": { "type": "object" }, "capabilities": { "$ref": "#/$defs/capabilities" } } },
+    "persistenceRequest": { "type": "object", "required": ["operation", "request_id", "scope", "expected_checkpoint", "presented_envelope", "envelope_digest", "transaction_inputs", "store_adapter_identifier", "store_capabilities", "host_profile", "host_guarantees", "retention_mode"], "additionalProperties": false, "properties": { "operation": { "const": "persistence_process_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "scope": { "$ref": "#/$defs/scopeSelection" }, "expected_checkpoint": { "$ref": "#/$defs/expectedCheckpoint" }, "presented_envelope": { "$ref": "#/$defs/envelope" }, "envelope_digest": { "$ref": "#/$defs/sha256" }, "transaction_inputs": { "$ref": "#/$defs/transactionInputs" }, "store_adapter_identifier": { "$ref": "#/$defs/adapterScheme" }, "store_capabilities": { "$ref": "#/$defs/capabilities" }, "host_profile": { "enum": ["durable_embedded_processing", "exactly_once_committed_processing", "broker_integrated", "shared_application_transaction"] }, "host_guarantees": { "$ref": "#/$defs/hostGuarantees" }, "retention_mode": { "enum": ["permanent", "bounded"] } } },
+    "releaseRequest": { "type": "object", "required": ["operation", "request_id", "scope", "expected_checkpoint", "event_id", "envelope_digest", "quarantine_reason_code", "release_authorization"], "additionalProperties": false, "properties": { "operation": { "const": "persistence_release_quarantine_v2" }, "request_id": { "$ref": "#/$defs/nonEmpty" }, "scope": { "$ref": "#/$defs/scopeSelection" }, "expected_checkpoint": { "$ref": "#/$defs/expectedCheckpoint" }, "event_id": { "$ref": "#/$defs/nonEmpty" }, "envelope_digest": { "$ref": "#/$defs/sha256" }, "quarantine_reason_code": { "$ref": "#/$defs/name" }, "release_authorization": { "$ref": "#/$defs/nonEmpty" } } }
+  }
+}

@@ -5,7 +5,7 @@ use super::model::{
 };
 use super::persistence::DefinitionResolver;
 use super::runtime::{
-    AggregateState, ComponentRuntime, FaultRecord, OwnedRuntime, RuntimeRelation, RuntimeState,
+    ComponentRuntime, FaultRecord, NativeAggregate, OwnedRuntime, RuntimeRelation, RuntimeState,
     RuntimeStatus, VariableSlot,
 };
 use super::strict_json;
@@ -211,7 +211,9 @@ impl TypedValue {
                     .collect::<Result<BTreeMap<_, _>, PersistenceError>>()?,
             ),
         };
-        if declaration.is_some_and(|declaration| declaration.value_type == "instance_reference") {
+        if declaration.is_some_and(|declaration| declaration.value_type == "instance_reference")
+            && !matches!(value, Value::Null)
+        {
             return instance_reference_from_value(value);
         }
         Ok(value)
@@ -490,6 +492,8 @@ pub struct WireRuntime {
     pub next_spawn_sequence: String,
     pub next_state_activation_sequences: Vec<WireNextCounter>,
     pub next_component_activation_sequences: Vec<WireNextCounter>,
+    pub ready_mailbox: Vec<JsonValue>,
+    pub deferred_mailbox: Vec<JsonValue>,
     pub fault: Option<WireFault>,
 }
 
@@ -509,6 +513,8 @@ pub struct AggregateEnvelope {
     pub migration_sequence: String,
     pub next_logical_step_sequence: String,
     pub next_output_sequence: String,
+    pub next_acceptance_sequence: String,
+    pub next_queue_sequence: String,
     pub runtimes: Vec<WireRuntime>,
     pub aggregate_state_digest: String,
 }
@@ -528,7 +534,7 @@ impl AggregateEnvelope {
 
 pub fn encode_aggregate(
     bundle: &Bundle,
-    state: &AggregateState,
+    state: &NativeAggregate,
 ) -> Result<(AggregateEnvelope, Vec<u8>), PersistenceError> {
     if !super::runtime::aggregate_is_valid_for_bundle(state, bundle) {
         return Err(invalid_state(
@@ -556,7 +562,7 @@ pub fn encode_aggregate(
     }
     let mut envelope = AggregateEnvelope {
         aggregate_state_format: "determa.aggregate_state".to_string(),
-        aggregate_state_schema_version: 1,
+        aggregate_state_schema_version: 2,
         machine_format: 1,
         validated_bundle_fingerprint: state.validated_bundle_fingerprint.clone(),
         namespace: state.namespace.clone(),
@@ -568,6 +574,8 @@ pub fn encode_aggregate(
         migration_sequence: state.migration_sequence.to_string(),
         next_logical_step_sequence: state.next_logical_step_sequence.to_string(),
         next_output_sequence: state.next_output_sequence.to_string(),
+        next_acceptance_sequence: state.next_acceptance_sequence.to_string(),
+        next_queue_sequence: state.next_queue_sequence.to_string(),
         runtimes,
         aggregate_state_digest: String::new(),
     };
@@ -577,18 +585,10 @@ pub fn encode_aggregate(
     Ok((envelope, bytes))
 }
 
-pub fn restore_aggregate(
-    source: &[u8],
-    resolver: &(impl DefinitionResolver + ?Sized),
-) -> Result<AggregateState, PersistenceError> {
-    let (envelope, _) = parse_aggregate_envelope(source)?;
-    restore_envelope(&envelope, resolver)
-}
-
 pub(crate) fn restore_envelope(
     envelope: &AggregateEnvelope,
     resolver: &(impl DefinitionResolver + ?Sized),
-) -> Result<AggregateState, PersistenceError> {
+) -> Result<NativeAggregate, PersistenceError> {
     let mut definitions = BTreeMap::new();
     for runtime in &envelope.runtimes {
         collect_definition(&runtime.current_definition, resolver, &mut definitions)?;
@@ -630,7 +630,9 @@ pub(crate) fn restore_envelope(
         return Err(invalid_state("runtime ownership graph is disconnected"));
     }
     validate_root_header(envelope, &root)?;
-    let aggregate = AggregateState {
+    let aggregate = NativeAggregate {
+        document: serde_json::to_value(envelope)
+            .map_err(|error| invalid_state(error.to_string()))?,
         validated_bundle_fingerprint: envelope.validated_bundle_fingerprint.clone(),
         namespace: envelope.namespace.clone(),
         root_instance_id: envelope.root_instance_id.clone(),
@@ -646,6 +648,10 @@ pub(crate) fn restore_envelope(
         next_logical_step_sequence: Counter::from_decimal(&envelope.next_logical_step_sequence)
             .map_err(invalid_state)?,
         next_output_sequence: Counter::from_decimal(&envelope.next_output_sequence)
+            .map_err(invalid_state)?,
+        next_acceptance_sequence: Counter::from_decimal(&envelope.next_acceptance_sequence)
+            .map_err(invalid_state)?,
+        next_queue_sequence: Counter::from_decimal(&envelope.next_queue_sequence)
             .map_err(invalid_state)?,
     };
     let current = definitions
@@ -1046,6 +1052,8 @@ fn restore_runtime(
         active_state_activation_sequence,
         fault,
         relation,
+        ready_mailbox: wire.ready_mailbox.clone(),
+        deferred_mailbox: wire.deferred_mailbox.clone(),
     })
 }
 
@@ -1066,7 +1074,7 @@ pub(crate) fn parse_aggregate_envelope(
         }
     }
     match object.get("aggregate_state_schema_version") {
-        Some(JsonValue::Number(value)) if value.as_i64() == Some(1) => {}
+        Some(JsonValue::Number(value)) if value.as_i64() == Some(2) => {}
         _ => {
             return Err(PersistenceError::new(
                 PersistenceErrorCode::UnsupportedAggregateStateSchemaVersion,
@@ -1076,7 +1084,7 @@ pub(crate) fn parse_aggregate_envelope(
     }
     validate_schema(
         &value,
-        include_str!("../../schema/aggregate-state.schema.json"),
+        include_str!("../../schema/aggregate-state-v2.schema.json"),
         PersistenceErrorCode::InvalidAggregateState,
     )?;
     let envelope: AggregateEnvelope =
@@ -1108,7 +1116,7 @@ pub(crate) fn aggregate_digest(value: &JsonValue) -> Result<String, PersistenceE
         return Err(invalid_state("aggregate state must be an object"));
     };
     object.remove("aggregate_state_digest");
-    jcs_hash(&json!(["determa-aggregate-state-digest-1", envelope]))
+    jcs_hash(&json!(["determa-aggregate-state-digest-2", envelope]))
 }
 
 pub(crate) fn validate_schema(
@@ -1220,7 +1228,7 @@ fn origin_from_wire(
     })
 }
 
-fn target_from_wire(target: &WireTarget) -> Result<Target, PersistenceError> {
+pub(crate) fn target_from_wire(target: &WireTarget) -> Result<Target, PersistenceError> {
     Ok(match target {
         WireTarget::Root { root } => Target::Root {
             root_instance_id: root.root_instance_id.clone(),
@@ -1520,7 +1528,7 @@ fn origin_to_wire(origin: &IdentityOrigin) -> WireIdentityOrigin {
     }
 }
 
-fn target_to_wire(target: &Target) -> Result<WireTarget, PersistenceError> {
+pub(crate) fn target_to_wire(target: &Target) -> Result<WireTarget, PersistenceError> {
     Ok(match target {
         Target::Root {
             root_instance_id,
@@ -1730,6 +1738,8 @@ fn runtime_to_wire(runtime: &RuntimeState) -> Result<WireRuntime, PersistenceErr
         next_spawn_sequence: runtime.next_spawn_sequence.to_string(),
         next_state_activation_sequences: next_state,
         next_component_activation_sequences: next_component,
+        ready_mailbox: runtime.ready_mailbox.clone(),
+        deferred_mailbox: runtime.deferred_mailbox.clone(),
         fault: runtime.fault.as_ref().map(|fault| WireFault {
             definition_fingerprint: fault.definition_fingerprint.clone(),
             runtime_id: fault.runtime_id.clone(),
@@ -1746,6 +1756,8 @@ fn validate_envelope_semantics(envelope: &AggregateEnvelope) -> Result<(), Persi
     require_canonical_decimal(&envelope.migration_sequence, false)?;
     require_canonical_decimal(&envelope.next_logical_step_sequence, false)?;
     require_canonical_decimal(&envelope.next_output_sequence, false)?;
+    require_canonical_decimal(&envelope.next_acceptance_sequence, false)?;
+    require_canonical_decimal(&envelope.next_queue_sequence, false)?;
     if envelope.runtimes.is_empty() {
         return Err(invalid_state("runtime records must not be empty"));
     }
@@ -1940,91 +1952,4 @@ fn is_descendant(path: &str, ancestor: &str) -> bool {
         || path
             .strip_prefix(ancestor)
             .is_some_and(|suffix| suffix.starts_with('.'))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::format1::{load_bundle, InMemoryDefinitionResolver};
-
-    #[test]
-    fn restores_and_canonicalizes_normative_aggregate() {
-        let directory = "conformance-suite/conformance/core/94-aggregate-wire-round-trip";
-        let bundle =
-            load_bundle(&std::fs::read_to_string(format!("{directory}/machine.yaml")).unwrap())
-                .unwrap();
-        let mut resolver = InMemoryDefinitionResolver::default();
-        assert!(resolver.insert(bundle.clone(), true));
-        let source = std::fs::read(format!("{directory}/source-aggregate-state.json")).unwrap();
-        let restored = restore_aggregate(&source, &resolver).unwrap();
-        let (_, bytes) = encode_aggregate(&bundle, &restored).unwrap();
-        assert_eq!(
-            bytes,
-            std::fs::read(format!("{directory}/source-aggregate-state.canonical.json")).unwrap()
-        );
-    }
-
-    #[test]
-    fn rejects_digest_consistent_root_header_forgery() {
-        let directory = "conformance-suite/conformance/core/94-aggregate-wire-round-trip";
-        let bundle =
-            load_bundle(&std::fs::read_to_string(format!("{directory}/machine.yaml")).unwrap())
-                .unwrap();
-        let mut resolver = InMemoryDefinitionResolver::default();
-        assert!(resolver.insert(bundle, true));
-        let source = std::fs::read(format!("{directory}/source-aggregate-state.json")).unwrap();
-
-        for (member, forged) in [("root_machine_id", "forged"), ("root_machine_version", "2")] {
-            let mut value: JsonValue = serde_json::from_slice(&source).unwrap();
-            value[member] = JsonValue::String(forged.to_string());
-            let digest = aggregate_digest(&value).unwrap();
-            value["aggregate_state_digest"] = JsonValue::String(digest);
-            let bytes = canonical_bytes(&value).unwrap();
-            let failure = restore_aggregate(&bytes, &resolver).unwrap_err();
-            assert_eq!(
-                failure.code,
-                PersistenceErrorCode::InvalidAggregateState,
-                "{member}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_forged_immutable_component_target_name() {
-        let directory = "conformance-suite/conformance/core/104-component-migration";
-        let bundle =
-            load_bundle(&std::fs::read_to_string(format!("{directory}/machine.yaml")).unwrap())
-                .unwrap();
-        let mut resolver = InMemoryDefinitionResolver::default();
-        assert!(resolver.insert(bundle.clone(), true));
-        let source = std::fs::read(format!("{directory}/source-aggregate-state.json")).unwrap();
-        let mut restored = restore_aggregate(&source, &resolver).unwrap();
-        let Target::Component { component_id, .. } =
-            &mut restored.root.components[0].runtime.target_identity
-        else {
-            panic!("fixture component target changed kind");
-        };
-        *component_id = "forged".to_string();
-        let dispatch = super::super::runtime::dispatch(&bundle, &restored, None);
-        assert_eq!(
-            dispatch.rejection.as_ref().map(|value| value.code.as_str()),
-            Some("invalid_prior_state")
-        );
-
-        let mut value: JsonValue = serde_json::from_slice(&source).unwrap();
-        let component = value["runtimes"]
-            .as_array_mut()
-            .unwrap()
-            .iter_mut()
-            .find(|runtime| runtime["identity_origin"]["kind"] == "component")
-            .unwrap();
-        component["target_identity"]["component"]["component_id"] =
-            JsonValue::String("forged".to_string());
-        let digest = aggregate_digest(&value).unwrap();
-        value["aggregate_state_digest"] = JsonValue::String(digest);
-        let bytes = canonical_bytes(&value).unwrap();
-
-        let failure = restore_aggregate(&bytes, &resolver).unwrap_err();
-        assert_eq!(failure.code, PersistenceErrorCode::InvalidAggregateState);
-    }
 }

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/schemas/conformance/durable-host-call-log-v2.schema.json",
+  "title": "Determa State durable host call log",
+  "type": "object",
+  "required": ["durable_host_call_log_format", "durable_host_call_log_schema_version", "calls"],
+  "additionalProperties": false,
+  "properties": {
+    "durable_host_call_log_format": { "const": "determa.durable_host.call_log" },
+    "durable_host_call_log_schema_version": { "const": 2 },
+    "calls": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "select_scope",
+          "resolve_artifacts",
+          "validate_capabilities",
+          "begin_transaction",
+          "read_checkpoint",
+          "check_replay",
+          "call_core",
+          "stage_checkpoint",
+          "stage_inbox",
+          "stage_outbox",
+          "stage_audit",
+          "stage_application_rows",
+          "commit",
+          "acknowledge",
+          "quarantine",
+          "release_quarantine",
+          "rollback"
+        ]
+      }
+    }
+  }
+}
