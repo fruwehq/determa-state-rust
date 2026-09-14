@@ -9,9 +9,9 @@ use super::store::{
     StoreError, StoreErrorCode, StoreRecord, StoreWriteResult,
 };
 use super::types::{
-    AdmissionSource, DurableFailurePolicy, DurableHostExecution, DurableHostResult,
-    DurableProcessRequest, DurableQuarantineReleaseRequest, PendingOutboxState, ProcessingRequest,
-    PruneRequest, ScopedStoreRecord, StoreScope, TerminalOutboxOutcome,
+    AdmissionSource, DurableCheckpointExecution, DurableFailurePolicy, DurableHostExecution,
+    DurableHostResult, DurableProcessRequest, DurableQuarantineReleaseRequest, PendingOutboxState,
+    ProcessingRequest, PruneRequest, ScopedStoreRecord, StoreScope, TerminalOutboxOutcome,
     TransactionalProcessRequest,
 };
 use super::v2::{
@@ -538,7 +538,7 @@ impl PostgresqlHostMutation<'_> {
 #[cfg(feature = "postgresql")]
 #[derive(Debug, Clone, PartialEq)]
 pub enum PostgresqlHostMutationResult {
-    Creation(Box<ExecutionCheckpoint>),
+    Creation(JsonValue),
     Admission(JsonValue),
     Step(JsonValue),
     Process(JsonValue),
@@ -710,7 +710,7 @@ where
                 bindings,
                 supplied_request_digest,
                 replay_retention,
-            } => PostgresqlHostMutationResult::Creation(Box::new(
+            } => PostgresqlHostMutationResult::Creation(
                 self.create_checkpoint_with_store(
                     &mut store,
                     bundle,
@@ -722,7 +722,7 @@ where
                     replay_retention.clone(),
                 )
                 .map_err(v2_host_failure)?,
-            )),
+            ),
             PostgresqlHostMutation::Admit {
                 root_instance_id,
                 deliveries,
@@ -901,24 +901,27 @@ where
         &self,
         operation: DurableCheckpointOperation<'_>,
         acknowledge_after_commit: bool,
-    ) -> DurableHostResult {
+    ) -> DurableCheckpointExecution {
         let root_instance_id = operation.root_instance_id().to_string();
         let before = match self.store.load(&root_instance_id) {
             Ok(record) => record,
             Err(_) => {
-                return DurableHostResult::new(
-                    "rejected",
-                    "none",
-                    0,
-                    false,
-                    Some("execution_store_failure"),
-                );
+                return DurableCheckpointExecution {
+                    result: DurableHostResult::new(
+                        "rejected",
+                        "none",
+                        0,
+                        false,
+                        Some("execution_store_failure"),
+                    ),
+                    operation_response: None,
+                };
             }
         };
         let core_operation = operation.is_core_operation();
         let creation_without_checkpoint =
             matches!(operation, DurableCheckpointOperation::Create { .. }) && before.is_none();
-        let result: Result<(), ArtifactError> = match operation {
+        let result: Result<JsonValue, ArtifactError> = match operation {
             DurableCheckpointOperation::Create {
                 bundle,
                 machine_id,
@@ -927,83 +930,72 @@ where
                 bindings,
                 supplied_request_digest,
                 replay_retention,
-            } => self
-                .create_checkpoint(
-                    bundle,
-                    machine_id,
-                    root_instance_id,
-                    creation_id,
-                    bindings,
-                    supplied_request_digest,
-                    replay_retention,
-                )
-                .map(|_| ()),
+            } => self.create_checkpoint(
+                bundle,
+                machine_id,
+                root_instance_id,
+                creation_id,
+                bindings,
+                supplied_request_digest,
+                replay_retention,
+            ),
             DurableCheckpointOperation::Admit {
                 root_instance_id,
                 sources,
                 guard,
-            } => self
-                .admit_checkpoint_sources(root_instance_id, sources, guard)
-                .map(|_| ()),
+            } => self.admit_checkpoint_sources(root_instance_id, sources, guard),
             DurableCheckpointOperation::Step {
                 root_instance_id,
                 request,
                 guard,
-            } => self
-                .step_checkpoint(root_instance_id, request, guard)
-                .map(|_| ()),
+            } => self.step_checkpoint(root_instance_id, request, guard),
             DurableCheckpointOperation::UpdatePendingOutbox {
                 root_instance_id,
                 effect_id,
                 desired,
                 guard,
-            } => self
-                .update_pending_outbox(root_instance_id, effect_id, desired, guard)
-                .map(|_| ()),
+            } => self.update_pending_outbox(root_instance_id, effect_id, desired, guard),
             DurableCheckpointOperation::TerminalizeOutbox {
                 root_instance_id,
                 effect_id,
                 outcome,
                 guard,
-            } => self
-                .terminalize_outbox(root_instance_id, effect_id, outcome, guard)
-                .map(|_| ()),
+            } => self.terminalize_outbox(root_instance_id, effect_id, outcome, guard),
             DurableCheckpointOperation::CompactOutbox {
                 root_instance_id,
                 effect_id,
                 guard,
-            } => self
-                .compact_outbox(root_instance_id, effect_id, guard)
-                .map(|_| ()),
+            } => self.compact_outbox(root_instance_id, effect_id, guard),
             DurableCheckpointOperation::Prune {
                 root_instance_id,
                 request,
                 guard,
-            } => self
-                .prune_checkpoint(root_instance_id, request, guard)
-                .map(|_| ()),
+            } => self.prune_checkpoint(root_instance_id, request, guard),
             DurableCheckpointOperation::Tombstone {
                 root_instance_id,
                 operation_id,
                 guard,
-            } => self
-                .tombstone_root(root_instance_id, operation_id, guard)
-                .map(|_| ()),
+            } => self.tombstone_root(root_instance_id, operation_id, guard),
             DurableCheckpointOperation::DeleteRetainedRecord {
                 root_instance_id,
                 guard,
-            } => self.delete_retained_record(root_instance_id, guard),
+            } => self
+                .delete_retained_record(root_instance_id, guard)
+                .map(|()| JsonValue::Null),
         };
         let after = match self.store.load(&root_instance_id) {
             Ok(record) => record,
             Err(_) => {
-                return DurableHostResult::new(
-                    "crashed",
-                    "none",
-                    u8::from(core_operation),
-                    false,
-                    Some("execution_store_failure"),
-                );
+                return DurableCheckpointExecution {
+                    result: DurableHostResult::new(
+                        "crashed",
+                        "none",
+                        u8::from(core_operation),
+                        false,
+                        Some("execution_store_failure"),
+                    ),
+                    operation_response: None,
+                };
             }
         };
         let changed = before != after;
@@ -1021,21 +1013,24 @@ where
                         || matches!(code, Some("injected_pre_commit_failure"))
                         || matches!(code, Some("creation_rejected")))),
         );
-        DurableHostResult::new(
-            if crashed {
-                "crashed"
-            } else if committed {
-                "committed"
-            } else if replayed {
-                "replayed"
-            } else {
-                "rejected"
-            },
-            if changed { "atomic" } else { "none" },
-            core_calls,
-            acknowledge_after_commit && (committed || replayed),
-            code,
-        )
+        DurableCheckpointExecution {
+            result: DurableHostResult::new(
+                if crashed {
+                    "crashed"
+                } else if committed {
+                    "committed"
+                } else if replayed {
+                    "replayed"
+                } else {
+                    "rejected"
+                },
+                if changed { "atomic" } else { "none" },
+                core_calls,
+                acknowledge_after_commit && (committed || replayed),
+                code,
+            ),
+            operation_response: result.ok(),
+        }
     }
 
     #[cfg(feature = "sqlite")]
@@ -1456,7 +1451,7 @@ where
         bindings: &Bindings,
         supplied_request_digest: Option<&str>,
         replay_retention: JsonValue,
-    ) -> Result<ExecutionCheckpoint, ArtifactError> {
+    ) -> Result<JsonValue, ArtifactError> {
         let mut store = DirectStoreAccess {
             store: self.store.as_ref(),
         };
@@ -1483,7 +1478,7 @@ where
         bindings: &Bindings,
         supplied_request_digest: Option<&str>,
         replay_retention: JsonValue,
-    ) -> Result<ExecutionCheckpoint, ArtifactError> {
+    ) -> Result<JsonValue, ArtifactError> {
         let request_digest =
             creation_request_digest(bundle, machine_id, root_instance_id, creation_id, bindings)?;
         if let Some(current) = store.load(root_instance_id).map_err(v2_store_error)? {
@@ -1510,7 +1505,7 @@ where
         })?;
         let record = StoreRecord::from_checkpoint(&candidate).map_err(v2_store_error)?;
         match store.insert_if_absent(record).map_err(v2_store_error)? {
-            StoreWriteResult::Committed => Ok(candidate),
+            StoreWriteResult::Committed => creation_response(&candidate),
             StoreWriteResult::Conflict(Some(current)) => {
                 self.replay_or_reject_creation(current, creation_id, &request_digest)
             }
@@ -1526,7 +1521,7 @@ where
         current: StoreRecord,
         creation_id: &str,
         request_digest: &str,
-    ) -> Result<ExecutionCheckpoint, ArtifactError> {
+    ) -> Result<JsonValue, ArtifactError> {
         let current = self.restore_record_v2(current)?;
         let receipt = current.value()["operation_receipts"]
             .as_array()
@@ -1537,7 +1532,7 @@ where
         if receipt["creation_id"].as_str() == Some(creation_id)
             && receipt["request_digest"].as_str() == Some(request_digest)
         {
-            Ok(current)
+            Ok(json!({"result": "committed", "receipt": receipt}))
         } else {
             Err(v2_failure(
                 "creation_id_conflict",
@@ -1906,7 +1901,20 @@ where
             Some(&guard.expected_checkpoint_digest),
         )?;
         self.commit_v2_result_with_store(store, &record, &result)?;
-        Ok(result)
+        let committed = result["pending_outbox_intents"]
+            .as_array()
+            .and_then(|records| {
+                records
+                    .iter()
+                    .find(|item| item["intent"]["effect_id"].as_str() == Some(effect_id))
+            })
+            .ok_or_else(|| {
+                v2_failure(
+                    "invalid_execution_checkpoint",
+                    "committed pending outbox record is absent",
+                )
+            })?;
+        Ok(json!({"result": "committed", "record": committed}))
     }
 
     pub fn terminalize_outbox(
@@ -1940,7 +1948,29 @@ where
             Some(&guard.expected_checkpoint_digest),
         )?;
         self.commit_v2_result_with_store(store, &record, &result)?;
-        Ok(result)
+        let committed = result["terminal_outbox_records"]
+            .as_array()
+            .and_then(|records| {
+                records
+                    .iter()
+                    .find(|item| item["intent"]["effect_id"].as_str() == Some(effect_id))
+            })
+            .or_else(|| {
+                result["outbox_effect_tombstones"]
+                    .as_array()
+                    .and_then(|records| {
+                        records
+                            .iter()
+                            .find(|item| item["effect_id"].as_str() == Some(effect_id))
+                    })
+            })
+            .ok_or_else(|| {
+                v2_failure(
+                    "invalid_execution_checkpoint",
+                    "committed terminal outbox record is absent",
+                )
+            })?;
+        Ok(json!({"result": "committed", "record": committed}))
     }
 
     pub fn compact_outbox(
@@ -1971,7 +2001,20 @@ where
             Some(&guard.expected_checkpoint_digest),
         )?;
         self.commit_v2_result_with_store(store, &record, &result)?;
-        Ok(result)
+        let committed = result["outbox_effect_tombstones"]
+            .as_array()
+            .and_then(|records| {
+                records
+                    .iter()
+                    .find(|item| item["effect_id"].as_str() == Some(effect_id))
+            })
+            .ok_or_else(|| {
+                v2_failure(
+                    "invalid_execution_checkpoint",
+                    "committed compact outbox record is absent",
+                )
+            })?;
+        Ok(json!({"result": "committed", "record": committed}))
     }
 
     pub fn tombstone_root(
@@ -2002,7 +2045,10 @@ where
             Some(&guard.expected_checkpoint_digest),
         )?;
         self.commit_v2_result_with_store(store, &record, &result)?;
-        Ok(result)
+        Ok(json!({
+            "result": "tombstoned",
+            "tombstone": result["root_record"]
+        }))
     }
 
     fn restore_record_v2(&self, record: StoreRecord) -> Result<ExecutionCheckpoint, ArtifactError> {
@@ -2130,6 +2176,20 @@ fn maintenance_request_digest(
         request.maintenance_mode
     ]))
     .map_err(|error| v2_failure("invalid_execution_checkpoint", &error.to_string()))
+}
+
+fn creation_response(checkpoint: &ExecutionCheckpoint) -> Result<JsonValue, ArtifactError> {
+    let receipt = checkpoint.value()["operation_receipts"]
+        .as_array()
+        .and_then(|receipts| receipts.first())
+        .filter(|receipt| receipt["operation_kind"] == "creation")
+        .ok_or_else(|| {
+            v2_failure(
+                "invalid_execution_checkpoint",
+                "committed creation receipt is absent",
+            )
+        })?;
+    Ok(json!({"result": "committed", "receipt": receipt}))
 }
 
 fn v2_store_error(error: StoreError) -> ArtifactError {

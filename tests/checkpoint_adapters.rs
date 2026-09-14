@@ -134,7 +134,7 @@ machines:
     assert_eq!(mismatch.code, "invalid_execution_checkpoint");
     assert!(store.load("digest-mismatch").unwrap().is_none());
 
-    let created = host
+    let created_response = host
         .create_checkpoint(
             &bundle,
             "transaction_server",
@@ -145,6 +145,9 @@ machines:
             retention.clone(),
         )
         .unwrap();
+    assert_eq!(created_response["result"], "committed");
+    assert_eq!(created_response["receipt"]["operation_kind"], "creation");
+    let created = host.load_checkpoint("server-1").unwrap().unwrap();
     let inputs: Value =
         serde_json::from_slice(&fs::read(core.join("operation-inputs.json")).unwrap()).unwrap();
     let admitted = host
@@ -230,7 +233,7 @@ machines:
         maintained
     );
 
-    let transactional_created = host
+    let transactional_created_response = host
         .create_checkpoint(
             &bundle,
             "transaction_server",
@@ -240,6 +243,11 @@ machines:
             None,
             retention.clone(),
         )
+        .unwrap();
+    assert_eq!(transactional_created_response["result"], "committed");
+    let transactional_created = host
+        .load_checkpoint("transactional-process-root")
+        .unwrap()
         .unwrap();
     let transactional = host
         .transactional_process(
@@ -262,7 +270,7 @@ machines:
         .unwrap();
     assert_eq!(transactional["revision"], "1");
     assert_eq!(transactional["migration_audit_records"], json!([]));
-    let terminal = host
+    let terminal_response = host
         .create_checkpoint(
             &terminal_bundle,
             "terminal",
@@ -273,6 +281,8 @@ machines:
             retention.clone(),
         )
         .unwrap();
+    assert_eq!(terminal_response["result"], "committed");
+    let terminal = host.load_checkpoint("terminal-root").unwrap().unwrap();
     let tombstoned = host
         .tombstone_root(
             "terminal-root",
@@ -280,9 +290,10 @@ machines:
             &MutationGuard::new(terminal.revision(), terminal.digest()),
         )
         .unwrap();
-    assert_eq!(tombstoned["root_record"]["status"], "tombstone");
+    assert_eq!(tombstoned["result"], "tombstoned");
+    assert_eq!(tombstoned["tombstone"]["status"], "tombstone");
 
-    let outbox = host
+    let outbox_response = host
         .create_checkpoint(
             &outbox_bundle,
             "publisher",
@@ -293,6 +304,8 @@ machines:
             retention,
         )
         .unwrap();
+    assert_eq!(outbox_response["result"], "committed");
+    let outbox = host.load_checkpoint("outbox-root").unwrap().unwrap();
     let effect_id = outbox.value()["pending_outbox_intents"][0]["intent"]["effect_id"]
         .as_str()
         .unwrap();
@@ -306,21 +319,27 @@ machines:
             &MutationGuard::new(outbox.revision(), outbox.digest()),
         )
         .unwrap();
+    assert_eq!(pending["result"], "committed");
+    assert_eq!(pending["record"]["intent"]["effect_id"], effect_id);
+    let pending_checkpoint = host.load_checkpoint("outbox-root").unwrap().unwrap();
     let terminal = host
         .terminalize_outbox(
             "outbox-root",
             effect_id,
             TerminalOutboxOutcome::Confirmed,
-            &guard_for(&pending),
+            &MutationGuard::new(pending_checkpoint.revision(), pending_checkpoint.digest()),
         )
         .unwrap();
+    assert_eq!(terminal["result"], "committed");
+    let terminal_checkpoint = host.load_checkpoint("outbox-root").unwrap().unwrap();
     let compacted = host
-        .compact_outbox("outbox-root", effect_id, &guard_for(&terminal))
+        .compact_outbox(
+            "outbox-root",
+            effect_id,
+            &MutationGuard::new(terminal_checkpoint.revision(), terminal_checkpoint.digest()),
+        )
         .unwrap();
-    assert_eq!(
-        compacted["outbox_effect_tombstones"][0]["effect_id"],
-        effect_id
-    );
+    assert_eq!(compacted["record"]["effect_id"], effect_id);
 }
 
 fn input_delivery(
@@ -367,13 +386,6 @@ fn processing_for(checkpoint: &Value) -> ProcessingRequest {
         queue_sequence: entry["queue_sequence"].as_str().unwrap().to_string(),
         processing_mode: "delayed".to_string(),
     }
-}
-
-fn guard_for(value: &Value) -> MutationGuard {
-    MutationGuard::new(
-        value["revision"].as_str().unwrap(),
-        value["execution_checkpoint_digest"].as_str().unwrap(),
-    )
 }
 
 fn raw_store_contract(store: &dyn ExecutionStore, root: &str) {

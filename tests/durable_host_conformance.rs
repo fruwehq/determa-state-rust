@@ -47,6 +47,44 @@ fn all_138_durable_host_vectors_execute_exactly() {
 }
 
 #[test]
+fn every_production_checkpoint_response_rejects_an_extra_member() {
+    let mut checked = 0;
+    for directory in profile_directories() {
+        let manifest = yaml(&fs::read_to_string(directory.join("test.yaml")).unwrap());
+        let Some(vectors) = manifest["durable_host_vectors"].as_array() else {
+            continue;
+        };
+        for vector in vectors {
+            let operation = vector["operation"].as_str().unwrap();
+            if !matches!(
+                operation,
+                "checkpoint_create_v2"
+                    | "checkpoint_admit_v2"
+                    | "checkpoint_step_v2"
+                    | "checkpoint_update_outbox_v2"
+                    | "checkpoint_terminalize_outbox_v2"
+                    | "checkpoint_compact_outbox_v2"
+                    | "checkpoint_prune_v2"
+                    | "checkpoint_tombstone_v2"
+            ) {
+                continue;
+            }
+            let request = request(&directory, vector);
+            match run_checkpoint_with_response_corruption(&directory, vector, &request) {
+                Err(error) if error == "production operation returned no success body" => {}
+                Err(error) if error.contains("malformed production response") => checked += 1,
+                Err(error) => panic!("{operation} failed for the wrong reason: {error}"),
+                Ok(result) => panic!("malformed {operation} response passed: {result}"),
+            }
+        }
+    }
+    assert_eq!(
+        checked, 50,
+        "response-bearing checkpoint vector count changed"
+    );
+}
+
+#[test]
 fn permanent_quarantine_obeys_retained_replay_and_conflict_precedence() {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
         "conformance-suite/conformance/profiles/persistence/persistence-05-permanent-quarantine-release",
@@ -132,6 +170,23 @@ fn run_vector(directory: &Path, vector: &Value) -> Result<(), String> {
 }
 
 fn run_checkpoint(directory: &Path, vector: &Value, request: &Value) -> Result<Value, String> {
+    run_checkpoint_inner(directory, vector, request, false)
+}
+
+fn run_checkpoint_with_response_corruption(
+    directory: &Path,
+    vector: &Value,
+    request: &Value,
+) -> Result<Value, String> {
+    run_checkpoint_inner(directory, vector, request, true)
+}
+
+fn run_checkpoint_inner(
+    directory: &Path,
+    vector: &Value,
+    request: &Value,
+    corrupt_response: bool,
+) -> Result<Value, String> {
     let before_name = vector["checkpoint_before"].as_str();
     let stored_before_name = vector["stored_checkpoint_before"].as_str().or(before_name);
     let after_name = vector["checkpoint_after"].as_str();
@@ -168,7 +223,7 @@ fn run_checkpoint(directory: &Path, vector: &Value, request: &Value) -> Result<V
     let operation = vector["operation"].as_str().unwrap();
     let acknowledge_after_commit =
         directory.file_name().unwrap() == "checkpoint-01-native-lifecycle";
-    let result = match operation {
+    let mut result = match operation {
         "checkpoint_create_v2" => {
             let bundle = load_bundle(
                 &fs::read_to_string(directory.join(request["bundle"]["file"].as_str().unwrap()))
@@ -265,6 +320,16 @@ fn run_checkpoint(directory: &Path, vector: &Value, request: &Value) -> Result<V
         ),
         other => return Err(format!("unsupported checkpoint operation {other}")),
     };
+    if corrupt_response {
+        let response = result
+            .operation_response
+            .as_mut()
+            .ok_or_else(|| "production operation returned no success body".to_string())?;
+        response
+            .as_object_mut()
+            .ok_or_else(|| "production operation returned a non-object body".to_string())?
+            .insert("unexpected_member".to_string(), Value::Bool(true));
+    }
     let stored = memory.load(&root).unwrap().map(|item| item.bytes);
     let expected_after = after_name.map(|name| fs::read(directory.join(name)).unwrap());
     if !same_document(stored.as_deref(), expected_after.as_deref()) {
@@ -279,15 +344,153 @@ fn run_checkpoint(directory: &Path, vector: &Value, request: &Value) -> Result<V
         remove_state_digests(&mut actual_semantics);
         return Err(format!(
             "checkpoint_after differs after {}: {}; semantic difference: {}",
-            serde_json::to_string(&result).unwrap(),
+            serde_json::to_string(&result.result).unwrap(),
             first_difference(&expected, &actual, ""),
             first_difference(&expected_semantics, &actual_semantics, "")
         ));
     }
-    let actual = serde_json::to_value(result).map_err(load_error)?;
+    validate_operation_response(
+        directory,
+        operation,
+        &result.result,
+        result.operation_response.as_ref(),
+    )?;
+    let actual = serde_json::to_value(result.result).map_err(load_error)?;
     (actual == pointer_file(directory, &vector["result"]))
         .then_some(actual)
         .ok_or_else(|| "operation result mismatch".to_string())
+}
+
+fn validate_operation_response(
+    directory: &Path,
+    operation: &str,
+    outcome: &DurableHostResult,
+    response: Option<&Value>,
+) -> Result<(), String> {
+    if matches!(outcome.result.as_str(), "rejected" | "crashed") {
+        return response
+            .is_none()
+            .then_some(())
+            .ok_or_else(|| "failed operation returned a success body".to_string());
+    }
+    let response = response.ok_or_else(|| "successful operation omitted its body".to_string())?;
+    let valid = match operation {
+        "checkpoint_create_v2" => {
+            exact_keys(response, &["result", "receipt"])
+                && response["result"] == "committed"
+                && response["receipt"]["operation_kind"] == "creation"
+        }
+        "checkpoint_admit_v2" => checkpoint_or_admission_evidence(directory, response),
+        "checkpoint_step_v2" => {
+            valid_checkpoint(directory, response)
+                || (response["operation_kind"] == "event_terminal"
+                    && exact_keys(
+                        response,
+                        &[
+                            "operation_kind",
+                            "receipt_sequence",
+                            "event_id",
+                            "request_digest",
+                            "acceptance_sequence",
+                            "final_queue_sequence",
+                            "committed_revision",
+                            "resulting_aggregate_state_digest",
+                            "outcome",
+                            "emission_references",
+                        ],
+                    ))
+        }
+        "checkpoint_prune_v2" => valid_checkpoint(directory, response),
+        "checkpoint_update_outbox_v2" => {
+            exact_keys(response, &["result", "record"])
+                && response["result"] == "committed"
+                && exact_keys(
+                    &response["record"],
+                    &["intent", "state_revision", "delivery_state"],
+                )
+        }
+        "checkpoint_terminalize_outbox_v2" => {
+            exact_keys(response, &["result", "record"])
+                && response["result"] == "committed"
+                && (exact_keys(
+                    &response["record"],
+                    &[
+                        "terminal_sequence",
+                        "intent",
+                        "committed_revision",
+                        "outcome",
+                    ],
+                ) || exact_keys(
+                    &response["record"],
+                    &[
+                        "terminal_sequence",
+                        "effect_id",
+                        "intent_digest",
+                        "committed_revision",
+                        "outcome",
+                    ],
+                ))
+        }
+        "checkpoint_compact_outbox_v2" => {
+            exact_keys(response, &["result", "record"])
+                && response["result"] == "committed"
+                && exact_keys(
+                    &response["record"],
+                    &[
+                        "terminal_sequence",
+                        "effect_id",
+                        "intent_digest",
+                        "committed_revision",
+                        "outcome",
+                    ],
+                )
+        }
+        "checkpoint_tombstone_v2" => {
+            exact_keys(response, &["result", "tombstone"])
+                && response["result"] == "tombstoned"
+                && exact_keys(
+                    &response["tombstone"],
+                    &[
+                        "status",
+                        "root_runtime_id",
+                        "creation_id",
+                        "terminal_status",
+                        "final_aggregate_state_digest",
+                        "tombstone_operation_id",
+                    ],
+                )
+        }
+        "checkpoint_delete_retained_record_v2" => false,
+        _ => false,
+    };
+    valid
+        .then_some(())
+        .ok_or_else(|| format!("malformed production response for {operation}: {response}"))
+}
+
+fn checkpoint_or_admission_evidence(directory: &Path, value: &Value) -> bool {
+    if valid_checkpoint(directory, value) {
+        return true;
+    }
+    let source = serde_json_canonicalizer::to_vec(value).unwrap();
+    determa_state::validate_artifact(
+        "version2_operation_result",
+        &source,
+        &resolver(directory),
+        true,
+    )
+    .is_ok()
+}
+
+fn valid_checkpoint(directory: &Path, value: &Value) -> bool {
+    let source = serde_json_canonicalizer::to_vec(value).unwrap();
+    determa_state::checkpoint::restore(&source, &resolver(directory)).is_ok()
+}
+
+fn exact_keys(value: &Value, expected: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+    })
 }
 
 fn run_contract(directory: &Path, vector: &Value, request: &Value) -> Value {

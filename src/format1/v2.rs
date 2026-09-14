@@ -106,7 +106,10 @@ pub fn restore_aggregate_v2(
     restore_aggregate_v2_value(value, resolver)
 }
 
-pub(crate) fn validate_aggregate_artifact(source: &[u8]) -> Result<JsonValue, Version2Error> {
+pub(crate) fn validate_aggregate_artifact(
+    source: &[u8],
+    resolver: &(impl DefinitionResolver + ?Sized),
+) -> Result<JsonValue, Version2Error> {
     let value = strict_json::parse(source).map_err(|error| {
         let code = match error.code {
             strict_json::StrictJsonErrorCode::DuplicateKey => "duplicate_key",
@@ -118,7 +121,34 @@ pub(crate) fn validate_aggregate_artifact(source: &[u8]) -> Result<JsonValue, Ve
         Version2Error::new(code, error.to_string())
     })?;
     validate_aggregate_artifact_value(&value)?;
-    Ok(value)
+    let mut fingerprints = BTreeSet::new();
+    collect_bundle_fingerprints(&value, &mut fingerprints);
+    for fingerprint in fingerprints {
+        let resolved = resolver.resolve_definition(&fingerprint).ok_or_else(|| {
+            Version2Error::new(
+                "source_definition_unavailable",
+                "retained provenance definition is unavailable",
+            )
+        })?;
+        if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
+            return Err(Version2Error::new(
+                "source_definition_untrusted",
+                "retained provenance definition is not trusted",
+            ));
+        }
+    }
+    match restore_aggregate_v2_value(value.clone(), resolver) {
+        Ok(_) => Ok(value),
+        Err(error)
+            if error.code == "invalid_aggregate_state"
+                && error.message == "spawned machine version is outside signed 64-bit" =>
+        {
+            // The artifact contract admits unbounded canonical target operands;
+            // executable round-trip admission applies the signed runtime limit.
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub fn create_v2(

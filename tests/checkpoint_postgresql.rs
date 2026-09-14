@@ -96,6 +96,8 @@ machines:
     let PostgresqlHostMutationResult::Creation(created) = created.host_result else {
         panic!("unexpected create result")
     };
+    assert_eq!(created["result"], "committed");
+    let created = host.load_checkpoint("server-1").unwrap().unwrap();
 
     let inputs: Value =
         serde_json::from_slice(&fs::read(core.join("operation-inputs.json")).unwrap()).unwrap();
@@ -313,6 +315,8 @@ machines:
     else {
         panic!("unexpected terminal create result")
     };
+    assert_eq!(terminal_created["result"], "committed");
+    let terminal_created = host.load_checkpoint("terminal-root").unwrap().unwrap();
     let before_rollback = store.load("terminal-root").unwrap().unwrap();
     let rollback_guard = MutationGuard::new(terminal_created.revision(), terminal_created.digest());
     let rollback = host.with_postgresql_transaction("terminal-root", |transaction| {
@@ -373,6 +377,8 @@ machines:
     let PostgresqlHostMutationResult::Creation(outbox_created) = outbox_created.host_result else {
         panic!("unexpected outbox create result")
     };
+    assert_eq!(outbox_created["result"], "committed");
+    let outbox_created = host.load_checkpoint("outbox-root").unwrap().unwrap();
     let effect_id = outbox_created.value()["pending_outbox_intents"][0]["intent"]["effect_id"]
         .as_str()
         .unwrap();
@@ -397,7 +403,10 @@ machines:
     let PostgresqlHostMutationResult::PendingOutbox(pending) = pending.host_result else {
         panic!("unexpected pending result")
     };
-    let pending_guard = guard_for(&pending);
+    assert_eq!(pending["result"], "committed");
+    let pending_checkpoint = host.load_checkpoint("outbox-root").unwrap().unwrap();
+    let pending_guard =
+        MutationGuard::new(pending_checkpoint.revision(), pending_checkpoint.digest());
     let terminal = host
         .with_postgresql_transaction("outbox-root", |transaction| {
             application_row(transaction.transaction(), "outbox-root", "terminal")?;
@@ -415,7 +424,10 @@ machines:
     let PostgresqlHostMutationResult::Outbox(terminal) = terminal.host_result else {
         panic!("unexpected terminal result")
     };
-    let terminal_guard = guard_for(&terminal);
+    assert_eq!(terminal["result"], "committed");
+    let terminal_checkpoint = host.load_checkpoint("outbox-root").unwrap().unwrap();
+    let terminal_guard =
+        MutationGuard::new(terminal_checkpoint.revision(), terminal_checkpoint.digest());
     let compacted = host
         .with_postgresql_transaction("outbox-root", |transaction| {
             application_row(transaction.transaction(), "outbox-root", "compact")?;
@@ -465,10 +477,11 @@ fn create_transaction_root(
             )
         })
         .unwrap();
-    let PostgresqlHostMutationResult::Creation(created) = created.host_result else {
+    let PostgresqlHostMutationResult::Creation(created_response) = created.host_result else {
         panic!("unexpected process-root creation result")
     };
-    *created
+    assert_eq!(created_response["result"], "committed");
+    host.load_checkpoint(root_instance_id).unwrap().unwrap()
 }
 
 fn input_delivery(

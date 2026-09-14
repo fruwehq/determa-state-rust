@@ -34,10 +34,11 @@ pub use store::{
     StoreRecord, StoreWriteResult,
 };
 pub use types::{
-    AdmissionSource, CheckpointErrorCode, DurableFailurePolicy, DurableHostExecution,
-    DurableHostResult, DurableProcessRequest, DurableQuarantineReleaseRequest, OutboxIntent,
-    PendingOutboxState, PreAcceptanceFailureCode, ProcessingRequest, PruneRequest,
-    ScopedStoreRecord, StoreScope, TerminalOutboxOutcome, TransactionalProcessRequest,
+    AdmissionSource, CheckpointErrorCode, DurableCheckpointExecution, DurableFailurePolicy,
+    DurableHostExecution, DurableHostResult, DurableProcessRequest,
+    DurableQuarantineReleaseRequest, OutboxIntent, PendingOutboxState, PreAcceptanceFailureCode,
+    ProcessingRequest, PruneRequest, ScopedStoreRecord, StoreScope, TerminalOutboxOutcome,
+    TransactionalProcessRequest,
 };
 pub use v2::{
     checkpoint_admit_v2 as admit, checkpoint_compact_outbox as compact_outbox,

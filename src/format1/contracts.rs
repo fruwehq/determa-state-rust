@@ -25,7 +25,7 @@ pub fn validate_artifact(
     verify_digest: bool,
 ) -> Result<Value, super::ArtifactError> {
     match kind {
-        "aggregate_state_v2" => super::v2::validate_aggregate_artifact(source),
+        "aggregate_state_v2" => super::v2::validate_aggregate_artifact(source, resolver),
         "aggregate_state_package_v2" if verify_digest => {
             let mut resolver = resolver_to_memory(resolver);
             super::package::restore_package_v2(source, &mut resolver).map(|_| {

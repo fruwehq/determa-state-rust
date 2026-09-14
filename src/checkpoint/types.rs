@@ -48,6 +48,12 @@ pub struct DurableHostResult {
     pub code: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DurableCheckpointExecution {
+    pub result: DurableHostResult,
+    pub operation_response: Option<Value>,
+}
+
 impl DurableHostResult {
     pub(crate) fn new(
         result: &str,

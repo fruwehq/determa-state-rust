@@ -1,5 +1,6 @@
 use determa_state::{load_bundle, validate_artifact, ArtifactError, InMemoryDefinitionResolver};
-use serde_json::Value;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -61,6 +62,59 @@ fn all_381_manifest_artifacts_receive_full_validation() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+#[test]
+fn resealed_aggregate_with_unavailable_definition_is_rejected() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "conformance-suite/conformance/core/117-version2-mailboxes/spawn-isolation-aggregate.json",
+    );
+    let mut aggregate: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    replace_fingerprints(
+        &mut aggregate,
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    );
+    let mut unsigned = aggregate.clone();
+    unsigned
+        .as_object_mut()
+        .unwrap()
+        .remove("aggregate_state_digest");
+    let bytes =
+        serde_json_canonicalizer::to_vec(&json!(["determa-aggregate-state-digest-2", unsigned]))
+            .unwrap();
+    aggregate["aggregate_state_digest"] = json!(format!("sha256:{:x}", Sha256::digest(bytes)));
+    let source = serde_json_canonicalizer::to_vec(&aggregate).unwrap();
+
+    let error = validate_artifact(
+        "aggregate_state_v2",
+        &source,
+        &InMemoryDefinitionResolver::default(),
+        true,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "source_definition_unavailable");
+}
+
+fn replace_fingerprints(value: &mut Value, replacement: &str) {
+    match value {
+        Value::Object(object) => {
+            if object.contains_key("validated_bundle_fingerprint") {
+                object.insert(
+                    "validated_bundle_fingerprint".to_string(),
+                    Value::String(replacement.to_string()),
+                );
+            }
+            for child in object.values_mut() {
+                replace_fingerprints(child, replacement);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                replace_fingerprints(item, replacement);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn definition_resolver(root: &Path) -> InMemoryDefinitionResolver {
