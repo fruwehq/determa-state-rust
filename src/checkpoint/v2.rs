@@ -1374,7 +1374,7 @@ fn validate_semantics(value: &Value) -> Result<(), ArtifactError> {
     let receipts = value["operation_receipts"].as_array().unwrap();
     let mut sequences = BTreeSet::new();
     let mut prior_sequence = None;
-    let mut prior_commit = Counter::zero();
+    let mut prior_effective_revision = Counter::zero();
     let mut creation_id = None;
     let mut creation_count = 0_usize;
     let mut acceptance_by_event = BTreeMap::new();
@@ -1392,7 +1392,7 @@ fn validate_semantics(value: &Value) -> Result<(), ArtifactError> {
         }
         prior_sequence = Some(sequence);
         let kind = receipt["operation_kind"].as_str().unwrap();
-        let committed = match kind {
+        let effective_revision = match kind {
             "creation" => {
                 creation_count += 1;
                 creation_id = receipt["creation_id"].as_str();
@@ -1410,7 +1410,7 @@ fn validate_semantics(value: &Value) -> Result<(), ArtifactError> {
                 {
                     return Err(invalid("acceptance identity is duplicated"));
                 }
-                None
+                Some(accepted)
             }
             "event_terminal" => {
                 let event_id = receipt["event_id"].as_str().unwrap();
@@ -1422,14 +1422,15 @@ fn validate_semantics(value: &Value) -> Result<(), ArtifactError> {
             "maintenance_migration" => Some(counter(receipt, "committed_revision")?),
             _ => return Err(invalid("unknown operation receipt kind")),
         };
-        if let Some(committed) = committed {
-            if committed > revision
-                || committed < prior_commit
-                || (kind == "maintenance_migration" && committed <= prior_commit)
+        if let Some(effective_revision) = effective_revision {
+            if effective_revision > revision
+                || effective_revision < prior_effective_revision
+                || (kind == "maintenance_migration"
+                    && effective_revision <= prior_effective_revision)
             {
                 return Err(invalid("receipt chronology is invalid"));
             }
-            prior_commit = committed;
+            prior_effective_revision = effective_revision;
         }
     }
     if creation_count != 1
@@ -1485,6 +1486,30 @@ fn validate_semantics(value: &Value) -> Result<(), ArtifactError> {
     if value["root_record"]["status"] == "tombstone" {
         validate_maintenance_receipts(value, None)?;
     }
+    let root_runtime_id = value["root_record"]["status"]
+        .as_str()
+        .filter(|status| *status == "retained")
+        .map_or(&value["root_record"]["root_runtime_id"], |_| {
+            &value["root_record"]["aggregate_state"]["root_runtime_id"]
+        });
+    let mut prior_audit_sequence = None;
+    for audit in value["migration_audit_records"].as_array().unwrap() {
+        let sequence = counter(audit, "migration_sequence")?;
+        if audit["root_instance_id"] != value["root_instance_id"]
+            || audit["root_runtime_id"] != *root_runtime_id
+            || prior_audit_sequence
+                .as_ref()
+                .is_some_and(|prior| prior >= &sequence)
+        {
+            return Err(invalid("migration audit identity or order is invalid"));
+        }
+        prior_audit_sequence = Some(sequence);
+    }
+    if acceptance_by_event.keys().any(|event_id| {
+        !mailbox_events.contains_key(event_id) && !terminal_by_event.contains_key(event_id)
+    }) {
+        return Err(invalid("acceptance receipt has no live or terminal event"));
+    }
 
     let mut tombstone_ids = BTreeSet::new();
     let mut prior_tombstone_sequence = None;
@@ -1496,6 +1521,9 @@ fn validate_semantics(value: &Value) -> Result<(), ArtifactError> {
             || terminal_by_event.contains_key(event_id)
             || acceptance_by_event.contains_key(event_id)
             || terminal_sequence >= next_receipt
+            || terminal_by_event.values().any(|terminal| {
+                terminal["receipt_sequence"] == tombstone["terminal_receipt_sequence"]
+            })
             || prior_tombstone_sequence
                 .as_ref()
                 .is_some_and(|prior| prior >= &terminal_sequence)
@@ -1503,6 +1531,69 @@ fn validate_semantics(value: &Value) -> Result<(), ArtifactError> {
             return Err(invalid("event tombstone identity is invalid"));
         }
         prior_tombstone_sequence = Some(terminal_sequence);
+    }
+    let aggregate = value["root_record"].get("aggregate_state");
+    let next_acceptance = aggregate
+        .map(|aggregate| counter(aggregate, "next_acceptance_sequence"))
+        .transpose()?;
+    let next_queue = aggregate
+        .map(|aggregate| counter(aggregate, "next_queue_sequence"))
+        .transpose()?;
+    let mut acceptance_owners = BTreeMap::new();
+    let mut record_acceptance = |event_id: &str, sequence: Counter| -> Result<(), ArtifactError> {
+        if next_acceptance
+            .as_ref()
+            .is_some_and(|next| sequence >= *next)
+            || acceptance_owners
+                .insert(sequence.clone(), event_id.to_string())
+                .is_some_and(|prior| prior != event_id)
+        {
+            return Err(invalid("acceptance allocation owner is invalid"));
+        }
+        Ok(())
+    };
+    let mut queue_allocations = BTreeSet::new();
+    for (event_id, entry) in &mailbox_events {
+        record_acceptance(event_id, counter(entry, "acceptance_sequence")?)?;
+        queue_allocations.insert(counter(entry, "queue_sequence")?);
+    }
+    for (event_id, receipt) in &acceptance_by_event {
+        record_acceptance(event_id, counter(receipt, "acceptance_sequence")?)?;
+    }
+    for (event_id, receipt) in &terminal_by_event {
+        record_acceptance(event_id, counter(receipt, "acceptance_sequence")?)?;
+        let sequence = counter(receipt, "final_queue_sequence")?;
+        if next_queue.as_ref().is_some_and(|next| sequence >= *next)
+            || !queue_allocations.insert(sequence)
+        {
+            return Err(invalid(
+                "terminal queue allocation is duplicated or invalid",
+            ));
+        }
+    }
+    for tombstone in value["event_identity_tombstones"].as_array().unwrap() {
+        record_acceptance(
+            tombstone["event_id"].as_str().unwrap(),
+            counter(tombstone, "acceptance_sequence")?,
+        )?;
+    }
+    let current_digest = aggregate.map_or(
+        &value["root_record"]["final_aggregate_state_digest"],
+        |aggregate| &aggregate["aggregate_state_digest"],
+    );
+    let mut terminal_digests = BTreeMap::new();
+    for terminal in terminal_by_event.values() {
+        let committed = counter(terminal, "committed_revision")?;
+        let digest = terminal["resulting_aggregate_state_digest"]
+            .as_str()
+            .unwrap();
+        if terminal_digests
+            .insert(committed.clone(), digest)
+            .is_some_and(|prior| prior != digest)
+            || (committed == revision && current_digest.as_str() != Some(digest))
+        {
+            return Err(invalid("terminal result digest is inconsistent"));
+        }
     }
     if value["root_record"]["status"] == "tombstone"
         && value["root_record"]["creation_id"].as_str() != creation_id
@@ -1989,16 +2080,18 @@ fn validate_emission_and_outbox_relationships(
     let mut outbox_sequences = BTreeSet::new();
     let next_terminal = counter(checkpoint, "next_outbox_terminal_sequence")?;
     let mut terminal_sequences = BTreeSet::new();
-    for records in [pending, terminal_outbox] {
+    for (pending_records, records) in [(true, pending), (false, terminal_outbox)] {
         let mut prior_outbox_sequence = None;
+        let mut prior_terminal_sequence = None;
         for record in records {
             let intent = &record["intent"];
             let sequence = counter(intent, "sequence")?;
             if !effects.insert(intent["effect_id"].as_str().unwrap())
                 || !outbox_sequences.insert(sequence.clone())
-                || prior_outbox_sequence
-                    .as_ref()
-                    .is_some_and(|prior| prior >= &sequence)
+                || (pending_records
+                    && prior_outbox_sequence
+                        .as_ref()
+                        .is_some_and(|prior| prior >= &sequence))
                 || counter(
                     record,
                     if record.get("state_revision").is_some() {
@@ -2016,17 +2109,32 @@ fn validate_emission_and_outbox_relationships(
             if record.get("terminal_sequence").is_some() {
                 let terminal_sequence = counter(record, "terminal_sequence")?;
                 if terminal_sequence >= next_terminal
-                    || !terminal_sequences.insert(terminal_sequence)
+                    || prior_terminal_sequence
+                        .as_ref()
+                        .is_some_and(|prior| prior >= &terminal_sequence)
+                    || !terminal_sequences.insert(terminal_sequence.clone())
                 {
                     return Err(invalid("outbox terminal allocation is invalid"));
                 }
+                prior_terminal_sequence = Some(terminal_sequence);
             }
         }
     }
+    let mut prior_effect_tombstone_sequence = None;
     for tombstone in effect_tombstones {
-        if !effects.insert(tombstone["effect_id"].as_str().unwrap()) {
-            return Err(invalid("outbox effect identity is duplicated"));
+        let sequence = counter(tombstone, "terminal_sequence")?;
+        if !effects.insert(tombstone["effect_id"].as_str().unwrap())
+            || sequence >= next_terminal
+            || !terminal_sequences.insert(sequence.clone())
+            || prior_effect_tombstone_sequence
+                .as_ref()
+                .is_some_and(|prior| prior >= &sequence)
+        {
+            return Err(invalid(
+                "outbox effect identity or terminal sequence is invalid",
+            ));
         }
+        prior_effect_tombstone_sequence = Some(sequence);
     }
     let mut internal_references = BTreeSet::new();
     let mut outbox_references = BTreeSet::new();
@@ -2055,6 +2163,10 @@ fn validate_emission_and_outbox_relationships(
                     let retained_terminal = terminals.get(event_id).is_some_and(|terminal| {
                         terminal["receipt_sequence"] == reference["terminal_receipt_sequence"]
                             && terminal["acceptance_sequence"] == reference["acceptance_sequence"]
+                            && counter(receipt, "receipt_sequence").unwrap()
+                                < counter(terminal, "receipt_sequence").unwrap()
+                            && counter(receipt, "committed_revision").unwrap()
+                                <= counter(terminal, "committed_revision").unwrap()
                     });
                     let pruned_terminal = checkpoint["event_identity_tombstones"]
                         .as_array()
@@ -2066,6 +2178,8 @@ fn validate_emission_and_outbox_relationships(
                                     == reference["terminal_receipt_sequence"]
                                 && tombstone["acceptance_sequence"]
                                     == reference["acceptance_sequence"]
+                                && counter(receipt, "receipt_sequence").unwrap()
+                                    < counter(tombstone, "terminal_receipt_sequence").unwrap()
                         });
                     if !internal_references.insert(event_id)
                         || !(retained_terminal || pruned_terminal)

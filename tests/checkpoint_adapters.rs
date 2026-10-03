@@ -425,6 +425,286 @@ fn checkpoint_restore_requires_producer_for_every_retained_outbox_effect() {
     }
 }
 
+#[test]
+fn checkpoint_restore_rejects_outbox_terminal_sequence_overlap() {
+    let directory = Path::new(
+        "conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-02-native-outbox",
+    );
+    let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let source = fs::read(directory.join("effect-tombstone-checkpoint-v2.json")).unwrap();
+    determa_state::checkpoint::restore(&source, &resolver).unwrap();
+    let mut value: Value = serde_json::from_slice(&source).unwrap();
+    value["outbox_effect_tombstones"][0]["terminal_sequence"] =
+        value["terminal_outbox_records"][0]["terminal_sequence"].clone();
+    reseal_checkpoint_digest(&mut value);
+    let error = determa_state::checkpoint::restore(&serde_json::to_vec(&value).unwrap(), &resolver)
+        .unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("outbox effect identity or terminal sequence"),
+        "{error:?}"
+    );
+
+    let source = fs::read(directory.join("terminal-checkpoint-v2.json")).unwrap();
+    determa_state::checkpoint::restore(&source, &resolver).unwrap();
+    let mut value: Value = serde_json::from_slice(&source).unwrap();
+    let terminal_records = value["terminal_outbox_records"].as_array_mut().unwrap();
+    let first = terminal_records[0]["terminal_sequence"].clone();
+    terminal_records[0]["terminal_sequence"] = terminal_records[1]["terminal_sequence"].clone();
+    terminal_records[1]["terminal_sequence"] = first;
+    reseal_checkpoint_digest(&mut value);
+    let error = determa_state::checkpoint::restore(&serde_json::to_vec(&value).unwrap(), &resolver)
+        .unwrap_err();
+    assert!(
+        error.message.contains("outbox terminal allocation"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn terminal_outbox_records_follow_completion_order_even_when_intents_arrived_earlier() {
+    let directory = Path::new(
+        "conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-02-native-outbox",
+    );
+    let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let checkpoint = determa_state::checkpoint::restore(
+        &fs::read(directory.join("pending-checkpoint-v2.json")).unwrap(),
+        &resolver,
+    )
+    .unwrap();
+    let effect_ids = checkpoint.value()["pending_outbox_intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["intent"]["effect_id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let store: Arc<dyn ExecutionStore> = Arc::new(MemoryExecutionStore::new());
+    store.initialize_schema().unwrap();
+    assert_eq!(
+        store
+            .insert_if_absent(StoreRecord::from_checkpoint(&checkpoint).unwrap())
+            .unwrap(),
+        StoreWriteResult::Committed
+    );
+    let host = CheckpointHost::new(store, Arc::new(resolver));
+    let mut prior = checkpoint.value().clone();
+    for effect_id in [&effect_ids[4], &effect_ids[0]] {
+        host.terminalize_outbox(
+            checkpoint.root_instance_id(),
+            effect_id,
+            TerminalOutboxOutcome::Confirmed,
+            &MutationGuard::new(
+                prior["revision"].as_str().unwrap(),
+                prior["execution_checkpoint_digest"].as_str().unwrap(),
+            ),
+        )
+        .unwrap();
+        prior = host
+            .load_checkpoint(checkpoint.root_instance_id())
+            .unwrap()
+            .unwrap()
+            .value()
+            .clone();
+    }
+    let records = prior["terminal_outbox_records"].as_array().unwrap();
+    assert_eq!(records[0]["intent"]["effect_id"], effect_ids[4]);
+    assert_eq!(records[1]["intent"]["effect_id"], effect_ids[0]);
+    assert_eq!(records[0]["terminal_sequence"], "0");
+    assert_eq!(records[1]["terminal_sequence"], "1");
+}
+
+#[test]
+fn checkpoint_restore_rejects_acceptance_without_live_or_terminal_event() {
+    let directory = Path::new("conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-05-spawned-host-trace");
+    let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let source = fs::read(directory.join("spawned-start-pending-checkpoint-v2.json")).unwrap();
+    determa_state::checkpoint::restore(&source, &resolver).unwrap();
+    let mut value: Value = serde_json::from_slice(&source).unwrap();
+    let accepted_event = value["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|receipt| receipt["operation_kind"] == "acceptance")
+        .unwrap()["event_id"]
+        .clone();
+    let aggregate = &mut value["root_record"]["aggregate_state"];
+    let ready = aggregate["runtimes"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .flat_map(|runtime| {
+            runtime["ready_mailbox"]
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+        })
+        .find(|entry| entry["envelope"]["event_id"] == accepted_event)
+        .unwrap();
+    *ready = Value::Null;
+    for runtime in aggregate["runtimes"].as_array_mut().unwrap() {
+        runtime["ready_mailbox"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|entry| !entry.is_null());
+    }
+    reseal_aggregate_digest(aggregate);
+    reseal_checkpoint_digest(&mut value);
+    assert!(
+        determa_state::checkpoint::restore(&serde_json::to_vec(&value).unwrap(), &resolver)
+            .is_err()
+    );
+}
+
+#[test]
+fn checkpoint_restore_enforces_receipt_chronology_allocation_and_digest() {
+    let directory = Path::new("conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-05-spawned-host-trace");
+    let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let source = fs::read(directory.join("spawned-child-terminal-checkpoint-v2.json")).unwrap();
+    determa_state::checkpoint::restore(&source, &resolver).unwrap();
+    let original: Value = serde_json::from_slice(&source).unwrap();
+
+    let mut chronology = original.clone();
+    chronology["operation_receipts"][3]["accepted_revision"] = json!("1");
+    reseal_checkpoint_digest(&mut chronology);
+    let error =
+        determa_state::checkpoint::restore(&serde_json::to_vec(&chronology).unwrap(), &resolver)
+            .unwrap_err();
+    assert!(error.message.contains("receipt chronology"), "{error:?}");
+
+    let mut digest = original.clone();
+    digest["operation_receipts"][5]["resulting_aggregate_state_digest"] =
+        json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    reseal_checkpoint_digest(&mut digest);
+    let error =
+        determa_state::checkpoint::restore(&serde_json::to_vec(&digest).unwrap(), &resolver)
+            .unwrap_err();
+    assert!(
+        error.message.contains("terminal result digest"),
+        "{error:?}"
+    );
+
+    let mut queue = original;
+    queue["operation_receipts"][5]["final_queue_sequence"] = json!("2");
+    reseal_checkpoint_digest(&mut queue);
+    let error = determa_state::checkpoint::restore(&serde_json::to_vec(&queue).unwrap(), &resolver)
+        .unwrap_err();
+    assert!(
+        error.message.contains("terminal queue allocation"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn checkpoint_restore_enforces_internal_producer_chronology_and_acceptance_owner() {
+    let directory = Path::new("conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-05-spawned-host-trace");
+    let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let source = fs::read(directory.join("spawned-owner-done-checkpoint-v2.json")).unwrap();
+    determa_state::checkpoint::restore(&source, &resolver).unwrap();
+    let original: Value = serde_json::from_slice(&source).unwrap();
+
+    let mut ownership = original.clone();
+    ownership["operation_receipts"][5]["emission_references"][0]["acceptance_sequence"] =
+        json!("2");
+    ownership["operation_receipts"][7]["acceptance_sequence"] = json!("2");
+    reseal_checkpoint_digest(&mut ownership);
+    let error =
+        determa_state::checkpoint::restore(&serde_json::to_vec(&ownership).unwrap(), &resolver)
+            .unwrap_err();
+    assert!(
+        error.message.contains("acceptance allocation owner"),
+        "{error:?}"
+    );
+
+    let mut chronology = original;
+    let reference = chronology["operation_receipts"][5]["emission_references"]
+        .as_array_mut()
+        .unwrap()
+        .remove(0);
+    chronology["operation_receipts"][7]["emission_references"]
+        .as_array_mut()
+        .unwrap()
+        .push(reference);
+    reseal_checkpoint_digest(&mut chronology);
+    let error =
+        determa_state::checkpoint::restore(&serde_json::to_vec(&chronology).unwrap(), &resolver)
+            .unwrap_err();
+    assert!(
+        error.message.contains("internal terminal reference"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn tombstone_restore_checks_every_migration_audit_root() {
+    let root = Path::new("conformance-suite/conformance/profiles/execution-checkpoint");
+    let source = fs::read(
+        root.join("checkpoint-07-complete-host-contract/bounded-tombstone-checkpoint-v2.json"),
+    )
+    .unwrap();
+    let resolver = InMemoryDefinitionResolver::default();
+    determa_state::checkpoint::restore(&source, &resolver).unwrap();
+    let mut value: Value = serde_json::from_slice(&source).unwrap();
+    let donor: Value = serde_json::from_slice(
+        &fs::read(
+            root.join("checkpoint-04-version2-mailboxes/maintenance-sequential-checkpoint-v2.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    value["migration_audit_records"]
+        .as_array_mut()
+        .unwrap()
+        .push(donor["migration_audit_records"][0].clone());
+    reseal_checkpoint_digest(&mut value);
+    let error = determa_state::checkpoint::restore(&serde_json::to_vec(&value).unwrap(), &resolver)
+        .unwrap_err();
+    assert!(
+        error.message.contains("migration audit identity"),
+        "{error:?}"
+    );
+
+    let mut overlap: Value = serde_json::from_slice(&source).unwrap();
+    let terminal_sequence = overlap["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|receipt| receipt["operation_kind"] == "event_terminal")
+        .unwrap()["receipt_sequence"]
+        .clone();
+    overlap["event_identity_tombstones"][0]["terminal_receipt_sequence"] = terminal_sequence;
+    reseal_checkpoint_digest(&mut overlap);
+    let error =
+        determa_state::checkpoint::restore(&serde_json::to_vec(&overlap).unwrap(), &resolver)
+            .unwrap_err();
+    assert!(
+        error.message.contains("event tombstone identity"),
+        "{error:?}"
+    );
+}
+
+fn reseal_aggregate_digest(value: &mut Value) {
+    let mut unsigned = value.clone();
+    unsigned
+        .as_object_mut()
+        .unwrap()
+        .remove("aggregate_state_digest");
+    let bytes =
+        serde_json_canonicalizer::to_vec(&json!(["determa-aggregate-state-digest-2", unsigned]))
+            .unwrap();
+    value["aggregate_state_digest"] = json!(format!("sha256:{:x}", Sha256::digest(bytes)));
+}
+
 fn reseal_checkpoint_digest(value: &mut Value) {
     let mut unsigned = value.clone();
     unsigned
