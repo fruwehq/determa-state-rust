@@ -426,6 +426,62 @@ fn checkpoint_restore_requires_producer_for_every_retained_outbox_effect() {
 }
 
 #[test]
+fn pruning_outbox_producer_removes_terminal_evidence_and_protects_pending_work() {
+    let directory = Path::new(
+        "conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-02-native-outbox",
+    );
+    let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let request = PruneRequest {
+        cutoff_receipt_sequence: "2".to_string(),
+        target_mode: "bounded".to_string(),
+        policy_identifier: Some("outbox-prune".to_string()),
+        dependency_receipt_sequences: Vec::new(),
+        dependency_effect_ids: Vec::new(),
+    };
+    for filename in [
+        "terminal-checkpoint-v2.json",
+        "effect-tombstone-checkpoint-v2.json",
+    ] {
+        let checkpoint = determa_state::checkpoint::restore(
+            &fs::read(directory.join(filename)).unwrap(),
+            &resolver,
+        )
+        .unwrap();
+        let pruned = determa_state::checkpoint::prune(&checkpoint, &request, None, None).unwrap();
+        assert!(
+            pruned["terminal_outbox_records"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{filename}"
+        );
+        assert!(
+            pruned["outbox_effect_tombstones"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{filename}"
+        );
+        assert_eq!(pruned["operation_receipts"].as_array().unwrap().len(), 1);
+        determa_state::checkpoint::restore(&serde_json::to_vec(&pruned).unwrap(), &resolver)
+            .unwrap();
+    }
+    let pending = determa_state::checkpoint::restore(
+        &fs::read(directory.join("pending-checkpoint-v2.json")).unwrap(),
+        &resolver,
+    )
+    .unwrap();
+    assert_eq!(
+        determa_state::checkpoint::prune(&pending, &request, None, None)
+            .unwrap_err()
+            .code,
+        "invalid_execution_checkpoint"
+    );
+}
+
+#[test]
 fn checkpoint_restore_rejects_outbox_terminal_sequence_overlap() {
     let directory = Path::new(
         "conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-02-native-outbox",

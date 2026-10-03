@@ -883,6 +883,26 @@ pub fn checkpoint_prune_v2(
         return Err(failure("invalid_execution_checkpoint"));
     }
     validate_prune_dependencies(receipts, &removable, prior.as_ref())?;
+    let pending_effect_ids = checkpoint.value["pending_outbox_intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|record| record["intent"]["effect_id"].as_str())
+        .collect::<BTreeSet<_>>();
+    if removable.iter().any(|receipt| {
+        receipt["emission_references"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|reference| {
+                reference["kind"] == "external_outbox"
+                    && reference["effect_id"]
+                        .as_str()
+                        .is_some_and(|effect_id| pending_effect_ids.contains(effect_id))
+            })
+    }) {
+        return Err(failure("invalid_execution_checkpoint"));
+    }
     let mut value = checkpoint.value.clone();
     let removed_sequences = removable
         .iter()
@@ -909,6 +929,36 @@ pub fn checkpoint_prune_v2(
         .filter(|r| !removed_sequences.contains(r["receipt_sequence"].as_str().unwrap()))
         .cloned()
         .collect::<Vec<_>>());
+    let retained_effect_ids = value["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|receipt| {
+            receipt["emission_references"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .filter(|reference| reference["kind"] == "external_outbox")
+        .filter_map(|reference| reference["effect_id"].as_str())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    value["terminal_outbox_records"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|record| {
+            record["intent"]["effect_id"]
+                .as_str()
+                .is_some_and(|effect_id| retained_effect_ids.contains(effect_id))
+        });
+    value["outbox_effect_tombstones"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|record| {
+            record["effect_id"]
+                .as_str()
+                .is_some_and(|effect_id| retained_effect_ids.contains(effect_id))
+        });
     tombstones.sort_by_key(|item| {
         Counter::from_decimal(item["terminal_receipt_sequence"].as_str().unwrap()).unwrap()
     });
@@ -920,7 +970,7 @@ pub fn checkpoint_prune_v2(
         "policy_identifier": request.policy_identifier.as_ref().unwrap()
     });
     value["revision"] = incremented(&value["revision"])?;
-    seal_checkpoint(&mut value)?;
+    seal_and_validate_checkpoint(&mut value)?;
     Ok(value)
 }
 
