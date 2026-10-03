@@ -379,6 +379,52 @@ fn checkpoint_restore_rejects_duplicate_and_dangling_producer_references() {
     }
 }
 
+#[test]
+fn checkpoint_restore_requires_producer_for_every_retained_outbox_effect() {
+    let directory = Path::new(
+        "conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-02-native-outbox",
+    );
+    let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    for filename in [
+        "pending-checkpoint-v2.json",
+        "terminal-checkpoint-v2.json",
+        "effect-tombstone-checkpoint-v2.json",
+    ] {
+        let source = fs::read(directory.join(filename)).unwrap();
+        determa_state::checkpoint::restore(&source, &resolver).unwrap();
+        let mut value: Value = serde_json::from_slice(&source).unwrap();
+        let references = value["operation_receipts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|receipt| {
+                receipt["emission_references"]
+                    .as_array()
+                    .is_some_and(|references| {
+                        references
+                            .iter()
+                            .any(|reference| reference["kind"] == "external_outbox")
+                    })
+            })
+            .unwrap()["emission_references"]
+            .as_array_mut()
+            .unwrap();
+        let index = references
+            .iter()
+            .position(|reference| reference["kind"] == "external_outbox")
+            .unwrap();
+        references.remove(index);
+        reseal_checkpoint_digest(&mut value);
+        assert!(
+            determa_state::checkpoint::restore(&serde_json::to_vec(&value).unwrap(), &resolver)
+                .is_err(),
+            "{filename} restored without an effect producer"
+        );
+    }
+}
+
 fn reseal_checkpoint_digest(value: &mut Value) {
     let mut unsigned = value.clone();
     unsigned

@@ -2086,6 +2086,9 @@ fn validate_emission_and_outbox_relationships(
             }
         }
     }
+    if outbox_references != effects {
+        return Err(invalid("outbox effect producer reference is absent"));
+    }
     Ok(())
 }
 
