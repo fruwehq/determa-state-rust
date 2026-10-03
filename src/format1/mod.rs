@@ -2,7 +2,7 @@ mod cel;
 mod compile;
 mod contracts;
 mod counter;
-mod migration;
+pub(crate) mod migration;
 mod model;
 pub(crate) mod native;
 mod package;

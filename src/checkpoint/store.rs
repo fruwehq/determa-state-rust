@@ -600,7 +600,10 @@ pub(crate) fn validate_policy_replacement(
     let after_receipts = after["operation_receipts"].as_array().unwrap();
     if mode.receipt_retention == ReceiptRetentionMode::Permanent
         && (after_receipts.len() < before_receipts.len()
-            || after_receipts[..before_receipts.len()] != *before_receipts)
+            || before_receipts
+                .iter()
+                .zip(after_receipts)
+                .any(|(prior, next)| !retained_receipt_evolves(prior, next, &before, &after)))
     {
         return Err(StoreError::new(
             "permanent receipt retention forbids receipt removal or replacement",
@@ -626,6 +629,154 @@ pub(crate) fn validate_policy_replacement(
         }
     }
     Ok(())
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgresql"))]
+fn retained_receipt_evolves(
+    prior: &Value,
+    next: &Value,
+    before: &Value,
+    checkpoint: &Value,
+) -> bool {
+    if prior == next {
+        return true;
+    }
+    let mut prior_body = prior.clone();
+    let mut next_body = next.clone();
+    let prior_refs = prior_body
+        .as_object_mut()
+        .and_then(|body| body.remove("emission_references"));
+    let next_refs = next_body
+        .as_object_mut()
+        .and_then(|body| body.remove("emission_references"));
+    if prior_body != next_body {
+        return false;
+    }
+    let (Some(prior_refs), Some(next_refs)) = (
+        prior_refs.and_then(|refs| refs.as_array().cloned()),
+        next_refs.and_then(|refs| refs.as_array().cloned()),
+    ) else {
+        return false;
+    };
+    prior_refs.len() == next_refs.len()
+        && prior_refs.iter().zip(&next_refs).all(|(prior, next)| {
+            if prior == next {
+                return true;
+            }
+            if prior["kind"] != "internal_mailbox" {
+                return false;
+            }
+            let mut old = prior.clone();
+            let mut updated = next.clone();
+            old.as_object_mut().unwrap().remove("kind");
+            updated.as_object_mut().unwrap().remove("kind");
+            old.as_object_mut().unwrap().remove("queue_sequence");
+            updated.as_object_mut().unwrap().remove("queue_sequence");
+            if next["kind"] == "internal_mailbox" && old == updated {
+                let queue_advanced = prior["queue_sequence"]
+                    .as_str()
+                    .and_then(|value| crate::format1::Counter::from_decimal(value).ok())
+                    .zip(
+                        next["queue_sequence"]
+                            .as_str()
+                            .and_then(|value| crate::format1::Counter::from_decimal(value).ok()),
+                    )
+                    .is_some_and(|(prior, next)| {
+                        before["root_record"]["aggregate_state"]["next_queue_sequence"]
+                            .as_str()
+                            .and_then(|value| crate::format1::Counter::from_decimal(value).ok())
+                            .is_some_and(|floor| next > prior && next >= floor)
+                    });
+                return queue_advanced
+                    && checkpoint["root_record"]["aggregate_state"]["runtimes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|runtime| {
+                            ["ready_mailbox", "deferred_mailbox"]
+                                .into_iter()
+                                .flat_map(|field| runtime[field].as_array().into_iter().flatten())
+                        })
+                        .filter(|entry| {
+                            entry["delivery_mode"] == "internal"
+                                && entry["envelope"]["event_id"] == next["event_id"]
+                                && entry["acceptance_sequence"] == next["acceptance_sequence"]
+                                && entry["queue_sequence"] == next["queue_sequence"]
+                        })
+                        .count()
+                        == 1;
+            }
+            if next["kind"] == "internal_terminal" {
+                let terminal = updated
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("terminal_receipt_sequence");
+                let terminal_is_new = terminal
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .and_then(|value| crate::format1::Counter::from_decimal(value).ok())
+                    .zip(
+                        prior_body["receipt_sequence"]
+                            .as_str()
+                            .and_then(|value| crate::format1::Counter::from_decimal(value).ok()),
+                    )
+                    .is_some_and(|(terminal, producer)| {
+                        before["next_operation_receipt_sequence"]
+                            .as_str()
+                            .and_then(|value| crate::format1::Counter::from_decimal(value).ok())
+                            .is_some_and(|floor| terminal > producer && terminal >= floor)
+                    });
+                return old == updated
+                    && terminal_is_new
+                    && terminal.is_some_and(|sequence| {
+                        checkpoint["operation_receipts"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|receipt| {
+                                receipt["operation_kind"] == "event_terminal"
+                                    && receipt["receipt_sequence"] == sequence
+                                    && receipt["event_id"] == next["event_id"]
+                                    && receipt["acceptance_sequence"] == next["acceptance_sequence"]
+                            })
+                            .count()
+                            == 1
+                    });
+            }
+            false
+        })
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgresql")))]
+mod retention_transition_tests {
+    use super::retained_receipt_evolves;
+    use serde_json::json;
+
+    #[test]
+    fn permanent_receipts_allow_only_attested_internal_reference_evolution() {
+        let prior = json!({"operation_kind":"creation","receipt_sequence":"0","emission_references":[{"kind":"internal_mailbox","emission_index":"0","event_id":"event-a","acceptance_sequence":"0","queue_sequence":"1"}]});
+        let before = json!({"next_operation_receipt_sequence":"1","root_record":{"aggregate_state":{"next_queue_sequence":"2"}}});
+        let mut next = prior.clone();
+        next["emission_references"][0]["queue_sequence"] = json!("2");
+        let mut after = json!({"root_record":{"aggregate_state":{"runtimes":[{"ready_mailbox":[],"deferred_mailbox":[{"delivery_mode":"internal","envelope":{"event_id":"event-a"},"acceptance_sequence":"0","queue_sequence":"2"}]}]}},"operation_receipts":[]});
+        assert!(retained_receipt_evolves(&prior, &next, &before, &after));
+        next["emission_references"][0]["event_id"] = json!("event-b");
+        assert!(!retained_receipt_evolves(&prior, &next, &before, &after));
+        next["emission_references"][0]["event_id"] = json!("event-a");
+        next["emission_references"][0]["queue_sequence"] = json!("0");
+        assert!(!retained_receipt_evolves(&prior, &next, &before, &after));
+        next["emission_references"][0]["queue_sequence"] = json!("2");
+        after["root_record"]["aggregate_state"]["runtimes"][0]["deferred_mailbox"][0]
+            ["delivery_mode"] = json!("input");
+        assert!(!retained_receipt_evolves(&prior, &next, &before, &after));
+        after["root_record"]["aggregate_state"]["runtimes"][0]["deferred_mailbox"][0]
+            ["delivery_mode"] = json!("internal");
+        next["emission_references"][0] = json!({"kind":"internal_terminal","emission_index":"0","event_id":"event-a","acceptance_sequence":"0","terminal_receipt_sequence":"1"});
+        after["operation_receipts"] = json!([{"operation_kind":"event_terminal","receipt_sequence":"1","event_id":"event-a","acceptance_sequence":"0"}]);
+        assert!(retained_receipt_evolves(&prior, &next, &before, &after));
+        after["operation_receipts"][0]["event_id"] = json!("event-b");
+        assert!(!retained_receipt_evolves(&prior, &next, &before, &after));
+    }
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgresql"))]

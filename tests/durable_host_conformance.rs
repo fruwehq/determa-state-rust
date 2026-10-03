@@ -85,6 +85,35 @@ fn every_production_checkpoint_response_rejects_an_extra_member() {
 }
 
 #[test]
+fn fixture_values_reject_corrupted_creation_tombstone_and_outbox_bodies() {
+    let cases = [
+        ("checkpoint_create_commit", "/receipt/creation_id"),
+        ("checkpoint_creation_replay", "/receipt/creation_id"),
+        ("checkpoint_root_tombstone", "/tombstone/creation_id"),
+        ("checkpoint_root_tombstone_replay", "/tombstone/creation_id"),
+        ("outbox_retryable_failure", "/record/intent/effect_id"),
+    ];
+    for (name, field) in cases {
+        let (directory, vector) = profile_directories()
+            .into_iter()
+            .find_map(|directory| {
+                let manifest = yaml(&fs::read_to_string(directory.join("test.yaml")).unwrap());
+                manifest["durable_host_vectors"]
+                    .as_array()
+                    .and_then(|vectors| vectors.iter().find(|vector| vector["name"] == name))
+                    .map(|vector| (directory.clone(), vector.clone()))
+            })
+            .unwrap_or_else(|| panic!("missing durable vector {name}"));
+        let request = request(&directory, &vector);
+        let result = run_checkpoint_inner(&directory, &vector, &request, Some(field));
+        assert!(
+            result.is_err_and(|error| error.contains("malformed production response")),
+            "{name} accepted a wrong response value"
+        );
+    }
+}
+
+#[test]
 fn permanent_quarantine_obeys_retained_replay_and_conflict_precedence() {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
         "conformance-suite/conformance/profiles/persistence/persistence-05-permanent-quarantine-release",
@@ -170,7 +199,7 @@ fn run_vector(directory: &Path, vector: &Value) -> Result<(), String> {
 }
 
 fn run_checkpoint(directory: &Path, vector: &Value, request: &Value) -> Result<Value, String> {
-    run_checkpoint_inner(directory, vector, request, false)
+    run_checkpoint_inner(directory, vector, request, None)
 }
 
 fn run_checkpoint_with_response_corruption(
@@ -178,14 +207,14 @@ fn run_checkpoint_with_response_corruption(
     vector: &Value,
     request: &Value,
 ) -> Result<Value, String> {
-    run_checkpoint_inner(directory, vector, request, true)
+    run_checkpoint_inner(directory, vector, request, Some("/unexpected_member"))
 }
 
 fn run_checkpoint_inner(
     directory: &Path,
     vector: &Value,
     request: &Value,
-    corrupt_response: bool,
+    corrupt_response: Option<&str>,
 ) -> Result<Value, String> {
     let before_name = vector["checkpoint_before"].as_str();
     let stored_before_name = vector["stored_checkpoint_before"].as_str().or(before_name);
@@ -320,15 +349,22 @@ fn run_checkpoint_inner(
         ),
         other => return Err(format!("unsupported checkpoint operation {other}")),
     };
-    if corrupt_response {
+    if let Some(field) = corrupt_response {
         let response = result
             .operation_response
             .as_mut()
             .ok_or_else(|| "production operation returned no success body".to_string())?;
-        response
-            .as_object_mut()
-            .ok_or_else(|| "production operation returned a non-object body".to_string())?
-            .insert("unexpected_member".to_string(), Value::Bool(true));
+        if field == "/unexpected_member" {
+            response
+                .as_object_mut()
+                .ok_or_else(|| "production operation returned a non-object body".to_string())?
+                .insert("unexpected_member".to_string(), Value::Bool(true));
+        } else {
+            let value = response
+                .pointer_mut(field)
+                .ok_or_else(|| format!("response field {field} absent"))?;
+            *value = json!("wrong");
+        }
     }
     let stored = memory.load(&root).unwrap().map(|item| item.bytes);
     let expected_after = after_name.map(|name| fs::read(directory.join(name)).unwrap());
@@ -351,7 +387,8 @@ fn run_checkpoint_inner(
     }
     validate_operation_response(
         directory,
-        operation,
+        vector,
+        request,
         &result.result,
         result.operation_response.as_ref(),
     )?;
@@ -363,7 +400,8 @@ fn run_checkpoint_inner(
 
 fn validate_operation_response(
     directory: &Path,
-    operation: &str,
+    vector: &Value,
+    request: &Value,
     outcome: &DurableHostResult,
     response: Option<&Value>,
 ) -> Result<(), String> {
@@ -373,123 +411,170 @@ fn validate_operation_response(
             .then_some(())
             .ok_or_else(|| "failed operation returned a success body".to_string());
     }
+    let operation = vector["operation"].as_str().unwrap();
+    let after = pointer_file(
+        directory,
+        &json!({"file": vector["checkpoint_after"], "pointer": ""}),
+    );
+    let expected = expected_checkpoint_response(operation, request, outcome, &after)?;
     let response = response.ok_or_else(|| "successful operation omitted its body".to_string())?;
-    let valid = match operation {
-        "checkpoint_create_v2" => {
-            exact_keys(response, &["result", "receipt"])
-                && response["result"] == "committed"
-                && response["receipt"]["operation_kind"] == "creation"
-        }
-        "checkpoint_admit_v2" => checkpoint_or_admission_evidence(directory, response),
-        "checkpoint_step_v2" => {
-            valid_checkpoint(directory, response)
-                || (response["operation_kind"] == "event_terminal"
-                    && exact_keys(
-                        response,
-                        &[
-                            "operation_kind",
-                            "receipt_sequence",
-                            "event_id",
-                            "request_digest",
-                            "acceptance_sequence",
-                            "final_queue_sequence",
-                            "committed_revision",
-                            "resulting_aggregate_state_digest",
-                            "outcome",
-                            "emission_references",
-                        ],
-                    ))
-        }
-        "checkpoint_prune_v2" => valid_checkpoint(directory, response),
-        "checkpoint_update_outbox_v2" => {
-            exact_keys(response, &["result", "record"])
-                && response["result"] == "committed"
-                && exact_keys(
-                    &response["record"],
-                    &["intent", "state_revision", "delivery_state"],
-                )
-        }
-        "checkpoint_terminalize_outbox_v2" => {
-            exact_keys(response, &["result", "record"])
-                && response["result"] == "committed"
-                && (exact_keys(
-                    &response["record"],
-                    &[
-                        "terminal_sequence",
-                        "intent",
-                        "committed_revision",
-                        "outcome",
-                    ],
-                ) || exact_keys(
-                    &response["record"],
-                    &[
-                        "terminal_sequence",
-                        "effect_id",
-                        "intent_digest",
-                        "committed_revision",
-                        "outcome",
-                    ],
-                ))
-        }
-        "checkpoint_compact_outbox_v2" => {
-            exact_keys(response, &["result", "record"])
-                && response["result"] == "committed"
-                && exact_keys(
-                    &response["record"],
-                    &[
-                        "terminal_sequence",
-                        "effect_id",
-                        "intent_digest",
-                        "committed_revision",
-                        "outcome",
-                    ],
-                )
-        }
-        "checkpoint_tombstone_v2" => {
-            exact_keys(response, &["result", "tombstone"])
-                && response["result"] == "tombstoned"
-                && exact_keys(
-                    &response["tombstone"],
-                    &[
-                        "status",
-                        "root_runtime_id",
-                        "creation_id",
-                        "terminal_status",
-                        "final_aggregate_state_digest",
-                        "tombstone_operation_id",
-                    ],
-                )
-        }
-        "checkpoint_delete_retained_record_v2" => false,
-        _ => false,
+    (response == &expected).then_some(()).ok_or_else(|| {
+        format!(
+            "malformed production response for {operation}: {}",
+            first_difference(&expected, response, "")
+        )
+    })
+}
+
+fn expected_checkpoint_response(
+    operation: &str,
+    request: &Value,
+    outcome: &DurableHostResult,
+    after: &Value,
+) -> Result<Value, String> {
+    let receipts = after["operation_receipts"]
+        .as_array()
+        .ok_or("fixture receipts absent")?;
+    let event_receipt = |event_id: &str| {
+        receipts
+            .iter()
+            .find(|receipt| receipt["event_id"] == event_id)
+            .cloned()
     };
-    valid
-        .then_some(())
-        .ok_or_else(|| format!("malformed production response for {operation}: {response}"))
-}
-
-fn checkpoint_or_admission_evidence(directory: &Path, value: &Value) -> bool {
-    if valid_checkpoint(directory, value) {
-        return true;
+    let effect_id = request["effect_id"].as_str();
+    let effect_record = |field: &str| {
+        after[field]
+            .as_array()
+            .and_then(|records| {
+                records.iter().find(|record| {
+                    record["effect_id"]
+                        .as_str()
+                        .or_else(|| record["intent"]["effect_id"].as_str())
+                        == effect_id
+                })
+            })
+            .cloned()
+    };
+    match operation {
+        "checkpoint_create_v2" => Ok(
+            json!({"result":"committed", "receipt": receipts.first().ok_or("fixture creation receipt absent")?}),
+        ),
+        "checkpoint_admit_v2" => {
+            let deliveries = request["envelopes"]
+                .as_array()
+                .ok_or("fixture admission envelopes absent")?;
+            if deliveries.len() == 1 && outcome.result == "replayed" {
+                let event_id = deliveries[0]["envelope"]["event_id"]
+                    .as_str()
+                    .ok_or("fixture event ID absent")?;
+                return replay_evidence(after, event_id);
+            }
+            if deliveries.len() == 1 {
+                return Ok(after.clone());
+            }
+            let mut members = Vec::new();
+            for delivery in deliveries {
+                let event_id = delivery["envelope"]["event_id"]
+                    .as_str()
+                    .ok_or("fixture event ID absent")?;
+                let receipt = event_receipt(event_id)
+                    .ok_or_else(|| format!("fixture acceptance receipt absent for {event_id}"))?;
+                if receipt["operation_kind"] == "acceptance"
+                    && receipt["accepted_revision"] == after["revision"]
+                    && outcome.result == "committed"
+                {
+                    let entry = after["root_record"]["aggregate_state"]["runtimes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|runtime| {
+                            runtime["ready_mailbox"].as_array().into_iter().flatten()
+                        })
+                        .find(|entry| entry["envelope"]["event_id"] == event_id)
+                        .ok_or_else(|| format!("fixture mailbox entry absent for {event_id}"))?;
+                    members.push(json!({"event_id":event_id,"disposition":"accepted","acceptance_sequence":receipt["acceptance_sequence"],"queue_sequence":entry["queue_sequence"]}));
+                } else {
+                    members.push(
+                        json!({"event_id":event_id,"disposition":"replay","evidence":replay_evidence(after, event_id)?}),
+                    );
+                }
+            }
+            Ok(json!({"result":"batch","checkpoint":after,"members":members}))
+        }
+        "checkpoint_step_v2" => {
+            if outcome.result == "replayed" {
+                let event_id = request["event_id"]
+                    .as_str()
+                    .ok_or("fixture event ID absent")?;
+                return event_receipt(event_id)
+                    .ok_or_else(|| format!("fixture terminal receipt absent for {event_id}"));
+            }
+            Ok(after.clone())
+        }
+        "checkpoint_prune_v2" => Ok(after.clone()),
+        "checkpoint_update_outbox_v2" => Ok(
+            json!({"result":"committed","record":effect_record("pending_outbox_intents").ok_or("fixture pending outbox record absent")?}),
+        ),
+        "checkpoint_terminalize_outbox_v2" => Ok(
+            json!({"result":"committed","record":effect_record("terminal_outbox_records").or_else(|| effect_record("outbox_effect_tombstones")).ok_or("fixture terminal outbox record absent")?}),
+        ),
+        "checkpoint_compact_outbox_v2" => Ok(
+            json!({"result":"committed","record":effect_record("outbox_effect_tombstones").ok_or("fixture outbox tombstone absent")?}),
+        ),
+        "checkpoint_tombstone_v2" => {
+            Ok(json!({"result":"tombstoned","tombstone":after["root_record"]}))
+        }
+        _ => Err(format!("unsupported response operation {operation}")),
     }
-    let source = serde_json_canonicalizer::to_vec(value).unwrap();
-    determa_state::validate_artifact(
-        "version2_operation_result",
-        &source,
-        &resolver(directory),
-        true,
-    )
-    .is_ok()
 }
 
-fn valid_checkpoint(directory: &Path, value: &Value) -> bool {
-    let source = serde_json_canonicalizer::to_vec(value).unwrap();
-    determa_state::checkpoint::restore(&source, &resolver(directory)).is_ok()
-}
-
-fn exact_keys(value: &Value, expected: &[&str]) -> bool {
-    value.as_object().is_some_and(|object| {
-        object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+fn replay_evidence(checkpoint: &Value, event_id: &str) -> Result<Value, String> {
+    for runtime in checkpoint["root_record"]["aggregate_state"]["runtimes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        for (field, location) in [("ready_mailbox", "ready"), ("deferred_mailbox", "deferred")] {
+            if let Some(entry) = runtime[field]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|entry| entry["envelope"]["event_id"] == event_id)
+            {
+                return Ok(
+                    json!({"result":"replay","event_id":event_id,"acceptance_sequence":entry["acceptance_sequence"],"location":location}),
+                );
+            }
+        }
+    }
+    if let Some(tombstone) = checkpoint["event_identity_tombstones"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["event_id"] == event_id)
+    {
+        return Ok(
+            json!({"result":"replay","terminal_receipt_sequence":tombstone["terminal_receipt_sequence"],"terminal_disposition":tombstone["terminal_disposition"]}),
+        );
+    }
+    let receipts = checkpoint["operation_receipts"]
+        .as_array()
+        .ok_or("fixture receipts absent")?;
+    let terminal = receipts
+        .iter()
+        .find(|receipt| {
+            receipt["operation_kind"] == "event_terminal" && receipt["event_id"] == event_id
+        })
+        .ok_or_else(|| format!("fixture replay evidence absent for {event_id}"))?;
+    let acceptance = receipts.iter().find(|receipt| {
+        receipt["operation_kind"] == "acceptance"
+            && receipt["event_id"] == event_id
+            && receipt["acceptance_sequence"] == terminal["acceptance_sequence"]
+    });
+    Ok(if let Some(acceptance) = acceptance {
+        json!({"result":"replay","acceptance_receipt_sequence":acceptance["receipt_sequence"],"terminal_receipt_sequence":terminal["receipt_sequence"]})
+    } else {
+        json!({"result":"replay","terminal_receipt_sequence":terminal["receipt_sequence"]})
     })
 }
 

@@ -34,6 +34,365 @@ fn file_store_runs_the_native_v2_host_contract_and_survives_restart() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn emitted_internal_event_deferral_and_recall_survive_host_restart() {
+    let bundle = load_bundle(
+        r#"
+format: 1
+namespace: test.internal_deferred_restart
+events:
+  release: { direction: input }
+  loop: { direction: internal }
+machines:
+  - machine_id: worker
+    root:
+      type: composite
+      deferred_event_capacity: 4
+      initial: { transition_to: busy }
+      states:
+        busy:
+          entry:
+            - send: { event: loop, to: { self: true } }
+          deferred_events: [loop]
+          on_events:
+            release: { transition_to: idle }
+        idle:
+          on_events:
+            loop: {}
+"#,
+    )
+    .unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle.clone(), true);
+    let resolver = Arc::new(resolver);
+    let directory = temporary_path("internal-deferred-restart");
+    let retention = json!({"mode":"permanent","permanent_replay_eligible":true,"pruned_through_receipt_sequence":null,"policy_identifier":null});
+
+    let store: Arc<dyn ExecutionStore> = Arc::new(FileExecutionStore::new(&directory).unwrap());
+    store.initialize_schema().unwrap();
+    let host = CheckpointHost::new(store.clone(), resolver.clone());
+    host.create_checkpoint(
+        &bundle,
+        "worker",
+        "internal-restart",
+        "create-internal-restart",
+        &Bindings::default(),
+        None,
+        retention,
+    )
+    .unwrap();
+    let created = host.load_checkpoint("internal-restart").unwrap().unwrap();
+    let initial = created.value();
+    let internal = &initial["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"][0];
+    assert_eq!(internal["delivery_mode"], "internal");
+    let original_queue = internal["queue_sequence"].clone();
+    let deferred = host
+        .step_checkpoint(
+            "internal-restart",
+            &processing_for(initial),
+            &MutationGuard::new(created.revision(), created.digest()),
+        )
+        .unwrap();
+    let deferred_entry =
+        &deferred["root_record"]["aggregate_state"]["runtimes"][0]["deferred_mailbox"][0];
+    assert_ne!(deferred_entry["queue_sequence"], original_queue);
+    assert_eq!(deferred_entry["deferral_count"], "1");
+    drop(host);
+    drop(store);
+
+    let store: Arc<dyn ExecutionStore> = Arc::new(FileExecutionStore::new(&directory).unwrap());
+    let host = CheckpointHost::new(store.clone(), resolver.clone());
+    let restored = host.load_checkpoint("internal-restart").unwrap().unwrap();
+    assert_eq!(restored.value(), &deferred);
+    let delivery = named_input_delivery(restored.value(), "release", "release-internal-restart");
+    let admitted = host
+        .admit_checkpoint(
+            "internal-restart",
+            &[delivery],
+            &MutationGuard::new(restored.revision(), restored.digest()),
+        )
+        .unwrap();
+    let released = host
+        .step_checkpoint(
+            "internal-restart",
+            &processing_for(&admitted),
+            &MutationGuard::new(
+                admitted["revision"].as_str().unwrap(),
+                admitted["execution_checkpoint_digest"].as_str().unwrap(),
+            ),
+        )
+        .unwrap();
+    let recalled = &released["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"][0];
+    assert_eq!(recalled["delivery_mode"], "internal");
+    assert_ne!(recalled["queue_sequence"], deferred_entry["queue_sequence"]);
+    drop(host);
+    drop(store);
+    let store: Arc<dyn ExecutionStore> = Arc::new(FileExecutionStore::new(&directory).unwrap());
+    let host = CheckpointHost::new(store, resolver);
+    assert_eq!(
+        host.load_checkpoint("internal-restart")
+            .unwrap()
+            .unwrap()
+            .value(),
+        &released
+    );
+    let terminal = host
+        .step_checkpoint(
+            "internal-restart",
+            &processing_for(&released),
+            &MutationGuard::new(
+                released["revision"].as_str().unwrap(),
+                released["execution_checkpoint_digest"].as_str().unwrap(),
+            ),
+        )
+        .unwrap();
+    let terminal_sequence = terminal["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["receipt_sequence"]
+        .as_str()
+        .unwrap();
+    let pruned = host
+        .prune_checkpoint(
+            "internal-restart",
+            &PruneRequest {
+                cutoff_receipt_sequence: terminal_sequence.to_string(),
+                target_mode: "bounded".to_string(),
+                policy_identifier: Some("internal-prune".to_string()),
+                dependency_receipt_sequences: Vec::new(),
+                dependency_effect_ids: Vec::new(),
+            },
+            &MutationGuard::new(
+                terminal["revision"].as_str().unwrap(),
+                terminal["execution_checkpoint_digest"].as_str().unwrap(),
+            ),
+        )
+        .unwrap();
+    let event_id = terminal["operation_receipts"][0]["emission_references"][0]["event_id"].clone();
+    assert!(pruned["event_identity_tombstones"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["event_id"] == event_id));
+    assert_eq!(
+        host.load_checkpoint("internal-restart")
+            .unwrap()
+            .unwrap()
+            .value(),
+        &pruned
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn permanent_sqlite_retains_internal_event_through_deferral_recall_and_terminalization() {
+    let bundle = load_bundle(
+        r#"
+format: 1
+namespace: test.internal_permanent
+events:
+  release: { direction: input }
+  loop: { direction: internal }
+machines:
+  - machine_id: worker
+    root:
+      type: composite
+      deferred_event_capacity: 4
+      initial: { transition_to: busy }
+      states:
+        busy:
+          entry:
+            - send: { event: loop, to: { self: true } }
+          deferred_events: [loop]
+          on_events:
+            release: { transition_to: idle }
+        idle:
+          on_events:
+            loop: {}
+"#,
+    )
+    .unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle.clone(), true);
+    let resolver = Arc::new(resolver);
+    let directory = temporary_path("internal-permanent");
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("checkpoint.sqlite3");
+    let mode = DurableStoreMode::new(
+        determa_state::checkpoint::ReceiptRetentionMode::Permanent,
+        determa_state::checkpoint::OutboxRetentionMode::Bounded,
+    );
+    let store: Arc<dyn ExecutionStore> = Arc::new(SqliteExecutionStore::open(&path, mode).unwrap());
+    store.initialize_schema().unwrap();
+    let host = CheckpointHost::new(store.clone(), resolver.clone());
+    host.create_checkpoint(
+        &bundle, "worker", "internal-permanent", "create-internal-permanent",
+        &Bindings::default(), None,
+        json!({"mode":"permanent","permanent_replay_eligible":true,"pruned_through_receipt_sequence":null,"policy_identifier":null}),
+    ).unwrap();
+    let created = host.load_checkpoint("internal-permanent").unwrap().unwrap();
+    host.step_checkpoint(
+        "internal-permanent",
+        &processing_for(created.value()),
+        &MutationGuard::new(created.revision(), created.digest()),
+    )
+    .unwrap();
+    drop(host);
+    drop(store);
+    let store: Arc<dyn ExecutionStore> = Arc::new(SqliteExecutionStore::open(&path, mode).unwrap());
+    let host = CheckpointHost::new(store.clone(), resolver.clone());
+    let deferred = host.load_checkpoint("internal-permanent").unwrap().unwrap();
+    let delivery = named_input_delivery(deferred.value(), "release", "release-internal-permanent");
+    let admitted = host
+        .admit_checkpoint(
+            "internal-permanent",
+            &[delivery],
+            &MutationGuard::new(deferred.revision(), deferred.digest()),
+        )
+        .unwrap();
+    let released = host
+        .step_checkpoint(
+            "internal-permanent",
+            &processing_for(&admitted),
+            &MutationGuard::new(
+                admitted["revision"].as_str().unwrap(),
+                admitted["execution_checkpoint_digest"].as_str().unwrap(),
+            ),
+        )
+        .unwrap();
+    let internal = &released["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"][0];
+    assert_eq!(internal["delivery_mode"], "internal");
+    let terminal = host
+        .step_checkpoint(
+            "internal-permanent",
+            &processing_for(&released),
+            &MutationGuard::new(
+                released["revision"].as_str().unwrap(),
+                released["execution_checkpoint_digest"].as_str().unwrap(),
+            ),
+        )
+        .unwrap();
+    assert!(terminal["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|receipt| {
+            receipt["emission_references"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|reference| reference["kind"] == "internal_terminal")
+        }));
+    drop(host);
+    drop(store);
+    let store: Arc<dyn ExecutionStore> = Arc::new(SqliteExecutionStore::open(&path, mode).unwrap());
+    let host = CheckpointHost::new(store, resolver);
+    assert_eq!(
+        host.load_checkpoint("internal-permanent")
+            .unwrap()
+            .unwrap()
+            .value(),
+        &terminal
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn checkpoint_restore_rejects_duplicate_and_dangling_producer_references() {
+    let root = Path::new("conformance-suite/conformance/profiles/execution-checkpoint");
+    let cases = [
+        (
+            "checkpoint-05-spawned-host-trace",
+            "spawned-child-terminal-checkpoint-v2.json",
+            "internal_mailbox",
+        ),
+        (
+            "checkpoint-05-spawned-host-trace",
+            "spawned-owner-done-checkpoint-v2.json",
+            "internal_terminal",
+        ),
+        (
+            "checkpoint-02-native-outbox",
+            "pending-checkpoint-v2.json",
+            "external_outbox",
+        ),
+    ];
+    for (directory, filename, kind) in cases {
+        let directory = root.join(directory);
+        let bundle =
+            load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(bundle, true);
+        let source = fs::read(directory.join(filename)).unwrap();
+        determa_state::checkpoint::restore(&source, &resolver).unwrap();
+        let mut value: Value = serde_json::from_slice(&source).unwrap();
+        let refs = value["operation_receipts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|receipt| {
+                receipt["emission_references"]
+                    .as_array()
+                    .is_some_and(|refs| refs.iter().any(|reference| reference["kind"] == kind))
+            })
+            .unwrap()["emission_references"]
+            .as_array_mut()
+            .unwrap();
+        let original = refs
+            .iter()
+            .find(|reference| reference["kind"] == kind)
+            .unwrap()
+            .clone();
+        refs.push(original);
+        reseal_checkpoint_digest(&mut value);
+        assert!(
+            determa_state::checkpoint::restore(&serde_json::to_vec(&value).unwrap(), &resolver)
+                .is_err(),
+            "duplicate {kind} producer reference restored"
+        );
+        if kind == "internal_mailbox" {
+            let refs = value["operation_receipts"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|receipt| {
+                    receipt["emission_references"]
+                        .as_array()
+                        .is_some_and(|refs| refs.iter().any(|reference| reference["kind"] == kind))
+                })
+                .unwrap()["emission_references"]
+                .as_array_mut()
+                .unwrap();
+            refs.pop();
+            refs.iter_mut()
+                .find(|reference| reference["kind"] == kind)
+                .unwrap()["event_id"] = json!("phantom-event");
+            reseal_checkpoint_digest(&mut value);
+            assert!(
+                determa_state::checkpoint::restore(&serde_json::to_vec(&value).unwrap(), &resolver)
+                    .is_err(),
+                "dangling internal producer reference restored"
+            );
+        }
+    }
+}
+
+fn reseal_checkpoint_digest(value: &mut Value) {
+    let mut unsigned = value.clone();
+    unsigned
+        .as_object_mut()
+        .unwrap()
+        .remove("execution_checkpoint_digest");
+    let bytes = serde_json_canonicalizer::to_vec(&json!([
+        "determa-execution-checkpoint-digest-2",
+        unsigned
+    ]))
+    .unwrap();
+    value["execution_checkpoint_digest"] = json!(format!("sha256:{:x}", Sha256::digest(bytes)));
+}
+
 #[cfg(feature = "sqlite")]
 #[test]
 fn sqlite_store_runs_the_native_v2_host_contract_and_survives_restart() {
@@ -346,19 +705,23 @@ fn input_delivery(
     checkpoint: &determa_state::checkpoint::ExecutionCheckpoint,
     event_id: &str,
 ) -> Value {
+    named_input_delivery(checkpoint.value(), "received", event_id)
+}
+
+fn named_input_delivery(checkpoint: &Value, event: &str, event_id: &str) -> Value {
     let envelope = json!({
-        "event": "received",
+        "event": event,
         "event_id": event_id,
         "cause_id": event_id,
         "source": {"host": true},
-        "target": checkpoint.value()["root_record"]["aggregate_state"]["runtimes"][0]
+        "target": checkpoint["root_record"]["aggregate_state"]["runtimes"][0]
             ["target_identity"],
         "payload": ["map", []]
     });
     let bytes = serde_json_canonicalizer::to_vec(&json!([
         "determa-inbox-envelope-digest-2",
         "2",
-        checkpoint.root_instance_id(),
+        checkpoint["root_instance_id"],
         "input",
         envelope
     ]))

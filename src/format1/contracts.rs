@@ -1,7 +1,8 @@
-use super::{restore_aggregate, DefinitionResolver};
+use super::{restore_aggregate, DefinitionResolver, MigrationArtifactResolver};
 use crate::checkpoint;
 use jsonschema::Resource;
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 pub fn validate_contract_artifact(
     kind: &str,
@@ -21,13 +22,14 @@ pub fn validate_contract_artifact(
 pub fn validate_artifact(
     kind: &str,
     source: &[u8],
-    resolver: &(impl DefinitionResolver + ?Sized),
+    resolver: &(impl MigrationArtifactResolver + ?Sized),
     verify_digest: bool,
 ) -> Result<Value, super::ArtifactError> {
     match kind {
         "aggregate_state_v2" => super::v2::validate_aggregate_artifact(source, resolver),
         "aggregate_state_package_v2" if verify_digest => {
-            let mut resolver = resolver_to_memory(resolver);
+            let package = super::package::validate_package_artifact_v2(source)?;
+            let mut resolver = resolver_to_memory(resolver, &package);
             super::package::restore_package_v2(source, &mut resolver).map(|_| {
                 super::strict_json::parse(source).expect("restored package is strict JSON")
             })
@@ -42,9 +44,57 @@ pub fn validate_artifact(
 }
 
 fn resolver_to_memory(
-    _resolver: &(impl DefinitionResolver + ?Sized),
+    resolver: &(impl MigrationArtifactResolver + ?Sized),
+    package: &Value,
 ) -> super::InMemoryDefinitionResolver {
-    super::InMemoryDefinitionResolver::default()
+    fn collect(value: &Value, fingerprints: &mut BTreeSet<String>) {
+        match value {
+            Value::Object(object) => {
+                if let Some(fingerprint) = object
+                    .get("validated_bundle_fingerprint")
+                    .and_then(Value::as_str)
+                {
+                    fingerprints.insert(fingerprint.to_string());
+                }
+                for child in object.values() {
+                    collect(child, fingerprints);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect(item, fingerprints);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut fingerprints = BTreeSet::new();
+    collect(package, &mut fingerprints);
+    let mut staged = super::InMemoryDefinitionResolver::default();
+    for fingerprint in fingerprints {
+        if let Some(existing) = resolver.resolve_definition(&fingerprint) {
+            staged.insert_at(fingerprint, existing.bundle, existing.trusted);
+        }
+    }
+    for digest in package["migration_route"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            package["migration_descriptors"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|descriptor| &descriptor["migration_descriptor_digest"]),
+        )
+    {
+        if let Some(digest) = digest.as_str() {
+            if let Some(existing) = resolver.resolve_migration_descriptor(digest) {
+                staged.insert_descriptor(digest, existing.bytes, existing.trusted);
+            }
+        }
+    }
+    staged
 }
 
 fn validate_schema(kind: &str, value: &Value, schema: &str) -> Result<(), super::ArtifactError> {

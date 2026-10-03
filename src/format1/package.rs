@@ -50,7 +50,8 @@ pub fn restore_package_v2(
     resolver: &mut InMemoryDefinitionResolver,
 ) -> Result<RestoredPackageV2, super::v2::Version2Error> {
     let value = validate_package_artifact_v2(source)?;
-    load_definition_attachments(&value, resolver)?;
+    let mut staged = resolver.clone();
+    load_definition_attachments(&value, &mut staged)?;
     let mut descriptors = BTreeSet::new();
     for descriptor in value["migration_descriptors"].as_array().unwrap() {
         let bytes = super::v2::canonical_bytes(descriptor)?;
@@ -61,14 +62,14 @@ pub fn restore_package_v2(
                 "migration descriptor attachment is duplicated",
             ));
         }
-        if let Some(existing) = resolver.descriptor(digest) {
+        if let Some(existing) = staged.descriptor(digest) {
             if existing.bytes != bytes {
                 return Err(invalid_package_v2(
                     "attached descriptor collides with resolver content",
                 ));
             }
         } else {
-            resolver.insert_descriptor(digest, bytes, true);
+            staged.insert_descriptor(digest, bytes, true);
         }
     }
     let route = value["migration_route"]
@@ -77,17 +78,32 @@ pub fn restore_package_v2(
         .iter()
         .map(|item| item.as_str().unwrap().to_string())
         .collect::<Vec<_>>();
-    if route.iter().collect::<BTreeSet<_>>().len() != route.len()
-        || route.iter().any(|digest| !descriptors.contains(digest))
-    {
+    if route.iter().collect::<BTreeSet<_>>().len() != route.len() {
         return Err(invalid_package_v2(
             "migration route is not closed over attachments",
         ));
     }
+    for digest in &route {
+        let Some(existing) = staged
+            .descriptor(digest)
+            .filter(|existing| existing.trusted)
+        else {
+            return Err(invalid_package_v2(
+                "migration route descriptor is unavailable",
+            ));
+        };
+        let decoded = super::v2::decode_descriptor_v2(&existing.bytes)?;
+        if decoded["migration_descriptor_digest"].as_str() != Some(digest) {
+            return Err(invalid_package_v2(
+                "migration route descriptor digest differs",
+            ));
+        }
+    }
     let aggregate = super::v2::restore_aggregate_v2(
         &super::v2::canonical_bytes(&value["aggregate_state"])?,
-        resolver,
+        &staged,
     )?;
+    *resolver = staged;
     Ok(RestoredPackageV2 {
         aggregate,
         migration_route: route,

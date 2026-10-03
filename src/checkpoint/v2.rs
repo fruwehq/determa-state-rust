@@ -409,6 +409,7 @@ fn apply_step_result(
     value["revision"] = new_revision.clone();
     let resulting_state = core["state"].clone();
     value["root_record"]["aggregate_state"] = resulting_state.clone();
+    synchronize_internal_mailbox_references(&mut value)?;
     if core["disposition"] == "deferred" {
         seal_checkpoint(&mut value)?;
         return Ok(value);
@@ -473,6 +474,53 @@ fn apply_step_result(
     Ok(value)
 }
 
+fn synchronize_internal_mailbox_references(checkpoint: &mut Value) -> Result<(), ArtifactError> {
+    let mut sequences = BTreeMap::new();
+    for runtime in checkpoint["root_record"]["aggregate_state"]["runtimes"]
+        .as_array()
+        .ok_or_else(|| invalid("aggregate runtimes are absent"))?
+    {
+        for field in ["ready_mailbox", "deferred_mailbox"] {
+            for entry in runtime[field]
+                .as_array()
+                .ok_or_else(|| invalid("aggregate mailbox is absent"))?
+            {
+                if entry["delivery_mode"] == "internal" {
+                    sequences.insert(
+                        (
+                            entry["envelope"]["event_id"].as_str().unwrap().to_string(),
+                            entry["acceptance_sequence"].as_str().unwrap().to_string(),
+                        ),
+                        entry["queue_sequence"].clone(),
+                    );
+                }
+            }
+        }
+    }
+    for receipt in checkpoint["operation_receipts"].as_array_mut().unwrap() {
+        for reference in receipt
+            .get_mut("emission_references")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if reference["kind"] == "internal_mailbox" {
+                let key = (
+                    reference["event_id"].as_str().unwrap().to_string(),
+                    reference["acceptance_sequence"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                );
+                if let Some(sequence) = sequences.get(&key) {
+                    reference["queue_sequence"] = sequence.clone();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn checkpoint_process(
     bundle: &Bundle,
     checkpoint: &ExecutionCheckpoint,
@@ -529,13 +577,17 @@ fn checkpoint_process_resolved(
     .map_err(|error| invalid(error.message))?;
     let mut selected = None;
     for runtime in aggregate.value()["runtimes"].as_array().unwrap() {
-        if let Some(entry) = runtime["ready_mailbox"]
+        if runtime["ready_mailbox"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|entry| entry["envelope"]["event_id"].as_str() == Some(&event_id))
+            .any(|entry| entry["envelope"]["event_id"].as_str() == Some(&event_id))
         {
-            selected = Some((runtime, entry));
+            selected = runtime["ready_mailbox"]
+                .as_array()
+                .unwrap()
+                .first()
+                .map(|entry| (runtime, entry));
             break;
         }
     }
@@ -649,6 +701,7 @@ fn apply_transaction_migration(
                 .iter()
                 .cloned(),
         );
+    synchronize_internal_mailbox_references(&mut value)?;
     seal_and_validate_checkpoint(&mut value)?;
     Ok(value)
 }
@@ -985,6 +1038,7 @@ fn apply_checkpoint_migration_v2(
                 .iter()
                 .cloned(),
         );
+    synchronize_internal_mailbox_references(&mut value)?;
     seal_and_validate_checkpoint(&mut value)?;
     Ok(value)
 }
@@ -1475,7 +1529,12 @@ fn validate_semantics(value: &Value) -> Result<(), ArtifactError> {
         &terminal_by_event,
         &mailbox_events,
     )?;
-    validate_emission_and_outbox_relationships(value, receipts, &terminal_by_event)?;
+    validate_emission_and_outbox_relationships(
+        value,
+        receipts,
+        &terminal_by_event,
+        &mailbox_events,
+    )?;
     Ok(())
 }
 
@@ -1921,6 +1980,7 @@ fn validate_emission_and_outbox_relationships(
     checkpoint: &Value,
     receipts: &[Value],
     terminals: &BTreeMap<&str, &Value>,
+    mailboxes: &BTreeMap<&str, &Value>,
 ) -> Result<(), ArtifactError> {
     let pending = checkpoint["pending_outbox_intents"].as_array().unwrap();
     let terminal_outbox = checkpoint["terminal_outbox_records"].as_array().unwrap();
@@ -1968,29 +2028,57 @@ fn validate_emission_and_outbox_relationships(
             return Err(invalid("outbox effect identity is duplicated"));
         }
     }
+    let mut internal_references = BTreeSet::new();
+    let mut outbox_references = BTreeSet::new();
     for receipt in receipts {
         let Some(references) = receipt["emission_references"].as_array() else {
             continue;
         };
         for reference in references {
             match reference["kind"].as_str().unwrap() {
-                "internal_mailbox" => {}
-                "internal_terminal" => {
-                    if !terminals
-                        .get(reference["event_id"].as_str().unwrap())
-                        .is_some_and(|terminal| {
-                            terminal["receipt_sequence"] == reference["terminal_receipt_sequence"]
-                                && terminal["acceptance_sequence"]
-                                    == reference["acceptance_sequence"]
+                "internal_mailbox" => {
+                    let event_id = reference["event_id"].as_str().unwrap();
+                    if !internal_references.insert(event_id)
+                        || !mailboxes.get(event_id).is_some_and(|entry| {
+                            entry["delivery_mode"] == "internal"
+                                && entry["acceptance_sequence"] == reference["acceptance_sequence"]
+                                && entry["queue_sequence"] == reference["queue_sequence"]
                         })
+                    {
+                        return Err(invalid(
+                            "internal mailbox reference is duplicated or dangling",
+                        ));
+                    }
+                }
+                "internal_terminal" => {
+                    let event_id = reference["event_id"].as_str().unwrap();
+                    let retained_terminal = terminals.get(event_id).is_some_and(|terminal| {
+                        terminal["receipt_sequence"] == reference["terminal_receipt_sequence"]
+                            && terminal["acceptance_sequence"] == reference["acceptance_sequence"]
+                    });
+                    let pruned_terminal = checkpoint["event_identity_tombstones"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|tombstone| {
+                            tombstone["event_id"] == event_id
+                                && tombstone["terminal_receipt_sequence"]
+                                    == reference["terminal_receipt_sequence"]
+                                && tombstone["acceptance_sequence"]
+                                    == reference["acceptance_sequence"]
+                        });
+                    if !internal_references.insert(event_id)
+                        || !(retained_terminal || pruned_terminal)
                     {
                         return Err(invalid("internal terminal reference is dangling"));
                     }
                 }
                 "external_outbox" => {
                     let effect_id = reference["effect_id"].as_str().unwrap();
-                    if !effects.contains(effect_id) {
-                        return Err(invalid("external outbox reference is dangling"));
+                    if !effects.contains(effect_id) || !outbox_references.insert(effect_id) {
+                        return Err(invalid(
+                            "external outbox reference is duplicated or dangling",
+                        ));
                     }
                 }
                 "internal_delivery" => {}
@@ -2256,4 +2344,124 @@ fn invalid(message: impl ToString) -> ArtifactError {
 }
 fn failure(code: &str) -> ArtifactError {
     ArtifactError::new(code, "checkpoint operation was rejected")
+}
+
+#[cfg(test)]
+mod reference_integrity_tests {
+    use super::{
+        checkpoint_maintenance_migration_route, checkpoint_step_v2, create_execution_checkpoint_v2,
+        restore_execution_checkpoint, restore_value, ProcessingRequest,
+    };
+    use crate::format1::{
+        load_bundle, Bindings, InMemoryDefinitionResolver, MigrationRequest, ResourceLimits,
+    };
+    use serde_json::{json, Value};
+
+    #[test]
+    fn maintenance_migration_recall_updates_internal_producer_reference() {
+        let source_text = r#"
+format: 1
+namespace: test.migration_recall
+events:
+  loop: { direction: internal }
+machines:
+  - machine_id: worker
+    root:
+      type: composite
+      deferred_event_capacity: 4
+      initial: { transition_to: busy }
+      states:
+        busy:
+          entry:
+            - send: { event: loop, to: { self: true } }
+          deferred_events: [loop]
+          on_events: {}
+"#;
+        let source = load_bundle(source_text).unwrap();
+        let target =
+            load_bundle(&source_text.replace("          deferred_events: [loop]\n", "")).unwrap();
+        let created = create_execution_checkpoint_v2(
+            &source, "worker", "migration-recall", "create-migration-recall",
+            &Bindings::default(), None,
+            json!({"mode":"permanent","permanent_replay_eligible":true,"pruned_through_receipt_sequence":null,"policy_identifier":null}),
+        ).unwrap();
+        let entry =
+            &created.value()["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"][0];
+        let request = ProcessingRequest {
+            target_runtime_id: created.value()["root_record"]["aggregate_state"]["runtimes"][0]
+                ["runtime_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            event_id: entry["envelope"]["event_id"].as_str().unwrap().to_string(),
+            envelope_digest: entry["envelope_digest"].as_str().unwrap().to_string(),
+            acceptance_sequence: entry["acceptance_sequence"].as_str().unwrap().to_string(),
+            queue_sequence: entry["queue_sequence"].as_str().unwrap().to_string(),
+            processing_mode: "delayed".to_string(),
+        };
+        let deferred = checkpoint_step_v2(&source, &created, &request, None, None).unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(source.clone(), true);
+        resolver.insert(target.clone(), true);
+        let deferred = restore_value(deferred, &resolver).unwrap();
+        let mut descriptor: Value = json!({
+            "migration_descriptor_format": "determa.aggregate_migration",
+            "migration_descriptor_schema_version": 2,
+            "mode": "compatible",
+            "source_machine_format": 1,
+            "target_machine_format": 1,
+            "mappings": {"active_states":[],"components":[],"counters":[],"history":[],"lifetime_holders":[],"machines":[],"owned_runtimes":[],"variables":[]},
+            "queued_event_default": "preserve_if_compatible",
+            "queued_event_rules": [],
+            "resource_requirements": {"maximum_cel_ast_nodes":"0","maximum_cel_evaluation_steps":"0","maximum_cel_expression_length":"0","maximum_transformed_output_bytes":"0"},
+            "terminal_policy": {"completed":"preserve","faulted":"preserve"}
+        });
+        descriptor["source_validated_bundle_fingerprint"] = json!(source.fingerprint);
+        descriptor["target_validated_bundle_fingerprint"] = json!(target.fingerprint);
+        descriptor["source_aggregate_shape_fingerprint"] =
+            json!(crate::format1::migration::aggregate_shape_fingerprint(&source).unwrap());
+        descriptor["target_aggregate_shape_fingerprint"] =
+            json!(crate::format1::migration::aggregate_shape_fingerprint(&target).unwrap());
+        descriptor
+            .as_object_mut()
+            .unwrap()
+            .remove("migration_descriptor_digest");
+        let digest =
+            super::jcs_hash(&json!(["determa-migration-descriptor-2", descriptor])).unwrap();
+        descriptor["migration_descriptor_digest"] = json!(digest);
+        resolver.insert_descriptor(&digest, serde_json::to_vec(&descriptor).unwrap(), true);
+        let migration = MigrationRequest {
+            migration_route: vec![digest],
+            target_validated_bundle_fingerprint: target.fingerprint.clone(),
+            maintenance_mode: false,
+        };
+        let request_digest = super::jcs_hash(&json!([
+            "determa-maintenance-migration-request-digest-2",
+            "2",
+            deferred.root_instance_id(),
+            "maintenance-recall",
+            deferred.value()["root_record"]["aggregate_state"]["aggregate_state_digest"],
+            target.fingerprint,
+            migration.migration_route,
+            false
+        ]))
+        .unwrap();
+        let migrated = checkpoint_maintenance_migration_route(
+            &deferred,
+            &migration,
+            "maintenance-recall",
+            &request_digest,
+            &resolver,
+            &ResourceLimits::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let recalled =
+            &migrated["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"][0];
+        let producer = &migrated["operation_receipts"][0]["emission_references"][0];
+        assert_eq!(producer["kind"], "internal_mailbox");
+        assert_eq!(producer["queue_sequence"], recalled["queue_sequence"]);
+        restore_execution_checkpoint(&serde_json::to_vec(&migrated).unwrap(), &resolver).unwrap();
+    }
 }

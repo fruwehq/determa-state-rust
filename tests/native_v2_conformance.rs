@@ -24,6 +24,121 @@ const CASES: &[&str] = &[
 ];
 
 #[test]
+fn failed_package_restore_does_not_seed_resolver() {
+    let directory = case_dir("120-native-v2-definition-package");
+    let mut package: Value =
+        serde_json::from_slice(&fs::read(directory.join("package-valid-package-v2.json")).unwrap())
+            .unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    let fingerprint = package["normalized_definitions"][0]["validated_bundle_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let descriptor = package["migration_descriptors"][0]["migration_descriptor_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    package["aggregate_state"]["aggregate_state_digest"] =
+        json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    let source = serde_json::to_vec(&package).unwrap();
+    assert!(restore_package(&source, &mut resolver).is_err());
+    assert!(resolver.get(&fingerprint).is_none());
+    assert!(resolver.descriptor(&descriptor).is_none());
+    assert_eq!(resolver.definitions().count(), 0);
+    assert_eq!(resolver.descriptors().count(), 0);
+}
+
+#[test]
+fn thin_package_uses_trusted_receiver_definitions_and_route_descriptor() {
+    let directory = case_dir("120-native-v2-definition-package");
+    let mut package: Value =
+        serde_json::from_slice(&fs::read(directory.join("package-valid-package-v2.json")).unwrap())
+            .unwrap();
+    let descriptor = package["migration_descriptors"][0].clone();
+    let digest = descriptor["migration_descriptor_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    package["normalized_definitions"] = json!([]);
+    package["migration_descriptors"] = json!([]);
+    let source = serde_json::to_vec(&package).unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    assert!(restore_package(&source, &mut resolver).is_err());
+    let source_bundle =
+        load_bundle(&fs::read_to_string(directory.join("package-source.yaml")).unwrap()).unwrap();
+    let target_bundle =
+        load_bundle(&fs::read_to_string(directory.join("package-target.yaml")).unwrap()).unwrap();
+    resolver.insert(source_bundle, true);
+    resolver.insert(target_bundle, true);
+    let descriptor_bytes = serde_json::to_vec(&descriptor).unwrap();
+    resolver.insert_descriptor(&digest, descriptor_bytes.clone(), false);
+    assert!(restore_package(&source, &mut resolver).is_err());
+    let attached_source = fs::read(directory.join("package-valid-package-v2.json")).unwrap();
+    assert!(restore_package(&attached_source, &mut resolver).is_err());
+    let mut trusted = InMemoryDefinitionResolver::default();
+    trusted.insert(
+        load_bundle(&fs::read_to_string(directory.join("package-source.yaml")).unwrap()).unwrap(),
+        true,
+    );
+    trusted.insert(
+        load_bundle(&fs::read_to_string(directory.join("package-target.yaml")).unwrap()).unwrap(),
+        true,
+    );
+    trusted.insert_descriptor(&digest, descriptor_bytes, true);
+    restore_package(&source, &mut trusted).unwrap();
+    determa_state::validate_artifact("aggregate_state_package_v2", &source, &trusted, true)
+        .unwrap();
+}
+
+#[test]
+fn process_with_backlog_receipts_the_ready_head_and_keeps_new_delivery() {
+    let directory = case_dir("117-version2-mailboxes");
+    let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle.clone(), true);
+    let created = determa_state::checkpoint::create(
+        &bundle, "transaction_server", "server-1", "create-server-1", &Bindings::default(),
+        None,
+        json!({"mode":"permanent","permanent_replay_eligible":true,"pruned_through_receipt_sequence":null,"policy_identifier":null}),
+    ).unwrap();
+    let inputs: Value =
+        serde_json::from_slice(&fs::read(directory.join("operation-inputs.json")).unwrap())
+            .unwrap();
+    let deliveries = inputs["admit_two"]["deliveries"].as_array().unwrap();
+    let admitted = determa_state::checkpoint::admit(
+        &bundle,
+        &created,
+        &deliveries[..1],
+        Some(created.revision()),
+        Some(created.digest()),
+    )
+    .unwrap();
+    let admitted =
+        determa_state::checkpoint::restore(&serde_json::to_vec(&admitted).unwrap(), &resolver)
+            .unwrap();
+    let processed = determa_state::checkpoint::process(
+        &bundle,
+        &admitted,
+        deliveries[1].clone(),
+        "delayed",
+        Some(admitted.revision()),
+        Some(admitted.digest()),
+    )
+    .unwrap();
+    let terminal = processed["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|receipt| receipt["operation_kind"] == "event_terminal")
+        .unwrap();
+    assert_eq!(terminal["event_id"], "batch-a");
+    let ready = &processed["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"];
+    assert_eq!(ready[0]["envelope"]["event_id"], "batch-b");
+    determa_state::checkpoint::restore(&serde_json::to_vec(&processed).unwrap(), &resolver)
+        .unwrap();
+}
+
+#[test]
 fn all_162_native_v2_vectors_match_exactly() {
     let mut count = 0;
     let mut failures = Vec::new();
