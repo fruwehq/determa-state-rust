@@ -3,10 +3,10 @@
 Rust implementation of the portable [Determa State](https://github.com/fruwehq/determa-state-spec)
 `format: 1` core with an optional synchronous portable execution-checkpoint host.
 
-Repository metadata prepares synchronized version `0.2.0`. The latest published crate
-remains `0.1.0` until the coordinated `v0.2.0` tag runs the release workflow. This
-branch is validated against the merged `0.2.0` metadata revisions at these exact
-normative inputs:
+Repository metadata prepares synchronized version `0.3.0` after the `v0.2.0` release.
+This version adds portable runtime-local event deferral, schema-version-2 aggregate
+artifacts, and durable checkpoint coverage. The implementation is validated against
+these exact normative inputs:
 
 - specification commit `ee38796d5e38e67e350a06548fd50faa530cbb12`;
 - conformance commit `99a4d9ad5256f7330e75b06d48f340cc7239a40d`.

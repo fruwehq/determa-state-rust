@@ -9,12 +9,10 @@ optional synchronous execution-checkpoint host. The crate is `determa-state`, th
 library module is `determa_state`, and the binary is published as `determa-state` plus
 the `determa-state-rust` launcher-selection alias.
 
-Repository metadata prepares the synchronized State `0.2.0` release. The latest
-published crate remains `0.1.0` until the coordinated `v0.2.0` tag runs the release
-workflow.
+Repository metadata prepares the synchronized State `0.3.0` release after the
+`v0.2.0` tag.
 
-The current draft is validated against the merged `0.2.0` metadata revisions at these
-exact immutable inputs:
+The current draft is validated against these exact immutable inputs:
 
 - specification: `ee38796d5e38e67e350a06548fd50faa530cbb12`;
 - conformance: `99a4d9ad5256f7330e75b06d48f340cc7239a40d`.

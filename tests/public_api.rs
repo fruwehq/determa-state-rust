@@ -134,7 +134,7 @@ fn command_line_surface_is_validation_only_for_both_executable_names() {
         assert!(version.status.success());
         assert_eq!(
             String::from_utf8(version.stdout).expect("UTF-8 output"),
-            "determa-state 0.2.0\n"
+            "determa-state 0.3.0\n"
         );
 
         let validation = Command::new(binary)
