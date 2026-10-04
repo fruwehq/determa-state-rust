@@ -1,7 +1,8 @@
 use determa_state::checkpoint::{
-    CheckpointHost, ExecutionStore, FileExecutionStore, MaintenanceMigrationRequest,
-    MemoryExecutionStore, MutationGuard, PendingOutboxState, ProcessingRequest, PruneRequest,
-    StoreRecord, StoreWriteResult, TerminalOutboxOutcome, TransactionalProcessRequest,
+    CheckpointHost, DurableCheckpointOperation, ExecutionStore, FileExecutionStore,
+    MaintenanceMigrationRequest, MemoryExecutionStore, MutationGuard, PendingOutboxState,
+    ProcessingRequest, PruneRequest, StoreRecord, StoreWriteResult, TerminalOutboxOutcome,
+    TransactionalProcessRequest,
 };
 #[cfg(feature = "sqlite")]
 use determa_state::checkpoint::{DurableStoreMode, SqliteExecutionStore};
@@ -14,6 +15,271 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[test]
+fn public_process_replays_the_original_terminal_receipt_before_cas_or_migration() {
+    let directory = Path::new("conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-01-native-lifecycle");
+    let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let resolver = Arc::new(resolver);
+    let created = determa_state::checkpoint::restore(
+        &fs::read(directory.join("created-checkpoint-v1.json")).unwrap(),
+        resolver.as_ref(),
+    )
+    .unwrap();
+    let accepted: Value =
+        serde_json::from_slice(&fs::read(directory.join("accepted-checkpoint-v1.json")).unwrap())
+            .unwrap();
+    let entry = &accepted["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"][0];
+    let delivery = json!({
+        "delivery_mode":entry["delivery_mode"],
+        "envelope":entry["envelope"],
+        "envelope_digest":entry["envelope_digest"]
+    });
+    let store: Arc<dyn ExecutionStore> = Arc::new(MemoryExecutionStore::new());
+    store.initialize_schema().unwrap();
+    assert_eq!(
+        store
+            .insert_if_absent(StoreRecord::from_checkpoint(&created).unwrap())
+            .unwrap(),
+        StoreWriteResult::Committed
+    );
+    let host = CheckpointHost::new(store, resolver);
+    let stale = MutationGuard::new(created.revision(), created.digest());
+    let first = host
+        .process_checkpoint(created.root_instance_id(), &delivery, "delayed", &stale)
+        .unwrap();
+    let receipt = first["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|value| {
+            value["operation_kind"] == "event_terminal"
+                && value["event_id"] == entry["envelope"]["event_id"]
+        })
+        .unwrap()
+        .clone();
+    assert_eq!(
+        host.process_checkpoint(created.root_instance_id(), &delivery, "delayed", &stale)
+            .unwrap(),
+        receipt
+    );
+    let before = host
+        .load_checkpoint(created.root_instance_id())
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    let transactional = TransactionalProcessRequest {
+        migration: MigrationRequest {
+            migration_route: vec![
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    .to_string(),
+            ],
+            target_validated_bundle_fingerprint:
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    .to_string(),
+            maintenance_mode: false,
+        },
+        migration_limits: ResourceLimits::default(),
+        delivery: delivery.clone(),
+        processing_mode: "delayed".to_string(),
+    };
+    assert_eq!(
+        host.transactional_process(created.root_instance_id(), &transactional, &stale)
+            .unwrap(),
+        receipt
+    );
+    let mut conflict = delivery;
+    conflict["envelope_digest"] =
+        json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    assert_eq!(
+        host.process_checkpoint(created.root_instance_id(), &conflict, "delayed", &stale)
+            .unwrap_err()
+            .code,
+        "event_id_conflict"
+    );
+    transactional_assert_conflict(
+        &host,
+        created.root_instance_id(),
+        &transactional,
+        &conflict,
+        &stale,
+    );
+    assert_eq!(
+        host.load_checkpoint(created.root_instance_id())
+            .unwrap()
+            .unwrap()
+            .value(),
+        &before
+    );
+}
+
+fn transactional_assert_conflict(
+    host: &CheckpointHost<InMemoryDefinitionResolver>,
+    root_instance_id: &str,
+    request: &TransactionalProcessRequest,
+    delivery: &Value,
+    guard: &MutationGuard,
+) {
+    let mut conflicting = request.clone();
+    conflicting.delivery = delivery.clone();
+    assert_eq!(
+        host.transactional_process(root_instance_id, &conflicting, guard)
+            .unwrap_err()
+            .code,
+        "event_id_conflict"
+    );
+}
+
+#[test]
+fn public_step_replays_terminal_and_tombstone_evidence_before_bundle_resolution() {
+    for (profile, checkpoint_name, request_name, expected_kind) in [
+        (
+            "checkpoint-01-native-lifecycle",
+            "processed-checkpoint-v1.json",
+            "process_replay",
+            "event_terminal",
+        ),
+        (
+            "checkpoint-07-complete-host-contract",
+            "bounded-tombstone-checkpoint-v1.json",
+            "handled_delayed",
+            "tombstone",
+        ),
+    ] {
+        let directory =
+            Path::new("conformance-suite/conformance/profiles/execution-checkpoint").join(profile);
+        let bundle =
+            load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(bundle, true);
+        let checkpoint = determa_state::checkpoint::restore(
+            &fs::read(directory.join(checkpoint_name)).unwrap(),
+            &resolver,
+        )
+        .unwrap();
+        let inputs: Value =
+            serde_json::from_slice(&fs::read(directory.join("inputs-v1.json")).unwrap()).unwrap();
+        let request = &inputs["requests"][request_name];
+        let processing = ProcessingRequest {
+            target_runtime_id: request["target"]["root"]["root_runtime_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            event_id: request["event_id"].as_str().unwrap().to_string(),
+            envelope_digest: request["envelope_digest"].as_str().unwrap().to_string(),
+            acceptance_sequence: request["acceptance_sequence"].as_str().unwrap().to_string(),
+            queue_sequence: request["queue_sequence"].as_str().unwrap().to_string(),
+            processing_mode: request["processing_mode"].as_str().unwrap().to_string(),
+        };
+        let expected = if expected_kind == "event_terminal" {
+            checkpoint.value()["operation_receipts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| {
+                    item["operation_kind"] == "event_terminal"
+                        && item["event_id"] == processing.event_id
+                })
+                .unwrap()
+        } else {
+            checkpoint.value()["event_identity_tombstones"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["event_id"] == processing.event_id)
+                .unwrap()
+        }
+        .clone();
+        let store: Arc<dyn ExecutionStore> = Arc::new(MemoryExecutionStore::new());
+        store.initialize_schema().unwrap();
+        assert_eq!(
+            store
+                .insert_if_absent(StoreRecord::from_checkpoint(&checkpoint).unwrap())
+                .unwrap(),
+            StoreWriteResult::Committed
+        );
+        let host = CheckpointHost::new(store, Arc::new(resolver));
+        let stale = MutationGuard::new(
+            "0",
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        );
+        assert_eq!(
+            host.step_checkpoint(checkpoint.root_instance_id(), &processing, &stale)
+                .unwrap(),
+            expected
+        );
+        let response = host.execute_checkpoint_operation(
+            DurableCheckpointOperation::Step {
+                root_instance_id: checkpoint.root_instance_id(),
+                request: &processing,
+                guard: &stale,
+            },
+            false,
+        );
+        assert_eq!(
+            response.caller_response.unwrap(),
+            json!({"kind":"retained_receipt","body":expected})
+        );
+        let mut conflict = processing.clone();
+        conflict.envelope_digest =
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
+        assert_eq!(
+            host.step_checkpoint(checkpoint.root_instance_id(), &conflict, &stale)
+                .unwrap_err()
+                .code,
+            "event_id_conflict"
+        );
+        let mut wrong_sequence = processing.clone();
+        wrong_sequence.acceptance_sequence = "999".to_string();
+        assert_eq!(
+            host.step_checkpoint(checkpoint.root_instance_id(), &wrong_sequence, &stale)
+                .unwrap_err()
+                .code,
+            "event_id_conflict"
+        );
+        if expected_kind == "event_terminal" {
+            let mut wrong_queue = processing.clone();
+            wrong_queue.queue_sequence = "999".to_string();
+            assert_eq!(
+                host.step_checkpoint(checkpoint.root_instance_id(), &wrong_queue, &stale)
+                    .unwrap_err()
+                    .code,
+                "event_id_conflict"
+            );
+        } else {
+            let delivery = &inputs["requests"]["tombstoned_replay"]["envelopes"][0];
+            assert_eq!(
+                host.process_checkpoint(checkpoint.root_instance_id(), delivery, "delayed", &stale)
+                    .unwrap(),
+                expected
+            );
+            let mut conflict = delivery.clone();
+            conflict["envelope_digest"] =
+                json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            assert_eq!(
+                host.process_checkpoint(
+                    checkpoint.root_instance_id(),
+                    &conflict,
+                    "delayed",
+                    &stale
+                )
+                .unwrap_err()
+                .code,
+                "event_id_conflict"
+            );
+        }
+        assert_eq!(
+            host.load_checkpoint(checkpoint.root_instance_id())
+                .unwrap()
+                .unwrap()
+                .value(),
+            checkpoint.value()
+        );
+    }
+}
 
 #[test]
 fn memory_store_runs_the_native_v1_host_contract() {

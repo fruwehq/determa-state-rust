@@ -357,40 +357,8 @@ pub(crate) fn checkpoint_step_v1_with_core(
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
 ) -> Result<(Value, Option<Value>), ArtifactError> {
-    if !matches!(request.processing_mode.as_str(), "delayed" | "foreground") {
-        return Err(failure("invalid_execution_checkpoint"));
-    }
-    if let Some(receipt) = checkpoint.value["operation_receipts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|receipt| {
-            receipt["operation_kind"] == "event_terminal"
-                && receipt["event_id"].as_str() == Some(&request.event_id)
-        })
-    {
-        return if receipt["request_digest"].as_str() == Some(&request.envelope_digest)
-            && receipt["acceptance_sequence"].as_str() == Some(&request.acceptance_sequence)
-            && receipt["final_queue_sequence"].as_str() == Some(&request.queue_sequence)
-        {
-            Ok((receipt.clone(), None))
-        } else {
-            Err(failure("event_id_conflict"))
-        };
-    }
-    if let Some(tombstone) = checkpoint.value["event_identity_tombstones"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["event_id"].as_str() == Some(&request.event_id))
-    {
-        return if tombstone["request_digest"].as_str() == Some(&request.envelope_digest)
-            && tombstone["acceptance_sequence"].as_str() == Some(&request.acceptance_sequence)
-        {
-            Ok((tombstone.clone(), None))
-        } else {
-            Err(failure("event_id_conflict"))
-        };
+    if let Some(replay) = checkpoint_step_replay(checkpoint, request)? {
+        return Ok((replay, None));
     }
     guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
     let aggregate = checkpoint
@@ -414,6 +382,48 @@ pub(crate) fn checkpoint_step_v1_with_core(
         step_v1_with_emission_indexes(bundle, aggregate, &request.target_runtime_id)?;
     let updated = apply_step_result(&checkpoint.value, &causal, core.clone(), emission_indexes)?;
     Ok((updated, Some(core)))
+}
+
+pub(crate) fn checkpoint_step_replay(
+    checkpoint: &ExecutionCheckpoint,
+    request: &ProcessingRequest,
+) -> Result<Option<Value>, ArtifactError> {
+    if !matches!(request.processing_mode.as_str(), "delayed" | "foreground") {
+        return Err(failure("invalid_execution_checkpoint"));
+    }
+    if let Some(receipt) = checkpoint.value["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|receipt| {
+            receipt["operation_kind"] == "event_terminal"
+                && receipt["event_id"].as_str() == Some(&request.event_id)
+        })
+    {
+        return if receipt["request_digest"].as_str() == Some(&request.envelope_digest)
+            && receipt["acceptance_sequence"].as_str() == Some(&request.acceptance_sequence)
+            && receipt["final_queue_sequence"].as_str() == Some(&request.queue_sequence)
+        {
+            Ok(Some(receipt.clone()))
+        } else {
+            Err(failure("event_id_conflict"))
+        };
+    }
+    if let Some(tombstone) = checkpoint.value["event_identity_tombstones"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["event_id"].as_str() == Some(&request.event_id))
+    {
+        return if tombstone["request_digest"].as_str() == Some(&request.envelope_digest)
+            && tombstone["acceptance_sequence"].as_str() == Some(&request.acceptance_sequence)
+        {
+            Ok(Some(tombstone.clone()))
+        } else {
+            Err(failure("event_id_conflict"))
+        };
+    }
+    Ok(None)
 }
 
 fn apply_step_result(
@@ -592,8 +602,8 @@ fn checkpoint_process_resolved(
     expected_checkpoint_digest: Option<&str>,
     resolver: &(impl DefinitionResolver + ?Sized),
 ) -> Result<(Value, Option<Value>), ArtifactError> {
-    if !matches!(processing_mode, "delayed" | "foreground") {
-        return Err(failure("invalid_execution_checkpoint"));
+    if let Some(replay) = checkpoint_process_replay(checkpoint, &delivery, processing_mode)? {
+        return Ok((replay, None));
     }
     guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
     let event_id = delivery["envelope"]["event_id"]
@@ -678,6 +688,9 @@ pub(crate) fn checkpoint_process_with_migration_with_core(
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
 ) -> Result<(Value, Option<Value>), ArtifactError> {
+    if let Some(replay) = checkpoint_process_replay(checkpoint, &delivery, processing_mode)? {
+        return Ok((replay, None));
+    }
     guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
     let aggregate = checkpoint
         .aggregate
@@ -704,6 +717,49 @@ pub(crate) fn checkpoint_process_with_migration_with_core(
         resolver,
     )?;
     Ok((collapse_process_revision(checkpoint, processed)?, core))
+}
+
+pub(crate) fn checkpoint_process_replay(
+    checkpoint: &ExecutionCheckpoint,
+    delivery: &Value,
+    processing_mode: &str,
+) -> Result<Option<Value>, ArtifactError> {
+    if !matches!(processing_mode, "delayed" | "foreground") {
+        return Err(failure("invalid_execution_checkpoint"));
+    }
+    validate_admission_delivery_schema(delivery).map_err(|_| failure("malformed_delivery"))?;
+    let parsed: AdmissionDelivery =
+        serde_json::from_value(delivery.clone()).map_err(|_| failure("malformed_delivery"))?;
+    let root_instance_id = checkpoint.root_instance_id();
+    if target_root_instance_id(&parsed.envelope.target).is_some_and(|root| root != root_instance_id)
+    {
+        return Err(failure("wrong_root"));
+    }
+    let request_digest = crate::format1::v1::envelope_digest(
+        root_instance_id,
+        &parsed.delivery_mode,
+        &parsed.envelope,
+    )?;
+    let event_id = parsed.envelope.event_id.as_str();
+    let retained = retained_identity(checkpoint.value())?;
+    let Some(identity) = retained.get(event_id) else {
+        return Ok(None);
+    };
+    if identity.digest != request_digest || identity.digest != parsed.envelope_digest {
+        return Err(failure("event_id_conflict"));
+    }
+    if let Some(receipt) = checkpoint.value()["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|receipt| {
+            receipt["operation_kind"] == "event_terminal"
+                && receipt["event_id"].as_str() == Some(event_id)
+        })
+    {
+        return Ok(Some(receipt.clone()));
+    }
+    Ok(Some(identity.replay.clone()))
 }
 
 fn apply_transaction_migration(

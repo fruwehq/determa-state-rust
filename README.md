@@ -171,8 +171,8 @@ DETERMA_TEST_POSTGRES_URL=postgresql://postgres:postgres@localhost/determa \
 ## CLI
 
 ```sh
-cargo run -- validate examples/minimal.yaml
-cargo run -- --version
+cargo run --bin determa-state -- validate examples/minimal.yaml
+cargo run --bin determa-state -- --version
 ```
 
 ## License

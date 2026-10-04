@@ -21,11 +21,11 @@ use super::types::{
 };
 use super::v1::{
     checkpoint_admit_v1_with_optional_bundle, checkpoint_compact_outbox,
-    checkpoint_maintenance_migration_route, checkpoint_process,
-    checkpoint_process_with_migration_with_core, checkpoint_prune_v1, checkpoint_step_v1_with_core,
-    checkpoint_terminalize_outbox, checkpoint_tombstone_root, checkpoint_update_pending_outbox,
-    create_execution_checkpoint_v1, creation_request_digest, restore_execution_checkpoint,
-    ExecutionCheckpoint,
+    checkpoint_maintenance_migration_route, checkpoint_process, checkpoint_process_replay,
+    checkpoint_process_with_migration_with_core, checkpoint_prune_v1, checkpoint_step_replay,
+    checkpoint_step_v1_with_core, checkpoint_terminalize_outbox, checkpoint_tombstone_root,
+    checkpoint_update_pending_outbox, create_execution_checkpoint_v1, creation_request_digest,
+    restore_execution_checkpoint, ExecutionCheckpoint,
 };
 use crate::format1::{
     ArtifactError, Bindings, Bundle, MigrationArtifactResolver, MigrationRequest, ResourceLimits,
@@ -1955,6 +1955,9 @@ where
     ) -> Result<(JsonValue, Option<JsonValue>), ArtifactError> {
         let (record, checkpoint) =
             self.require_checkpoint_v1_with_store(store, root_instance_id)?;
+        if let Some(replay) = checkpoint_step_replay(&checkpoint, request)? {
+            return Ok((replay, None));
+        }
         let bundle = self.checkpoint_v1_bundle(&checkpoint)?;
         let (result, core) = checkpoint_step_v1_with_core(
             &bundle,
@@ -1996,6 +1999,9 @@ where
     ) -> Result<JsonValue, ArtifactError> {
         let (record, checkpoint) =
             self.require_checkpoint_v1_with_store(store, root_instance_id)?;
+        if let Some(replay) = checkpoint_process_replay(&checkpoint, delivery, processing_mode)? {
+            return Ok(replay);
+        }
         let bundle = self.checkpoint_v1_bundle(&checkpoint)?;
         let result = checkpoint_process(
             &bundle,
