@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://determa.dev/state/schema/aggregate-state-v2.schema.json",
+  "$id": "https://determa.dev/state/schema/aggregate-state-v1.schema.json",
   "title": "Determa State portable aggregate state",
   "description": "Closed wire schema for the sole supported queue-bearing aggregate state artifact.",
   "$ref": "#/$defs/aggregateState",
@@ -734,7 +734,7 @@
           "const": "determa.aggregate_state"
         },
         "aggregate_state_schema_version": {
-          "const": 2
+          "const": 1
         },
         "machine_format": {
           "const": 1

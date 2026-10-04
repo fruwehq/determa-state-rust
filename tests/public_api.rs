@@ -74,7 +74,7 @@ fn queue_bearing_public_operations_create_admit_step_and_restore() {
     .expect("admitted aggregate restores");
     let processed = step(&bundle, &admitted, &root_runtime_id).expect("ready work is processed");
 
-    assert_eq!(processed["core_step_result_schema_version"], 2);
+    assert_eq!(processed["core_step_result_schema_version"], 1);
     assert_eq!(processed["disposition"], "handled");
     assert_eq!(
         processed["state"]["runtimes"][0]["active_leaf_state_definition_pointers"],
@@ -113,11 +113,11 @@ fn examples_and_revision_metadata_are_current() {
     load_bundle(include_str!("../examples/full.yaml")).expect("full example loads");
     assert_eq!(
         FORMAT_1_SPECIFICATION_COMMIT,
-        "6796b554b976627c68fc746ec5629629aaf2b38e"
+        "6bd25e3fcdf068af861aa289903a8489bd8f0139"
     );
     assert_eq!(
         FORMAT_1_CONFORMANCE_COMMIT,
-        "a586417292d0a5cac8d07e1164669688c407a7e1"
+        "710d5e9bcf517e8a8cc8d7087123bda37a362d6b"
     );
 }
 
@@ -151,8 +151,8 @@ fn command_line_surface_is_validation_only_for_both_executable_names() {
 
 fn inbox_digest(root_instance_id: &str, delivery_mode: &str, envelope: &QueueEnvelope) -> String {
     let bytes = serde_json_canonicalizer::to_vec(&json!([
-        "determa-inbox-envelope-digest-2",
-        "2",
+        "determa-inbox-envelope-digest-1",
+        "1",
         root_instance_id,
         delivery_mode,
         envelope

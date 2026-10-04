@@ -8,7 +8,7 @@ mod adapters;
 mod host;
 mod store;
 mod types;
-mod v2;
+mod v1;
 
 pub use adapters::{
     register_bundled_adapters, FileExecutionStore, FileExecutionStoreFactory, MemoryExecutionStore,
@@ -19,8 +19,9 @@ pub use adapters::{PostgresqlExecutionStore, PostgresqlExecutionStoreFactory};
 #[cfg(feature = "sqlite")]
 pub use adapters::{SqliteExecutionStore, SqliteExecutionStoreFactory};
 pub use host::{
-    CheckpointHost, DurableCheckpointOperation, HostFailure, HostFailureCode,
-    MaintenanceMigrationRequest, MutationGuard,
+    execute_adapter_registration, execute_adapter_resolution, CheckpointHost,
+    DurableCheckpointOperation, HostFailure, HostFailureCode, MaintenanceMigrationRequest,
+    MutationGuard,
 };
 #[cfg(feature = "postgresql")]
 pub use host::{
@@ -34,19 +35,19 @@ pub use store::{
     StoreRecord, StoreWriteResult,
 };
 pub use types::{
-    AdmissionSource, CheckpointErrorCode, DurableCheckpointExecution, DurableFailurePolicy,
-    DurableHostExecution, DurableHostResult, DurableProcessRequest,
+    AdmissionSource, CheckpointErrorCode, DurableCheckpointExecution, DurableContractExecution,
+    DurableFailurePolicy, DurableHostExecution, DurableHostResult, DurableProcessRequest,
     DurableQuarantineReleaseRequest, OutboxIntent, PendingOutboxState, PreAcceptanceFailureCode,
     ProcessingRequest, PruneRequest, ScopedStoreRecord, StoreScope, TerminalOutboxOutcome,
     TransactionalProcessRequest,
 };
-pub use v2::{
-    checkpoint_admit_v2 as admit, checkpoint_compact_outbox as compact_outbox,
+pub use v1::{
+    checkpoint_admit_v1 as admit, checkpoint_compact_outbox as compact_outbox,
     checkpoint_process as process, checkpoint_process_with_migration as process_with_migration,
-    checkpoint_prune_v2 as prune, checkpoint_step_v2 as step,
+    checkpoint_prune_v1 as prune, checkpoint_step_v1 as step,
     checkpoint_terminalize_outbox as terminalize_outbox,
     checkpoint_tombstone_root as tombstone_root,
     checkpoint_update_pending_outbox as update_pending_outbox,
-    create_execution_checkpoint_v2 as create, creation_request_digest,
+    create_execution_checkpoint_v1 as create, creation_request_digest,
     restore_execution_checkpoint as restore, ExecutionCheckpoint,
 };

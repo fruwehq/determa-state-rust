@@ -562,7 +562,7 @@ pub fn encode_aggregate(
     }
     let mut envelope = AggregateEnvelope {
         aggregate_state_format: "determa.aggregate_state".to_string(),
-        aggregate_state_schema_version: 2,
+        aggregate_state_schema_version: 1,
         machine_format: 1,
         validated_bundle_fingerprint: state.validated_bundle_fingerprint.clone(),
         namespace: state.namespace.clone(),
@@ -1074,7 +1074,7 @@ pub(crate) fn parse_aggregate_envelope(
         }
     }
     match object.get("aggregate_state_schema_version") {
-        Some(JsonValue::Number(value)) if value.as_i64() == Some(2) => {}
+        Some(JsonValue::Number(value)) if value.as_i64() == Some(1) => {}
         _ => {
             return Err(PersistenceError::new(
                 PersistenceErrorCode::UnsupportedAggregateStateSchemaVersion,
@@ -1084,7 +1084,7 @@ pub(crate) fn parse_aggregate_envelope(
     }
     validate_schema(
         &value,
-        include_str!("../../schema/aggregate-state-v2.schema.json"),
+        include_str!("../../schema/aggregate-state-v1.schema.json"),
         PersistenceErrorCode::InvalidAggregateState,
     )?;
     let envelope: AggregateEnvelope =
@@ -1116,7 +1116,7 @@ pub(crate) fn aggregate_digest(value: &JsonValue) -> Result<String, PersistenceE
         return Err(invalid_state("aggregate state must be an object"));
     };
     object.remove("aggregate_state_digest");
-    jcs_hash(&json!(["determa-aggregate-state-digest-2", envelope]))
+    jcs_hash(&json!(["determa-aggregate-state-digest-1", envelope]))
 }
 
 pub(crate) fn validate_schema(
@@ -1124,13 +1124,23 @@ pub(crate) fn validate_schema(
     schema_source: &str,
     code: PersistenceErrorCode,
 ) -> Result<(), PersistenceError> {
-    let schema: JsonValue = serde_json::from_str(schema_source).expect("bundled schema is valid");
-    let validator = jsonschema::validator_for(&schema)
-        .map_err(|error| PersistenceError::new(code, error.to_string()))?;
-    if let Some(error) = validator.iter_errors(value).next() {
-        return Err(PersistenceError::new(code, error.to_string()));
+    thread_local! {
+        static VALIDATORS: std::cell::RefCell<std::collections::HashMap<usize, jsonschema::Validator>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
     }
-    Ok(())
+    VALIDATORS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let validator = cache
+            .entry(schema_source.as_ptr() as usize)
+            .or_insert_with(|| {
+                let schema: JsonValue =
+                    serde_json::from_str(schema_source).expect("bundled schema is valid");
+                jsonschema::validator_for(&schema).expect("bundled schema is valid")
+            });
+        validator
+            .validate(value)
+            .map_err(|error| PersistenceError::new(code, error.to_string()))
+    })
 }
 
 fn invalid_state(message: impl Into<String>) -> PersistenceError {

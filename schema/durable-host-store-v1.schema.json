@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://determa.dev/schemas/conformance/durable-host-store-v2.schema.json",
+  "$id": "https://determa.dev/schemas/conformance/durable-host-store-v1.schema.json",
   "title": "Determa State durable host store snapshot",
   "type": "object",
   "required": [
@@ -14,8 +14,8 @@
   "additionalProperties": false,
   "properties": {
     "durable_host_store_format": { "const": "determa.durable_host.store" },
-    "durable_host_store_schema_version": { "const": 2 },
-    "checkpoint": { "$ref": "https://determa.dev/state/schema/execution-checkpoint-v2.schema.json" },
+    "durable_host_store_schema_version": { "const": 1 },
+    "checkpoint": { "$ref": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json" },
     "inbox": {
       "type": "array",
       "items": {

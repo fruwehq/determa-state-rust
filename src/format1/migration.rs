@@ -240,7 +240,7 @@ pub(crate) fn migrate_aggregate(
         let current_bytes = envelope.canonical_bytes()?;
         require_within(current_bytes.len(), &limits.maximum_aggregate_bytes)?;
         audit_records.push(MigrationAuditRecord {
-            migration_audit_record_schema_version: 2,
+            migration_audit_record_schema_version: 1,
             root_instance_id: envelope.root_instance_id.clone(),
             root_runtime_id: envelope.root_runtime_id.clone(),
             migration_sequence: envelope.migration_sequence.clone(),
@@ -345,7 +345,7 @@ fn decode_descriptor(
         }
     }
     match object.get("migration_descriptor_schema_version") {
-        Some(JsonValue::Number(value)) if value.as_i64() == Some(2) => {}
+        Some(JsonValue::Number(value)) if value.as_i64() == Some(1) => {}
         _ => {
             return Err(error(
                 PersistenceErrorCode::UnsupportedMigrationDescriptorSchemaVersion,
@@ -355,7 +355,7 @@ fn decode_descriptor(
     }
     super::native::validate_schema(
         &value,
-        include_str!("../../schema/migration-descriptor-v2.schema.json"),
+        include_str!("../../schema/migration-descriptor-v1.schema.json"),
         PersistenceErrorCode::InvalidMigrationDescriptor,
     )?;
     let mut without_digest = value.clone();
@@ -363,7 +363,7 @@ fn decode_descriptor(
         .as_object_mut()
         .expect("checked object")
         .remove("migration_descriptor_digest");
-    let computed = jcs_hash(&json!(["determa-migration-descriptor-2", without_digest]))?;
+    let computed = jcs_hash(&json!(["determa-migration-descriptor-1", without_digest]))?;
     let declared_digest = string(&value, "migration_descriptor_digest")?;
     let expected_digest = expected_digest.unwrap_or(declared_digest);
     if computed != expected_digest || declared_digest != expected_digest {

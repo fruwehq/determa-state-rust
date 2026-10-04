@@ -1,7 +1,8 @@
 use determa_state::checkpoint::{
-    CheckpointHost, ExecutionStore, FileExecutionStore, MaintenanceMigrationRequest,
-    MemoryExecutionStore, MutationGuard, PendingOutboxState, ProcessingRequest, PruneRequest,
-    StoreRecord, StoreWriteResult, TerminalOutboxOutcome, TransactionalProcessRequest,
+    CheckpointHost, DurableCheckpointOperation, ExecutionStore, FileExecutionStore,
+    MaintenanceMigrationRequest, MemoryExecutionStore, MutationGuard, PendingOutboxState,
+    ProcessingRequest, PruneRequest, StoreRecord, StoreWriteResult, TerminalOutboxOutcome,
+    TransactionalProcessRequest,
 };
 #[cfg(feature = "sqlite")]
 use determa_state::checkpoint::{DurableStoreMode, SqliteExecutionStore};
@@ -16,10 +17,275 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
-fn memory_store_runs_the_native_v2_host_contract() {
+fn public_process_replays_the_original_terminal_receipt_before_cas_or_migration() {
+    let directory = Path::new("conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-01-native-lifecycle");
+    let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let resolver = Arc::new(resolver);
+    let created = determa_state::checkpoint::restore(
+        &fs::read(directory.join("created-checkpoint-v1.json")).unwrap(),
+        resolver.as_ref(),
+    )
+    .unwrap();
+    let accepted: Value =
+        serde_json::from_slice(&fs::read(directory.join("accepted-checkpoint-v1.json")).unwrap())
+            .unwrap();
+    let entry = &accepted["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"][0];
+    let delivery = json!({
+        "delivery_mode":entry["delivery_mode"],
+        "envelope":entry["envelope"],
+        "envelope_digest":entry["envelope_digest"]
+    });
     let store: Arc<dyn ExecutionStore> = Arc::new(MemoryExecutionStore::new());
     store.initialize_schema().unwrap();
-    native_v2_host_contract(store);
+    assert_eq!(
+        store
+            .insert_if_absent(StoreRecord::from_checkpoint(&created).unwrap())
+            .unwrap(),
+        StoreWriteResult::Committed
+    );
+    let host = CheckpointHost::new(store, resolver);
+    let stale = MutationGuard::new(created.revision(), created.digest());
+    let first = host
+        .process_checkpoint(created.root_instance_id(), &delivery, "delayed", &stale)
+        .unwrap();
+    let receipt = first["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|value| {
+            value["operation_kind"] == "event_terminal"
+                && value["event_id"] == entry["envelope"]["event_id"]
+        })
+        .unwrap()
+        .clone();
+    assert_eq!(
+        host.process_checkpoint(created.root_instance_id(), &delivery, "delayed", &stale)
+            .unwrap(),
+        receipt
+    );
+    let before = host
+        .load_checkpoint(created.root_instance_id())
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    let transactional = TransactionalProcessRequest {
+        migration: MigrationRequest {
+            migration_route: vec![
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    .to_string(),
+            ],
+            target_validated_bundle_fingerprint:
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    .to_string(),
+            maintenance_mode: false,
+        },
+        migration_limits: ResourceLimits::default(),
+        delivery: delivery.clone(),
+        processing_mode: "delayed".to_string(),
+    };
+    assert_eq!(
+        host.transactional_process(created.root_instance_id(), &transactional, &stale)
+            .unwrap(),
+        receipt
+    );
+    let mut conflict = delivery;
+    conflict["envelope_digest"] =
+        json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    assert_eq!(
+        host.process_checkpoint(created.root_instance_id(), &conflict, "delayed", &stale)
+            .unwrap_err()
+            .code,
+        "event_id_conflict"
+    );
+    transactional_assert_conflict(
+        &host,
+        created.root_instance_id(),
+        &transactional,
+        &conflict,
+        &stale,
+    );
+    assert_eq!(
+        host.load_checkpoint(created.root_instance_id())
+            .unwrap()
+            .unwrap()
+            .value(),
+        &before
+    );
+}
+
+fn transactional_assert_conflict(
+    host: &CheckpointHost<InMemoryDefinitionResolver>,
+    root_instance_id: &str,
+    request: &TransactionalProcessRequest,
+    delivery: &Value,
+    guard: &MutationGuard,
+) {
+    let mut conflicting = request.clone();
+    conflicting.delivery = delivery.clone();
+    assert_eq!(
+        host.transactional_process(root_instance_id, &conflicting, guard)
+            .unwrap_err()
+            .code,
+        "event_id_conflict"
+    );
+}
+
+#[test]
+fn public_step_replays_terminal_and_tombstone_evidence_before_bundle_resolution() {
+    for (profile, checkpoint_name, request_name, expected_kind) in [
+        (
+            "checkpoint-01-native-lifecycle",
+            "processed-checkpoint-v1.json",
+            "process_replay",
+            "event_terminal",
+        ),
+        (
+            "checkpoint-07-complete-host-contract",
+            "bounded-tombstone-checkpoint-v1.json",
+            "handled_delayed",
+            "tombstone",
+        ),
+    ] {
+        let directory =
+            Path::new("conformance-suite/conformance/profiles/execution-checkpoint").join(profile);
+        let bundle =
+            load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(bundle, true);
+        let checkpoint = determa_state::checkpoint::restore(
+            &fs::read(directory.join(checkpoint_name)).unwrap(),
+            &resolver,
+        )
+        .unwrap();
+        let inputs: Value =
+            serde_json::from_slice(&fs::read(directory.join("inputs-v1.json")).unwrap()).unwrap();
+        let request = &inputs["requests"][request_name];
+        let processing = ProcessingRequest {
+            target_runtime_id: request["target"]["root"]["root_runtime_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            event_id: request["event_id"].as_str().unwrap().to_string(),
+            envelope_digest: request["envelope_digest"].as_str().unwrap().to_string(),
+            acceptance_sequence: request["acceptance_sequence"].as_str().unwrap().to_string(),
+            queue_sequence: request["queue_sequence"].as_str().unwrap().to_string(),
+            processing_mode: request["processing_mode"].as_str().unwrap().to_string(),
+        };
+        let expected = if expected_kind == "event_terminal" {
+            checkpoint.value()["operation_receipts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| {
+                    item["operation_kind"] == "event_terminal"
+                        && item["event_id"] == processing.event_id
+                })
+                .unwrap()
+        } else {
+            checkpoint.value()["event_identity_tombstones"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["event_id"] == processing.event_id)
+                .unwrap()
+        }
+        .clone();
+        let store: Arc<dyn ExecutionStore> = Arc::new(MemoryExecutionStore::new());
+        store.initialize_schema().unwrap();
+        assert_eq!(
+            store
+                .insert_if_absent(StoreRecord::from_checkpoint(&checkpoint).unwrap())
+                .unwrap(),
+            StoreWriteResult::Committed
+        );
+        let host = CheckpointHost::new(store, Arc::new(resolver));
+        let stale = MutationGuard::new(
+            "0",
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        );
+        assert_eq!(
+            host.step_checkpoint(checkpoint.root_instance_id(), &processing, &stale)
+                .unwrap(),
+            expected
+        );
+        let response = host.execute_checkpoint_operation(
+            DurableCheckpointOperation::Step {
+                root_instance_id: checkpoint.root_instance_id(),
+                request: &processing,
+                guard: &stale,
+            },
+            false,
+        );
+        assert_eq!(
+            response.caller_response.unwrap(),
+            json!({"kind":"retained_receipt","body":expected})
+        );
+        let mut conflict = processing.clone();
+        conflict.envelope_digest =
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
+        assert_eq!(
+            host.step_checkpoint(checkpoint.root_instance_id(), &conflict, &stale)
+                .unwrap_err()
+                .code,
+            "event_id_conflict"
+        );
+        let mut wrong_sequence = processing.clone();
+        wrong_sequence.acceptance_sequence = "999".to_string();
+        assert_eq!(
+            host.step_checkpoint(checkpoint.root_instance_id(), &wrong_sequence, &stale)
+                .unwrap_err()
+                .code,
+            "event_id_conflict"
+        );
+        if expected_kind == "event_terminal" {
+            let mut wrong_queue = processing.clone();
+            wrong_queue.queue_sequence = "999".to_string();
+            assert_eq!(
+                host.step_checkpoint(checkpoint.root_instance_id(), &wrong_queue, &stale)
+                    .unwrap_err()
+                    .code,
+                "event_id_conflict"
+            );
+        } else {
+            let delivery = &inputs["requests"]["tombstoned_replay"]["envelopes"][0];
+            assert_eq!(
+                host.process_checkpoint(checkpoint.root_instance_id(), delivery, "delayed", &stale)
+                    .unwrap(),
+                expected
+            );
+            let mut conflict = delivery.clone();
+            conflict["envelope_digest"] =
+                json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            assert_eq!(
+                host.process_checkpoint(
+                    checkpoint.root_instance_id(),
+                    &conflict,
+                    "delayed",
+                    &stale
+                )
+                .unwrap_err()
+                .code,
+                "event_id_conflict"
+            );
+        }
+        assert_eq!(
+            host.load_checkpoint(checkpoint.root_instance_id())
+                .unwrap()
+                .unwrap()
+                .value(),
+            checkpoint.value()
+        );
+    }
+}
+
+#[test]
+fn memory_store_runs_the_native_v1_host_contract() {
+    let store: Arc<dyn ExecutionStore> = Arc::new(MemoryExecutionStore::new());
+    store.initialize_schema().unwrap();
+    native_v1_host_contract(store);
 }
 
 #[test]
@@ -29,7 +295,7 @@ fn empty_checkpoint_admission_is_malformed_without_mutation() {
     let mut resolver = InMemoryDefinitionResolver::default();
     resolver.insert(bundle.clone(), true);
     let checkpoint = determa_state::checkpoint::restore(
-        &fs::read(directory.join("created-checkpoint-v2.json")).unwrap(),
+        &fs::read(directory.join("created-checkpoint-v1.json")).unwrap(),
         &resolver,
     )
     .unwrap();
@@ -68,11 +334,11 @@ fn empty_checkpoint_admission_is_malformed_without_mutation() {
 }
 
 #[test]
-fn file_store_runs_the_native_v2_host_contract_and_survives_restart() {
-    let directory = temporary_path("file-native-v2");
+fn file_store_runs_the_native_v1_host_contract_and_survives_restart() {
+    let directory = temporary_path("file-native-v1");
     let store: Arc<dyn ExecutionStore> = Arc::new(FileExecutionStore::new(&directory).unwrap());
     store.initialize_schema().unwrap();
-    native_v2_host_contract(store.clone());
+    native_v1_host_contract(store.clone());
     drop(store);
     let reopened = FileExecutionStore::new(&directory).unwrap();
     assert!(reopened.load("server-1").unwrap().is_some());
@@ -350,17 +616,17 @@ fn checkpoint_restore_rejects_duplicate_and_dangling_producer_references() {
     let cases = [
         (
             "checkpoint-05-spawned-host-trace",
-            "spawned-child-terminal-checkpoint-v2.json",
+            "spawned-child-terminal-checkpoint-v1.json",
             "internal_mailbox",
         ),
         (
             "checkpoint-05-spawned-host-trace",
-            "spawned-owner-done-checkpoint-v2.json",
+            "spawned-owner-done-checkpoint-v1.json",
             "internal_terminal",
         ),
         (
             "checkpoint-02-native-outbox",
-            "pending-checkpoint-v2.json",
+            "pending-checkpoint-v1.json",
             "external_outbox",
         ),
     ];
@@ -433,9 +699,9 @@ fn checkpoint_restore_requires_producer_for_every_retained_outbox_effect() {
     let mut resolver = InMemoryDefinitionResolver::default();
     resolver.insert(bundle, true);
     for filename in [
-        "pending-checkpoint-v2.json",
-        "terminal-checkpoint-v2.json",
-        "effect-tombstone-checkpoint-v2.json",
+        "pending-checkpoint-v1.json",
+        "terminal-checkpoint-v1.json",
+        "effect-tombstone-checkpoint-v1.json",
     ] {
         let source = fs::read(directory.join(filename)).unwrap();
         determa_state::checkpoint::restore(&source, &resolver).unwrap();
@@ -486,8 +752,8 @@ fn pruning_outbox_producer_removes_terminal_evidence_and_protects_pending_work()
         dependency_effect_ids: Vec::new(),
     };
     for filename in [
-        "terminal-checkpoint-v2.json",
-        "effect-tombstone-checkpoint-v2.json",
+        "terminal-checkpoint-v1.json",
+        "effect-tombstone-checkpoint-v1.json",
     ] {
         let checkpoint = determa_state::checkpoint::restore(
             &fs::read(directory.join(filename)).unwrap(),
@@ -514,7 +780,7 @@ fn pruning_outbox_producer_removes_terminal_evidence_and_protects_pending_work()
             .unwrap();
     }
     let pending = determa_state::checkpoint::restore(
-        &fs::read(directory.join("pending-checkpoint-v2.json")).unwrap(),
+        &fs::read(directory.join("pending-checkpoint-v1.json")).unwrap(),
         &resolver,
     )
     .unwrap();
@@ -534,7 +800,7 @@ fn checkpoint_restore_rejects_outbox_terminal_sequence_overlap() {
     let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
     let mut resolver = InMemoryDefinitionResolver::default();
     resolver.insert(bundle, true);
-    let source = fs::read(directory.join("effect-tombstone-checkpoint-v2.json")).unwrap();
+    let source = fs::read(directory.join("effect-tombstone-checkpoint-v1.json")).unwrap();
     determa_state::checkpoint::restore(&source, &resolver).unwrap();
     let mut value: Value = serde_json::from_slice(&source).unwrap();
     value["outbox_effect_tombstones"][0]["terminal_sequence"] =
@@ -549,7 +815,7 @@ fn checkpoint_restore_rejects_outbox_terminal_sequence_overlap() {
         "{error:?}"
     );
 
-    let source = fs::read(directory.join("terminal-checkpoint-v2.json")).unwrap();
+    let source = fs::read(directory.join("terminal-checkpoint-v1.json")).unwrap();
     determa_state::checkpoint::restore(&source, &resolver).unwrap();
     let mut value: Value = serde_json::from_slice(&source).unwrap();
     let terminal_records = value["terminal_outbox_records"].as_array_mut().unwrap();
@@ -574,7 +840,7 @@ fn terminal_outbox_records_follow_completion_order_even_when_intents_arrived_ear
     let mut resolver = InMemoryDefinitionResolver::default();
     resolver.insert(bundle, true);
     let checkpoint = determa_state::checkpoint::restore(
-        &fs::read(directory.join("pending-checkpoint-v2.json")).unwrap(),
+        &fs::read(directory.join("pending-checkpoint-v1.json")).unwrap(),
         &resolver,
     )
     .unwrap();
@@ -625,7 +891,7 @@ fn checkpoint_restore_rejects_acceptance_without_live_or_terminal_event() {
     let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
     let mut resolver = InMemoryDefinitionResolver::default();
     resolver.insert(bundle, true);
-    let source = fs::read(directory.join("spawned-start-pending-checkpoint-v2.json")).unwrap();
+    let source = fs::read(directory.join("spawned-start-pending-checkpoint-v1.json")).unwrap();
     determa_state::checkpoint::restore(&source, &resolver).unwrap();
     let mut value: Value = serde_json::from_slice(&source).unwrap();
     let accepted_event = value["operation_receipts"]
@@ -669,7 +935,7 @@ fn checkpoint_restore_enforces_receipt_chronology_allocation_and_digest() {
     let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
     let mut resolver = InMemoryDefinitionResolver::default();
     resolver.insert(bundle, true);
-    let source = fs::read(directory.join("spawned-child-terminal-checkpoint-v2.json")).unwrap();
+    let source = fs::read(directory.join("spawned-child-terminal-checkpoint-v1.json")).unwrap();
     determa_state::checkpoint::restore(&source, &resolver).unwrap();
     let original: Value = serde_json::from_slice(&source).unwrap();
 
@@ -710,7 +976,7 @@ fn checkpoint_restore_enforces_internal_producer_chronology_and_acceptance_owner
     let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
     let mut resolver = InMemoryDefinitionResolver::default();
     resolver.insert(bundle, true);
-    let source = fs::read(directory.join("spawned-owner-done-checkpoint-v2.json")).unwrap();
+    let source = fs::read(directory.join("spawned-owner-done-checkpoint-v1.json")).unwrap();
     determa_state::checkpoint::restore(&source, &resolver).unwrap();
     let original: Value = serde_json::from_slice(&source).unwrap();
 
@@ -750,7 +1016,7 @@ fn checkpoint_restore_enforces_internal_producer_chronology_and_acceptance_owner
 fn tombstone_restore_checks_every_migration_audit_root() {
     let root = Path::new("conformance-suite/conformance/profiles/execution-checkpoint");
     let source = fs::read(
-        root.join("checkpoint-07-complete-host-contract/bounded-tombstone-checkpoint-v2.json"),
+        root.join("checkpoint-07-complete-host-contract/bounded-tombstone-checkpoint-v1.json"),
     )
     .unwrap();
     let resolver = InMemoryDefinitionResolver::default();
@@ -758,7 +1024,7 @@ fn tombstone_restore_checks_every_migration_audit_root() {
     let mut value: Value = serde_json::from_slice(&source).unwrap();
     let donor: Value = serde_json::from_slice(
         &fs::read(
-            root.join("checkpoint-04-version2-mailboxes/maintenance-sequential-checkpoint-v2.json"),
+            root.join("checkpoint-04-version1-mailboxes/maintenance-sequential-checkpoint-v1.json"),
         )
         .unwrap(),
     )
@@ -801,7 +1067,7 @@ fn reseal_aggregate_digest(value: &mut Value) {
         .unwrap()
         .remove("aggregate_state_digest");
     let bytes =
-        serde_json_canonicalizer::to_vec(&json!(["determa-aggregate-state-digest-2", unsigned]))
+        serde_json_canonicalizer::to_vec(&json!(["determa-aggregate-state-digest-1", unsigned]))
             .unwrap();
     value["aggregate_state_digest"] = json!(format!("sha256:{:x}", Sha256::digest(bytes)));
 }
@@ -813,7 +1079,7 @@ fn reseal_checkpoint_digest(value: &mut Value) {
         .unwrap()
         .remove("execution_checkpoint_digest");
     let bytes = serde_json_canonicalizer::to_vec(&json!([
-        "determa-execution-checkpoint-digest-2",
+        "determa-execution-checkpoint-digest-1",
         unsigned
     ]))
     .unwrap();
@@ -822,14 +1088,14 @@ fn reseal_checkpoint_digest(value: &mut Value) {
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn sqlite_store_runs_the_native_v2_host_contract_and_survives_restart() {
-    let directory = temporary_path("sqlite-native-v2");
+fn sqlite_store_runs_the_native_v1_host_contract_and_survives_restart() {
+    let directory = temporary_path("sqlite-native-v1");
     fs::create_dir_all(&directory).unwrap();
     let path = directory.join("checkpoints.sqlite3");
     let store: Arc<dyn ExecutionStore> =
         Arc::new(SqliteExecutionStore::open(&path, DurableStoreMode::bounded()).unwrap());
     store.initialize_schema().unwrap();
-    native_v2_host_contract(store.clone());
+    native_v1_host_contract(store.clone());
     drop(store);
     let reopened = SqliteExecutionStore::open(&path, DurableStoreMode::bounded()).unwrap();
     assert!(reopened.load("server-1").unwrap().is_some());
@@ -863,13 +1129,13 @@ fn sqlite_store_satisfies_compare_and_swap() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-fn native_v2_host_contract(store: Arc<dyn ExecutionStore>) {
-    let core = Path::new("conformance-suite/conformance/core/117-version2-mailboxes");
+fn native_v1_host_contract(store: Arc<dyn ExecutionStore>) {
+    let core = Path::new("conformance-suite/conformance/core/117-version1-mailboxes");
     let bundle = load_bundle(&fs::read_to_string(core.join("machine.yaml")).unwrap()).unwrap();
     let outbox_bundle = load_bundle(
         r#"
 format: 1
-namespace: test.native_v2_adapter
+namespace: test.native_v1_adapter
 events:
   published: { direction: output, payload: {} }
 machines:
@@ -883,7 +1149,7 @@ machines:
     let terminal_bundle = load_bundle(
         r#"
 format: 1
-namespace: test.native_v2_terminal
+namespace: test.native_v1_terminal
 machines:
   - machine_id: terminal
     root:
@@ -902,7 +1168,7 @@ machines:
     let retention = json!({
         "mode": "bounded",
         "permanent_replay_eligible": false,
-        "policy_identifier": "native-v2-test",
+        "policy_identifier": "native-v1-test",
         "pruned_through_receipt_sequence": null
     });
 
@@ -974,7 +1240,7 @@ machines:
             &PruneRequest {
                 cutoff_receipt_sequence: "4".to_string(),
                 target_mode: "bounded".to_string(),
-                policy_identifier: Some("native-v2-test".to_string()),
+                policy_identifier: Some("native-v1-test".to_string()),
                 dependency_receipt_sequences: Vec::new(),
                 dependency_effect_ids: Vec::new(),
             },
@@ -993,7 +1259,7 @@ machines:
 
     let maintenance = MaintenanceMigrationRequest {
         root_instance_id: "server-1".to_string(),
-        operation_id: "native-v2-no-op".to_string(),
+        operation_id: "native-v1-no-op".to_string(),
         source_aggregate_state_digest: pruned["root_record"]["aggregate_state"]
             ["aggregate_state_digest"]
             .as_str()
@@ -1072,7 +1338,7 @@ machines:
     let tombstoned = host
         .tombstone_root(
             "terminal-root",
-            "native-v2-tombstone",
+            "native-v1-tombstone",
             &MutationGuard::new(terminal.revision(), terminal.digest()),
         )
         .unwrap();
@@ -1146,8 +1412,8 @@ fn named_input_delivery(checkpoint: &Value, event: &str, event_id: &str) -> Valu
         "payload": ["map", []]
     });
     let bytes = serde_json_canonicalizer::to_vec(&json!([
-        "determa-inbox-envelope-digest-2",
-        "2",
+        "determa-inbox-envelope-digest-1",
+        "1",
         checkpoint["root_instance_id"],
         "input",
         envelope

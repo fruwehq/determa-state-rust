@@ -18,12 +18,12 @@ use serde_json::{json, Map, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Version2Error {
+pub struct Version1Error {
     pub code: String,
     pub message: String,
 }
 
-impl Version2Error {
+impl Version1Error {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
@@ -32,13 +32,13 @@ impl Version2Error {
     }
 }
 
-impl std::fmt::Display for Version2Error {
+impl std::fmt::Display for Version1Error {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}: {}", self.code, self.message)
     }
 }
 
-impl std::error::Error for Version2Error {}
+impl std::error::Error for Version1Error {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,30 +69,30 @@ const ADMISSION_DELIVERY_SCHEMA: &str = r#"
   "additionalProperties":false,
   "properties":{
     "delivery_mode":{"type":"string"},
-    "envelope":{"$ref":"https://determa.dev/state/schema/aggregate-state-v2.schema.json#/$defs/envelope"},
-    "envelope_digest":{"$ref":"https://determa.dev/state/schema/aggregate-state-v2.schema.json#/$defs/sha256"}
+    "envelope":{"$ref":"https://determa.dev/state/schema/aggregate-state-v1.schema.json#/$defs/envelope"},
+    "envelope_digest":{"$ref":"https://determa.dev/state/schema/aggregate-state-v1.schema.json#/$defs/sha256"}
   }
 }
 "#;
 
 pub(crate) fn validate_admission_delivery_schema(
     delivery: &JsonValue,
-) -> Result<(), Version2Error> {
-    validate_v2_schema(
+) -> Result<(), Version1Error> {
+    validate_v1_schema(
         delivery,
         ADMISSION_DELIVERY_SCHEMA,
         &[(
-            "https://determa.dev/state/schema/aggregate-state-v2.schema.json",
-            include_str!("../../schema/aggregate-state-v2.schema.json"),
+            "https://determa.dev/state/schema/aggregate-state-v1.schema.json",
+            include_str!("../../schema/aggregate-state-v1.schema.json"),
         )],
         "invalid_delivery_source",
     )
 }
 
-pub fn restore_aggregate_v2(
+pub fn restore_aggregate_v1(
     source: &[u8],
     resolver: &(impl DefinitionResolver + ?Sized),
-) -> Result<NativeAggregate, Version2Error> {
+) -> Result<NativeAggregate, Version1Error> {
     let value = strict_json::parse(source).map_err(|error| {
         let code = match error.code {
             strict_json::StrictJsonErrorCode::DuplicateKey => "duplicate_key",
@@ -101,15 +101,15 @@ pub fn restore_aggregate_v2(
             strict_json::StrictJsonErrorCode::InvalidNumber
             | strict_json::StrictJsonErrorCode::InvalidJson => "invalid_aggregate_state",
         };
-        Version2Error::new(code, error.to_string())
+        Version1Error::new(code, error.to_string())
     })?;
-    restore_aggregate_v2_value(value, resolver)
+    restore_aggregate_v1_value(value, resolver)
 }
 
 pub(crate) fn validate_aggregate_artifact(
     source: &[u8],
     resolver: &(impl DefinitionResolver + ?Sized),
-) -> Result<JsonValue, Version2Error> {
+) -> Result<JsonValue, Version1Error> {
     let value = strict_json::parse(source).map_err(|error| {
         let code = match error.code {
             strict_json::StrictJsonErrorCode::DuplicateKey => "duplicate_key",
@@ -118,26 +118,26 @@ pub(crate) fn validate_aggregate_artifact(
             strict_json::StrictJsonErrorCode::InvalidNumber
             | strict_json::StrictJsonErrorCode::InvalidJson => "invalid_aggregate_state",
         };
-        Version2Error::new(code, error.to_string())
+        Version1Error::new(code, error.to_string())
     })?;
     validate_aggregate_artifact_value(&value)?;
     let mut fingerprints = BTreeSet::new();
     collect_bundle_fingerprints(&value, &mut fingerprints);
     for fingerprint in fingerprints {
         let resolved = resolver.resolve_definition(&fingerprint).ok_or_else(|| {
-            Version2Error::new(
+            Version1Error::new(
                 "source_definition_unavailable",
                 "retained provenance definition is unavailable",
             )
         })?;
         if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
-            return Err(Version2Error::new(
+            return Err(Version1Error::new(
                 "source_definition_untrusted",
                 "retained provenance definition is not trusted",
             ));
         }
     }
-    match restore_aggregate_v2_value(value.clone(), resolver) {
+    match restore_aggregate_v1_value(value.clone(), resolver) {
         Ok(_) => Ok(value),
         Err(error)
             if error.code == "invalid_aggregate_state"
@@ -151,18 +151,18 @@ pub(crate) fn validate_aggregate_artifact(
     }
 }
 
-pub fn create_v2(
+pub fn create_v1(
     bundle: &Bundle,
     machine_id: &str,
     root_instance_id: &str,
     creation_id: &str,
     bindings: &Bindings,
-) -> Result<NativeAggregate, Version2Error> {
-    create_v2_with_evidence(bundle, machine_id, root_instance_id, creation_id, bindings)
+) -> Result<NativeAggregate, Version1Error> {
+    create_v1_with_evidence(bundle, machine_id, root_instance_id, creation_id, bindings)
         .map(|result| result.aggregate)
 }
 
-pub(crate) struct CreateV2Evidence {
+pub(crate) struct CreateV1Evidence {
     pub aggregate: NativeAggregate,
     pub status: String,
     pub emissions: Vec<JsonValue>,
@@ -171,17 +171,17 @@ pub(crate) struct CreateV2Evidence {
     pub fault: Option<JsonValue>,
 }
 
-pub(crate) fn create_v2_with_evidence(
+pub(crate) fn create_v1_with_evidence(
     bundle: &Bundle,
     machine_id: &str,
     root_instance_id: &str,
     creation_id: &str,
     bindings: &Bindings,
-) -> Result<CreateV2Evidence, Version2Error> {
+) -> Result<CreateV1Evidence, Version1Error> {
     let result =
         create_native_aggregate(bundle, machine_id, root_instance_id, creation_id, bindings);
     if result.status == ResultStatus::Rejected {
-        return Err(Version2Error::new(
+        return Err(Version1Error::new(
             result
                 .rejection
                 .as_ref()
@@ -192,12 +192,12 @@ pub(crate) fn create_v2_with_evidence(
         ));
     }
     let mut aggregate = result.state.ok_or_else(|| {
-        Version2Error::new("invalid_aggregate_state", "creation returned no state")
+        Version1Error::new("invalid_aggregate_state", "creation returned no state")
     })?;
     let (_, bytes) =
         super::native::encode_aggregate(bundle, &aggregate).map_err(map_persistence)?;
     let value: JsonValue = serde_json::from_slice(&bytes)
-        .map_err(|error| Version2Error::new("invalid_aggregate_state", error.to_string()))?;
+        .map_err(|error| Version1Error::new("invalid_aggregate_state", error.to_string()))?;
     aggregate.document = value;
     let status = match result.status {
         ResultStatus::Running => "running",
@@ -216,7 +216,7 @@ pub(crate) fn create_v2_with_evidence(
         append_internal_emissions(&mut aggregate, &result.emissions)?;
     aggregate.document = seal_aggregate(aggregate.document)?;
     sync_native_mailboxes(&mut aggregate)?;
-    Ok(CreateV2Evidence {
+    Ok(CreateV1Evidence {
         aggregate,
         status,
         emissions,
@@ -226,15 +226,15 @@ pub(crate) fn create_v2_with_evidence(
     })
 }
 
-pub fn migrate_aggregate_v2(
+pub fn migrate_aggregate_v1(
     aggregate: &NativeAggregate,
     source_bundle: &Bundle,
     target_bundle: &Bundle,
     descriptor_source: &[u8],
     maintenance_mode: bool,
     limits: &super::migration::ResourceLimits,
-) -> Result<JsonValue, Version2Error> {
-    let result = migrate_aggregate_v2_with_evidence(
+) -> Result<JsonValue, Version1Error> {
+    let result = migrate_aggregate_v1_with_evidence(
         aggregate,
         source_bundle,
         target_bundle,
@@ -245,27 +245,27 @@ pub fn migrate_aggregate_v2(
     Ok(public_migration_result(result))
 }
 
-pub fn migrate_aggregate_v2_route(
+pub fn migrate_aggregate_v1_route(
     aggregate: &NativeAggregate,
     request: &MigrationRequest,
     resolver: &impl MigrationArtifactResolver,
     limits: &super::migration::ResourceLimits,
-) -> Result<JsonValue, Version2Error> {
-    migrate_aggregate_v2_route_with_evidence(aggregate, request, resolver, limits)
+) -> Result<JsonValue, Version1Error> {
+    migrate_aggregate_v1_route_with_evidence(aggregate, request, resolver, limits)
         .map(public_migration_result)
 }
 
-pub(crate) fn migrate_aggregate_v2_route_with_evidence(
+pub(crate) fn migrate_aggregate_v1_route_with_evidence(
     aggregate: &NativeAggregate,
     request: &MigrationRequest,
     resolver: &impl MigrationArtifactResolver,
     limits: &super::migration::ResourceLimits,
-) -> Result<JsonValue, Version2Error> {
+) -> Result<JsonValue, Version1Error> {
     if request.migration_route.is_empty() {
         if request.target_validated_bundle_fingerprint
             != aggregate.document["validated_bundle_fingerprint"]
         {
-            return Err(Version2Error::new(
+            return Err(Version1Error::new(
                 "migration_route_missing",
                 "empty migration route requires the current bundle fingerprint",
             ));
@@ -285,20 +285,20 @@ pub(crate) fn migrate_aggregate_v2_route_with_evidence(
         let descriptor = resolver
             .resolve_migration_descriptor(digest)
             .ok_or_else(|| {
-                Version2Error::new(
+                Version1Error::new(
                     "migration_descriptor_not_found",
                     "migration descriptor is unavailable",
                 )
             })?;
         if !descriptor.trusted {
-            return Err(Version2Error::new(
+            return Err(Version1Error::new(
                 "migration_descriptor_untrusted",
                 "migration descriptor is not trusted",
             ));
         }
-        let decoded = decode_descriptor_v2(&descriptor.bytes)?;
+        let decoded = decode_descriptor_v1(&descriptor.bytes)?;
         if decoded["migration_descriptor_digest"].as_str() != Some(digest) {
-            return Err(Version2Error::new(
+            return Err(Version1Error::new(
                 "invalid_migration_descriptor",
                 "resolved migration descriptor does not match its route digest",
             ));
@@ -309,7 +309,7 @@ pub(crate) fn migrate_aggregate_v2_route_with_evidence(
         let source = resolver
             .resolve_definition(source_fingerprint)
             .ok_or_else(|| {
-                Version2Error::new(
+                Version1Error::new(
                     "source_definition_unavailable",
                     "source definition is unavailable",
                 )
@@ -317,7 +317,7 @@ pub(crate) fn migrate_aggregate_v2_route_with_evidence(
         let target_fingerprint = decoded["target_validated_bundle_fingerprint"]
             .as_str()
             .ok_or_else(|| {
-                Version2Error::new(
+                Version1Error::new(
                     "invalid_migration_descriptor",
                     "target bundle fingerprint is absent",
                 )
@@ -325,7 +325,7 @@ pub(crate) fn migrate_aggregate_v2_route_with_evidence(
         let target = resolver
             .resolve_definition(target_fingerprint)
             .ok_or_else(|| {
-                Version2Error::new(
+                Version1Error::new(
                     "target_definition_unavailable",
                     "target definition is unavailable",
                 )
@@ -335,12 +335,12 @@ pub(crate) fn migrate_aggregate_v2_route_with_evidence(
             || !target.trusted
             || target.bundle.fingerprint != target_fingerprint
         {
-            return Err(Version2Error::new(
+            return Err(Version1Error::new(
                 "definition_not_trusted",
                 "migration definition is not trusted or content-addressed correctly",
             ));
         }
-        let result = migrate_aggregate_v2_with_evidence_resolved(
+        let result = migrate_aggregate_v1_with_evidence_resolved(
             &current,
             &source.bundle,
             &target.bundle,
@@ -351,12 +351,12 @@ pub(crate) fn migrate_aggregate_v2_route_with_evidence(
         )?;
         dispositions.extend(result["dispositions"].as_array().unwrap().iter().cloned());
         audit_records.extend(result["audit_records"].as_array().unwrap().iter().cloned());
-        current = restore_aggregate_v2_value(result["aggregate_state"].clone(), resolver)?;
+        current = restore_aggregate_v1_value(result["aggregate_state"].clone(), resolver)?;
     }
     if current.document["validated_bundle_fingerprint"].as_str()
         != Some(request.target_validated_bundle_fingerprint.as_str())
     {
-        return Err(Version2Error::new(
+        return Err(Version1Error::new(
             "migration_totality_failure",
             "migration route does not reach the requested target bundle",
         ));
@@ -383,15 +383,15 @@ fn public_migration_result(mut result: JsonValue) -> JsonValue {
     result
 }
 
-pub(crate) fn migrate_aggregate_v2_with_evidence(
+pub(crate) fn migrate_aggregate_v1_with_evidence(
     aggregate: &NativeAggregate,
     source_bundle: &Bundle,
     target_bundle: &Bundle,
     descriptor_source: &[u8],
     maintenance_mode: bool,
     limits: &super::migration::ResourceLimits,
-) -> Result<JsonValue, Version2Error> {
-    migrate_aggregate_v2_with_evidence_resolved(
+) -> Result<JsonValue, Version1Error> {
+    migrate_aggregate_v1_with_evidence_resolved(
         aggregate,
         source_bundle,
         target_bundle,
@@ -403,7 +403,7 @@ pub(crate) fn migrate_aggregate_v2_with_evidence(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn migrate_aggregate_v2_with_evidence_resolved(
+fn migrate_aggregate_v1_with_evidence_resolved(
     aggregate: &NativeAggregate,
     source_bundle: &Bundle,
     target_bundle: &Bundle,
@@ -411,19 +411,19 @@ fn migrate_aggregate_v2_with_evidence_resolved(
     maintenance_mode: bool,
     limits: &super::migration::ResourceLimits,
     artifact_resolver: Option<&dyn MigrationArtifactResolver>,
-) -> Result<JsonValue, Version2Error> {
+) -> Result<JsonValue, Version1Error> {
     if aggregate.document["validated_bundle_fingerprint"].as_str()
         != Some(source_bundle.fingerprint.as_str())
     {
-        return Err(Version2Error::new(
+        return Err(Version1Error::new(
             "definition_fingerprint_mismatch",
             "source bundle does not match queue-bearing aggregate",
         ));
     }
-    let descriptor = decode_descriptor_v2(descriptor_source)?;
+    let descriptor = decode_descriptor_v1(descriptor_source)?;
     let descriptor_digest = descriptor["migration_descriptor_digest"]
         .as_str()
-        .ok_or_else(|| Version2Error::new("invalid_migration_descriptor", "digest is absent"))?
+        .ok_or_else(|| Version1Error::new("invalid_migration_descriptor", "digest is absent"))?
         .to_string();
     let descriptor_bytes = canonical_bytes(&descriptor)?;
     let mut resolver = InMemoryDefinitionResolver::default();
@@ -436,13 +436,13 @@ fn migrate_aggregate_v2_with_evidence_resolved(
             let resolved = artifact_resolver
                 .resolve_definition(&fingerprint)
                 .ok_or_else(|| {
-                    Version2Error::new(
+                    Version1Error::new(
                         "source_definition_unavailable",
                         "retained provenance definition is unavailable",
                     )
                 })?;
             if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
-                return Err(Version2Error::new(
+                return Err(Version1Error::new(
                     "source_definition_untrusted",
                     "retained provenance definition is not trusted",
                 ));
@@ -469,7 +469,7 @@ fn migrate_aggregate_v2_with_evidence_resolved(
     )?;
     let rules = descriptor["queued_event_rules"]
         .as_array()
-        .ok_or_else(|| Version2Error::new("invalid_migration_descriptor", "rules are absent"))?;
+        .ok_or_else(|| Version1Error::new("invalid_migration_descriptor", "rules are absent"))?;
     let dispositions = apply_queued_event_rules(
         &mut value,
         &outcome.aggregate,
@@ -528,24 +528,24 @@ fn collect_bundle_fingerprints(value: &JsonValue, fingerprints: &mut BTreeSet<St
     }
 }
 
-pub fn validate_migration_descriptor_v2(source: &[u8]) -> Result<JsonValue, Version2Error> {
+pub fn validate_migration_descriptor_v1(source: &[u8]) -> Result<JsonValue, Version1Error> {
     let value = strict_json::parse(source)
-        .map_err(|error| Version2Error::new("invalid_migration_descriptor", error.to_string()))?;
+        .map_err(|error| Version1Error::new("invalid_migration_descriptor", error.to_string()))?;
     if value["migration_descriptor_format"].as_str() != Some("determa.aggregate_migration") {
-        return Err(Version2Error::new(
+        return Err(Version1Error::new(
             "unsupported_migration_descriptor_format",
             "unsupported migration descriptor format",
         ));
     }
-    if value["migration_descriptor_schema_version"].as_i64() != Some(2) {
-        return Err(Version2Error::new(
+    if value["migration_descriptor_schema_version"].as_i64() != Some(1) {
+        return Err(Version1Error::new(
             "unsupported_migration_descriptor_schema_version",
             "unsupported migration descriptor schema version",
         ));
     }
-    validate_v2_schema(
+    validate_v1_schema(
         &value,
-        include_str!("../../schema/migration-descriptor-v2.schema.json"),
+        include_str!("../../schema/migration-descriptor-v1.schema.json"),
         &[],
         "invalid_migration_descriptor",
     )?;
@@ -554,10 +554,10 @@ pub fn validate_migration_descriptor_v2(source: &[u8]) -> Result<JsonValue, Vers
         .as_object_mut()
         .expect("schema requires object")
         .remove("migration_descriptor_digest");
-    let expected = native::jcs_hash(&json!(["determa-migration-descriptor-2", unsigned]))
+    let expected = native::jcs_hash(&json!(["determa-migration-descriptor-1", unsigned]))
         .map_err(map_persistence)?;
     if value["migration_descriptor_digest"].as_str() != Some(expected.as_str()) {
-        return Err(Version2Error::new(
+        return Err(Version1Error::new(
             "invalid_migration_descriptor",
             "migration descriptor digest does not match content",
         ));
@@ -573,7 +573,7 @@ pub fn validate_migration_descriptor_v2(source: &[u8]) -> Result<JsonValue, Vers
             rule["delivery_mode"].as_str().unwrap(),
         );
         if !selectors.insert(selector) {
-            return Err(Version2Error::new(
+            return Err(Version1Error::new(
                 "invalid_migration_descriptor",
                 "queued event selectors must be unique",
             ));
@@ -582,14 +582,14 @@ pub fn validate_migration_descriptor_v2(source: &[u8]) -> Result<JsonValue, Vers
     Ok(value)
 }
 
-pub(crate) fn decode_descriptor_v2(source: &[u8]) -> Result<JsonValue, Version2Error> {
-    validate_migration_descriptor_v2(source)
+pub(crate) fn decode_descriptor_v1(source: &[u8]) -> Result<JsonValue, Version1Error> {
+    validate_migration_descriptor_v1(source)
 }
 
 fn runtime_id_map(
     old: &RuntimeState,
     new: &RuntimeState,
-) -> Result<BTreeMap<String, String>, Version2Error> {
+) -> Result<BTreeMap<String, String>, Version1Error> {
     let mut result = BTreeMap::from([(old.runtime_id.clone(), new.runtime_id.clone())]);
     for old_component in &old.components {
         let new_component = new
@@ -597,7 +597,7 @@ fn runtime_id_map(
             .iter()
             .find(|candidate| candidate.runtime.runtime_id == old_component.runtime.runtime_id)
             .ok_or_else(|| {
-                Version2Error::new(
+                Version1Error::new(
                     "migration_totality_failure",
                     "component runtime mapping is absent",
                 )
@@ -613,7 +613,7 @@ fn runtime_id_map(
             .iter()
             .find(|candidate| candidate.runtime.runtime_id == old_owned.runtime.runtime_id)
             .ok_or_else(|| {
-                Version2Error::new(
+                Version1Error::new(
                     "migration_totality_failure",
                     "spawned runtime mapping is absent",
                 )
@@ -629,7 +629,7 @@ fn merge_migrated_state(
     state: &NativeAggregate,
     migrated: &AggregateEnvelope,
     id_map: &BTreeMap<String, String>,
-) -> Result<JsonValue, Version2Error> {
+) -> Result<JsonValue, Version1Error> {
     let mut state = state.clone();
     state.next_acceptance_sequence =
         Counter::from_decimal(&migrated.next_acceptance_sequence).map_err(invalid_aggregate)?;
@@ -640,7 +640,7 @@ fn merge_migrated_state(
         super::native::encode_aggregate(target_bundle, &state).map_err(map_persistence)?;
     let mut value: JsonValue =
         serde_json::from_slice(&bytes).map_err(|error| invalid_aggregate(error.to_string()))?;
-    value["aggregate_state_schema_version"] = json!(2);
+    value["aggregate_state_schema_version"] = json!(1);
     value["next_acceptance_sequence"] = old["next_acceptance_sequence"].clone();
     value["next_queue_sequence"] = old["next_queue_sequence"].clone();
     let old_runtimes = runtimes(old)?;
@@ -700,14 +700,14 @@ fn replace_runtime_ids(value: &mut JsonValue, replacements: &BTreeMap<String, St
 fn copy_wire_mailboxes(
     aggregate: &mut NativeAggregate,
     envelope: &AggregateEnvelope,
-) -> Result<(), Version2Error> {
+) -> Result<(), Version1Error> {
     copy_runtime_mailboxes(&mut aggregate.root, envelope)
 }
 
 fn copy_runtime_mailboxes(
     runtime: &mut RuntimeState,
     envelope: &AggregateEnvelope,
-) -> Result<(), Version2Error> {
+) -> Result<(), Version1Error> {
     if let Some(wire) = envelope
         .runtimes
         .iter()
@@ -729,7 +729,7 @@ fn copy_runtime_mailboxes(
     Ok(())
 }
 
-fn sync_native_mailboxes(aggregate: &mut NativeAggregate) -> Result<(), Version2Error> {
+fn sync_native_mailboxes(aggregate: &mut NativeAggregate) -> Result<(), Version1Error> {
     let envelope: AggregateEnvelope = serde_json::from_value(aggregate.document.clone())
         .map_err(|error| invalid_aggregate(error.to_string()))?;
     aggregate.next_acceptance_sequence =
@@ -745,7 +745,7 @@ fn apply_queued_event_rules(
     target_bundle: &Bundle,
     rules: &[JsonValue],
     descriptor_digest: &str,
-) -> Result<Vec<JsonValue>, Version2Error> {
+) -> Result<Vec<JsonValue>, Version1Error> {
     let mut dispositions = Vec::new();
     let runtime_ids = runtimes(value)?
         .iter()
@@ -789,7 +789,7 @@ fn apply_queued_event_rules(
                 .map_err(|error| invalid_aggregate(error.to_string()))?;
                 let core = core_delivery(&delivery)?;
                 validate_queued_event_for_migration(target_bundle, state, &core).map_err(|_| {
-                    Version2Error::new(
+                    Version1Error::new(
                         "migration_totality_failure",
                         "queued event is incompatible with target definition",
                     )
@@ -805,7 +805,7 @@ fn apply_queued_event_rules(
 fn validate_migrated_capacity(
     value: &JsonValue,
     state: &NativeAggregate,
-) -> Result<(), Version2Error> {
+) -> Result<(), Version1Error> {
     for runtime in runtimes(value)? {
         let runtime_id = runtime["runtime_id"].as_str().unwrap();
         let runtime_state = runtime_by_id(&state.root, runtime_id)
@@ -814,7 +814,7 @@ fn validate_migrated_capacity(
         if deferred_event_capacity(runtime_state)
             .is_some_and(|capacity| count > usize::try_from(capacity).unwrap_or(0))
         {
-            return Err(Version2Error::new(
+            return Err(Version1Error::new(
                 "migration_totality_failure",
                 "deferred mailbox exceeds target capacity",
             ));
@@ -823,17 +823,17 @@ fn validate_migrated_capacity(
     Ok(())
 }
 
-pub fn admit_v2(
+pub fn admit_v1(
     bundle: &Bundle,
     aggregate: &NativeAggregate,
     deliveries: &[AdmissionDelivery],
-) -> Result<JsonValue, Version2Error> {
+) -> Result<JsonValue, Version1Error> {
     let mut seen = BTreeSet::new();
     if deliveries
         .iter()
         .any(|delivery| !seen.insert(delivery.envelope.event_id.as_str()))
     {
-        return Err(Version2Error::new(
+        return Err(Version1Error::new(
             "duplicate_event_id_in_batch",
             "delivery batch contains a duplicate event id",
         ));
@@ -845,7 +845,7 @@ pub fn admit_v2(
     for delivery in deliveries {
         validate_admission_delivery_schema(
             &serde_json::to_value(delivery).map_err(|error| {
-                Version2Error::new("invalid_delivery_source", error.to_string())
+                Version1Error::new("invalid_delivery_source", error.to_string())
             })?,
         )?;
         let computed = envelope_digest(
@@ -855,7 +855,7 @@ pub fn admit_v2(
         )?;
         if let Some(existing) = locations.get(&delivery.envelope.event_id) {
             if existing.digest != computed {
-                return Err(Version2Error::new(
+                return Err(Version1Error::new(
                     "event_id_conflict",
                     "event identity is already retained with different content",
                 ));
@@ -881,7 +881,7 @@ pub fn admit_v2(
 
     for (delivery, _) in &fresh {
         if !matches!(delivery.delivery_mode.as_str(), "input" | "internal") {
-            return Err(Version2Error::new(
+            return Err(Version1Error::new(
                 "invalid_delivery_mode",
                 "invalid delivery mode",
             ));
@@ -912,7 +912,7 @@ pub fn admit_v2(
     }
     for (delivery, computed, _) in &validated {
         if delivery.envelope_digest != *computed {
-            return Err(Version2Error::new(
+            return Err(Version1Error::new(
                 "delivery_digest_mismatch",
                 "supplied envelope digest does not match canonical content",
             ));
@@ -964,21 +964,21 @@ fn admission_failure_rank(code: DispatchRejectionCode) -> u8 {
     }
 }
 
-pub fn step_v2(
+pub fn step_v1(
     bundle: &Bundle,
     aggregate: &NativeAggregate,
     target_runtime_id: &str,
-) -> Result<JsonValue, Version2Error> {
-    step_v2_impl(bundle, aggregate, target_runtime_id, None)
+) -> Result<JsonValue, Version1Error> {
+    step_v1_impl(bundle, aggregate, target_runtime_id, None)
 }
 
-pub(crate) fn step_v2_with_emission_indexes(
+pub(crate) fn step_v1_with_emission_indexes(
     bundle: &Bundle,
     aggregate: &NativeAggregate,
     target_runtime_id: &str,
-) -> Result<(JsonValue, Vec<String>), Version2Error> {
+) -> Result<(JsonValue, Vec<String>), Version1Error> {
     let mut emission_indexes = Vec::new();
-    let result = step_v2_impl(
+    let result = step_v1_impl(
         bundle,
         aggregate,
         target_runtime_id,
@@ -987,12 +987,12 @@ pub(crate) fn step_v2_with_emission_indexes(
     Ok((result, emission_indexes))
 }
 
-fn step_v2_impl(
+fn step_v1_impl(
     bundle: &Bundle,
     aggregate: &NativeAggregate,
     target_runtime_id: &str,
     mut evidence_indexes: Option<&mut Vec<String>>,
-) -> Result<JsonValue, Version2Error> {
+) -> Result<JsonValue, Version1Error> {
     let root_status = aggregate_status(&aggregate.document)?;
     if aggregate.document["validated_bundle_fingerprint"].as_str()
         != Some(bundle.fingerprint.as_str())
@@ -1170,7 +1170,7 @@ fn merge_native_state(
     bundle: &Bundle,
     old: &JsonValue,
     state: &NativeAggregate,
-) -> Result<JsonValue, Version2Error> {
+) -> Result<JsonValue, Version1Error> {
     let retained: AggregateEnvelope = serde_json::from_value(old.clone())
         .map_err(|error| invalid_aggregate(error.to_string()))?;
     let mut state = state.clone();
@@ -1185,7 +1185,7 @@ fn merge_native_state(
     seal_aggregate(value)
 }
 
-fn remove_ready_head(value: &mut JsonValue, runtime_id: &str) -> Result<JsonValue, Version2Error> {
+fn remove_ready_head(value: &mut JsonValue, runtime_id: &str) -> Result<JsonValue, Version1Error> {
     let ready = runtime_object_mut(value, runtime_id)?["ready_mailbox"]
         .as_array_mut()
         .ok_or_else(|| invalid_aggregate("runtime ready mailbox is absent"))?;
@@ -1195,7 +1195,7 @@ fn remove_ready_head(value: &mut JsonValue, runtime_id: &str) -> Result<JsonValu
     Ok(ready.remove(0))
 }
 
-fn recall_deferred(value: &mut JsonValue, state: &NativeAggregate) -> Result<(), Version2Error> {
+fn recall_deferred(value: &mut JsonValue, state: &NativeAggregate) -> Result<(), Version1Error> {
     let runtime_ids = runtimes(value)?
         .iter()
         .filter_map(|runtime| runtime["runtime_id"].as_str().map(str::to_string))
@@ -1240,7 +1240,7 @@ fn dispose_removed_mailboxes(
     emissions: &[Emission],
     root_status: RuntimeStatus,
     causal_event_id: &str,
-) -> Result<Vec<JsonValue>, Version2Error> {
+) -> Result<Vec<JsonValue>, Version1Error> {
     let retained_ids = runtimes(new)?
         .iter()
         .filter_map(|runtime| runtime["runtime_id"].as_str().map(str::to_string))
@@ -1298,7 +1298,7 @@ fn append_step_emissions(
     old: &JsonValue,
     emissions: &[Emission],
     lifecycle: &mut Vec<JsonValue>,
-) -> Result<Vec<JsonValue>, Version2Error> {
+) -> Result<Vec<JsonValue>, Version1Error> {
     let mut results = Vec::new();
     for emission in emissions {
         if matches!(emission.target, Target::External) {
@@ -1394,7 +1394,7 @@ fn lifecycle_disposition(
     entry: &JsonValue,
     runtime_id: &str,
     reason: &str,
-) -> Result<JsonValue, Version2Error> {
+) -> Result<JsonValue, Version1Error> {
     Ok(json!({
         "event_id": entry["envelope"]["event_id"],
         "request_digest": entry["envelope_digest"],
@@ -1421,7 +1421,7 @@ fn runtime_status<'a>(value: &'a JsonValue, runtime_id: &str) -> Option<&'a str>
         .and_then(|runtime| runtime["status"].as_str())
 }
 
-fn queue_target_to_core(value: &JsonValue) -> Result<Target, Version2Error> {
+fn queue_target_to_core(value: &JsonValue) -> Result<Target, Version1Error> {
     let mut target = value.clone();
     if let Some(spawned) = target
         .get_mut("spawned_instance")
@@ -1438,7 +1438,7 @@ fn queue_target_to_core(value: &JsonValue) -> Result<Target, Version2Error> {
     serde_json::from_value(target).map_err(|error| invalid_aggregate(error.to_string()))
 }
 
-fn core_target_to_queue(target: &Target) -> Result<JsonValue, Version2Error> {
+fn core_target_to_queue(target: &Target) -> Result<JsonValue, Version1Error> {
     let mut value =
         serde_json::to_value(target).map_err(|error| invalid_aggregate(error.to_string()))?;
     if let Some(spawned) = value
@@ -1468,7 +1468,7 @@ fn target_runtime_id(target: &Target) -> Option<&str> {
     }
 }
 
-fn core_step_rejected(aggregate: &NativeAggregate, code: &str) -> Result<JsonValue, Version2Error> {
+fn core_step_rejected(aggregate: &NativeAggregate, code: &str) -> Result<JsonValue, Version1Error> {
     core_step_result(
         aggregate.document.clone(),
         "rejected",
@@ -1486,11 +1486,11 @@ fn core_step_result(
     lifecycle_dispositions: Vec<JsonValue>,
     fault: Option<JsonValue>,
     rejection: Option<JsonValue>,
-) -> Result<JsonValue, Version2Error> {
+) -> Result<JsonValue, Version1Error> {
     let status = aggregate_status(&state)?;
     Ok(json!({
         "core_step_result_format": "determa.core_step_result",
-        "core_step_result_schema_version": 2,
+        "core_step_result_schema_version": 1,
         "status": status,
         "disposition": disposition,
         "state": state,
@@ -1509,7 +1509,7 @@ struct MailboxLocation<'a> {
 
 fn mailbox_locations(
     value: &JsonValue,
-) -> Result<BTreeMap<String, MailboxLocation<'_>>, Version2Error> {
+) -> Result<BTreeMap<String, MailboxLocation<'_>>, Version1Error> {
     let mut locations = BTreeMap::new();
     for runtime in runtimes(value)? {
         for (field, location) in [("ready_mailbox", "ready"), ("deferred_mailbox", "deferred")] {
@@ -1540,10 +1540,10 @@ fn mailbox_locations(
     Ok(locations)
 }
 
-pub(crate) fn restore_aggregate_v2_value(
+pub(crate) fn restore_aggregate_v1_value(
     value: JsonValue,
     resolver: &(impl DefinitionResolver + ?Sized),
-) -> Result<NativeAggregate, Version2Error> {
+) -> Result<NativeAggregate, Version1Error> {
     validate_aggregate_artifact_value(&value)?;
     let envelope: AggregateEnvelope = serde_json::from_value(value.clone())
         .map_err(|error| invalid_aggregate(error.to_string()))?;
@@ -1554,14 +1554,14 @@ pub(crate) fn restore_aggregate_v2_value(
     Ok(state)
 }
 
-fn validate_aggregate_artifact_value(value: &JsonValue) -> Result<(), Version2Error> {
+fn validate_aggregate_artifact_value(value: &JsonValue) -> Result<(), Version1Error> {
     let object = aggregate_object(value)?;
     if object
         .get("aggregate_state_format")
         .and_then(JsonValue::as_str)
         != Some("determa.aggregate_state")
     {
-        return Err(Version2Error::new(
+        return Err(Version1Error::new(
             "unsupported_aggregate_state_format",
             "unsupported aggregate-state format",
         ));
@@ -1569,9 +1569,9 @@ fn validate_aggregate_artifact_value(value: &JsonValue) -> Result<(), Version2Er
     if object
         .get("aggregate_state_schema_version")
         .and_then(JsonValue::as_i64)
-        != Some(2)
+        != Some(1)
     {
-        return Err(Version2Error::new(
+        return Err(Version1Error::new(
             "unsupported_aggregate_state_schema_version",
             "unsupported queue-bearing aggregate-state schema version",
         ));
@@ -1583,7 +1583,7 @@ fn validate_aggregate_artifact_value(value: &JsonValue) -> Result<(), Version2Er
         .and_then(JsonValue::as_str)
         != Some(expected.as_str())
     {
-        return Err(Version2Error::new(
+        return Err(Version1Error::new(
             "aggregate_state_digest_mismatch",
             "queue-bearing aggregate-state digest does not match content",
         ));
@@ -1592,7 +1592,7 @@ fn validate_aggregate_artifact_value(value: &JsonValue) -> Result<(), Version2Er
     validate_wire_runtime_relations(value)
 }
 
-fn validate_wire_runtime_relations(value: &JsonValue) -> Result<(), Version2Error> {
+fn validate_wire_runtime_relations(value: &JsonValue) -> Result<(), Version1Error> {
     let root_instance_id = aggregate_root_instance_id(value)?;
     let root_runtime_id = value["root_runtime_id"]
         .as_str()
@@ -1685,7 +1685,7 @@ fn validate_wire_runtime_relations(value: &JsonValue) -> Result<(), Version2Erro
     Ok(())
 }
 
-fn seal_aggregate(mut value: JsonValue) -> Result<JsonValue, Version2Error> {
+fn seal_aggregate(mut value: JsonValue) -> Result<JsonValue, Version1Error> {
     for runtime in runtimes_mut(&mut value)? {
         for field in ["ready_mailbox", "deferred_mailbox"] {
             runtime[field]
@@ -1708,10 +1708,10 @@ fn seal_aggregate(mut value: JsonValue) -> Result<JsonValue, Version2Error> {
     Ok(value)
 }
 
-fn aggregate_digest(value: &JsonValue) -> Result<String, Version2Error> {
+fn aggregate_digest(value: &JsonValue) -> Result<String, Version1Error> {
     let mut unsigned = value.clone();
     aggregate_object_mut(&mut unsigned)?.remove("aggregate_state_digest");
-    native::jcs_hash(&json!(["determa-aggregate-state-digest-2", unsigned]))
+    native::jcs_hash(&json!(["determa-aggregate-state-digest-1", unsigned]))
         .map_err(map_persistence)
 }
 
@@ -1719,10 +1719,10 @@ pub(crate) fn envelope_digest(
     root_instance_id: &str,
     delivery_mode: &str,
     envelope: &QueueEnvelope,
-) -> Result<String, Version2Error> {
+) -> Result<String, Version1Error> {
     native::jcs_hash(&json!([
-        "determa-inbox-envelope-digest-2",
-        "2",
+        "determa-inbox-envelope-digest-1",
+        "1",
         root_instance_id,
         delivery_mode,
         envelope
@@ -1730,14 +1730,14 @@ pub(crate) fn envelope_digest(
     .map_err(map_persistence)
 }
 
-fn core_delivery(delivery: &AdmissionDelivery) -> Result<Delivery, Version2Error> {
+fn core_delivery(delivery: &AdmissionDelivery) -> Result<Delivery, Version1Error> {
     let payload = delivery
         .envelope
         .payload
         .to_value(None)
-        .map_err(|error| Version2Error::new("invalid_payload", error.to_string()))?;
+        .map_err(|error| Version1Error::new("invalid_payload", error.to_string()))?;
     let crate::value::Value::Map(payload) = payload else {
-        return Err(Version2Error::new(
+        return Err(Version1Error::new(
             "invalid_payload",
             "queue payload is not a typed map",
         ));
@@ -1752,7 +1752,7 @@ fn core_delivery(delivery: &AdmissionDelivery) -> Result<Delivery, Version2Error
     match delivery.delivery_mode.as_str() {
         "input" => Ok(Delivery::Input(envelope)),
         "internal" => Ok(Delivery::Internal(envelope)),
-        _ => Err(Version2Error::new(
+        _ => Err(Version1Error::new(
             "invalid_delivery_mode",
             "invalid delivery mode",
         )),
@@ -1762,15 +1762,15 @@ fn core_delivery(delivery: &AdmissionDelivery) -> Result<Delivery, Version2Error
 fn validate_source(
     delivery: &AdmissionDelivery,
     aggregate: &JsonValue,
-) -> Result<(), Version2Error> {
+) -> Result<(), Version1Error> {
     let source =
         delivery.envelope.source.as_object().ok_or_else(|| {
-            Version2Error::new("invalid_delivery_source", "source must be an object")
+            Version1Error::new("invalid_delivery_source", "source must be an object")
         })?;
     let host = source.len() == 1 && source.get("host").and_then(JsonValue::as_bool) == Some(true);
     if delivery.delivery_mode == "input" {
         if !host || delivery.envelope.cause_id != delivery.envelope.event_id {
-            return Err(Version2Error::new(
+            return Err(Version1Error::new(
                 "invalid_delivery_source",
                 "input must be host-sourced with cause equal to event id",
             ));
@@ -1790,7 +1790,7 @@ fn validate_source(
             false
         };
         if !valid || !valid_internal_source_shape(source) {
-            return Err(Version2Error::new(
+            return Err(Version1Error::new(
                 "invalid_delivery_source",
                 "internal delivery provenance is invalid",
             ));
@@ -1828,42 +1828,55 @@ fn valid_internal_source_shape(source: &serde_json::Map<String, JsonValue>) -> b
     }
 }
 
-fn validate_aggregate_schema(value: &JsonValue) -> Result<(), Version2Error> {
-    let schema: JsonValue =
-        serde_json::from_str(include_str!("../../schema/aggregate-state-v2.schema.json"))
-            .expect("bundled aggregate v2 schema is valid");
-    let validator =
-        jsonschema::validator_for(&schema).map_err(|error| invalid_aggregate(error.to_string()))?;
-    validator
-        .validate(value)
-        .map_err(|error| invalid_aggregate(error.to_string()))
+fn validate_aggregate_schema(value: &JsonValue) -> Result<(), Version1Error> {
+    thread_local! {
+        static VALIDATOR: jsonschema::Validator = {
+            let schema: JsonValue = serde_json::from_str(include_str!("../../schema/aggregate-state-v1.schema.json"))
+                .expect("bundled aggregate v1 schema is valid");
+            jsonschema::validator_for(&schema).expect("bundled aggregate v1 schema is valid")
+        };
+    }
+    VALIDATOR.with(|validator| {
+        validator
+            .validate(value)
+            .map_err(|error| invalid_aggregate(error.to_string()))
+    })
 }
 
-pub(crate) fn validate_v2_schema(
+pub(crate) fn validate_v1_schema(
     value: &JsonValue,
     schema_source: &str,
     resources: &[(&str, &str)],
     code: &str,
-) -> Result<(), Version2Error> {
-    let schema: JsonValue = serde_json::from_str(schema_source)
-        .map_err(|error| Version2Error::new(code, error.to_string()))?;
-    let mut options = jsonschema::options();
-    for (uri, source) in resources {
-        let resource_value: JsonValue = serde_json::from_str(source)
-            .map_err(|error| Version2Error::new(code, error.to_string()))?;
-        let resource = jsonschema::Resource::from_contents(resource_value)
-            .map_err(|error| Version2Error::new(code, error.to_string()))?;
-        options = options.with_resource((*uri).to_string(), resource);
+) -> Result<(), Version1Error> {
+    thread_local! {
+        static VALIDATORS: std::cell::RefCell<std::collections::HashMap<usize, jsonschema::Validator>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
     }
-    let validator = options
-        .build(&schema)
-        .map_err(|error| Version2Error::new(code, error.to_string()))?;
-    validator
-        .validate(value)
-        .map_err(|error| Version2Error::new(code, error.to_string()))
+    VALIDATORS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let validator = cache
+            .entry(schema_source.as_ptr() as usize)
+            .or_insert_with(|| {
+                let schema: JsonValue =
+                    serde_json::from_str(schema_source).expect("bundled schema is valid");
+                let mut options = jsonschema::options();
+                for (uri, source) in resources {
+                    let resource_value: JsonValue =
+                        serde_json::from_str(source).expect("bundled resource is valid");
+                    let resource = jsonschema::Resource::from_contents(resource_value)
+                        .expect("bundled resource is valid");
+                    options = options.with_resource((*uri).to_string(), resource);
+                }
+                options.build(&schema).expect("bundled schema is valid")
+            });
+        validator
+            .validate(value)
+            .map_err(|error| Version1Error::new(code, error.to_string()))
+    })
 }
 
-fn validate_mailbox_integrity(value: &JsonValue) -> Result<(), Version2Error> {
+fn validate_mailbox_integrity(value: &JsonValue) -> Result<(), Version1Error> {
     let next_acceptance = counter_value(value, "next_acceptance_sequence")?;
     let next_queue = counter_value(value, "next_queue_sequence")?;
     let mut event_ids = BTreeSet::new();
@@ -1928,7 +1941,7 @@ fn validate_mailbox_semantics(
     value: &JsonValue,
     state: &NativeAggregate,
     resolver: &(impl DefinitionResolver + ?Sized),
-) -> Result<(), Version2Error> {
+) -> Result<(), Version1Error> {
     for runtime_value in runtimes(value)? {
         let runtime_id = runtime_value["runtime_id"]
             .as_str()
@@ -1986,7 +1999,7 @@ fn validate_restored_source(
     delivery_mode: &str,
     envelope: &QueueEnvelope,
     aggregate: &JsonValue,
-) -> Result<(), Version2Error> {
+) -> Result<(), Version1Error> {
     let source = envelope
         .source
         .as_object()
@@ -2026,7 +2039,7 @@ type InternalEmissionEvidence = (Vec<JsonValue>, Vec<String>, Vec<JsonValue>);
 fn append_internal_emissions(
     aggregate: &mut NativeAggregate,
     emissions: &[Emission],
-) -> Result<InternalEmissionEvidence, Version2Error> {
+) -> Result<InternalEmissionEvidence, Version1Error> {
     let before = aggregate.document.clone();
     let mut lifecycle = Vec::new();
     let references =
@@ -2038,27 +2051,27 @@ fn append_internal_emissions(
     Ok((references, indexes, lifecycle))
 }
 
-fn map_dispatch_rejection(code: DispatchRejectionCode) -> Version2Error {
-    Version2Error::new(code.as_str(), "delivery is not admissible")
+fn map_dispatch_rejection(code: DispatchRejectionCode) -> Version1Error {
+    Version1Error::new(code.as_str(), "delivery is not admissible")
 }
 
-fn map_persistence(error: super::native::PersistenceError) -> Version2Error {
-    Version2Error::new(error.code.as_str(), error.message)
+fn map_persistence(error: super::native::PersistenceError) -> Version1Error {
+    Version1Error::new(error.code.as_str(), error.message)
 }
 
-fn invalid_aggregate(message: impl Into<String>) -> Version2Error {
-    Version2Error::new(
+fn invalid_aggregate(message: impl Into<String>) -> Version1Error {
+    Version1Error::new(
         PersistenceErrorCode::InvalidAggregateState.as_str(),
         message,
     )
 }
 
-pub(crate) fn canonical_bytes(value: &JsonValue) -> Result<Vec<u8>, Version2Error> {
+pub(crate) fn canonical_bytes(value: &JsonValue) -> Result<Vec<u8>, Version1Error> {
     native::canonical_bytes(value)
-        .map_err(|error| Version2Error::new("invalid_aggregate_state", error.to_string()))
+        .map_err(|error| Version1Error::new("invalid_aggregate_state", error.to_string()))
 }
 
-fn aggregate_object(value: &JsonValue) -> Result<&Map<String, JsonValue>, Version2Error> {
+fn aggregate_object(value: &JsonValue) -> Result<&Map<String, JsonValue>, Version1Error> {
     value
         .as_object()
         .ok_or_else(|| invalid_aggregate("aggregate state must be an object"))
@@ -2066,19 +2079,19 @@ fn aggregate_object(value: &JsonValue) -> Result<&Map<String, JsonValue>, Versio
 
 fn aggregate_object_mut(
     value: &mut JsonValue,
-) -> Result<&mut Map<String, JsonValue>, Version2Error> {
+) -> Result<&mut Map<String, JsonValue>, Version1Error> {
     value
         .as_object_mut()
         .ok_or_else(|| invalid_aggregate("aggregate state must be an object"))
 }
 
-fn runtimes(value: &JsonValue) -> Result<&Vec<JsonValue>, Version2Error> {
+fn runtimes(value: &JsonValue) -> Result<&Vec<JsonValue>, Version1Error> {
     value["runtimes"]
         .as_array()
         .ok_or_else(|| invalid_aggregate("aggregate runtimes are absent"))
 }
 
-fn runtimes_mut(value: &mut JsonValue) -> Result<&mut Vec<JsonValue>, Version2Error> {
+fn runtimes_mut(value: &mut JsonValue) -> Result<&mut Vec<JsonValue>, Version1Error> {
     value["runtimes"]
         .as_array_mut()
         .ok_or_else(|| invalid_aggregate("aggregate runtimes are absent"))
@@ -2087,7 +2100,7 @@ fn runtimes_mut(value: &mut JsonValue) -> Result<&mut Vec<JsonValue>, Version2Er
 fn runtime_object_mut<'a>(
     value: &'a mut JsonValue,
     runtime_id: &str,
-) -> Result<&'a mut Map<String, JsonValue>, Version2Error> {
+) -> Result<&'a mut Map<String, JsonValue>, Version1Error> {
     runtimes_mut(value)?
         .iter_mut()
         .find(|runtime| runtime["runtime_id"].as_str() == Some(runtime_id))
@@ -2095,13 +2108,13 @@ fn runtime_object_mut<'a>(
         .ok_or_else(|| invalid_aggregate("target runtime is absent"))
 }
 
-fn aggregate_root_instance_id(value: &JsonValue) -> Result<&str, Version2Error> {
+fn aggregate_root_instance_id(value: &JsonValue) -> Result<&str, Version1Error> {
     value["root_instance_id"]
         .as_str()
         .ok_or_else(|| invalid_aggregate("root instance id is absent"))
 }
 
-fn aggregate_status(value: &JsonValue) -> Result<&str, Version2Error> {
+fn aggregate_status(value: &JsonValue) -> Result<&str, Version1Error> {
     let root_id = value["root_runtime_id"]
         .as_str()
         .ok_or_else(|| invalid_aggregate("root runtime id is absent"))?;
@@ -2112,7 +2125,7 @@ fn aggregate_status(value: &JsonValue) -> Result<&str, Version2Error> {
         .ok_or_else(|| invalid_aggregate("root runtime status is absent"))
 }
 
-fn allocate_counter(value: &mut JsonValue, field: &str) -> Result<Counter, Version2Error> {
+fn allocate_counter(value: &mut JsonValue, field: &str) -> Result<Counter, Version1Error> {
     let current = counter_value(value, field)?;
     let mut next = current.clone();
     next.allocate();
@@ -2120,7 +2133,7 @@ fn allocate_counter(value: &mut JsonValue, field: &str) -> Result<Counter, Versi
     Ok(current)
 }
 
-fn counter_value(value: &JsonValue, field: &str) -> Result<Counter, Version2Error> {
+fn counter_value(value: &JsonValue, field: &str) -> Result<Counter, Version1Error> {
     Counter::from_decimal(
         value[field]
             .as_str()
@@ -2146,7 +2159,7 @@ mod tests {
         super::super::load_bundle(
             r#"
 format: 1
-namespace: test.v2_restore_mailbox
+namespace: test.v1_restore_mailbox
 events:
   request_sent: { direction: output }
   request:
@@ -2168,7 +2181,7 @@ machines:
     }
 
     fn aggregate_with_input_mailbox(bundle: &Bundle) -> JsonValue {
-        let aggregate = create_v2(
+        let aggregate = create_v1(
             bundle,
             "worker",
             "restore-root",
@@ -2193,7 +2206,7 @@ machines:
             correlation_id: Some("request-1".to_string()),
         };
         let digest = envelope_digest("restore-root", "input", &envelope).unwrap();
-        let result = admit_v2(
+        let result = admit_v1(
             bundle,
             &aggregate,
             &[AdmissionDelivery {
@@ -2228,7 +2241,7 @@ machines:
         resolver.insert(bundle.clone(), true);
         let bytes = canonical_bytes(&forged).unwrap();
         assert_eq!(
-            restore_aggregate_v2(&bytes, &resolver).unwrap_err().code,
+            restore_aggregate_v1(&bytes, &resolver).unwrap_err().code,
             "invalid_aggregate_state"
         );
     }

@@ -409,18 +409,24 @@ fn validate_numeric_domain(value: &serde_json::Value, path: &str) -> Result<(), 
 }
 
 fn validate_schema(value: &serde_json::Value) -> Result<(), LoadError> {
-    let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../../schema/machine.schema.json"))
-            .expect("bundled format-1 schema is valid JSON");
-    let validator = jsonschema::validator_for(&schema).expect("bundled schema compiles");
-    if let Some(error) = validator.iter_errors(value).next() {
-        return Err(LoadError {
-            code: LoadErrorCode::StructuralValidation,
-            path: error.instance_path.to_string(),
-            message: error.to_string(),
-        });
+    thread_local! {
+        static VALIDATOR: jsonschema::Validator = {
+            let schema: serde_json::Value =
+                serde_json::from_str(include_str!("../../schema/machine.schema.json"))
+                    .expect("bundled format-1 schema is valid JSON");
+            jsonschema::validator_for(&schema).expect("bundled schema compiles")
+        };
     }
-    Ok(())
+    VALIDATOR.with(|validator| {
+        if let Some(error) = validator.iter_errors(value).next() {
+            return Err(LoadError {
+                code: LoadErrorCode::StructuralValidation,
+                path: error.instance_path.to_string(),
+                message: error.to_string(),
+            });
+        }
+        Ok(())
+    })
 }
 
 pub(crate) fn escape_pointer(value: &str) -> String {

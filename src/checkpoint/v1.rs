@@ -1,8 +1,8 @@
 use crate::format1::native::jcs_hash;
 use crate::format1::strict_json;
-use crate::format1::v2::{
-    canonical_bytes, migrate_aggregate_v2_route_with_evidence, step_v2_with_emission_indexes,
-    validate_admission_delivery_schema, validate_v2_schema,
+use crate::format1::v1::{
+    canonical_bytes, migrate_aggregate_v1_route_with_evidence, step_v1_with_emission_indexes,
+    validate_admission_delivery_schema, validate_v1_schema,
 };
 use crate::format1::{
     admit, restore_aggregate, AdmissionDelivery, Aggregate, ArtifactError, Bindings, Bundle,
@@ -56,7 +56,7 @@ impl ExecutionCheckpoint {
     }
 }
 
-pub fn create_execution_checkpoint_v2(
+pub fn create_execution_checkpoint_v1(
     bundle: &Bundle,
     machine_id: &str,
     root_instance_id: &str,
@@ -72,7 +72,7 @@ pub fn create_execution_checkpoint_v2(
             "supplied creation request digest does not match canonical content",
         ));
     }
-    let created = crate::format1::v2::create_v2_with_evidence(
+    let created = crate::format1::v1::create_v1_with_evidence(
         bundle,
         machine_id,
         root_instance_id,
@@ -82,7 +82,7 @@ pub fn create_execution_checkpoint_v2(
     let aggregate = created.aggregate.value().clone();
     let mut value = json!({
         "execution_checkpoint_format": "determa.execution_checkpoint",
-        "execution_checkpoint_schema_version": 2,
+        "execution_checkpoint_schema_version": 1,
         "root_instance_id": root_instance_id,
         "revision": "0",
         "root_record": {"status": "retained", "aggregate_state": aggregate},
@@ -163,8 +163,8 @@ pub fn creation_request_digest(
         ),
     ]));
     jcs_hash(&json!([
-        "determa-creation-request-digest-2",
-        "2",
+        "determa-creation-request-digest-1",
+        "1",
         bundle.fingerprint,
         bundle.namespace,
         machine_id,
@@ -184,14 +184,14 @@ pub fn restore_execution_checkpoint(
     restore_value(value, resolver)
 }
 
-pub fn checkpoint_admit_v2(
+pub fn checkpoint_admit_v1(
     bundle: &Bundle,
     checkpoint: &ExecutionCheckpoint,
     deliveries: &[Value],
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
 ) -> Result<Value, ArtifactError> {
-    checkpoint_admit_v2_with_optional_bundle(
+    checkpoint_admit_v1_with_optional_bundle(
         Some(bundle),
         checkpoint,
         deliveries,
@@ -200,7 +200,7 @@ pub fn checkpoint_admit_v2(
     )
 }
 
-pub(super) fn checkpoint_admit_v2_with_optional_bundle(
+pub(super) fn checkpoint_admit_v1_with_optional_bundle(
     bundle: Option<&Bundle>,
     checkpoint: &ExecutionCheckpoint,
     deliveries: &[Value],
@@ -236,7 +236,7 @@ pub(super) fn checkpoint_admit_v2_with_optional_bundle(
         if !seen.insert(event_id.to_string()) {
             return Err(failure("duplicate_event_id_in_batch"));
         }
-        let candidate = crate::format1::v2::envelope_digest(
+        let candidate = crate::format1::v1::envelope_digest(
             root_instance_id,
             &parsed.delivery_mode,
             &parsed.envelope,
@@ -333,49 +333,34 @@ pub(super) fn checkpoint_admit_v2_with_optional_bundle(
     }
 }
 
-pub fn checkpoint_step_v2(
+pub fn checkpoint_step_v1(
     bundle: &Bundle,
     checkpoint: &ExecutionCheckpoint,
     request: &ProcessingRequest,
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
 ) -> Result<Value, ArtifactError> {
-    if !matches!(request.processing_mode.as_str(), "delayed" | "foreground") {
-        return Err(failure("invalid_execution_checkpoint"));
+    checkpoint_step_v1_with_core(
+        bundle,
+        checkpoint,
+        request,
+        expected_revision,
+        expected_checkpoint_digest,
+    )
+    .map(|(checkpoint, _)| checkpoint)
+}
+
+pub(crate) fn checkpoint_step_v1_with_core(
+    bundle: &Bundle,
+    checkpoint: &ExecutionCheckpoint,
+    request: &ProcessingRequest,
+    expected_revision: Option<&str>,
+    expected_checkpoint_digest: Option<&str>,
+) -> Result<(Value, Option<Value>), ArtifactError> {
+    if let Some(replay) = checkpoint_step_replay(checkpoint, request)? {
+        return Ok((replay, None));
     }
     guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
-    if let Some(receipt) = checkpoint.value["operation_receipts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|receipt| {
-            receipt["operation_kind"] == "event_terminal"
-                && receipt["event_id"].as_str() == Some(&request.event_id)
-        })
-    {
-        return if receipt["request_digest"].as_str() == Some(&request.envelope_digest)
-            && receipt["acceptance_sequence"].as_str() == Some(&request.acceptance_sequence)
-            && receipt["final_queue_sequence"].as_str() == Some(&request.queue_sequence)
-        {
-            Ok(receipt.clone())
-        } else {
-            Err(failure("event_id_conflict"))
-        };
-    }
-    if let Some(tombstone) = checkpoint.value["event_identity_tombstones"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["event_id"].as_str() == Some(&request.event_id))
-    {
-        return if tombstone["request_digest"].as_str() == Some(&request.envelope_digest)
-            && tombstone["acceptance_sequence"].as_str() == Some(&request.acceptance_sequence)
-        {
-            Ok(tombstone.clone())
-        } else {
-            Err(failure("event_id_conflict"))
-        };
-    }
     let aggregate = checkpoint
         .aggregate
         .as_ref()
@@ -394,8 +379,51 @@ pub fn checkpoint_step_v2(
         return Err(failure("invalid_execution_checkpoint"));
     }
     let (core, emission_indexes) =
-        step_v2_with_emission_indexes(bundle, aggregate, &request.target_runtime_id)?;
-    apply_step_result(&checkpoint.value, &causal, core, emission_indexes)
+        step_v1_with_emission_indexes(bundle, aggregate, &request.target_runtime_id)?;
+    let updated = apply_step_result(&checkpoint.value, &causal, core.clone(), emission_indexes)?;
+    Ok((updated, Some(core)))
+}
+
+pub(crate) fn checkpoint_step_replay(
+    checkpoint: &ExecutionCheckpoint,
+    request: &ProcessingRequest,
+) -> Result<Option<Value>, ArtifactError> {
+    if !matches!(request.processing_mode.as_str(), "delayed" | "foreground") {
+        return Err(failure("invalid_execution_checkpoint"));
+    }
+    if let Some(receipt) = checkpoint.value["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|receipt| {
+            receipt["operation_kind"] == "event_terminal"
+                && receipt["event_id"].as_str() == Some(&request.event_id)
+        })
+    {
+        return if receipt["request_digest"].as_str() == Some(&request.envelope_digest)
+            && receipt["acceptance_sequence"].as_str() == Some(&request.acceptance_sequence)
+            && receipt["final_queue_sequence"].as_str() == Some(&request.queue_sequence)
+        {
+            Ok(Some(receipt.clone()))
+        } else {
+            Err(failure("event_id_conflict"))
+        };
+    }
+    if let Some(tombstone) = checkpoint.value["event_identity_tombstones"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["event_id"].as_str() == Some(&request.event_id))
+    {
+        return if tombstone["request_digest"].as_str() == Some(&request.envelope_digest)
+            && tombstone["acceptance_sequence"].as_str() == Some(&request.acceptance_sequence)
+        {
+            Ok(Some(tombstone.clone()))
+        } else {
+            Err(failure("event_id_conflict"))
+        };
+    }
+    Ok(None)
 }
 
 fn apply_step_result(
@@ -532,6 +560,26 @@ pub fn checkpoint_process(
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
 ) -> Result<Value, ArtifactError> {
+    checkpoint_process_with_core(
+        bundle,
+        checkpoint,
+        delivery,
+        processing_mode,
+        expected_revision,
+        expected_checkpoint_digest,
+    )
+    .map(|(checkpoint, _)| checkpoint)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checkpoint_process_with_core(
+    bundle: &Bundle,
+    checkpoint: &ExecutionCheckpoint,
+    delivery: Value,
+    processing_mode: &str,
+    expected_revision: Option<&str>,
+    expected_checkpoint_digest: Option<&str>,
+) -> Result<(Value, Option<Value>), ArtifactError> {
     let resolver = single_bundle_resolver(bundle);
     checkpoint_process_resolved(
         bundle,
@@ -553,16 +601,16 @@ fn checkpoint_process_resolved(
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
     resolver: &(impl DefinitionResolver + ?Sized),
-) -> Result<Value, ArtifactError> {
-    if !matches!(processing_mode, "delayed" | "foreground") {
-        return Err(failure("invalid_execution_checkpoint"));
+) -> Result<(Value, Option<Value>), ArtifactError> {
+    if let Some(replay) = checkpoint_process_replay(checkpoint, &delivery, processing_mode)? {
+        return Ok((replay, None));
     }
     guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
     let event_id = delivery["envelope"]["event_id"]
         .as_str()
         .ok_or_else(|| failure("malformed_delivery"))?
         .to_string();
-    let admitted = checkpoint_admit_v2(
+    let admitted = checkpoint_admit_v1(
         bundle,
         checkpoint,
         &[delivery],
@@ -570,7 +618,7 @@ fn checkpoint_process_resolved(
         expected_checkpoint_digest,
     )?;
     if admitted["execution_checkpoint_format"] != "determa.execution_checkpoint" {
-        return Ok(admitted);
+        return Ok((admitted, None));
     }
     let admitted_value = admitted;
     let aggregate = restore_aggregate(
@@ -597,12 +645,12 @@ fn checkpoint_process_resolved(
     let (runtime, causal) = selected.ok_or_else(|| invalid("admitted event is not runnable"))?;
     let causal = causal.clone();
     let (core, emission_indexes) =
-        step_v2_with_emission_indexes(bundle, &aggregate, runtime["runtime_id"].as_str().unwrap())?;
-    let stepped = apply_step_result(&admitted_value, &causal, core, emission_indexes)?;
+        step_v1_with_emission_indexes(bundle, &aggregate, runtime["runtime_id"].as_str().unwrap())?;
+    let stepped = apply_step_result(&admitted_value, &causal, core.clone(), emission_indexes)?;
     if stepped["execution_checkpoint_format"] != "determa.execution_checkpoint" {
-        return Ok(stepped);
+        return Ok((stepped, Some(core)));
     }
-    collapse_process_revision(checkpoint, stepped)
+    Ok((collapse_process_revision(checkpoint, stepped)?, Some(core)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -616,13 +664,40 @@ pub fn checkpoint_process_with_migration(
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
 ) -> Result<Value, ArtifactError> {
+    checkpoint_process_with_migration_with_core(
+        checkpoint,
+        migration,
+        resolver,
+        limits,
+        delivery,
+        processing_mode,
+        expected_revision,
+        expected_checkpoint_digest,
+    )
+    .map(|(checkpoint, _)| checkpoint)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checkpoint_process_with_migration_with_core(
+    checkpoint: &ExecutionCheckpoint,
+    migration: &MigrationRequest,
+    resolver: &impl MigrationArtifactResolver,
+    limits: &ResourceLimits,
+    delivery: Value,
+    processing_mode: &str,
+    expected_revision: Option<&str>,
+    expected_checkpoint_digest: Option<&str>,
+) -> Result<(Value, Option<Value>), ArtifactError> {
+    if let Some(replay) = checkpoint_process_replay(checkpoint, &delivery, processing_mode)? {
+        return Ok((replay, None));
+    }
     guard(checkpoint, expected_revision, expected_checkpoint_digest)?;
     let aggregate = checkpoint
         .aggregate
         .as_ref()
         .ok_or_else(|| failure("terminal_root"))?;
     let migrated =
-        migrate_aggregate_v2_route_with_evidence(aggregate, migration, resolver, limits)?;
+        migrate_aggregate_v1_route_with_evidence(aggregate, migration, resolver, limits)?;
     let prepared = apply_transaction_migration(checkpoint, migrated)?;
     let prepared = restore_value(prepared, resolver)?;
     let target = resolver
@@ -632,7 +707,7 @@ pub fn checkpoint_process_with_migration(
                 && resolved.bundle.fingerprint == migration.target_validated_bundle_fingerprint
         })
         .ok_or_else(|| failure("target_definition_unavailable"))?;
-    let processed = checkpoint_process_resolved(
+    let (processed, core) = checkpoint_process_resolved(
         &target.bundle,
         &prepared,
         delivery,
@@ -641,7 +716,50 @@ pub fn checkpoint_process_with_migration(
         Some(prepared.digest()),
         resolver,
     )?;
-    collapse_process_revision(checkpoint, processed)
+    Ok((collapse_process_revision(checkpoint, processed)?, core))
+}
+
+pub(crate) fn checkpoint_process_replay(
+    checkpoint: &ExecutionCheckpoint,
+    delivery: &Value,
+    processing_mode: &str,
+) -> Result<Option<Value>, ArtifactError> {
+    if !matches!(processing_mode, "delayed" | "foreground") {
+        return Err(failure("invalid_execution_checkpoint"));
+    }
+    validate_admission_delivery_schema(delivery).map_err(|_| failure("malformed_delivery"))?;
+    let parsed: AdmissionDelivery =
+        serde_json::from_value(delivery.clone()).map_err(|_| failure("malformed_delivery"))?;
+    let root_instance_id = checkpoint.root_instance_id();
+    if target_root_instance_id(&parsed.envelope.target).is_some_and(|root| root != root_instance_id)
+    {
+        return Err(failure("wrong_root"));
+    }
+    let request_digest = crate::format1::v1::envelope_digest(
+        root_instance_id,
+        &parsed.delivery_mode,
+        &parsed.envelope,
+    )?;
+    let event_id = parsed.envelope.event_id.as_str();
+    let retained = retained_identity(checkpoint.value())?;
+    let Some(identity) = retained.get(event_id) else {
+        return Ok(None);
+    };
+    if identity.digest != request_digest || identity.digest != parsed.envelope_digest {
+        return Err(failure("event_id_conflict"));
+    }
+    if let Some(receipt) = checkpoint.value()["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|receipt| {
+            receipt["operation_kind"] == "event_terminal"
+                && receipt["event_id"].as_str() == Some(event_id)
+        })
+    {
+        return Ok(Some(receipt.clone()));
+    }
+    Ok(Some(identity.replay.clone()))
 }
 
 fn apply_transaction_migration(
@@ -828,7 +946,7 @@ fn lifecycle_receipt(
     })
 }
 
-pub fn checkpoint_prune_v2(
+pub fn checkpoint_prune_v1(
     checkpoint: &ExecutionCheckpoint,
     request: &PruneRequest,
     expected_revision: Option<&str>,
@@ -920,7 +1038,7 @@ pub fn checkpoint_prune_v2(
             tombstones.push(json!({
                 "event_id": receipt["event_id"],
                 "request_digest": receipt["request_digest"],
-                "request_digest_domain": "determa-inbox-envelope-digest-2",
+                "request_digest_domain": "determa-inbox-envelope-digest-1",
                 "acceptance_sequence": receipt["acceptance_sequence"],
                 "terminal_receipt_sequence": receipt["receipt_sequence"],
                 "terminal_disposition": receipt["outcome"]["disposition"]
@@ -993,8 +1111,8 @@ pub(crate) fn checkpoint_maintenance_migration_route(
         .aggregate
         .as_ref()
         .ok_or_else(|| failure("terminal_root"))?;
-    let migrated = migrate_aggregate_v2_route_with_evidence(aggregate, request, resolver, limits)?;
-    apply_checkpoint_migration_v2(
+    let migrated = migrate_aggregate_v1_route_with_evidence(aggregate, request, resolver, limits)?;
+    apply_checkpoint_migration_v1(
         checkpoint,
         migrated,
         operation_id,
@@ -1003,7 +1121,7 @@ pub(crate) fn checkpoint_maintenance_migration_route(
     )
 }
 
-fn apply_checkpoint_migration_v2(
+fn apply_checkpoint_migration_v1(
     checkpoint: &ExecutionCheckpoint,
     migrated: Value,
     operation_id: &str,
@@ -1332,6 +1450,13 @@ struct Identity {
 
 fn retained_identity(value: &Value) -> Result<BTreeMap<String, Identity>, ArtifactError> {
     let mut result = BTreeMap::new();
+    let acceptance = value["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|receipt| receipt["operation_kind"] == "acceptance")
+        .map(|receipt| (receipt["event_id"].as_str().unwrap(), receipt))
+        .collect::<BTreeMap<_, _>>();
     if value["root_record"]["status"] == "retained" {
         for runtime in value["root_record"]["aggregate_state"]["runtimes"]
             .as_array()
@@ -1341,21 +1466,21 @@ fn retained_identity(value: &Value) -> Result<BTreeMap<String, Identity>, Artifa
             {
                 for entry in runtime[field].as_array().unwrap() {
                     let event_id = entry["envelope"]["event_id"].as_str().unwrap().to_string();
-                    result.insert(event_id.clone(), Identity { digest: entry["envelope_digest"].as_str().unwrap().to_string(), replay: json!({
+                    let evidence = acceptance.get(event_id.as_str()).copied().cloned().unwrap_or_else(|| json!({
                         "result": "replay", "event_id": event_id,
                         "acceptance_sequence": entry["acceptance_sequence"], "location": location
-                    }) });
+                    }));
+                    result.insert(
+                        event_id.clone(),
+                        Identity {
+                            digest: entry["envelope_digest"].as_str().unwrap().to_string(),
+                            replay: evidence,
+                        },
+                    );
                 }
             }
         }
     }
-    let acceptance = value["operation_receipts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|r| r["operation_kind"] == "acceptance")
-        .map(|r| (r["event_id"].as_str().unwrap(), r))
-        .collect::<BTreeMap<_, _>>();
     for receipt in value["operation_receipts"].as_array().unwrap() {
         if receipt["operation_kind"] == "event_terminal" {
             let event_id = receipt["event_id"].as_str().unwrap().to_string();
@@ -1363,11 +1488,10 @@ fn retained_identity(value: &Value) -> Result<BTreeMap<String, Identity>, Artifa
             let acceptance_receipt = acceptance
                 .get(event_id.as_str())
                 .filter(|r| r["acceptance_sequence"].as_str() == Some(acceptance_sequence));
-            let replay = if let Some(acceptance_receipt) = acceptance_receipt {
-                json!({"result":"replay","acceptance_receipt_sequence":acceptance_receipt["receipt_sequence"],"terminal_receipt_sequence":receipt["receipt_sequence"]})
-            } else {
-                json!({"result":"replay","terminal_receipt_sequence":receipt["receipt_sequence"]})
-            };
+            let replay = acceptance_receipt
+                .copied()
+                .cloned()
+                .unwrap_or_else(|| receipt.clone());
             result.insert(
                 event_id,
                 Identity {
@@ -1378,10 +1502,13 @@ fn retained_identity(value: &Value) -> Result<BTreeMap<String, Identity>, Artifa
         }
     }
     for item in value["event_identity_tombstones"].as_array().unwrap() {
-        result.insert(item["event_id"].as_str().unwrap().to_string(), Identity {
-            digest: item["request_digest"].as_str().unwrap().to_string(),
-            replay: json!({"result":"replay","terminal_receipt_sequence":item["terminal_receipt_sequence"],"terminal_disposition":item["terminal_disposition"]})
-        });
+        result.insert(
+            item["event_id"].as_str().unwrap().to_string(),
+            Identity {
+                digest: item["request_digest"].as_str().unwrap().to_string(),
+                replay: item.clone(),
+            },
+        );
     }
     Ok(result)
 }
@@ -1390,12 +1517,12 @@ fn restore_value(
     value: Value,
     resolver: &(impl DefinitionResolver + ?Sized),
 ) -> Result<ExecutionCheckpoint, ArtifactError> {
-    validate_v2_schema(
+    validate_v1_schema(
         &value,
-        include_str!("../../schema/execution-checkpoint-v2.schema.json"),
+        include_str!("../../schema/execution-checkpoint-v1.schema.json"),
         &[(
-            "https://determa.dev/state/schema/aggregate-state-v2.schema.json",
-            include_str!("../../schema/aggregate-state-v2.schema.json"),
+            "https://determa.dev/state/schema/aggregate-state-v1.schema.json",
+            include_str!("../../schema/aggregate-state-v1.schema.json"),
         )],
         "invalid_execution_checkpoint",
     )?;
@@ -1824,8 +1951,8 @@ fn maintenance_request_digest_matches(
 ) -> Result<bool, ArtifactError> {
     for maintenance_mode in [false, true] {
         let expected = jcs_hash(&json!([
-            "determa-maintenance-migration-request-digest-2",
-            "2",
+            "determa-maintenance-migration-request-digest-1",
+            "1",
             checkpoint["root_instance_id"],
             operation_id,
             receipt["source_aggregate_state_digest"],
@@ -1993,7 +2120,7 @@ fn validate_mailboxes<'a>(
                 prior_queue = Some(queue);
                 let parsed: crate::format1::QueueEnvelope =
                     serde_json::from_value(envelope.clone()).map_err(invalid)?;
-                let expected = crate::format1::v2::envelope_digest(
+                let expected = crate::format1::v1::envelope_digest(
                     root_instance_id,
                     entry["delivery_mode"].as_str().unwrap(),
                     &parsed,
@@ -2454,12 +2581,12 @@ fn seal_checkpoint(value: &mut Value) -> Result<(), ArtifactError> {
 
 fn seal_and_validate_checkpoint(value: &mut Value) -> Result<(), ArtifactError> {
     seal_checkpoint(value)?;
-    validate_v2_schema(
+    validate_v1_schema(
         value,
-        include_str!("../../schema/execution-checkpoint-v2.schema.json"),
+        include_str!("../../schema/execution-checkpoint-v1.schema.json"),
         &[(
-            "https://determa.dev/state/schema/aggregate-state-v2.schema.json",
-            include_str!("../../schema/aggregate-state-v2.schema.json"),
+            "https://determa.dev/state/schema/aggregate-state-v1.schema.json",
+            include_str!("../../schema/aggregate-state-v1.schema.json"),
         )],
         "invalid_execution_checkpoint",
     )?;
@@ -2472,7 +2599,7 @@ fn checkpoint_digest(value: &Value) -> Result<String, ArtifactError> {
         .as_object_mut()
         .ok_or_else(|| invalid("checkpoint must be an object"))?
         .remove("execution_checkpoint_digest");
-    jcs_hash(&json!(["determa-execution-checkpoint-digest-2", unsigned]))
+    jcs_hash(&json!(["determa-execution-checkpoint-digest-1", unsigned]))
         .map_err(|e| invalid(e.to_string()))
 }
 
@@ -2481,8 +2608,8 @@ fn outbox_intent_digest(
     intent: &OutboxIntent,
 ) -> Result<String, ArtifactError> {
     jcs_hash(&json!([
-        "determa-outbox-intent-digest-2",
-        "2",
+        "determa-outbox-intent-digest-1",
+        "1",
         root_instance_id,
         intent
     ]))
@@ -2519,7 +2646,7 @@ fn failure(code: &str) -> ArtifactError {
 #[cfg(test)]
 mod reference_integrity_tests {
     use super::{
-        checkpoint_maintenance_migration_route, checkpoint_step_v2, create_execution_checkpoint_v2,
+        checkpoint_maintenance_migration_route, checkpoint_step_v1, create_execution_checkpoint_v1,
         restore_execution_checkpoint, restore_value, ProcessingRequest,
     };
     use crate::format1::{
@@ -2550,7 +2677,7 @@ machines:
         let source = load_bundle(source_text).unwrap();
         let target =
             load_bundle(&source_text.replace("          deferred_events: [loop]\n", "")).unwrap();
-        let created = create_execution_checkpoint_v2(
+        let created = create_execution_checkpoint_v1(
             &source, "worker", "migration-recall", "create-migration-recall",
             &Bindings::default(), None,
             json!({"mode":"permanent","permanent_replay_eligible":true,"pruned_through_receipt_sequence":null,"policy_identifier":null}),
@@ -2569,14 +2696,14 @@ machines:
             queue_sequence: entry["queue_sequence"].as_str().unwrap().to_string(),
             processing_mode: "delayed".to_string(),
         };
-        let deferred = checkpoint_step_v2(&source, &created, &request, None, None).unwrap();
+        let deferred = checkpoint_step_v1(&source, &created, &request, None, None).unwrap();
         let mut resolver = InMemoryDefinitionResolver::default();
         resolver.insert(source.clone(), true);
         resolver.insert(target.clone(), true);
         let deferred = restore_value(deferred, &resolver).unwrap();
         let mut descriptor: Value = json!({
             "migration_descriptor_format": "determa.aggregate_migration",
-            "migration_descriptor_schema_version": 2,
+            "migration_descriptor_schema_version": 1,
             "mode": "compatible",
             "source_machine_format": 1,
             "target_machine_format": 1,
@@ -2597,7 +2724,7 @@ machines:
             .unwrap()
             .remove("migration_descriptor_digest");
         let digest =
-            super::jcs_hash(&json!(["determa-migration-descriptor-2", descriptor])).unwrap();
+            super::jcs_hash(&json!(["determa-migration-descriptor-1", descriptor])).unwrap();
         descriptor["migration_descriptor_digest"] = json!(digest);
         resolver.insert_descriptor(&digest, serde_json::to_vec(&descriptor).unwrap(), true);
         let migration = MigrationRequest {
@@ -2606,8 +2733,8 @@ machines:
             maintenance_mode: false,
         };
         let request_digest = super::jcs_hash(&json!([
-            "determa-maintenance-migration-request-digest-2",
-            "2",
+            "determa-maintenance-migration-request-digest-1",
+            "1",
             deferred.root_instance_id(),
             "maintenance-recall",
             deferred.value()["root_record"]["aggregate_state"]["aggregate_state_digest"],

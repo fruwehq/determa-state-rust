@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://determa.dev/state/schema/core-step-result-v2.schema.json",
+  "$id": "https://determa.dev/state/schema/core-step-result-v1.schema.json",
   "title": "Determa State queue-bearing core step result",
   "description": "Closed result for one explicitly targeted portable aggregate-state mailbox step.",
   "$ref": "#/$defs/coreStepResult",
@@ -82,7 +82,7 @@
           "$ref": "#/$defs/internalDisposedEmission"
         },
         {
-          "$ref": "execution-checkpoint-v2.schema.json#/$defs/outboxIntent"
+          "$ref": "execution-checkpoint-v1.schema.json#/$defs/outboxIntent"
         }
       ]
     },
@@ -158,7 +158,7 @@
           "const": "determa.core_step_result"
         },
         "core_step_result_schema_version": {
-          "const": 2
+          "const": 1
         },
         "status": {
           "enum": [
@@ -178,7 +178,7 @@
           ]
         },
         "state": {
-          "$ref": "aggregate-state-v2.schema.json"
+          "$ref": "aggregate-state-v1.schema.json"
         },
         "emissions": {
           "type": "array",
@@ -198,7 +198,7 @@
               "type": "null"
             },
             {
-              "$ref": "aggregate-state-v2.schema.json#/$defs/fault"
+              "$ref": "aggregate-state-v1.schema.json#/$defs/fault"
             }
           ]
         },

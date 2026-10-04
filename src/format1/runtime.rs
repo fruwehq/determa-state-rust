@@ -231,8 +231,8 @@ impl NativeAggregate {
         &self.document
     }
 
-    pub fn canonical_bytes(&self) -> Result<Vec<u8>, super::v2::Version2Error> {
-        super::v2::canonical_bytes(&self.document)
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, super::v1::Version1Error> {
+        super::v1::canonical_bytes(&self.document)
     }
 }
 
@@ -931,7 +931,7 @@ fn validate_root_identity(state: &NativeAggregate) -> bool {
         return false;
     }
     let expected = hash_json(serde_json::json!([
-        "determa-root-runtime-identity-2",
+        "determa-root-runtime-identity-1",
         "1",
         definition.validated_bundle_fingerprint,
         definition.machine.namespace,
@@ -965,7 +965,7 @@ fn validate_runtime_identity(aggregate: &NativeAggregate, runtime: &RuntimeState
             RuntimeRelation::Root,
         ) => {
             let expected = hash_json(serde_json::json!([
-                "determa-root-runtime-identity-2",
+                "determa-root-runtime-identity-1",
                 "1",
                 definition.validated_bundle_fingerprint,
                 definition.machine.namespace,
@@ -1999,7 +1999,7 @@ fn root_runtime_identity_parts(
     root_instance_id: &str,
 ) -> String {
     hash_json(serde_json::json!([
-        "determa-root-runtime-identity-2",
+        "determa-root-runtime-identity-1",
         "1",
         fingerprint,
         namespace,
@@ -4691,13 +4691,13 @@ machines:
         let aggregate = result.state.unwrap();
         assert_eq!(
             aggregate.root.runtime_id,
-            "sha256:72dca6d0b2b3690ae28bda2f17a461179b18fbf11daad7a12709d9384a500c64"
+            "sha256:d42f331cbd0c491bba66d512c010f89f94c52df12057a80fecde85d3b954592f"
         );
         let left = &aggregate.root.components[0];
         assert_eq!(left.component_id, "left");
         assert_eq!(
             left.runtime.runtime_id,
-            "sha256:43db74b6a8d6f31543f7d142fb5e25a49e33eb3bf548e7bfd20d59513778cbc3"
+            "sha256:b0145e3c9c3d470fda4e59e55fe1585a1a9a7d74e29377062d70bf1789ffeb76"
         );
         assert_eq!(
             initialization_cause(
@@ -4710,7 +4710,7 @@ machines:
                 "/machines/0/root",
                 &Counter::zero(),
             ),
-            "sha256:c9e8e89a01362f40e9a74c01392d09abe2323f31c8f14f22e05bfcaf6dfac0ab"
+            "sha256:a1ba8e26366fdefe45f62e34e2856d0bebbf22b9b73fad742ebf5294421ae91c"
         );
         assert_eq!(
             runtime_target(&left.runtime, &aggregate.root_instance_id),
@@ -4738,7 +4738,7 @@ machines:
         .unwrap();
         let root_id = &aggregate.root.runtime_id;
         let component_id = &aggregate.root.components[0].runtime.runtime_id;
-        let cause_id = "sha256:c9e8e89a01362f40e9a74c01392d09abe2323f31c8f14f22e05bfcaf6dfac0ab";
+        let cause_id = "sha256:a1ba8e26366fdefe45f62e34e2856d0bebbf22b9b73fad742ebf5294421ae91c";
         let step = Counter::from_decimal("9007199254740993").unwrap();
         let locator = "/machines/0/root/states/locked/on_events/tick/action/0";
         assert_eq!(
@@ -4751,7 +4751,7 @@ machines:
                 locator,
                 0,
             ),
-            "sha256:4546950b5141f5c27568f01832a44571dbb2f8b4b62f7ed0e1985f93a817bf12"
+            "sha256:afc404600d54f45da0ba8f91de958891609b22be2eeee562630ec67ddbeeb574"
         );
         assert_eq!(
             external_effect_identity(
@@ -4763,7 +4763,7 @@ machines:
                 locator,
                 0,
             ),
-            "sha256:7386c6dfe80ee1019984b2b96d275d0ca90eddc9ba9075d57e120a3bd6b13386"
+            "sha256:796957a14274effab1dd8c519e02b4a76c6ec7a10375b8efc0b4b0faf3fed95d"
         );
     }
 

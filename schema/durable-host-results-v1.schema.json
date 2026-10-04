@@ -1,13 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://determa.dev/schemas/conformance/durable-host-results-v2.schema.json",
+  "$id": "https://determa.dev/schemas/conformance/durable-host-results-v1.schema.json",
   "title": "Determa State durable host operation results",
   "type": "object",
   "required": ["durable_host_results_format", "durable_host_results_schema_version", "results"],
   "additionalProperties": false,
   "properties": {
     "durable_host_results_format": { "const": "determa.durable_host.results" },
-    "durable_host_results_schema_version": { "const": 2 },
+    "durable_host_results_schema_version": { "const": 1 },
     "results": {
       "type": "object",
       "minProperties": 1,

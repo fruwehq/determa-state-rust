@@ -87,7 +87,10 @@
         },
         {
           "not": {
-            "enum": ["env", "done"]
+            "enum": [
+              "env",
+              "done"
+            ]
           }
         }
       ]
@@ -96,8 +99,185 @@
       "type": "string",
       "description": "A CEL expression."
     },
+    "providerReference": {
+      "type": "object",
+      "required": [
+        "identifier",
+        "version",
+        "content_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "identifier": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9.-]*$"
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+        },
+        "content_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "providerCapabilities": {
+      "type": "object",
+      "required": [
+        "deterministic",
+        "pure",
+        "portable",
+        "semantically_introspectable",
+        "process_contained",
+        "external_io_capable"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "deterministic": {
+          "type": "boolean"
+        },
+        "pure": {
+          "type": "boolean"
+        },
+        "portable": {
+          "type": "boolean"
+        },
+        "semantically_introspectable": {
+          "type": "boolean"
+        },
+        "process_contained": {
+          "type": "boolean"
+        },
+        "external_io_capable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "providerBinding": {
+      "type": "object",
+      "required": [
+        "provider_reference",
+        "source_media_type",
+        "source_digest",
+        "dependencies",
+        "capabilities",
+        "input_types",
+        "output_type"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "provider_reference": {
+          "$ref": "#/$defs/providerReference"
+        },
+        "source_media_type": {
+          "type": "string",
+          "pattern": "^[a-z0-9.+-]+/[a-z0-9.+-]+$"
+        },
+        "source_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "source": {
+          "type": "string"
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/providerReference"
+          }
+        },
+        "capabilities": {
+          "$ref": "#/$defs/providerCapabilities"
+        },
+        "input_types": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "event": {
+              "const": "event_envelope"
+            },
+            "variables": {
+              "const": "typed_variables"
+            },
+            "owner": {
+              "const": "owner_reference"
+            },
+            "env": {
+              "const": "external_values"
+            }
+          }
+        },
+        "output_type": {
+          "enum": [
+            "bool",
+            "structured_actions"
+          ]
+        }
+      }
+    },
+    "guardSlot": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/expression"
+        },
+        {
+          "type": "object",
+          "required": [
+            "provider"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/providerBinding"
+                },
+                {
+                  "properties": {
+                    "output_type": {
+                      "const": "bool"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "providerActionSlot": {
+      "type": "object",
+      "required": [
+        "provider_actions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "provider_actions": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/providerBinding"
+            },
+            {
+              "properties": {
+                "output_type": {
+                  "const": "structured_actions"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
     "valueType": {
-      "enum": ["string", "int", "float", "bool", "map", "list"]
+      "enum": [
+        "string",
+        "int",
+        "float",
+        "bool",
+        "map",
+        "list"
+      ]
     },
     "languages": {
       "type": "object",
@@ -115,7 +295,9 @@
     },
     "payloadField": {
       "type": "object",
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "additionalProperties": false,
       "properties": {
         "type": {
@@ -135,7 +317,10 @@
                 "const": true
               }
             },
-            "required": ["required", "default"]
+            "required": [
+              "required",
+              "default"
+            ]
           }
         },
         {
@@ -145,7 +330,10 @@
                 "const": "string"
               }
             },
-            "required": ["type", "default"]
+            "required": [
+              "type",
+              "default"
+            ]
           },
           "then": {
             "properties": {
@@ -162,7 +350,10 @@
                 "const": "int"
               }
             },
-            "required": ["type", "default"]
+            "required": [
+              "type",
+              "default"
+            ]
           },
           "then": {
             "properties": {
@@ -181,14 +372,17 @@
                 "const": "float"
               }
             },
-            "required": ["type", "default"]
+            "required": [
+              "type",
+              "default"
+            ]
           },
           "then": {
             "properties": {
               "default": {
                 "type": "number",
-                "minimum": -1.7976931348623157e308,
-                "maximum": 1.7976931348623157e308
+                "minimum": -1.7976931348623157e+308,
+                "maximum": 1.7976931348623157e+308
               }
             }
           }
@@ -200,7 +394,10 @@
                 "const": "bool"
               }
             },
-            "required": ["type", "default"]
+            "required": [
+              "type",
+              "default"
+            ]
           },
           "then": {
             "properties": {
@@ -217,7 +414,10 @@
                 "const": "map"
               }
             },
-            "required": ["type", "default"]
+            "required": [
+              "type",
+              "default"
+            ]
           },
           "then": {
             "properties": {
@@ -234,7 +434,10 @@
                 "const": "list"
               }
             },
-            "required": ["type", "default"]
+            "required": [
+              "type",
+              "default"
+            ]
           },
           "then": {
             "properties": {
@@ -260,7 +463,11 @@
       "additionalProperties": false,
       "properties": {
         "direction": {
-          "enum": ["internal", "input", "output"],
+          "enum": [
+            "internal",
+            "input",
+            "output"
+          ],
           "default": "internal"
         },
         "payload": {
@@ -273,10 +480,14 @@
       "allOf": [
         {
           "if": {
-            "required": ["correlates_to"]
+            "required": [
+              "correlates_to"
+            ]
           },
           "then": {
-            "required": ["direction"],
+            "required": [
+              "direction"
+            ],
             "properties": {
               "direction": {
                 "const": "input"
@@ -301,11 +512,21 @@
     },
     "variable": {
       "type": "object",
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "additionalProperties": false,
       "properties": {
         "type": {
-          "enum": ["string", "int", "float", "bool", "map", "list", "instance_reference"]
+          "enum": [
+            "string",
+            "int",
+            "float",
+            "bool",
+            "map",
+            "list",
+            "instance_reference"
+          ]
         },
         "init": {},
         "input": {
@@ -334,7 +555,10 @@
                 "const": true
               }
             },
-            "required": ["input", "external"]
+            "required": [
+              "input",
+              "external"
+            ]
           }
         },
         {
@@ -347,7 +571,9 @@
                       "const": true
                     }
                   },
-                  "required": ["input"]
+                  "required": [
+                    "input"
+                  ]
                 },
                 {
                   "properties": {
@@ -355,13 +581,17 @@
                       "const": true
                     }
                   },
-                  "required": ["external"]
+                  "required": [
+                    "external"
+                  ]
                 }
               ]
             }
           },
           "then": {
-            "required": ["init"]
+            "required": [
+              "init"
+            ]
           }
         },
         {
@@ -371,10 +601,15 @@
                 "const": "instance_reference"
               }
             },
-            "required": ["type"]
+            "required": [
+              "type"
+            ]
           },
           "then": {
-            "required": ["init", "nullable"],
+            "required": [
+              "init",
+              "nullable"
+            ],
             "properties": {
               "init": {
                 "type": "null"
@@ -394,10 +629,14 @@
             "not": {
               "anyOf": [
                 {
-                  "required": ["nullable"]
+                  "required": [
+                    "nullable"
+                  ]
                 },
                 {
-                  "required": ["machine_id"]
+                  "required": [
+                    "machine_id"
+                  ]
                 }
               ]
             }
@@ -410,7 +649,10 @@
                 "const": "string"
               }
             },
-            "required": ["type", "init"]
+            "required": [
+              "type",
+              "init"
+            ]
           },
           "then": {
             "properties": {
@@ -427,7 +669,10 @@
                 "const": "int"
               }
             },
-            "required": ["type", "init"]
+            "required": [
+              "type",
+              "init"
+            ]
           },
           "then": {
             "properties": {
@@ -446,14 +691,17 @@
                 "const": "float"
               }
             },
-            "required": ["type", "init"]
+            "required": [
+              "type",
+              "init"
+            ]
           },
           "then": {
             "properties": {
               "init": {
                 "type": "number",
-                "minimum": -1.7976931348623157e308,
-                "maximum": 1.7976931348623157e308
+                "minimum": -1.7976931348623157e+308,
+                "maximum": 1.7976931348623157e+308
               }
             }
           }
@@ -465,7 +713,10 @@
                 "const": "bool"
               }
             },
-            "required": ["type", "init"]
+            "required": [
+              "type",
+              "init"
+            ]
           },
           "then": {
             "properties": {
@@ -482,7 +733,10 @@
                 "const": "map"
               }
             },
-            "required": ["type", "init"]
+            "required": [
+              "type",
+              "init"
+            ]
           },
           "then": {
             "properties": {
@@ -499,7 +753,10 @@
                 "const": "list"
               }
             },
-            "required": ["type", "init"]
+            "required": [
+              "type",
+              "init"
+            ]
           },
           "then": {
             "properties": {
@@ -515,7 +772,9 @@
       "oneOf": [
         {
           "type": "object",
-          "required": ["self"],
+          "required": [
+            "self"
+          ],
           "additionalProperties": false,
           "properties": {
             "self": {
@@ -525,7 +784,9 @@
         },
         {
           "type": "object",
-          "required": ["owner"],
+          "required": [
+            "owner"
+          ],
           "additionalProperties": false,
           "properties": {
             "owner": {
@@ -535,7 +796,9 @@
         },
         {
           "type": "object",
-          "required": ["component"],
+          "required": [
+            "component"
+          ],
           "additionalProperties": false,
           "properties": {
             "component": {
@@ -545,7 +808,9 @@
         },
         {
           "type": "object",
-          "required": ["instance"],
+          "required": [
+            "instance"
+          ],
           "additionalProperties": false,
           "properties": {
             "instance": {
@@ -555,7 +820,9 @@
         },
         {
           "type": "object",
-          "required": ["external"],
+          "required": [
+            "external"
+          ],
           "additionalProperties": false,
           "properties": {
             "external": {
@@ -567,7 +834,9 @@
     },
     "send": {
       "type": "object",
-      "required": ["event"],
+      "required": [
+        "event"
+      ],
       "additionalProperties": false,
       "properties": {
         "event": {
@@ -597,7 +866,10 @@
         }
       },
       "not": {
-        "required": ["to", "targets"]
+        "required": [
+          "to",
+          "targets"
+        ]
       }
     },
     "bindingExpressions": {
@@ -626,7 +898,9 @@
     },
     "spawn": {
       "type": "object",
-      "required": ["machine_id"],
+      "required": [
+        "machine_id"
+      ],
       "additionalProperties": false,
       "properties": {
         "machine_id": {
@@ -642,7 +916,9 @@
     },
     "cancel": {
       "type": "object",
-      "required": ["instance"],
+      "required": [
+        "instance"
+      ],
       "additionalProperties": false,
       "properties": {
         "instance": {
@@ -698,7 +974,14 @@
     "actionList": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/action"
+        "oneOf": [
+          {
+            "$ref": "#/$defs/action"
+          },
+          {
+            "$ref": "#/$defs/providerActionSlot"
+          }
+        ]
       }
     },
     "exitAction": {
@@ -710,10 +993,14 @@
           "not": {
             "anyOf": [
               {
-                "required": ["spawn"]
+                "required": [
+                  "spawn"
+                ]
               },
               {
-                "required": ["stop"]
+                "required": [
+                  "stop"
+                ]
               }
             ]
           }
@@ -723,12 +1010,21 @@
     "exitActionList": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/exitAction"
+        "oneOf": [
+          {
+            "$ref": "#/$defs/exitAction"
+          },
+          {
+            "$ref": "#/$defs/providerActionSlot"
+          }
+        ]
       }
     },
     "historyTarget": {
       "type": "object",
-      "required": ["history"],
+      "required": [
+        "history"
+      ],
       "additionalProperties": false,
       "properties": {
         "history": {
@@ -754,7 +1050,7 @@
           "$ref": "#/$defs/transitionTarget"
         },
         "guard": {
-          "$ref": "#/$defs/expression"
+          "$ref": "#/$defs/guardSlot"
         },
         "lang": {
           "const": "cel"
@@ -769,10 +1065,14 @@
       "allOf": [
         {
           "if": {
-            "required": ["local"]
+            "required": [
+              "local"
+            ]
           },
           "then": {
-            "required": ["transition_to"]
+            "required": [
+              "transition_to"
+            ]
           }
         }
       ]
@@ -793,7 +1093,9 @@
     },
     "initialTransition": {
       "type": "object",
-      "required": ["transition_to"],
+      "required": [
+        "transition_to"
+      ],
       "additionalProperties": false,
       "properties": {
         "transition_to": {
@@ -806,14 +1108,16 @@
     },
     "choiceBranch": {
       "type": "object",
-      "required": ["transition_to"],
+      "required": [
+        "transition_to"
+      ],
       "additionalProperties": false,
       "properties": {
         "transition_to": {
           "$ref": "#/$defs/transitionTarget"
         },
         "guard": {
-          "$ref": "#/$defs/expression"
+          "$ref": "#/$defs/guardSlot"
         },
         "action": {
           "$ref": "#/$defs/actionList"
@@ -827,14 +1131,18 @@
         },
         {
           "not": {
-            "required": ["choice"]
+            "required": [
+              "choice"
+            ]
           }
         }
       ]
     },
     "component": {
       "type": "object",
-      "required": ["component_id"],
+      "required": [
+        "component_id"
+      ],
       "additionalProperties": false,
       "properties": {
         "component_id": {
@@ -855,15 +1163,23 @@
       },
       "oneOf": [
         {
-          "required": ["machine_id"],
+          "required": [
+            "machine_id"
+          ],
           "not": {
-            "required": ["root"]
+            "required": [
+              "root"
+            ]
           }
         },
         {
-          "required": ["root"],
+          "required": [
+            "root"
+          ],
           "not": {
-            "required": ["machine_id"]
+            "required": [
+              "machine_id"
+            ]
           }
         }
       ]
@@ -873,7 +1189,12 @@
       "additionalProperties": false,
       "properties": {
         "type": {
-          "enum": ["simple", "composite", "parallel", "final"],
+          "enum": [
+            "simple",
+            "composite",
+            "parallel",
+            "final"
+          ],
           "default": "simple"
         },
         "meta": {
@@ -937,7 +1258,11 @@
           "maximum": 9223372036854775807
         },
         "history": {
-          "enum": ["none", "shallow", "deep"],
+          "enum": [
+            "none",
+            "shallow",
+            "deep"
+          ],
           "default": "none"
         },
         "choice": {
@@ -961,16 +1286,24 @@
             "not": {
               "anyOf": [
                 {
-                  "required": ["initial"]
+                  "required": [
+                    "initial"
+                  ]
                 },
                 {
-                  "required": ["states"]
+                  "required": [
+                    "states"
+                  ]
                 },
                 {
-                  "required": ["components"]
+                  "required": [
+                    "components"
+                  ]
                 },
                 {
-                  "required": ["history"]
+                  "required": [
+                    "history"
+                  ]
                 }
               ]
             }
@@ -983,12 +1316,19 @@
                 "const": "composite"
               }
             },
-            "required": ["type"]
+            "required": [
+              "type"
+            ]
           },
           "then": {
-            "required": ["initial", "states"],
+            "required": [
+              "initial",
+              "states"
+            ],
             "not": {
-              "required": ["components"]
+              "required": [
+                "components"
+              ]
             }
           }
         },
@@ -999,20 +1339,30 @@
                 "const": "parallel"
               }
             },
-            "required": ["type"]
+            "required": [
+              "type"
+            ]
           },
           "then": {
-            "required": ["components"],
+            "required": [
+              "components"
+            ],
             "not": {
               "anyOf": [
                 {
-                  "required": ["initial"]
+                  "required": [
+                    "initial"
+                  ]
                 },
                 {
-                  "required": ["states"]
+                  "required": [
+                    "states"
+                  ]
                 },
                 {
-                  "required": ["history"]
+                  "required": [
+                    "history"
+                  ]
                 }
               ]
             }
@@ -1025,37 +1375,57 @@
                 "const": "final"
               }
             },
-            "required": ["type"]
+            "required": [
+              "type"
+            ]
           },
           "then": {
             "not": {
               "anyOf": [
                 {
-                  "required": ["exit"]
+                  "required": [
+                    "exit"
+                  ]
                 },
                 {
-                  "required": ["initial"]
+                  "required": [
+                    "initial"
+                  ]
                 },
                 {
-                  "required": ["states"]
+                  "required": [
+                    "states"
+                  ]
                 },
                 {
-                  "required": ["components"]
+                  "required": [
+                    "components"
+                  ]
                 },
                 {
-                  "required": ["on_events"]
+                  "required": [
+                    "on_events"
+                  ]
                 },
                 {
-                  "required": ["deferred_events"]
+                  "required": [
+                    "deferred_events"
+                  ]
                 },
                 {
-                  "required": ["deferred_event_capacity"]
+                  "required": [
+                    "deferred_event_capacity"
+                  ]
                 },
                 {
-                  "required": ["history"]
+                  "required": [
+                    "history"
+                  ]
                 },
                 {
-                  "required": ["choice"]
+                  "required": [
+                    "choice"
+                  ]
                 }
               ]
             }
@@ -1063,10 +1433,14 @@
         },
         {
           "if": {
-            "required": ["history"]
+            "required": [
+              "history"
+            ]
           },
           "then": {
-            "required": ["type"],
+            "required": [
+              "type"
+            ],
             "properties": {
               "type": {
                 "const": "composite"
@@ -1076,43 +1450,67 @@
         },
         {
           "if": {
-            "required": ["choice"]
+            "required": [
+              "choice"
+            ]
           },
           "then": {
             "not": {
               "anyOf": [
                 {
-                  "required": ["variables"]
+                  "required": [
+                    "variables"
+                  ]
                 },
                 {
-                  "required": ["entry"]
+                  "required": [
+                    "entry"
+                  ]
                 },
                 {
-                  "required": ["exit"]
+                  "required": [
+                    "exit"
+                  ]
                 },
                 {
-                  "required": ["initial"]
+                  "required": [
+                    "initial"
+                  ]
                 },
                 {
-                  "required": ["states"]
+                  "required": [
+                    "states"
+                  ]
                 },
                 {
-                  "required": ["components"]
+                  "required": [
+                    "components"
+                  ]
                 },
                 {
-                  "required": ["on_events"]
+                  "required": [
+                    "on_events"
+                  ]
                 },
                 {
-                  "required": ["deferred_events"]
+                  "required": [
+                    "deferred_events"
+                  ]
                 },
                 {
-                  "required": ["deferred_event_capacity"]
+                  "required": [
+                    "deferred_event_capacity"
+                  ]
                 },
                 {
-                  "required": ["history"]
+                  "required": [
+                    "history"
+                  ]
                 },
                 {
-                  "required": ["type"]
+                  "required": [
+                    "type"
+                  ]
                 }
               ]
             }
@@ -1122,7 +1520,10 @@
     },
     "machine": {
       "type": "object",
-      "required": ["machine_id", "root"],
+      "required": [
+        "machine_id",
+        "root"
+      ],
       "additionalProperties": false,
       "properties": {
         "machine_id": {
@@ -1156,7 +1557,11 @@
     },
     "bundle": {
       "type": "object",
-      "required": ["format", "namespace", "machines"],
+      "required": [
+        "format",
+        "namespace",
+        "machines"
+      ],
       "additionalProperties": false,
       "properties": {
         "format": {

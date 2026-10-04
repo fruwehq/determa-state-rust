@@ -78,6 +78,13 @@ impl SqliteExecutionStore {
     }
 
     pub fn import_durable_host_snapshot(&self, value: &Value) -> Result<(), StoreError> {
+        if value["durable_host_store_format"] != "determa.durable_host.store"
+            || value["durable_host_store_schema_version"].as_u64() != Some(1)
+        {
+            return Err(StoreError::new(
+                "durable host snapshot format or integer schema version is invalid",
+            ));
+        }
         let checkpoint = value
             .get("checkpoint")
             .ok_or_else(|| StoreError::new("durable host snapshot checkpoint is absent"))?;
@@ -155,7 +162,9 @@ impl SqliteExecutionStore {
                             root_instance_id,
                             value["quarantine"]["event_id"].as_str(),
                             value["quarantine"]["reason_code"].as_str(),
-                            value["quarantine"]["released"].as_bool()
+                            value["quarantine"]["released"].as_bool().ok_or_else(|| {
+                                StoreError::new("quarantine released must be a Boolean")
+                            })?
                         ],
                     )
                     .map_err(sql_error)?;
@@ -206,7 +215,7 @@ impl ExecutionStore for SqliteExecutionStore {
                     CONSTRAINT determa_execution_store_metadata_singleton_check
                         CHECK (singleton = 1),
                     CONSTRAINT determa_execution_store_metadata_version_check
-                        CHECK (schema_version = 2),
+                        CHECK (schema_version = 1),
                     CONSTRAINT determa_execution_store_metadata_receipt_check
                         CHECK (receipt_retention IN ('bounded', 'permanent')),
                     CONSTRAINT determa_execution_store_metadata_outbox_check
@@ -271,7 +280,7 @@ impl ExecutionStore for SqliteExecutionStore {
                 "
                 INSERT OR IGNORE INTO determa_execution_store_metadata
                     (singleton, schema_version, receipt_retention, outbox_retention)
-                VALUES (1, 2, ?1, ?2)
+                VALUES (1, 1, ?1, ?2)
                 ",
                 params![
                     self.mode.receipt_retention.as_str(),
@@ -540,7 +549,7 @@ fn durable_snapshot(connection: &Connection, root_instance_id: &str) -> Result<V
         .unwrap_or(Value::Null);
     Ok(json!({
         "durable_host_store_format": "determa.durable_host.store",
-        "durable_host_store_schema_version": 2,
+        "durable_host_store_schema_version": 1,
         "checkpoint": checkpoint,
         "inbox": inbox,
         "application_rows": application_rows,
@@ -571,7 +580,7 @@ fn verify_schema_contract(
         .map_err(sql_error)?;
     if metadata
         != (
-            2,
+            1,
             mode.receipt_retention.as_str().to_string(),
             mode.outbox_retention.as_str().to_string(),
         )
@@ -596,7 +605,7 @@ fn verify_schema_contract(
             ]
     {
         return Err(StoreError::new(
-            "SQLite execution-store columns do not match schema version 2",
+            "SQLite execution-store columns do not match schema version 1",
         ));
     }
     let metadata_schema = schema_sql(connection, "table", "determa_execution_store_metadata")?;
@@ -619,7 +628,7 @@ fn verify_schema_contract(
                 CONSTRAINT determa_execution_store_metadata_singleton_check
                     CHECK (singleton = 1),
                 CONSTRAINT determa_execution_store_metadata_version_check
-                    CHECK (schema_version = 2),
+                    CHECK (schema_version = 1),
                 CONSTRAINT determa_execution_store_metadata_receipt_check
                     CHECK (receipt_retention IN ('bounded', 'permanent')),
                 CONSTRAINT determa_execution_store_metadata_outbox_check
@@ -670,7 +679,7 @@ fn verify_schema_contract(
             )
     {
         return Err(StoreError::new(
-            "SQLite execution-store constraints or deletion guard do not match schema version 2",
+            "SQLite execution-store constraints or deletion guard do not match schema version 1",
         ));
     }
     let journal_mode: String = connection

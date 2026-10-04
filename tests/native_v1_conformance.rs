@@ -13,21 +13,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const CASES: &[&str] = &[
-    "117-version2-mailboxes",
-    "118-version2-persistence",
-    "119-native-v2-aggregate-integrity",
-    "120-native-v2-definition-package",
-    "121-native-v2-migration-totality",
-    "122-native-v2-migration-execution",
-    "123-native-v2-migration-guards",
-    "124-native-v2-occurrence-identity",
+    "117-version1-mailboxes",
+    "118-version1-persistence",
+    "119-native-v1-aggregate-integrity",
+    "120-native-v1-definition-package",
+    "121-native-v1-migration-totality",
+    "122-native-v1-migration-execution",
+    "123-native-v1-migration-guards",
+    "124-native-v1-occurrence-identity",
 ];
 
 #[test]
 fn failed_package_restore_does_not_seed_resolver() {
-    let directory = case_dir("120-native-v2-definition-package");
+    let directory = case_dir("120-native-v1-definition-package");
     let mut package: Value =
-        serde_json::from_slice(&fs::read(directory.join("package-valid-package-v2.json")).unwrap())
+        serde_json::from_slice(&fs::read(directory.join("package-valid-package-v1.json")).unwrap())
             .unwrap();
     let mut resolver = InMemoryDefinitionResolver::default();
     let fingerprint = package["normalized_definitions"][0]["validated_bundle_fingerprint"]
@@ -50,9 +50,9 @@ fn failed_package_restore_does_not_seed_resolver() {
 
 #[test]
 fn thin_package_uses_trusted_receiver_definitions_and_route_descriptor() {
-    let directory = case_dir("120-native-v2-definition-package");
+    let directory = case_dir("120-native-v1-definition-package");
     let mut package: Value =
-        serde_json::from_slice(&fs::read(directory.join("package-valid-package-v2.json")).unwrap())
+        serde_json::from_slice(&fs::read(directory.join("package-valid-package-v1.json")).unwrap())
             .unwrap();
     let descriptor = package["migration_descriptors"][0].clone();
     let digest = descriptor["migration_descriptor_digest"]
@@ -73,7 +73,7 @@ fn thin_package_uses_trusted_receiver_definitions_and_route_descriptor() {
     let descriptor_bytes = serde_json::to_vec(&descriptor).unwrap();
     resolver.insert_descriptor(&digest, descriptor_bytes.clone(), false);
     assert!(restore_package(&source, &mut resolver).is_err());
-    let attached_source = fs::read(directory.join("package-valid-package-v2.json")).unwrap();
+    let attached_source = fs::read(directory.join("package-valid-package-v1.json")).unwrap();
     assert!(restore_package(&attached_source, &mut resolver).is_err());
     let mut trusted = InMemoryDefinitionResolver::default();
     trusted.insert(
@@ -86,13 +86,13 @@ fn thin_package_uses_trusted_receiver_definitions_and_route_descriptor() {
     );
     trusted.insert_descriptor(&digest, descriptor_bytes, true);
     restore_package(&source, &mut trusted).unwrap();
-    determa_state::validate_artifact("aggregate_state_package_v2", &source, &trusted, true)
+    determa_state::validate_artifact("aggregate_state_package_v1", &source, &trusted, true)
         .unwrap();
 }
 
 #[test]
 fn process_with_backlog_receipts_the_ready_head_and_keeps_new_delivery() {
-    let directory = case_dir("117-version2-mailboxes");
+    let directory = case_dir("117-version1-mailboxes");
     let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
     let mut resolver = InMemoryDefinitionResolver::default();
     resolver.insert(bundle.clone(), true);
@@ -139,13 +139,13 @@ fn process_with_backlog_receipts_the_ready_head_and_keeps_new_delivery() {
 }
 
 #[test]
-fn all_162_native_v2_vectors_match_exactly() {
+fn all_162_native_v1_vectors_match_exactly() {
     let mut count = 0;
     let mut failures = Vec::new();
     for case in CASES {
         let directory = case_dir(case);
         let manifest = parse_yaml(&fs::read_to_string(directory.join("test.yaml")).unwrap());
-        for vector in manifest["version2_vectors"].as_array().unwrap() {
+        for vector in manifest["version1_vectors"].as_array().unwrap() {
             count += 1;
             if let Err(error) = run_vector(&directory, vector) {
                 failures.push(format!(
@@ -161,7 +161,7 @@ fn all_162_native_v2_vectors_match_exactly() {
     assert_eq!(count, 162);
     assert!(
         failures.is_empty(),
-        "{} native-v2 vector(s) failed:\n{}",
+        "{} native-v1 vector(s) failed:\n{}",
         failures.len(),
         failures.join("\n")
     );
@@ -169,18 +169,18 @@ fn all_162_native_v2_vectors_match_exactly() {
 
 fn run_checkpoint_vectors() -> (usize, Vec<String>) {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-04-version2-mailboxes",
+        "conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-04-version1-mailboxes",
     );
     let manifest = parse_yaml(&fs::read_to_string(directory.join("test.yaml")).unwrap());
     let requests: Value =
         serde_json::from_slice(&fs::read(directory.join("operation-inputs.json")).unwrap())
             .unwrap();
     let mut failures = Vec::new();
-    let vectors = manifest["version2_vectors"].as_array().unwrap();
+    let vectors = manifest["version1_vectors"].as_array().unwrap();
     for vector in vectors {
         if let Err(error) = run_checkpoint_vector(&directory, &requests, vector) {
             failures.push(format!(
-                "checkpoint-04-version2-mailboxes/{}: {error}",
+                "checkpoint-04-version1-mailboxes/{}: {error}",
                 vector["name"].as_str().unwrap()
             ));
         }
@@ -318,7 +318,7 @@ fn run_vector(directory: &Path, vector: &Value) -> Result<(), String> {
     let operation = vector["operation"].as_str().unwrap();
     let actual = (|| -> Result<Value, ArtifactError> {
         match operation {
-            "create_v2" => {
+            "create_v1" => {
                 let bundle_file = vector["bundle"]
                     .as_str()
                     .or_else(|| request["bundle"]["bundle_file"].as_str())
@@ -334,20 +334,20 @@ fn run_vector(directory: &Path, vector: &Value) -> Result<(), String> {
                 )
                 .map(|aggregate| aggregate.value().clone())
             }
-            "round_trip_aggregate_v2" => restore_aggregate(
+            "round_trip_aggregate_v1" => restore_aggregate(
                 before.as_deref().expect("round trip requires state_before"),
                 &resolver,
             )
             .map(|aggregate| aggregate.value().clone()),
-            "restore_package_v2" => restore_package_operation(directory, request, &mut resolver),
-            "admit_v2" => {
+            "restore_package_v1" => restore_package_operation(directory, request, &mut resolver),
+            "admit_v1" => {
                 let bundle = vector_bundle(directory, vector)?;
                 let aggregate = restore_aggregate(before.as_deref().unwrap(), &resolver)?;
                 let deliveries: Vec<AdmissionDelivery> =
                     serde_json::from_value(request["deliveries"].clone()).map_err(invalid)?;
                 admit(&bundle, &aggregate, &deliveries)
             }
-            "step_v2" => {
+            "step_v1" => {
                 let bundle = vector_bundle(directory, vector)?;
                 let aggregate = restore_aggregate(before.as_deref().unwrap(), &resolver)?;
                 step(
@@ -356,10 +356,10 @@ fn run_vector(directory: &Path, vector: &Value) -> Result<(), String> {
                     request["target_runtime_id"].as_str().unwrap(),
                 )
             }
-            "migrate_aggregate_v2" => {
+            "migrate_aggregate_v1" => {
                 migrate_operation(directory, request, before.as_deref().unwrap(), &resolver)
             }
-            "migrate_then_process_v2" => {
+            "migrate_then_process_v1" => {
                 migrate_then_process(directory, request, before.as_deref().unwrap(), &resolver)
             }
             other => Err(ArtifactError::new("unsupported_operation", other)),
@@ -487,7 +487,7 @@ fn migrate_then_process(
                 "migration_audit_records": migrated["audit_records"],
                 "processing": {
                     "core_step_result_format": "determa.core_step_result",
-                    "core_step_result_schema_version": 2,
+                    "core_step_result_schema_version": 1,
                     "disposition": "rejected",
                     "emissions": [],
                     "fault": null,

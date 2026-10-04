@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-const SCHEMA_MARKER: &str = ".determa-execution-checkpoint-v2";
+const SCHEMA_MARKER: &str = ".determa-execution-checkpoint-v1";
 const LOCK_FILE: &str = ".determa-execution-checkpoint.lock";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

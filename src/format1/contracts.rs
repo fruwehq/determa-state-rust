@@ -26,17 +26,17 @@ pub fn validate_artifact(
     verify_digest: bool,
 ) -> Result<Value, super::ArtifactError> {
     match kind {
-        "aggregate_state_v2" => super::v2::validate_aggregate_artifact(source, resolver),
-        "aggregate_state_package_v2" if verify_digest => {
-            let package = super::package::validate_package_artifact_v2(source)?;
+        "aggregate_state_v1" => super::v1::validate_aggregate_artifact(source, resolver),
+        "aggregate_state_package_v1" if verify_digest => {
+            let package = super::package::validate_package_artifact_v1(source)?;
             let mut resolver = resolver_to_memory(resolver, &package);
-            super::package::restore_package_v2(source, &mut resolver).map(|_| {
+            super::package::restore_package_v1(source, &mut resolver).map(|_| {
                 super::strict_json::parse(source).expect("restored package is strict JSON")
             })
         }
-        "aggregate_state_package_v2" => super::package::validate_package_artifact_v2(source),
-        "migration_descriptor_v2" => super::v2::validate_migration_descriptor_v2(source),
-        "execution_checkpoint_v2" => {
+        "aggregate_state_package_v1" => super::package::validate_package_artifact_v1(source),
+        "migration_descriptor_v1" => super::v1::validate_migration_descriptor_v1(source),
+        "execution_checkpoint_v1" => {
             checkpoint::restore(source, resolver).map(|checkpoint| checkpoint.value().clone())
         }
         _ => validate_contract_artifact(kind, source, resolver),
@@ -98,28 +98,34 @@ fn resolver_to_memory(
 }
 
 fn validate_schema(kind: &str, value: &Value, schema: &str) -> Result<(), super::ArtifactError> {
-    let schema_value: Value = serde_json::from_str(schema)
-        .map_err(|error| invalid_contract(kind, format!("invalid embedded schema: {error}")))?;
-    let mut options = jsonschema::options();
-    for resource in schema_resources() {
-        let parsed: Value = serde_json::from_str(resource)
-            .map_err(|error| invalid_contract(kind, format!("invalid embedded schema: {error}")))?;
-        if let Some(id) = parsed["$id"].as_str() {
-            options = options.with_resource(
-                id.to_string(),
-                Resource::from_contents(parsed).map_err(|error| {
-                    invalid_contract(kind, format!("invalid schema resource: {error}"))
-                })?,
-            );
-        }
+    thread_local! {
+        static VALIDATORS: std::cell::RefCell<std::collections::HashMap<usize, jsonschema::Validator>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
     }
-    let validator = options
-        .build(&schema_value)
-        .map_err(|error| invalid_contract(kind, format!("invalid contract schema: {error}")))?;
-    validator
-        .validate(value)
-        .map_err(|error| invalid_contract(kind, error.to_string()))?;
-    Ok(())
+    VALIDATORS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let validator = cache.entry(schema.as_ptr() as usize).or_insert_with(|| {
+            let schema_value: Value =
+                serde_json::from_str(schema).expect("bundled contract schema is valid");
+            let mut options = jsonschema::options();
+            for resource in schema_resources() {
+                let parsed: Value =
+                    serde_json::from_str(resource).expect("bundled schema resource is valid");
+                if let Some(id) = parsed["$id"].as_str() {
+                    options = options.with_resource(
+                        id.to_string(),
+                        Resource::from_contents(parsed).expect("bundled schema resource is valid"),
+                    );
+                }
+            }
+            options
+                .build(&schema_value)
+                .expect("bundled contract schema is valid")
+        });
+        validator
+            .validate(value)
+            .map_err(|error| invalid_contract(kind, error.to_string()))
+    })
 }
 
 fn validate_embedded_artifacts(
@@ -163,55 +169,65 @@ fn validate_embedded_artifacts(
 
 fn contract_schema(kind: &str) -> Option<&'static str> {
     match kind {
-        "core_step_result_v2" => Some(include_str!("../../schema/core-step-result-v2.schema.json")),
-        "durable_host_call_log_v2" => Some(include_str!(
-            "../../schema/durable-host-call-log-v2.schema.json"
+        "core_step_result_v1" => Some(include_str!("../../schema/core-step-result-v1.schema.json")),
+        "durable_host_call_log_v1" => Some(include_str!(
+            "../../schema/durable-host-call-log-v1.schema.json"
         )),
-        "durable_host_inputs_v2" => Some(include_str!(
-            "../../schema/durable-host-inputs-v2.schema.json"
+        "durable_host_inputs_v1" => Some(include_str!(
+            "../../schema/durable-host-inputs-v1.schema.json"
         )),
-        "durable_host_results_v2" => Some(include_str!(
-            "../../schema/durable-host-results-v2.schema.json"
+        "durable_host_results_v1" => Some(include_str!(
+            "../../schema/durable-host-results-v1.schema.json"
         )),
-        "durable_host_store_v2" => Some(include_str!(
-            "../../schema/durable-host-store-v2.schema.json"
+        "durable_host_responses_v1" => Some(include_str!(
+            "../../schema/durable-host-responses-v1.schema.json"
         )),
-        "version2_operation_inputs" => Some(include_str!(
-            "../../schema/version2-operation-inputs.schema.json"
+        "durable_host_store_v1" => Some(include_str!(
+            "../../schema/durable-host-store-v1.schema.json"
         )),
-        "version2_operation_result" => Some(include_str!(
-            "../../schema/version2-operation-result.schema.json"
+        "version1_operation_inputs" => Some(include_str!(
+            "../../schema/version1-operation-inputs.schema.json"
+        )),
+        "version1_operation_result" => Some(include_str!(
+            "../../schema/version1-operation-result.schema.json"
+        )),
+        "version1_operation_failures" => Some(include_str!(
+            "../../schema/version1-operation-failures.schema.json"
         )),
         _ => None,
     }
 }
 
-fn schema_resources() -> [&'static str; 12] {
+fn schema_resources() -> [&'static str; 14] {
     [
-        include_str!("../../schema/aggregate-state-v2.schema.json"),
-        include_str!("../../schema/aggregate-state-package-v2.schema.json"),
-        include_str!("../../schema/core-step-result-v2.schema.json"),
-        include_str!("../../schema/execution-checkpoint-v2.schema.json"),
-        include_str!("../../schema/migration-descriptor-v2.schema.json"),
-        include_str!("../../schema/durable-host-call-log-v2.schema.json"),
-        include_str!("../../schema/durable-host-inputs-v2.schema.json"),
-        include_str!("../../schema/durable-host-results-v2.schema.json"),
-        include_str!("../../schema/durable-host-store-v2.schema.json"),
-        include_str!("../../schema/version2-operation-inputs.schema.json"),
-        include_str!("../../schema/version2-operation-result.schema.json"),
+        include_str!("../../schema/aggregate-state-v1.schema.json"),
+        include_str!("../../schema/aggregate-state-package-v1.schema.json"),
+        include_str!("../../schema/core-step-result-v1.schema.json"),
+        include_str!("../../schema/execution-checkpoint-v1.schema.json"),
+        include_str!("../../schema/migration-descriptor-v1.schema.json"),
+        include_str!("../../schema/durable-host-call-log-v1.schema.json"),
+        include_str!("../../schema/durable-host-inputs-v1.schema.json"),
+        include_str!("../../schema/durable-host-results-v1.schema.json"),
+        include_str!("../../schema/durable-host-responses-v1.schema.json"),
+        include_str!("../../schema/durable-host-store-v1.schema.json"),
+        include_str!("../../schema/version1-operation-inputs.schema.json"),
+        include_str!("../../schema/version1-operation-result.schema.json"),
+        include_str!("../../schema/version1-operation-failures.schema.json"),
         include_str!("../../schema/machine.schema.json"),
     ]
 }
 
 fn invalid_contract(kind: &str, message: impl Into<String>) -> super::ArtifactError {
     let code = match kind {
-        "core_step_result_v2" => "invalid_core_step_result",
-        "durable_host_call_log_v2" => "invalid_durable_host_call_log_v2",
-        "durable_host_inputs_v2" => "invalid_durable_host_inputs_v2",
-        "durable_host_results_v2" => "invalid_durable_host_results_v2",
-        "durable_host_store_v2" => "invalid_durable_host_store_v2",
-        "version2_operation_inputs" => "invalid_version2_operation_inputs",
-        "version2_operation_result" => "invalid_version2_operation_result",
+        "core_step_result_v1" => "invalid_core_step_result",
+        "durable_host_call_log_v1" => "invalid_durable_host_call_log_v1",
+        "durable_host_inputs_v1" => "invalid_durable_host_inputs_v1",
+        "durable_host_results_v1" => "invalid_durable_host_results_v1",
+        "durable_host_responses_v1" => "invalid_durable_host_responses_v1",
+        "durable_host_store_v1" => "invalid_durable_host_store_v1",
+        "version1_operation_inputs" => "invalid_version1_operation_inputs",
+        "version1_operation_result" => "invalid_version1_operation_result",
+        "version1_operation_failures" => "invalid_version1_operation_failures",
         _ => "invalid_contract_artifact",
     };
     super::ArtifactError::new(code, message)

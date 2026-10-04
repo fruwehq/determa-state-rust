@@ -52,6 +52,15 @@ pub struct DurableHostResult {
 pub struct DurableCheckpointExecution {
     pub result: DurableHostResult,
     pub operation_response: Option<Value>,
+    /// Complete response delivered to the caller; absent only when the call aborted.
+    pub caller_response: Option<Value>,
+}
+
+/// A completed host or adapter contract call and its caller-visible response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DurableContractExecution {
+    pub result: DurableHostResult,
+    pub caller_response: Value,
 }
 
 impl DurableHostResult {
@@ -99,6 +108,8 @@ pub struct ScopedStoreRecord {
 pub struct DurableHostExecution {
     pub result: DurableHostResult,
     pub calls: Vec<String>,
+    /// Caller-visible body, absent when the call aborts before a response.
+    pub caller_response: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

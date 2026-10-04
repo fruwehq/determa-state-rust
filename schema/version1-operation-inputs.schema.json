@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://determa.dev/schemas/conformance/version2-operation-inputs.schema.json",
-  "title": "Determa State version-2 operation inputs",
+  "$id": "https://determa.dev/schemas/conformance/version1-operation-inputs.schema.json",
+  "title": "Determa State version-1 operation inputs",
   "type": "object",
   "minProperties": 1,
   "additionalProperties": { "$ref": "#/$defs/operationInput" },
@@ -113,7 +113,7 @@
           "minLength": 1,
           "not": { "enum": ["input", "internal"] }
         },
-        "envelope": { "$ref": "https://determa.dev/state/schema/aggregate-state-v2.schema.json#/$defs/envelope" },
+        "envelope": { "$ref": "https://determa.dev/state/schema/aggregate-state-v1.schema.json#/$defs/envelope" },
         "envelope_digest": { "$ref": "#/$defs/sha256" }
       }
     },
@@ -123,7 +123,7 @@
       "additionalProperties": false,
       "properties": {
         "delivery_mode": { "enum": ["input", "internal"] },
-        "envelope": { "$ref": "https://determa.dev/state/schema/aggregate-state-v2.schema.json#/$defs/envelope" },
+        "envelope": { "$ref": "https://determa.dev/state/schema/aggregate-state-v1.schema.json#/$defs/envelope" },
         "envelope_digest": { "$ref": "#/$defs/sha256" }
       }
     },
@@ -132,7 +132,7 @@
       "required": ["operation", "bundle", "machine_id", "machine_version", "root_instance_id", "creation_id", "bindings"],
       "additionalProperties": false,
       "properties": {
-        "operation": { "const": "create_v2" },
+        "operation": { "const": "create_v1" },
         "bundle": { "$ref": "#/$defs/bundleBinding" },
         "machine_id": { "$ref": "#/$defs/nonEmptyString" },
         "machine_version": { "$ref": "#/$defs/canonicalDecimal" },
@@ -154,7 +154,7 @@
       "required": ["operation", "deliveries"],
       "additionalProperties": false,
       "properties": {
-        "operation": { "const": "admit_v2" },
+        "operation": { "const": "admit_v1" },
         "deliveries": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/delivery" } }
       }
     },
@@ -163,7 +163,7 @@
       "required": ["operation", "target_runtime_id"],
       "additionalProperties": false,
       "properties": {
-        "operation": { "const": "step_v2" },
+        "operation": { "const": "step_v1" },
         "target_runtime_id": { "$ref": "#/$defs/sha256" }
       }
     },
@@ -172,7 +172,7 @@
       "required": ["operation", "definition_resolver"],
       "additionalProperties": false,
       "properties": {
-        "operation": { "const": "round_trip_aggregate_v2" },
+        "operation": { "const": "round_trip_aggregate_v1" },
         "definition_resolver": { "$ref": "#/$defs/artifactResolver" }
       }
     },
@@ -181,7 +181,7 @@
       "required": ["operation", "intent", "package_file", "artifact_resolver", "maintenance_mode"],
       "additionalProperties": false,
       "properties": {
-        "operation": { "const": "restore_package_v2" },
+        "operation": { "const": "restore_package_v1" },
         "intent": { "enum": ["restore_aggregate", "restore_and_apply_migration_route"] },
         "package_file": { "$ref": "#/$defs/jsonFile" },
         "artifact_resolver": { "$ref": "#/$defs/artifactResolver" },
@@ -193,7 +193,7 @@
       "required": ["operation", "source_bundle", "target_bundle", "migration_descriptor_digest_route"],
       "additionalProperties": false,
       "properties": {
-        "operation": { "enum": ["migrate_aggregate_v2", "migrate_then_process_v2", "checkpoint_migrate_v2"] },
+        "operation": { "enum": ["migrate_aggregate_v1", "migrate_then_process_v1", "checkpoint_migrate_v1"] },
         "source_bundle": { "$ref": "#/$defs/bundleBinding" },
         "target_bundle": { "$ref": "#/$defs/bundleBinding" },
         "migration_descriptor_file": { "$ref": "#/$defs/jsonFile" },
@@ -216,10 +216,10 @@
         "expected_checkpoint_digest": { "$ref": "#/$defs/expectedCheckpointDigest" }
       },
       "allOf": [{
-        "if": { "properties": { "operation": { "const": "checkpoint_migrate_v2" } } },
+        "if": { "properties": { "operation": { "const": "checkpoint_migrate_v1" } } },
         "then": { "required": ["operation_id", "request_digest", "expected_revision", "expected_checkpoint_digest"] }
       }, {
-        "if": { "properties": { "operation": { "const": "migrate_then_process_v2" } } },
+        "if": { "properties": { "operation": { "const": "migrate_then_process_v1" } } },
         "then": { "required": ["delivery"] }
       }],
       "oneOf": [

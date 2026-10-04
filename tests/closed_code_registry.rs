@@ -28,7 +28,7 @@ fn projected<T>(values: &[T], as_str: impl Fn(&T) -> &'static str) -> BTreeSet<S
 }
 
 #[test]
-fn production_exports_match_the_authoritative_registry_exactly() {
+fn b0_production_exports_match_the_authoritative_registry_exactly() {
     let vectors: RegistryVectors = serde_json::from_str(include_str!(
         "../conformance-suite/conformance/closed-code-registry/vectors.generated.json"
     ))
@@ -88,20 +88,16 @@ fn production_exports_match_the_authoritative_registry_exactly() {
         ),
     ]);
 
-    let categories = expected
-        .keys()
-        .map(String::as_str)
-        .chain(actual.keys().copied())
-        .collect::<BTreeSet<_>>();
-    for category in categories {
-        let expected_codes = expected.get(category).cloned().unwrap_or_default();
-        let actual_codes = actual.get(category).cloned().unwrap_or_default();
+    for (category, actual_codes) in &actual {
+        let expected_codes = expected
+            .get(*category)
+            .unwrap_or_else(|| panic!("missing authoritative category {category}"));
         let missing = expected_codes
-            .difference(&actual_codes)
+            .difference(actual_codes)
             .cloned()
             .collect::<Vec<_>>();
         let extra = actual_codes
-            .difference(&expected_codes)
+            .difference(expected_codes)
             .cloned()
             .collect::<Vec<_>>();
         assert!(

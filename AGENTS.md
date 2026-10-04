@@ -14,11 +14,11 @@ Repository metadata prepares the synchronized State `0.3.0` release after the
 
 The current draft is validated against these exact immutable inputs:
 
-- specification: `6796b554b976627c68fc746ec5629629aaf2b38e`;
-- conformance: `a586417292d0a5cac8d07e1164669688c407a7e1`.
+- specification: `6bd25e3fcdf068af861aa289903a8489bd8f0139`;
+- conformance: `710d5e9bcf517e8a8cc8d7087123bda37a362d6b`.
 
-The conformance suite is the arbiter of behavior. These exact merged commits are the
-authoritative release inputs; tag publication is a later coordinated release operation.
+The conformance suite is the arbiter of behavior. These exact reviewed public commits are
+the current implementation inputs; tag publication is a later coordinated release operation.
 Never invent a release tag or weaken an exact revision check.
 
 ## Layout
@@ -31,15 +31,15 @@ Never invent a release tag or weaken an exact revision check.
   store registry, capability profiles, and bundled adapters.
 - `src/value.rs`: portable values and nominal instance references.
 - `src/cli.rs`: nonportable validation utility only.
-- `tests/native_v2_conformance.rs`: driver for all 162 applicable native schema-v2
+- `tests/native_v1_conformance.rs`: driver for all 162 applicable native schema-v1
   aggregate, migration, package, and execution-checkpoint vectors.
 - `src/format1/runtime_conformance.rs`: repository-only driver for all 75 mailbox-neutral
   runtime traces through the private RTC kernel shared by the sole queue-bearing public API;
   it is explicitly configured by CI and excluded from the published crate.
-- `tests/artifact_manifest.rs`: schema and semantic routing gate for all 381 declared
+- `tests/artifact_manifest.rs`: schema and semantic routing gate for all 403 declared
   conformance artifact documents. Operation admissibility is checked separately by
-  the native schema-v2 vectors through public operations.
-- `tests/durable_host_conformance.rs`: production-host driver for all 138 optional
+  the native schema-v1 vectors through public operations.
+- `tests/durable_host_conformance.rs`: production-host driver for all 142 optional
   durable-host vectors, including SQLite shared transactions.
 - `tests/checkpoint_adapters.rs`: shared memory/file/SQLite setup, restart, and CAS
   contracts.
@@ -63,7 +63,7 @@ Never invent a release tag or weaken an exact revision check.
 ```sh
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
-  "a586417292d0a5cac8d07e1164669688c407a7e1"
+  "710d5e9bcf517e8a8cc8d7087123bda37a362d6b"
 cargo +1.86.0 build --release --locked --all-features
 cargo +1.86.0 test --locked --all-features
 cargo clippy --locked --all-features --all-targets -- -D warnings
@@ -72,14 +72,14 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 The declared MSRV is Rust `1.86`. CI must keep the locked default and all-features graph,
 including PostgreSQL, buildable and testable with that toolchain.
 
-CI runs all 162 applicable native schema-v2 core vectors, all 138 durable-host vectors,
-and all 381 declared artifact documents.
+CI runs all 162 applicable native schema-v1 core vectors, all 142 durable-host vectors,
+and all 403 declared artifact documents.
 It also checks every local schema byte-for-byte against the exact specification commit
 and runs the optional PostgreSQL adapter against a service.
 
 ## Boundaries
 
-The portable API exposes only queue-bearing schema-v2 create, admission, step,
+The portable API exposes only queue-bearing schema-v1 create, admission, step,
 serialization/restoration, package restoration, and definition migration operations.
 The optional synchronous host wraps those unchanged
 operations with portable checkpoint transactions. It owns no broker, timer, worker,
