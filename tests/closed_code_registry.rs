@@ -4,7 +4,7 @@ use determa_state::checkpoint::{
 };
 use determa_state::{
     CreationRejectionCode, DispatchRejectionCode, Disposition, EngineFaultCode, LoadErrorCode,
-    PersistenceErrorCode, CREATION_REJECTION_CODES, DISPATCH_REJECTION_CODES, ENGINE_FAULT_CODES,
+    PersistenceErrorCode,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -109,31 +109,6 @@ fn production_exports_match_the_authoritative_registry_exactly() {
             "portable code mismatch for {category}: missing={missing:?}, extra={extra:?}"
         );
     }
-}
-
-#[test]
-fn compatibility_string_exports_are_exact_projections_of_emitter_codes() {
-    assert_eq!(
-        CREATION_REJECTION_CODES,
-        CreationRejectionCode::PORTABLE_CODES
-            .iter()
-            .map(|code| code.as_str())
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        DISPATCH_REJECTION_CODES,
-        DispatchRejectionCode::PORTABLE_CODES
-            .iter()
-            .map(|code| code.as_str())
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        ENGINE_FAULT_CODES,
-        EngineFaultCode::PORTABLE_CODES
-            .iter()
-            .map(|code| code.as_str())
-            .collect::<Vec<_>>()
-    );
 }
 
 #[test]

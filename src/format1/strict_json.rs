@@ -6,6 +6,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StrictJsonErrorCode {
     InvalidUtf8,
+    InvalidUnicode,
     DuplicateKey,
     InvalidNumber,
     InvalidJson,
@@ -42,6 +43,11 @@ fn classify_error(error: serde_json::Error) -> StrictJsonError {
     let message = error.to_string();
     let code = if message.contains("duplicate object member") {
         StrictJsonErrorCode::DuplicateKey
+    } else if message.contains("surrogate")
+        || message.contains("unicode escape")
+        || message.contains("hex escape")
+    {
+        StrictJsonErrorCode::InvalidUnicode
     } else if message.contains("outside the signed 64-bit domain")
         || message.contains("non-finite number")
     {

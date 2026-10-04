@@ -65,6 +65,21 @@
       "type": "string",
       "pattern": "^(?:[A-Za-z_][A-Za-z0-9_]*|determa\\.(?:component_completed|component_failed|spawned_instance_failed))$"
     },
+    "deferrableEventName": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "not": {
+            "enum": [
+              "done",
+              "env"
+            ]
+          }
+        }
+      ]
+    },
     "authorEventName": {
       "allOf": [
         {
@@ -908,6 +923,19 @@
             "$ref": "#/$defs/transitionOrList"
           }
         },
+        "deferred_events": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/deferrableEventName"
+          }
+        },
+        "deferred_event_capacity": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
         "history": {
           "enum": ["none", "shallow", "deep"],
           "default": "none"
@@ -1018,6 +1046,12 @@
                   "required": ["on_events"]
                 },
                 {
+                  "required": ["deferred_events"]
+                },
+                {
+                  "required": ["deferred_event_capacity"]
+                },
+                {
                   "required": ["history"]
                 },
                 {
@@ -1067,6 +1101,12 @@
                 },
                 {
                   "required": ["on_events"]
+                },
+                {
+                  "required": ["deferred_events"]
+                },
+                {
+                  "required": ["deferred_event_capacity"]
                 },
                 {
                   "required": ["history"]

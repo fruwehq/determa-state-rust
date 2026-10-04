@@ -1,6 +1,6 @@
-use super::wire::ExecutionCheckpoint;
+use serde_json::{json, Value};
 #[cfg(any(feature = "sqlite", feature = "postgresql"))]
-use super::wire::{outbox_intent_digest, EmissionReference, TerminalOutboxRecord};
+use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
@@ -96,11 +96,13 @@ pub struct StoreRecord {
 }
 
 impl StoreRecord {
-    pub fn from_checkpoint(checkpoint: &ExecutionCheckpoint) -> Result<Self, StoreError> {
+    pub fn from_checkpoint(
+        checkpoint: &super::v2::ExecutionCheckpoint,
+    ) -> Result<Self, StoreError> {
         Ok(Self {
-            root_instance_id: checkpoint.root_instance_id.clone(),
-            revision: checkpoint.revision.to_string(),
-            execution_checkpoint_digest: checkpoint.execution_checkpoint_digest.clone(),
+            root_instance_id: checkpoint.root_instance_id().to_string(),
+            revision: checkpoint.revision().to_string(),
+            execution_checkpoint_digest: checkpoint.digest().to_string(),
             bytes: checkpoint
                 .canonical_bytes()
                 .map_err(|error| StoreError::new(error.to_string()))?,
@@ -147,7 +149,10 @@ impl StoreError {
 pub enum StoreErrorCode {
     ExecutionStoreFailure,
     InjectedPreCommitFailure,
+    InvalidStoreScope,
+    PermanentProcessingFailure,
     ResponseLostAfterCommit,
+    TransientProcessingFailure,
 }
 
 impl StoreErrorCode {
@@ -157,14 +162,20 @@ impl StoreErrorCode {
     /// is intentionally not a portable execution-store failure code.
     pub const PORTABLE_CODES: &'static [Self] = &[
         Self::InjectedPreCommitFailure,
+        Self::InvalidStoreScope,
+        Self::PermanentProcessingFailure,
         Self::ResponseLostAfterCommit,
+        Self::TransientProcessingFailure,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ExecutionStoreFailure => "execution_store_failure",
             Self::InjectedPreCommitFailure => "injected_pre_commit_failure",
+            Self::InvalidStoreScope => "invalid_store_scope",
+            Self::PermanentProcessingFailure => "permanent_processing_failure",
             Self::ResponseLostAfterCommit => "response_lost_after_commit",
+            Self::TransientProcessingFailure => "transient_processing_failure",
         }
     }
 }
@@ -194,8 +205,8 @@ impl HealthStatus {
 
 /// Atomic checkpoint storage primitive.
 ///
-/// The trait intentionally has no delete method. Schema-version-1 root identity
-/// markers and tombstones cannot be physically removed through this API.
+/// The trait intentionally has no delete method. Root identity tombstones cannot
+/// be physically removed through this API.
 pub trait ExecutionStore: Send + Sync + Any {
     fn as_any(&self) -> &dyn Any;
 
@@ -337,6 +348,31 @@ impl AdapterRegistry {
         }
         Ok(store)
     }
+
+    pub fn resolve_configured(
+        &self,
+        uri: &str,
+        configuration_schema: &Value,
+        configuration: &Value,
+        requested_capabilities: &BTreeSet<ExecutionStoreCapability>,
+    ) -> Result<Arc<dyn ExecutionStore>, AdapterError> {
+        jsonschema::options()
+            .build(configuration_schema)
+            .map_err(|error| {
+                AdapterError::new(
+                    AdapterErrorCode::InvalidAdapterConfiguration,
+                    format!("invalid adapter configuration schema: {error}"),
+                )
+            })?
+            .validate(configuration)
+            .map_err(|error| {
+                AdapterError::new(
+                    AdapterErrorCode::InvalidAdapterConfiguration,
+                    format!("adapter configuration is invalid: {error}"),
+                )
+            })?;
+        self.resolve(uri, requested_capabilities)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,7 +428,6 @@ pub fn validate_store_host_profile(
         HostProfile::StrictDurableOutbox => {
             durable
                 && root_retained
-                && atomic
                 && capabilities
                     .contains(&ExecutionStoreCapability::PermanentOutboxTerminalRetention)
                 && features.contains(&HostFeature::OutboxWorker)
@@ -402,7 +437,6 @@ pub fn validate_store_host_profile(
         HostProfile::CompactDurableOutbox => {
             durable
                 && root_retained
-                && atomic
                 && capabilities.contains(&ExecutionStoreCapability::CompactEffectIdentityRetention)
                 && features.contains(&HostFeature::OutboxWorker)
                 && features.contains(&HostFeature::TotalOutboxLifecycle)
@@ -411,7 +445,6 @@ pub fn validate_store_host_profile(
         HostProfile::SharedApplicationTransaction => {
             durable
                 && root_retained
-                && atomic
                 && capabilities.contains(&ExecutionStoreCapability::SharedApplicationTransaction)
                 && features.contains(&HostFeature::NativeSharedApplicationTransaction)
         }
@@ -563,10 +596,14 @@ pub(crate) fn validate_policy_replacement(
     let before = policy_checkpoint(current)?;
     let after = policy_checkpoint(replacement)?;
     validate_policy_candidate(mode, &after)?;
+    let before_receipts = before["operation_receipts"].as_array().unwrap();
+    let after_receipts = after["operation_receipts"].as_array().unwrap();
     if mode.receipt_retention == ReceiptRetentionMode::Permanent
-        && (after.operation_receipts.len() < before.operation_receipts.len()
-            || after.operation_receipts[..before.operation_receipts.len()]
-                != before.operation_receipts)
+        && (after_receipts.len() < before_receipts.len()
+            || before_receipts
+                .iter()
+                .zip(after_receipts)
+                .any(|(prior, next)| !retained_receipt_evolves(prior, next, &before, &after)))
     {
         return Err(StoreError::new(
             "permanent receipt retention forbids receipt removal or replacement",
@@ -575,8 +612,12 @@ pub(crate) fn validate_policy_replacement(
     match mode.outbox_retention {
         OutboxRetentionMode::Bounded => {}
         OutboxRetentionMode::Strict => {
-            for terminal in &before.terminal_outbox_records {
-                if !after.terminal_outbox_records.contains(terminal) {
+            for terminal in before["terminal_outbox_records"].as_array().unwrap() {
+                if !after["terminal_outbox_records"]
+                    .as_array()
+                    .unwrap()
+                    .contains(terminal)
+                {
                     return Err(StoreError::new(
                         "strict outbox retention forbids terminal record removal or compaction",
                     ));
@@ -591,25 +632,172 @@ pub(crate) fn validate_policy_replacement(
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgresql"))]
-fn policy_checkpoint(record: &StoreRecord) -> Result<ExecutionCheckpoint, StoreError> {
+fn retained_receipt_evolves(
+    prior: &Value,
+    next: &Value,
+    before: &Value,
+    checkpoint: &Value,
+) -> bool {
+    if prior == next {
+        return true;
+    }
+    let mut prior_body = prior.clone();
+    let mut next_body = next.clone();
+    let prior_refs = prior_body
+        .as_object_mut()
+        .and_then(|body| body.remove("emission_references"));
+    let next_refs = next_body
+        .as_object_mut()
+        .and_then(|body| body.remove("emission_references"));
+    if prior_body != next_body {
+        return false;
+    }
+    let (Some(prior_refs), Some(next_refs)) = (
+        prior_refs.and_then(|refs| refs.as_array().cloned()),
+        next_refs.and_then(|refs| refs.as_array().cloned()),
+    ) else {
+        return false;
+    };
+    prior_refs.len() == next_refs.len()
+        && prior_refs.iter().zip(&next_refs).all(|(prior, next)| {
+            if prior == next {
+                return true;
+            }
+            if prior["kind"] != "internal_mailbox" {
+                return false;
+            }
+            let mut old = prior.clone();
+            let mut updated = next.clone();
+            old.as_object_mut().unwrap().remove("kind");
+            updated.as_object_mut().unwrap().remove("kind");
+            old.as_object_mut().unwrap().remove("queue_sequence");
+            updated.as_object_mut().unwrap().remove("queue_sequence");
+            if next["kind"] == "internal_mailbox" && old == updated {
+                let queue_advanced = prior["queue_sequence"]
+                    .as_str()
+                    .and_then(|value| crate::format1::Counter::from_decimal(value).ok())
+                    .zip(
+                        next["queue_sequence"]
+                            .as_str()
+                            .and_then(|value| crate::format1::Counter::from_decimal(value).ok()),
+                    )
+                    .is_some_and(|(prior, next)| {
+                        before["root_record"]["aggregate_state"]["next_queue_sequence"]
+                            .as_str()
+                            .and_then(|value| crate::format1::Counter::from_decimal(value).ok())
+                            .is_some_and(|floor| next > prior && next >= floor)
+                    });
+                return queue_advanced
+                    && checkpoint["root_record"]["aggregate_state"]["runtimes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|runtime| {
+                            ["ready_mailbox", "deferred_mailbox"]
+                                .into_iter()
+                                .flat_map(|field| runtime[field].as_array().into_iter().flatten())
+                        })
+                        .filter(|entry| {
+                            entry["delivery_mode"] == "internal"
+                                && entry["envelope"]["event_id"] == next["event_id"]
+                                && entry["acceptance_sequence"] == next["acceptance_sequence"]
+                                && entry["queue_sequence"] == next["queue_sequence"]
+                        })
+                        .count()
+                        == 1;
+            }
+            if next["kind"] == "internal_terminal" {
+                let terminal = updated
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("terminal_receipt_sequence");
+                let terminal_is_new = terminal
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .and_then(|value| crate::format1::Counter::from_decimal(value).ok())
+                    .zip(
+                        prior_body["receipt_sequence"]
+                            .as_str()
+                            .and_then(|value| crate::format1::Counter::from_decimal(value).ok()),
+                    )
+                    .is_some_and(|(terminal, producer)| {
+                        before["next_operation_receipt_sequence"]
+                            .as_str()
+                            .and_then(|value| crate::format1::Counter::from_decimal(value).ok())
+                            .is_some_and(|floor| terminal > producer && terminal >= floor)
+                    });
+                return old == updated
+                    && terminal_is_new
+                    && terminal.is_some_and(|sequence| {
+                        checkpoint["operation_receipts"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|receipt| {
+                                receipt["operation_kind"] == "event_terminal"
+                                    && receipt["receipt_sequence"] == sequence
+                                    && receipt["event_id"] == next["event_id"]
+                                    && receipt["acceptance_sequence"] == next["acceptance_sequence"]
+                            })
+                            .count()
+                            == 1
+                    });
+            }
+            false
+        })
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgresql")))]
+mod retention_transition_tests {
+    use super::retained_receipt_evolves;
+    use serde_json::json;
+
+    #[test]
+    fn permanent_receipts_allow_only_attested_internal_reference_evolution() {
+        let prior = json!({"operation_kind":"creation","receipt_sequence":"0","emission_references":[{"kind":"internal_mailbox","emission_index":"0","event_id":"event-a","acceptance_sequence":"0","queue_sequence":"1"}]});
+        let before = json!({"next_operation_receipt_sequence":"1","root_record":{"aggregate_state":{"next_queue_sequence":"2"}}});
+        let mut next = prior.clone();
+        next["emission_references"][0]["queue_sequence"] = json!("2");
+        let mut after = json!({"root_record":{"aggregate_state":{"runtimes":[{"ready_mailbox":[],"deferred_mailbox":[{"delivery_mode":"internal","envelope":{"event_id":"event-a"},"acceptance_sequence":"0","queue_sequence":"2"}]}]}},"operation_receipts":[]});
+        assert!(retained_receipt_evolves(&prior, &next, &before, &after));
+        next["emission_references"][0]["event_id"] = json!("event-b");
+        assert!(!retained_receipt_evolves(&prior, &next, &before, &after));
+        next["emission_references"][0]["event_id"] = json!("event-a");
+        next["emission_references"][0]["queue_sequence"] = json!("0");
+        assert!(!retained_receipt_evolves(&prior, &next, &before, &after));
+        next["emission_references"][0]["queue_sequence"] = json!("2");
+        after["root_record"]["aggregate_state"]["runtimes"][0]["deferred_mailbox"][0]
+            ["delivery_mode"] = json!("input");
+        assert!(!retained_receipt_evolves(&prior, &next, &before, &after));
+        after["root_record"]["aggregate_state"]["runtimes"][0]["deferred_mailbox"][0]
+            ["delivery_mode"] = json!("internal");
+        next["emission_references"][0] = json!({"kind":"internal_terminal","emission_index":"0","event_id":"event-a","acceptance_sequence":"0","terminal_receipt_sequence":"1"});
+        after["operation_receipts"] = json!([{"operation_kind":"event_terminal","receipt_sequence":"1","event_id":"event-a","acceptance_sequence":"0"}]);
+        assert!(retained_receipt_evolves(&prior, &next, &before, &after));
+        after["operation_receipts"][0]["event_id"] = json!("event-b");
+        assert!(!retained_receipt_evolves(&prior, &next, &before, &after));
+    }
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgresql"))]
+fn policy_checkpoint(record: &StoreRecord) -> Result<Value, StoreError> {
     serde_json::from_slice(&record.bytes)
         .map_err(|error| StoreError::new(format!("checkpoint policy validation failed: {error}")))
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgresql"))]
-fn validate_policy_candidate(
-    mode: DurableStoreMode,
-    checkpoint: &ExecutionCheckpoint,
-) -> Result<(), StoreError> {
+fn validate_policy_candidate(mode: DurableStoreMode, checkpoint: &Value) -> Result<(), StoreError> {
     if mode.receipt_retention == ReceiptRetentionMode::Permanent
-        && !checkpoint.replay_retention.is_permanent()
+        && checkpoint["replay_retention"]["mode"] != "permanent"
     {
         return Err(StoreError::new(
             "permanent receipt retention requires permanent checkpoint replay retention",
         ));
     }
     if mode.outbox_retention == OutboxRetentionMode::Strict
-        && !checkpoint.outbox_effect_tombstones.is_empty()
+        && !checkpoint["outbox_effect_tombstones"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
     {
         return Err(StoreError::new(
             "strict outbox retention forbids compact effect tombstones",
@@ -619,29 +807,35 @@ fn validate_policy_candidate(
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgresql"))]
-fn validate_compact_retention_transition(
-    before: &ExecutionCheckpoint,
-    after: &ExecutionCheckpoint,
-) -> Result<(), StoreError> {
-    for tombstone in &before.outbox_effect_tombstones {
-        if receipt_references_effect(after, &tombstone.effect_id)
-            && !after.outbox_effect_tombstones.contains(tombstone)
+fn validate_compact_retention_transition(before: &Value, after: &Value) -> Result<(), StoreError> {
+    for tombstone in before["outbox_effect_tombstones"].as_array().unwrap() {
+        let effect_id = tombstone["effect_id"].as_str().unwrap();
+        if receipt_references_effect(after, effect_id)
+            && !after["outbox_effect_tombstones"]
+                .as_array()
+                .unwrap()
+                .contains(tombstone)
         {
             return Err(StoreError::new(
                 "compact outbox retention forbids referenced tombstone removal",
             ));
         }
     }
-    for terminal in &before.terminal_outbox_records {
-        if !receipt_references_effect(after, &terminal.intent.effect_id)
-            || after.terminal_outbox_records.contains(terminal)
+    for terminal in before["terminal_outbox_records"].as_array().unwrap() {
+        let effect_id = terminal["intent"]["effect_id"].as_str().unwrap();
+        if !receipt_references_effect(after, effect_id)
+            || after["terminal_outbox_records"]
+                .as_array()
+                .unwrap()
+                .contains(terminal)
         {
             continue;
         }
-        let retained_tombstone = after
-            .outbox_effect_tombstones
+        let retained_tombstone = after["outbox_effect_tombstones"]
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|value| value.effect_id == terminal.intent.effect_id);
+            .find(|value| value["effect_id"].as_str() == Some(effect_id));
         if !retained_tombstone.is_some_and(|tombstone| {
             compact_tombstone_matches(before, terminal, tombstone).unwrap_or(false)
         }) {
@@ -655,32 +849,44 @@ fn validate_compact_retention_transition(
 
 #[cfg(any(feature = "sqlite", feature = "postgresql"))]
 fn compact_tombstone_matches(
-    checkpoint: &ExecutionCheckpoint,
-    terminal: &TerminalOutboxRecord,
-    tombstone: &super::wire::OutboxEffectTombstone,
+    checkpoint: &Value,
+    terminal: &Value,
+    tombstone: &Value,
 ) -> Result<bool, StoreError> {
-    Ok(terminal.terminal_sequence == tombstone.terminal_sequence
-        && terminal.intent.effect_id == tombstone.effect_id
-        && terminal.committed_revision == tombstone.committed_revision
-        && terminal.outcome == tombstone.outcome
-        && outbox_intent_digest(&checkpoint.root_instance_id, &terminal.intent)
-            .map_err(|error| StoreError::new(error.to_string()))?
-            == tombstone.intent_digest)
+    Ok(
+        terminal["terminal_sequence"] == tombstone["terminal_sequence"]
+            && terminal["intent"]["effect_id"] == tombstone["effect_id"]
+            && terminal["committed_revision"] == tombstone["committed_revision"]
+            && terminal["outcome"] == tombstone["outcome"]
+            && outbox_intent_digest(&checkpoint["root_instance_id"], &terminal["intent"])?
+                == tombstone["intent_digest"],
+    )
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgresql"))]
-fn receipt_references_effect(checkpoint: &ExecutionCheckpoint, effect_id: &str) -> bool {
-    checkpoint.operation_receipts.iter().any(|receipt| {
-        receipt.emission_references().iter().any(|reference| {
-            matches!(
-                reference,
-                EmissionReference::ExternalOutbox {
-                    effect_id: referenced,
-                    ..
-                } if referenced == effect_id
-            )
+fn receipt_references_effect(checkpoint: &Value, effect_id: &str) -> bool {
+    checkpoint["operation_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|receipt| receipt["emission_references"].as_array())
+        .flatten()
+        .any(|reference| {
+            reference["kind"] == "external_outbox"
+                && reference["effect_id"].as_str() == Some(effect_id)
         })
-    })
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgresql"))]
+fn outbox_intent_digest(root_instance_id: &Value, intent: &Value) -> Result<Value, StoreError> {
+    let bytes = serde_json_canonicalizer::to_vec(&json!([
+        "determa-outbox-intent-digest-2",
+        "2",
+        root_instance_id,
+        intent
+    ]))
+    .map_err(|error| StoreError::new(error.to_string()))?;
+    Ok(Value::String(format!("sha256:{:x}", Sha256::digest(bytes))))
 }
 
 fn extract_scheme(configuration: &str) -> Result<&str, AdapterError> {

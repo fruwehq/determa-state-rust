@@ -3,7 +3,7 @@ mod memory;
 #[cfg(feature = "postgresql")]
 mod postgresql;
 #[cfg(feature = "sqlite")]
-mod sqlite;
+pub(crate) mod sqlite;
 
 pub use file::{FileExecutionStore, FileExecutionStoreFactory};
 pub use memory::{MemoryExecutionStore, MemoryExecutionStoreFactory};

@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://determa.dev/state/schema/aggregate-state-package.schema.json",
+  "$id": "https://determa.dev/state/schema/aggregate-state-package-v2.schema.json",
   "title": "Determa State self-contained aggregate-state package",
-  "description": "Closed transport package for one aggregate and its verified attachments.",
+  "description": "Closed transport package for the sole supported queue-bearing aggregate artifact and its verified attachments.",
   "type": "object",
   "required": [
     "aggregate_state_package_format",
@@ -18,10 +18,10 @@
       "const": "determa.aggregate_state_package"
     },
     "aggregate_state_package_schema_version": {
-      "const": 1
+      "const": 2
     },
     "aggregate_state": {
-      "$ref": "aggregate-state.schema.json"
+      "$ref": "aggregate-state-v2.schema.json"
     },
     "normalized_definitions": {
       "type": "array",
@@ -38,7 +38,7 @@
             "pattern": "^sha256:[0-9a-f]{64}$"
           },
           "normalized_bundle": {
-            "$ref": "aggregate-state.schema.json#/$defs/typedValue"
+            "$ref": "aggregate-state-v2.schema.json#/$defs/typedValue"
           }
         }
       }
@@ -46,7 +46,7 @@
     "migration_descriptors": {
       "type": "array",
       "items": {
-        "$ref": "migration-descriptor.schema.json"
+        "$ref": "migration-descriptor-v2.schema.json"
       }
     },
     "migration_route": {

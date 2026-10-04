@@ -1,10 +1,69 @@
-use determa_state::{
-    create, dispatch, load_bundle, string_from_utf16, AggregateState, Bindings, CoreResult,
-    Counter, Delivery, Disposition, Emission, Envelope, ResultStatus, RuntimeStatus, Target, Value,
+use super::model::{Bindings, Delivery, Envelope, Target};
+use super::runtime::{
+    create_native_aggregate, step_native_aggregate, ComponentRuntime, CoreResult, Disposition,
+    Emission, FaultRecord, NativeAggregate, OwnedRuntime, ResultStatus, RuntimeRelation,
+    RuntimeState, RuntimeStatus,
 };
+use super::{load_bundle, Counter};
+use crate::{string_from_utf16, InstanceReference, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+impl Emission {
+    fn envelope(&self) -> Option<Envelope> {
+        Some(Envelope {
+            event: self.event.clone(),
+            event_id: self.event_id.clone()?,
+            target: self.target.clone(),
+            payload: self.payload.clone(),
+            correlation_id: self.correlation_id.clone(),
+        })
+    }
+}
+
+impl RuntimeState {
+    fn visible_variables(&self) -> BTreeMap<String, Value> {
+        let scope = self
+            .config()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "root".to_string());
+        let mut values = BTreeMap::new();
+        let mut current = Some(scope);
+        while let Some(path) = current {
+            for slot in self
+                .variables
+                .values()
+                .filter(|slot| slot.declaration_path == path)
+            {
+                values
+                    .entry(slot.name.clone())
+                    .or_insert_with(|| slot.value.clone());
+            }
+            current = self.definition.states[&path].parent.clone();
+        }
+        values
+    }
+}
+
+fn runtime_create(
+    bundle: &super::Bundle,
+    machine_id: &str,
+    root_instance_id: &str,
+    creation_id: &str,
+    bindings: &Bindings,
+) -> CoreResult {
+    create_native_aggregate(bundle, machine_id, root_instance_id, creation_id, bindings)
+}
+
+fn runtime_dispatch(
+    bundle: &super::Bundle,
+    prior: &NativeAggregate,
+    delivery: Option<Delivery>,
+) -> CoreResult {
+    step_native_aggregate(bundle, prior, delivery)
+}
 
 fn core_directory() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -14,14 +73,25 @@ fn core_directory() -> PathBuf {
 }
 
 #[test]
-fn all_format_1_core_cases() {
+fn all_75_format_1_runtime_scenarios() {
+    // These mailbox-neutral traces exercise the same private RTC kernel used by the
+    // sole queue-bearing public API. Queue admission and persistence are covered by
+    // the native schema-v2 vectors rather than adapted inside this driver.
     let mut cases = fs::read_dir(core_directory())
         .expect("conformance submodule is initialized")
         .map(|entry| entry.expect("case entry").path())
         .filter(|path| path.is_dir())
         .collect::<Vec<_>>();
     cases.sort();
-    assert_eq!(cases.len(), 111, "expected the complete merged core suite");
+    cases.retain(|path| {
+        let test = parse_yaml(&fs::read_to_string(path.join("test.yaml")).unwrap()).unwrap();
+        test.get("steps").is_some() || test.get("create").is_some()
+    });
+    assert_eq!(
+        cases.len(),
+        75,
+        "expected every authoritative runtime scenario"
+    );
     let mut failures = Vec::new();
     for case in cases {
         if let Err(error) = run_case(&case) {
@@ -98,11 +168,11 @@ fn run_case(case: &Path) -> Result<(), String> {
         let expected = create_spec
             .and_then(|create| create.get("expect"))
             .ok_or_else(|| "invalid-Unicode create lacks expectation".to_string())?;
-        let result = create(&bundle, machine_id, "", &creation_id, &bindings);
+        let result = runtime_create(&bundle, machine_id, "", &creation_id, &bindings);
         check_result(&result, expected, None, None)?;
         return Ok(());
     }
-    let mut result = create(
+    let mut result = runtime_create(
         &bundle,
         machine_id,
         &root_instance_id,
@@ -177,7 +247,7 @@ fn run_case(case: &Path) -> Result<(), String> {
                     bundle.clone()
                 };
             (
-                dispatch(
+                runtime_dispatch(
                     &dispatch_bundle,
                     &state,
                     Some(Delivery::Input(envelope.clone())),
@@ -209,14 +279,14 @@ fn run_case(case: &Path) -> Result<(), String> {
                 apply_envelope_replacement(&mut envelope, replace, &state)?;
             }
             (
-                dispatch(&bundle, &state, Some(Delivery::Internal(envelope.clone()))),
+                runtime_dispatch(&bundle, &state, Some(Delivery::Internal(envelope.clone()))),
                 Some(envelope),
                 state.clone(),
             )
         } else if let Some(inspect) = step.get("inspect") {
             let mut corrupted = state.clone();
             apply_prior_state_corruption(&mut corrupted, inspect)?;
-            (dispatch(&bundle, &corrupted, None), None, corrupted)
+            (runtime_dispatch(&bundle, &corrupted, None), None, corrupted)
         } else {
             return Err(format!(
                 "step {step_index} has no send, deliver, or inspect"
@@ -250,7 +320,7 @@ fn run_case(case: &Path) -> Result<(), String> {
 }
 
 fn resolve_driver_target(
-    state: &AggregateState,
+    state: &NativeAggregate,
     selector: &serde_json::Value,
     default_root: bool,
 ) -> Result<Target, String> {
@@ -292,9 +362,9 @@ fn resolve_driver_target(
 }
 
 fn collect_components<'a>(
-    runtime: &'a determa_state::format1::RuntimeState,
+    runtime: &'a RuntimeState,
     component_id: &str,
-    matches: &mut Vec<&'a determa_state::format1::ComponentRuntime>,
+    matches: &mut Vec<&'a ComponentRuntime>,
 ) {
     for component in &runtime.components {
         if component.component_id == component_id {
@@ -310,7 +380,7 @@ fn collect_components<'a>(
 fn apply_envelope_replacement(
     envelope: &mut Envelope,
     replacement: &serde_json::Value,
-    state: &AggregateState,
+    state: &NativeAggregate,
 ) -> Result<(), String> {
     let replacement = replacement
         .as_object()
@@ -371,7 +441,7 @@ fn required_string<'a>(value: &'a serde_json::Value, name: &str) -> Result<&'a s
 }
 
 fn apply_prior_state_corruption(
-    state: &mut AggregateState,
+    state: &mut NativeAggregate,
     inspect: &serde_json::Value,
 ) -> Result<(), String> {
     let corruption = inspect
@@ -480,7 +550,7 @@ fn check_result(
     result: &CoreResult,
     expected: &serde_json::Value,
     supplied_envelope: Option<&Envelope>,
-    prior_state: Option<&AggregateState>,
+    prior_state: Option<&NativeAggregate>,
 ) -> Result<(), String> {
     let expected = expected
         .as_object()
@@ -505,7 +575,9 @@ fn check_result(
     {
         let actual = result.disposition.map(|value| match value {
             Disposition::Handled => "handled",
+            Disposition::Deferred => "deferred",
             Disposition::Unhandled => "unhandled",
+            Disposition::NotRunnable => "not_runnable",
             Disposition::Rejected => "rejected",
             Disposition::Faulted => "faulted",
         });
@@ -533,12 +605,9 @@ fn check_result(
         prior_state.ok_or_else(|| "caller ownership asserted without prior state".to_string())?;
         if !matches!(
             result.disposition,
-            Some(Disposition::Rejected | Disposition::Faulted)
+            Some(Disposition::Deferred | Disposition::Rejected | Disposition::Faulted)
         ) {
-            return Err(
-                "caller input ownership asserted for a non-rejected, non-faulted dispatch"
-                    .to_string(),
-            );
+            return Err("caller input ownership asserted for a consuming dispatch".to_string());
         }
     }
     if expected
@@ -656,7 +725,7 @@ fn check_result(
 fn check_emissions(
     result: &CoreResult,
     expected: &serde_json::Map<String, serde_json::Value>,
-    state: Option<&AggregateState>,
+    state: Option<&NativeAggregate>,
 ) -> Result<(), String> {
     let Some(expected) = expected.get("emissions") else {
         return Ok(());
@@ -733,11 +802,11 @@ fn check_emissions(
     Ok(())
 }
 
-fn compare_components(state: &AggregateState, expected: &serde_json::Value) -> Result<(), String> {
+fn compare_components(state: &NativeAggregate, expected: &serde_json::Value) -> Result<(), String> {
     compare_runtime_components(&state.root, expected, state)
 }
 
-fn compare_owned(state: &AggregateState, expected: &serde_json::Value) -> Result<(), String> {
+fn compare_owned(state: &NativeAggregate, expected: &serde_json::Value) -> Result<(), String> {
     let expected = expected
         .as_array()
         .ok_or_else(|| "owned_instances expectation is not a list".to_string())?;
@@ -791,9 +860,9 @@ fn compare_owned(state: &AggregateState, expected: &serde_json::Value) -> Result
 }
 
 fn compare_runtime(
-    runtime: &determa_state::format1::RuntimeState,
+    runtime: &RuntimeState,
     expected: &serde_json::Value,
-    aggregate: &AggregateState,
+    aggregate: &NativeAggregate,
 ) -> Result<(), String> {
     let expected = expected
         .as_object()
@@ -833,9 +902,9 @@ fn compare_runtime(
 }
 
 fn compare_runtime_components(
-    runtime: &determa_state::format1::RuntimeState,
+    runtime: &RuntimeState,
     expected: &serde_json::Value,
-    aggregate: &AggregateState,
+    aggregate: &NativeAggregate,
 ) -> Result<(), String> {
     let expected = expected
         .as_object()
@@ -863,9 +932,9 @@ fn compare_runtime_components(
 }
 
 fn compare_runtime_owned(
-    runtime: &determa_state::format1::RuntimeState,
+    runtime: &RuntimeState,
     expected: &serde_json::Value,
-    aggregate: &AggregateState,
+    aggregate: &NativeAggregate,
 ) -> Result<(), String> {
     let expected = expected
         .as_array()
@@ -905,10 +974,7 @@ fn compare_runtime_owned(
     Ok(())
 }
 
-fn compare_history(
-    runtime: &determa_state::format1::RuntimeState,
-    expected: &serde_json::Value,
-) -> Result<(), String> {
+fn compare_history(runtime: &RuntimeState, expected: &serde_json::Value) -> Result<(), String> {
     let actual = runtime
         .history
         .iter()
@@ -948,10 +1014,7 @@ fn compare_history(
     Ok(())
 }
 
-fn collect_owned<'a>(
-    runtime: &'a determa_state::format1::RuntimeState,
-    collected: &mut Vec<&'a determa_state::format1::OwnedRuntime>,
-) {
+fn collect_owned<'a>(runtime: &'a RuntimeState, collected: &mut Vec<&'a OwnedRuntime>) {
     for component in &runtime.components {
         collect_owned(&component.runtime, collected);
     }
@@ -962,10 +1025,10 @@ fn collect_owned<'a>(
 }
 
 fn resolve_owned_key<'a>(
-    state: &AggregateState,
-    actual: &[&'a determa_state::format1::OwnedRuntime],
+    state: &NativeAggregate,
+    actual: &[&'a OwnedRuntime],
     key: &serde_json::Value,
-) -> Result<&'a determa_state::format1::OwnedRuntime, String> {
+) -> Result<&'a OwnedRuntime, String> {
     if let Some(variable) = key
         .get("bound_instance")
         .and_then(serde_json::Value::as_str)
@@ -1016,10 +1079,10 @@ fn resolve_owned_key<'a>(
 }
 
 fn resolve_direct_owned_key<'a>(
-    state: &AggregateState,
-    owner: &'a determa_state::format1::RuntimeState,
+    state: &NativeAggregate,
+    owner: &'a RuntimeState,
     key: &serde_json::Value,
-) -> Result<&'a determa_state::format1::OwnedRuntime, String> {
+) -> Result<&'a OwnedRuntime, String> {
     let actual = owner.owned_instances.iter().collect::<Vec<_>>();
     resolve_owned_key(state, &actual, key).and_then(|owned| {
         (relation_owner_runtime_id(&owned.runtime.relation) == Some(owner.runtime_id.as_str()))
@@ -1029,7 +1092,7 @@ fn resolve_direct_owned_key<'a>(
 }
 
 fn resolve_runtime_notation(
-    state: &AggregateState,
+    state: &NativeAggregate,
     notation: &serde_json::Value,
 ) -> Result<String, String> {
     if notation.as_str() == Some("root") {
@@ -1053,10 +1116,7 @@ fn resolve_runtime_notation(
     Err(format!("unsupported runtime notation {notation:?}"))
 }
 
-fn find_runtime_by_id<'a>(
-    runtime: &'a determa_state::format1::RuntimeState,
-    runtime_id: &str,
-) -> Option<&'a determa_state::format1::RuntimeState> {
+fn find_runtime_by_id<'a>(runtime: &'a RuntimeState, runtime_id: &str) -> Option<&'a RuntimeState> {
     if runtime.runtime_id == runtime_id {
         return Some(runtime);
     }
@@ -1073,31 +1133,26 @@ fn find_runtime_by_id<'a>(
     None
 }
 
-fn relation_owner_runtime_id(relation: &determa_state::format1::RuntimeRelation) -> Option<&str> {
+fn relation_owner_runtime_id(relation: &RuntimeRelation) -> Option<&str> {
     match relation {
-        determa_state::format1::RuntimeRelation::Root => None,
-        determa_state::format1::RuntimeRelation::Component {
+        RuntimeRelation::Root => None,
+        RuntimeRelation::Component {
             owner_runtime_id, ..
         }
-        | determa_state::format1::RuntimeRelation::Spawned {
+        | RuntimeRelation::Spawned {
             owner_runtime_id, ..
         } => Some(owner_runtime_id),
     }
 }
 
-fn runtime_target(
-    state: &AggregateState,
-    runtime: &determa_state::format1::RuntimeState,
-) -> Target {
+fn runtime_target(state: &NativeAggregate, runtime: &RuntimeState) -> Target {
     match &runtime.relation {
-        determa_state::format1::RuntimeRelation::Root => Target::Root {
+        RuntimeRelation::Root => Target::Root {
             root_instance_id: state.root_instance_id.clone(),
             root_runtime_id: runtime.runtime_id.clone(),
         },
-        determa_state::format1::RuntimeRelation::Spawned { reference, .. } => {
-            Target::SpawnedInstance(reference.clone())
-        }
-        determa_state::format1::RuntimeRelation::Component {
+        RuntimeRelation::Spawned { reference, .. } => Target::SpawnedInstance(reference.clone()),
+        RuntimeRelation::Component {
             owner_runtime_id,
             component_id,
             activation_sequence,
@@ -1115,7 +1170,7 @@ fn runtime_target(
 fn compare_variable_map(
     actual: &BTreeMap<String, Value>,
     expected: &serde_json::Value,
-    runtime: &determa_state::format1::RuntimeState,
+    runtime: &RuntimeState,
 ) -> Result<(), String> {
     let expected = expected
         .as_object()
@@ -1133,7 +1188,7 @@ fn compare_variable_map(
 fn compare_partial_map(
     actual: &BTreeMap<String, Value>,
     expected: &serde_json::Value,
-    runtime: Option<&determa_state::format1::RuntimeState>,
+    runtime: Option<&RuntimeState>,
 ) -> Result<(), String> {
     let expected = expected
         .as_object()
@@ -1151,7 +1206,7 @@ fn compare_partial_map(
 fn compare_value(
     actual: &Value,
     expected: &serde_json::Value,
-    runtime: Option<&determa_state::format1::RuntimeState>,
+    runtime: Option<&RuntimeState>,
 ) -> Result<(), String> {
     if expected
         .get("normalized_double")
@@ -1230,7 +1285,7 @@ fn compare_value(
 fn compare_target(
     actual: &Target,
     expected: &serde_json::Value,
-    state: Option<&AggregateState>,
+    state: Option<&NativeAggregate>,
     emitting_runtime_id: Option<&str>,
     emitting_owner_runtime_id: Option<&str>,
 ) -> Result<(), String> {
@@ -1312,10 +1367,7 @@ fn compare_target(
     Err(format!("unsupported target expectation {expected:?}"))
 }
 
-fn compare_fault(
-    actual: &determa_state::FaultRecord,
-    expected: &serde_json::Value,
-) -> Result<(), String> {
+fn compare_fault(actual: &FaultRecord, expected: &serde_json::Value) -> Result<(), String> {
     if let Some(code) = expected.get("code").and_then(serde_json::Value::as_str) {
         if actual.code != code {
             return Err(format!("fault code {:?} != {code:?}", actual.code));
@@ -1347,9 +1399,9 @@ fn compare_fault(
 }
 
 fn find_reference<'a>(
-    runtime: &'a determa_state::format1::RuntimeState,
-    reference: &determa_state::InstanceReference,
-) -> Option<&'a determa_state::format1::RuntimeState> {
+    runtime: &'a RuntimeState,
+    reference: &InstanceReference,
+) -> Option<&'a RuntimeState> {
     for owned in &runtime.owned_instances {
         if owned.reference == *reference {
             return Some(&owned.runtime);
@@ -1460,7 +1512,7 @@ fn value_from_fixture(value: &serde_json::Value) -> Result<Value, String> {
     }
 }
 
-fn aggregate_exact_equal(left: &AggregateState, right: &AggregateState) -> bool {
+fn aggregate_exact_equal(left: &NativeAggregate, right: &NativeAggregate) -> bool {
     if !runtime_values_exact_equal(&left.root, &right.root) {
         return false;
     }
@@ -1471,10 +1523,7 @@ fn aggregate_exact_equal(left: &AggregateState, right: &AggregateState) -> bool 
     left == right
 }
 
-fn runtime_values_exact_equal(
-    left: &determa_state::format1::RuntimeState,
-    right: &determa_state::format1::RuntimeState,
-) -> bool {
+fn runtime_values_exact_equal(left: &RuntimeState, right: &RuntimeState) -> bool {
     left.variables.len() == right.variables.len()
         && left.variables.iter().all(|(key, left)| {
             right
@@ -1496,7 +1545,7 @@ fn runtime_values_exact_equal(
             .all(|(left, right)| runtime_values_exact_equal(&left.runtime, &right.runtime))
 }
 
-fn scrub_runtime_values(runtime: &mut determa_state::format1::RuntimeState) {
+fn scrub_runtime_values(runtime: &mut RuntimeState) {
     for slot in runtime.variables.values_mut() {
         slot.value = Value::Null;
     }
@@ -1631,7 +1680,7 @@ machines:
 "#,
     )
     .expect("focused driver bundle loads");
-    let state = create(
+    let state = runtime_create(
         &bundle,
         "owner",
         "owner-1",
