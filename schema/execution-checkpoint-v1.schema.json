@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://determa.dev/state/schema/execution-checkpoint-v2.schema.json",
+  "$id": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json",
   "title": "Determa State portable execution checkpoint",
   "description": "Closed durable-host checkpoint for the sole supported queue-bearing aggregate artifact.",
   "$ref": "#/$defs/executionCheckpoint",
@@ -113,7 +113,7 @@
           "const": "faulted"
         },
         "fault": {
-          "$ref": "aggregate-state-v2.schema.json#/$defs/fault"
+          "$ref": "aggregate-state-v1.schema.json#/$defs/fault"
         },
         "rejection": {
           "type": "null"
@@ -209,7 +209,7 @@
       "additionalProperties": false,
       "properties": {
         "migration_audit_record_schema_version": {
-          "const": 2
+          "const": 1
         },
         "root_instance_id": {
           "$ref": "#/$defs/nonEmptyString"
@@ -402,7 +402,7 @@
               "type": "null"
             },
             {
-              "$ref": "aggregate-state-v2.schema.json#/$defs/fault"
+              "$ref": "aggregate-state-v1.schema.json#/$defs/fault"
             }
           ]
         },
@@ -428,7 +428,7 @@
           "then": {
             "properties": {
               "fault": {
-                "$ref": "aggregate-state-v2.schema.json#/$defs/fault"
+                "$ref": "aggregate-state-v1.schema.json#/$defs/fault"
               }
             }
           },
@@ -739,7 +739,7 @@
           "$ref": "#/$defs/sha256"
         },
         "request_digest_domain": {
-          "const": "determa-inbox-envelope-digest-2"
+          "const": "determa-inbox-envelope-digest-1"
         },
         "acceptance_sequence": {
           "$ref": "#/$defs/canonicalDecimal"
@@ -770,7 +770,7 @@
           "const": "retained"
         },
         "aggregate_state": {
-          "$ref": "aggregate-state-v2.schema.json"
+          "$ref": "aggregate-state-v1.schema.json"
         }
       }
     },
@@ -809,7 +809,7 @@
           "const": "determa.execution_checkpoint"
         },
         "execution_checkpoint_schema_version": {
-          "const": 2
+          "const": 1
         },
         "root_instance_id": {
           "$ref": "#/$defs/nonEmptyString"
@@ -1090,7 +1090,7 @@
                 "type": "string"
               },
               {
-                "$ref": "aggregate-state-v2.schema.json#/$defs/typedValue"
+                "$ref": "aggregate-state-v1.schema.json#/$defs/typedValue"
               }
             ],
             "minItems": 2,

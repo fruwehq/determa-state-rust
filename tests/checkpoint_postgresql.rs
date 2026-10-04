@@ -18,11 +18,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
-fn postgresql_shared_application_transaction_runs_every_native_v2_variant() {
+fn postgresql_shared_application_transaction_runs_every_native_v1_variant() {
     let Some(base_url) = postgresql_url() else {
         return;
     };
-    let url = isolated_schema_url(&base_url, "native_v2");
+    let url = isolated_schema_url(&base_url, "native_v1");
     let concrete = Arc::new(
         PostgresqlExecutionStore::connect_no_tls(&url, DurableStoreMode::bounded()).unwrap(),
     );
@@ -37,12 +37,12 @@ fn postgresql_shared_application_transaction_runs_every_native_v2_variant() {
         })
         .unwrap();
 
-    let core = Path::new("conformance-suite/conformance/core/117-version2-mailboxes");
+    let core = Path::new("conformance-suite/conformance/core/117-version1-mailboxes");
     let bundle = load_bundle(&fs::read_to_string(core.join("machine.yaml")).unwrap()).unwrap();
     let outbox_bundle = load_bundle(
         r#"
 format: 1
-namespace: test.postgresql_native_v2
+namespace: test.postgresql_native_v1
 events:
   published: { direction: output, payload: {} }
 machines:
@@ -56,7 +56,7 @@ machines:
     let terminal_bundle = load_bundle(
         r#"
 format: 1
-namespace: test.postgresql_native_v2_terminal
+namespace: test.postgresql_native_v1_terminal
 machines:
   - machine_id: terminal
     root:
@@ -168,7 +168,7 @@ machines:
                     request: &PruneRequest {
                         cutoff_receipt_sequence: "4".to_string(),
                         target_mode: "bounded".to_string(),
-                        policy_identifier: Some("postgresql-native-v2-test".to_string()),
+                        policy_identifier: Some("postgresql-native-v1-test".to_string()),
                         dependency_receipt_sequences: Vec::new(),
                         dependency_effect_ids: Vec::new(),
                     },
@@ -499,8 +499,8 @@ fn input_delivery(
     });
     let root_instance_id = checkpoint.root_instance_id();
     let bytes = serde_json_canonicalizer::to_vec(&json!([
-        "determa-inbox-envelope-digest-2",
-        "2",
+        "determa-inbox-envelope-digest-1",
+        "1",
         root_instance_id,
         "input",
         envelope
@@ -535,7 +535,7 @@ fn retention() -> Value {
     json!({
         "mode": "bounded",
         "permanent_replay_eligible": false,
-        "policy_identifier": "postgresql-native-v2-test",
+        "policy_identifier": "postgresql-native-v1-test",
         "pruned_through_receipt_sequence": null
     })
 }

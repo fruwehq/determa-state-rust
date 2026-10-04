@@ -12,7 +12,7 @@ mod runtime;
 mod runtime_conformance;
 mod source;
 pub(crate) mod strict_json;
-pub(crate) mod v2;
+pub(crate) mod v1;
 
 pub use compile::{Bundle, SemanticError};
 pub use contracts::{validate_artifact, validate_contract_artifact};
@@ -20,7 +20,7 @@ pub use counter::Counter;
 pub use migration::{MigrationRequest, ResourceLimits};
 pub use model::{Bindings, DefinitionBinding, IdentityOrigin, MachineIdentity, Target};
 pub use native::{PersistenceError, PersistenceErrorCode, TypedValue};
-pub use package::{restore_package_v2 as restore_package, RestoredPackageV2 as RestoredPackage};
+pub use package::{restore_package_v1 as restore_package, RestoredPackageV1 as RestoredPackage};
 pub use persistence::{
     DefinitionResolver, InMemoryDefinitionResolver, MigrationArtifactResolver, ResolvedDefinition,
     ResolvedMigrationDescriptor,
@@ -30,10 +30,10 @@ pub use runtime::{
     NativeAggregate as Aggregate,
 };
 pub use source::{load_bundle, load_bundle_from_json, parse_document, LoadError, LoadErrorCode};
-pub use v2::{
-    admit_v2 as admit, create_v2 as create, migrate_aggregate_v2 as migrate_aggregate,
-    migrate_aggregate_v2_route as migrate_aggregate_route,
-    restore_aggregate_v2 as restore_aggregate, step_v2 as step,
-    validate_migration_descriptor_v2 as validate_migration_descriptor, AdmissionDelivery,
-    QueueEnvelope, Version2Error as ArtifactError,
+pub use v1::{
+    admit_v1 as admit, create_v1 as create, migrate_aggregate_v1 as migrate_aggregate,
+    migrate_aggregate_v1_route as migrate_aggregate_route,
+    restore_aggregate_v1 as restore_aggregate, step_v1 as step,
+    validate_migration_descriptor_v1 as validate_migration_descriptor, AdmissionDelivery,
+    QueueEnvelope, Version1Error as ArtifactError,
 };

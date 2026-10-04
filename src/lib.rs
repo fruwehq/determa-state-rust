@@ -13,10 +13,10 @@ pub mod format1;
 pub mod value;
 
 /// Exact normative specification revision implemented by this crate.
-pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "6796b554b976627c68fc746ec5629629aaf2b38e";
+pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "6bd25e3fcdf068af861aa289903a8489bd8f0139";
 
 /// Exact core conformance revision exercised by this crate.
-pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "a586417292d0a5cac8d07e1164669688c407a7e1";
+pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "710d5e9bcf517e8a8cc8d7087123bda37a362d6b";
 
 pub use format1::{
     admit, create, load_bundle, load_bundle_from_json, migrate_aggregate, migrate_aggregate_route,

@@ -8,8 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: 1
-  SPECIFICATION_COMMIT: 6796b554b976627c68fc746ec5629629aaf2b38e
-  CONFORMANCE_COMMIT: a586417292d0a5cac8d07e1164669688c407a7e1
+  SPECIFICATION_COMMIT: 6bd25e3fcdf068af861aa289903a8489bd8f0139
+  CONFORMANCE_COMMIT: 710d5e9bcf517e8a8cc8d7087123bda37a362d6b
 
 jobs:
   msrv:
@@ -93,17 +93,19 @@ jobs:
           test "$(git -C conformance-suite rev-parse HEAD)" = "$CONFORMANCE_COMMIT"
           test "$(git -C authoritative-spec rev-parse HEAD)" = "$SPECIFICATION_COMMIT"
           cmp schema/machine.schema.json authoritative-spec/schema/machine.schema.json
-          cmp schema/aggregate-state-v2.schema.json authoritative-spec/schema/aggregate-state-v2.schema.json
-          cmp schema/aggregate-state-package-v2.schema.json authoritative-spec/schema/aggregate-state-package-v2.schema.json
-          cmp schema/migration-descriptor-v2.schema.json authoritative-spec/schema/migration-descriptor-v2.schema.json
-          cmp schema/core-step-result-v2.schema.json authoritative-spec/schema/core-step-result-v2.schema.json
-          cmp schema/execution-checkpoint-v2.schema.json authoritative-spec/schema/execution-checkpoint-v2.schema.json
-          cmp schema/durable-host-call-log-v2.schema.json conformance-suite/scripts/schemas/durable-host-call-log-v2.schema.json
-          cmp schema/durable-host-inputs-v2.schema.json conformance-suite/scripts/schemas/durable-host-inputs-v2.schema.json
-          cmp schema/durable-host-results-v2.schema.json conformance-suite/scripts/schemas/durable-host-results-v2.schema.json
-          cmp schema/durable-host-store-v2.schema.json conformance-suite/scripts/schemas/durable-host-store-v2.schema.json
-          cmp schema/version2-operation-inputs.schema.json conformance-suite/scripts/schemas/version2-operation-inputs.schema.json
-          cmp schema/version2-operation-result.schema.json conformance-suite/scripts/schemas/version2-operation-result.schema.json
+          cmp schema/aggregate-state-v1.schema.json authoritative-spec/schema/aggregate-state-v1.schema.json
+          cmp schema/aggregate-state-package-v1.schema.json authoritative-spec/schema/aggregate-state-package-v1.schema.json
+          cmp schema/migration-descriptor-v1.schema.json authoritative-spec/schema/migration-descriptor-v1.schema.json
+          cmp schema/core-step-result-v1.schema.json authoritative-spec/schema/core-step-result-v1.schema.json
+          cmp schema/execution-checkpoint-v1.schema.json authoritative-spec/schema/execution-checkpoint-v1.schema.json
+          cmp schema/durable-host-call-log-v1.schema.json conformance-suite/scripts/schemas/durable-host-call-log-v1.schema.json
+          cmp schema/durable-host-inputs-v1.schema.json conformance-suite/scripts/schemas/durable-host-inputs-v1.schema.json
+          cmp schema/durable-host-results-v1.schema.json conformance-suite/scripts/schemas/durable-host-results-v1.schema.json
+          cmp schema/durable-host-responses-v1.schema.json conformance-suite/scripts/schemas/durable-host-responses-v1.schema.json
+          cmp schema/durable-host-store-v1.schema.json conformance-suite/scripts/schemas/durable-host-store-v1.schema.json
+          cmp schema/version1-operation-inputs.schema.json conformance-suite/scripts/schemas/version1-operation-inputs.schema.json
+          cmp schema/version1-operation-result.schema.json conformance-suite/scripts/schemas/version1-operation-result.schema.json
+          cmp schema/version1-operation-failures.schema.json conformance-suite/scripts/schemas/version1-operation-failures.schema.json
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-03
 
@@ -128,13 +130,13 @@ jobs:
       - name: Documentation tests
         run: cargo test --locked --doc
 
-      - name: All 162 native artifact/checkpoint schema-v2 vectors
-        run: cargo test --locked --test native_v2_conformance -- --nocapture
+      - name: All 162 native artifact/checkpoint schema-v1 vectors
+        run: cargo test --locked --test native_v1_conformance -- --nocapture
 
-      - name: All 381 declared artifact documents
+      - name: All 403 declared artifact documents
         run: cargo test --locked --test artifact_manifest -- --nocapture
 
-      - name: All 138 durable-host vectors
+      - name: All 142 durable-host vectors
         run: cargo test --locked --test durable_host_conformance -- --nocapture
 
   postgresql:

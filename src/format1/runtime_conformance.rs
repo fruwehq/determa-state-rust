@@ -76,7 +76,7 @@ fn core_directory() -> PathBuf {
 fn all_75_format_1_runtime_scenarios() {
     // These mailbox-neutral traces exercise the same private RTC kernel used by the
     // sole queue-bearing public API. Queue admission and persistence are covered by
-    // the native schema-v2 vectors rather than adapted inside this driver.
+    // the native schema-v1 vectors rather than adapted inside this driver.
     let mut cases = fs::read_dir(core_directory())
         .expect("conformance submodule is initialized")
         .map(|entry| entry.expect("case entry").path())

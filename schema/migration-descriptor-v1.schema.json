@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://determa.dev/state/schema/migration-descriptor-v2.schema.json",
+  "$id": "https://determa.dev/state/schema/migration-descriptor-v1.schema.json",
   "title": "Determa State aggregate migration descriptor",
   "description": "Closed declarative migration schema for the sole supported queue-bearing aggregate artifact.",
   "$ref": "#/$defs/migrationDescriptor",
@@ -484,7 +484,7 @@
           "const": "determa.aggregate_migration"
         },
         "migration_descriptor_schema_version": {
-          "const": 2
+          "const": 1
         },
         "source_machine_format": {
           "const": 1

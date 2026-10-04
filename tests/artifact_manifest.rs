@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[test]
-fn all_381_manifest_artifacts_receive_full_validation() {
+fn all_403_manifest_artifacts_receive_full_validation() {
     // Artifact validity is intentionally narrower than operation admissibility.
     // Valid operands that a later operation must reject are exercised by the 162
     // operation vectors through the corresponding public operation.
@@ -55,7 +55,7 @@ fn all_381_manifest_artifacts_receive_full_validation() {
             }
         }
     }
-    assert_eq!(count, 381, "artifact manifest entry count changed");
+    assert_eq!(count, 403, "artifact manifest entry count changed");
     assert!(
         failures.is_empty(),
         "{} artifact(s) failed validation:\n{}",
@@ -67,7 +67,7 @@ fn all_381_manifest_artifacts_receive_full_validation() {
 #[test]
 fn resealed_aggregate_with_unavailable_definition_is_rejected() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "conformance-suite/conformance/core/117-version2-mailboxes/spawn-isolation-aggregate.json",
+        "conformance-suite/conformance/core/117-version1-mailboxes/spawn-isolation-aggregate.json",
     );
     let mut aggregate: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     replace_fingerprints(
@@ -80,19 +80,100 @@ fn resealed_aggregate_with_unavailable_definition_is_rejected() {
         .unwrap()
         .remove("aggregate_state_digest");
     let bytes =
-        serde_json_canonicalizer::to_vec(&json!(["determa-aggregate-state-digest-2", unsigned]))
+        serde_json_canonicalizer::to_vec(&json!(["determa-aggregate-state-digest-1", unsigned]))
             .unwrap();
     aggregate["aggregate_state_digest"] = json!(format!("sha256:{:x}", Sha256::digest(bytes)));
     let source = serde_json_canonicalizer::to_vec(&aggregate).unwrap();
 
     let error = validate_artifact(
-        "aggregate_state_v2",
+        "aggregate_state_v1",
         &source,
         &InMemoryDefinitionResolver::default(),
         true,
     )
     .unwrap_err();
+    assert_eq!(error.code, "source_definition_unavailable", "{error:?}");
+}
+
+#[test]
+fn resealed_checkpoint_with_unavailable_definition_is_rejected() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-07-complete-host-contract/created-checkpoint-v1.json",
+    );
+    let mut checkpoint: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        checkpoint["operation_receipts"][0]["request_digest"],
+        creation_request_digest(&checkpoint)
+    );
+    replace_fingerprints(
+        &mut checkpoint,
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    );
+    let aggregate = &mut checkpoint["root_record"]["aggregate_state"];
+    seal_digest(
+        aggregate,
+        "aggregate_state_digest",
+        "determa-aggregate-state-digest-1",
+    );
+    checkpoint["operation_receipts"][0]["resulting_aggregate_state_digest"] =
+        aggregate["aggregate_state_digest"].clone();
+    checkpoint["operation_receipts"][0]["request_digest"] = creation_request_digest(&checkpoint);
+    seal_digest(
+        &mut checkpoint,
+        "execution_checkpoint_digest",
+        "determa-execution-checkpoint-digest-1",
+    );
+    let source = serde_json_canonicalizer::to_vec(&checkpoint).unwrap();
+    let error = determa_state::checkpoint::restore(&source, &InMemoryDefinitionResolver::default())
+        .unwrap_err();
+    assert_eq!(error.code, "invalid_execution_checkpoint", "{error:?}");
+    assert!(error.message.contains("required definition is unavailable"));
+}
+
+fn creation_request_digest(checkpoint: &Value) -> Value {
+    let aggregate = &checkpoint["root_record"]["aggregate_state"];
+    let material = json!([
+        "determa-creation-request-digest-1",
+        "1",
+        aggregate["validated_bundle_fingerprint"],
+        aggregate["namespace"],
+        aggregate["root_machine_id"],
+        aggregate["root_machine_version"],
+        aggregate["root_instance_id"],
+        aggregate["creation_id"],
+        ["map", [["external", ["map", []]], ["input", ["map", []]]]]
+    ]);
+    let bytes = serde_json_canonicalizer::to_vec(&material).unwrap();
+    json!(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+#[test]
+fn resealed_thin_package_with_unavailable_definition_is_rejected() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "conformance-suite/conformance/core/120-native-v1-definition-package/package-valid-package-v1.json",
+    );
+    let mut package: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    package["normalized_definitions"] = json!([]);
+    replace_fingerprints(
+        &mut package["aggregate_state"],
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    );
+    seal_digest(
+        &mut package["aggregate_state"],
+        "aggregate_state_digest",
+        "determa-aggregate-state-digest-1",
+    );
+    let source = serde_json_canonicalizer::to_vec(&package).unwrap();
+    let error = determa_state::restore_package(&source, &mut InMemoryDefinitionResolver::default())
+        .unwrap_err();
     assert_eq!(error.code, "source_definition_unavailable");
+}
+
+fn seal_digest(value: &mut Value, field: &str, domain: &str) {
+    let mut unsigned = value.clone();
+    unsigned.as_object_mut().unwrap().remove(field);
+    let bytes = serde_json_canonicalizer::to_vec(&json!([domain, unsigned])).unwrap();
+    value[field] = json!(format!("sha256:{:x}", Sha256::digest(bytes)));
 }
 
 fn replace_fingerprints(value: &mut Value, replacement: &str) {

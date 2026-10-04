@@ -4,20 +4,19 @@ Rust implementation of the portable [Determa State](https://github.com/fruwehq/d
 `format: 1` core with an optional synchronous portable execution-checkpoint host.
 
 Repository metadata prepares synchronized version `0.3.0` after the `v0.2.0` release.
-This version adds portable runtime-local event deferral, schema-version-2 aggregate
-artifacts, and durable checkpoint coverage. The implementation is validated against
+This version adds portable runtime-local event deferral, the sole current schema-v1
+aggregate artifacts, and durable checkpoint coverage. The implementation is validated against
 these exact normative inputs:
 
-- specification commit `6796b554b976627c68fc746ec5629629aaf2b38e`;
-- conformance commit `a586417292d0a5cac8d07e1164669688c407a7e1`.
+- specification commit `6bd25e3fcdf068af861aa289903a8489bd8f0139`;
+- conformance commit `710d5e9bcf517e8a8cc8d7087123bda37a362d6b`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 75 mailbox-neutral runtime traces through the shared private RTC kernel,
-all 162 applicable native artifact/checkpoint schema-v2 core vectors, and all 138
-durable-host vectors, plus semantic validation of all 381 declared artifact documents.
-Durable host profiles remain
-optional host contracts; memory, file, SQLite, and PostgreSQL tests exercise the
-implemented transactional host surface.
+all 162 applicable native artifact/checkpoint schema-v1 core vectors, and all 142
+durable-host vectors, plus semantic validation of all 403 declared artifact documents.
+Durable host profiles remain optional host contracts; memory, file, SQLite, and
+PostgreSQL tests exercise the implemented transactional host surface.
 
 ## Implemented core
 
@@ -34,7 +33,7 @@ implemented transactional host surface.
   model that owns runtime mailboxes and their allocation counters, with deterministic
   runtime, cause, event, and external-effect identities.
 - Portable aggregate serialization and restoration with strict typed values, canonical
-  JSON, content-addressed definitions, sole schema-v2 artifacts, and
+  JSON, content-addressed definitions, sole schema-v1 artifacts, and
   self-contained aggregate packages.
 - Resolver-backed compatible and transforming definition migration, exact route
   execution, resource limits, and ordered audit records.
@@ -63,6 +62,8 @@ concerns. The command-line binary still provides bundle validation only.
 The minimum supported Rust version (MSRV) is `1.86`. CI verifies the locked default and
 all-features dependency graph with that toolchain, including PostgreSQL compile and test
 coverage. Stable Rust remains the toolchain for formatting and clippy.
+The lockfile pins `chacha20` `0.10.2` because `0.10.1` was yanked; this
+allows clean consumers to resolve the optional PostgreSQL dependency graph.
 
 ```sh
 git submodule update --init
@@ -72,10 +73,10 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`a586417292d0a5cac8d07e1164669688c407a7e1`. CI also checks that all bundled schemas
+`710d5e9bcf517e8a8cc8d7087123bda37a362d6b`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
-`6796b554b976627c68fc746ec5629629aaf2b38e`. These exact merged commits are the
-authoritative release inputs; tag publication is a later coordinated release operation.
+`6bd25e3fcdf068af861aa289903a8489bd8f0139`. These exact reviewed public commits are
+the current implementation inputs; tag publication is a later coordinated release operation.
 
 ## Library
 
@@ -92,7 +93,7 @@ let aggregate = create(
     &Bindings::default(),
 )?;
 
-assert_eq!(aggregate.value()["aggregate_state_schema_version"], 2);
+assert_eq!(aggregate.value()["aggregate_state_schema_version"], 1);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -150,7 +151,7 @@ For shared application and checkpoint atomicity, use
 transaction for application SQL and accepts exactly one root-bound checkpoint mutation
 through `CheckpointHost::stage_postgresql_mutation`. The host uses `SERIALIZABLE`,
 rejects cross-store/cross-root handles, rolls both parts back on failure, and returns
-the committed host result only after commit succeeds. Native schema-v2 creation,
+the committed host result only after commit succeeds. Native schema-v1 creation,
 admission, step, maintenance migration, pruning, outbox lifecycle, and root
 tombstone mutations use this same shared transaction API. The store's lower-level
 native transaction callback does not run host operations.

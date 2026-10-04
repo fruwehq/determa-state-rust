@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/schemas/conformance/version1-operation-failures.schema.json",
+  "title": "Exact driver-normalized portable failure responses",
+  "type": "object",
+  "required": ["portable_failure_responses_format", "portable_failure_responses_schema_version", "responses"],
+  "additionalProperties": false,
+  "properties": {
+    "portable_failure_responses_format": { "const": "determa.conformance.portable_failure_responses" },
+    "portable_failure_responses_schema_version": { "const": 1 },
+    "responses": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]*$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["result", "code"],
+        "additionalProperties": false,
+        "properties": {
+          "result": { "const": "failure" },
+          "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+        }
+      }
+    }
+  }
+}

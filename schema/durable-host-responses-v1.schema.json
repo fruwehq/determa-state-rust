@@ -1,0 +1,504 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/schemas/conformance/durable-host-responses-v1.schema.json",
+  "title": "Complete driver-normalized durable host return values",
+  "type": "object",
+  "required": [
+    "durable_host_responses_format",
+    "durable_host_responses_schema_version",
+    "responses"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "durable_host_responses_format": {
+      "const": "determa.durable_host.responses"
+    },
+    "durable_host_responses_schema_version": {
+      "const": 1
+    },
+    "responses": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/response"
+      }
+    }
+  },
+  "$defs": {
+    "response": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "tombstoned"
+            },
+            "body": {
+              "type": "object",
+              "required": [
+                "result",
+                "tombstone"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "result": {
+                  "const": "tombstoned"
+                },
+                "tombstone": {
+                  "$ref": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json#/$defs/rootTombstone"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "creation"
+            },
+            "body": {
+              "type": "object",
+              "required": [
+                "result",
+                "receipt"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "result": {
+                  "const": "committed"
+                },
+                "receipt": {
+                  "$ref": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json#/$defs/creationReceipt"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "pending_outbox"
+            },
+            "body": {
+              "type": "object",
+              "required": [
+                "result",
+                "record"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "result": {
+                  "const": "committed"
+                },
+                "record": {
+                  "$ref": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json#/$defs/pendingOutboxIntent"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "terminal_outbox"
+            },
+            "body": {
+              "$ref": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json#/$defs/terminalOutboxRecord"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "registration"
+            },
+            "body": {
+              "$ref": "https://determa.dev/schemas/conformance/durable-host-inputs-v1.schema.json#/$defs/registration"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "resolution"
+            },
+            "body": {
+              "type": "object",
+              "required": [
+                "registration",
+                "configuration",
+                "requested_capabilities"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "registration": {
+                  "$ref": "https://determa.dev/schemas/conformance/durable-host-inputs-v1.schema.json#/$defs/registration"
+                },
+                "configuration": {
+                  "type": "object"
+                },
+                "requested_capabilities": {
+                  "$ref": "https://determa.dev/schemas/conformance/durable-host-inputs-v1.schema.json#/$defs/capabilities"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "capability_report"
+            },
+            "body": {
+              "type": "object",
+              "required": [
+                "adapter_identifier",
+                "host_profile",
+                "store_capabilities",
+                "host_guarantees",
+                "retention_mode",
+                "validated"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "adapter_identifier": {
+                  "$ref": "https://determa.dev/schemas/conformance/durable-host-inputs-v1.schema.json#/$defs/adapterScheme"
+                },
+                "host_profile": {
+                  "type": "string"
+                },
+                "store_capabilities": {
+                  "$ref": "https://determa.dev/schemas/conformance/durable-host-inputs-v1.schema.json#/$defs/capabilities"
+                },
+                "host_guarantees": {
+                  "$ref": "https://determa.dev/schemas/conformance/durable-host-inputs-v1.schema.json#/$defs/hostGuarantees"
+                },
+                "retention_mode": {
+                  "enum": [
+                    "permanent",
+                    "bounded"
+                  ]
+                },
+                "validated": {
+                  "const": true
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "scope_record"
+            },
+            "body": {
+              "$ref": "https://determa.dev/schemas/conformance/durable-host-inputs-v1.schema.json#/$defs/scopeRecord"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "adapter_reference"
+            },
+            "body": {
+              "type": "object",
+              "required": [
+                "adapter_identifier",
+                "uri",
+                "configuration",
+                "capabilities"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "adapter_identifier": {
+                  "$ref": "https://determa.dev/schemas/conformance/durable-host-inputs-v1.schema.json#/$defs/adapterScheme"
+                },
+                "uri": {
+                  "$ref": "https://determa.dev/schemas/conformance/durable-host-inputs-v1.schema.json#/$defs/adapterUri"
+                },
+                "configuration": {
+                  "type": "object"
+                },
+                "capabilities": {
+                  "$ref": "https://determa.dev/schemas/conformance/durable-host-inputs-v1.schema.json#/$defs/capabilities"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "typed_failure"
+            },
+            "body": {
+              "type": "object",
+              "required": [
+                "code"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "quarantine"
+            },
+            "body": {
+              "type": "object",
+              "required": [
+                "code",
+                "record"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$"
+                },
+                "record": {
+                  "$ref": "https://determa.dev/schemas/conformance/durable-host-store-v1.schema.json#/properties/quarantine"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "no_response"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "admission"
+            },
+            "body": {
+              "type": "object",
+              "required": [
+                "evidence"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "evidence": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "oneOf": [
+                      {
+                        "$ref": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                      },
+                      {
+                        "$ref": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json#/$defs/eventIdentityTombstone"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "processing"
+            },
+            "body": {
+              "type": "object",
+              "required": [
+                "core_result",
+                "receipt"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "core_result": {
+                  "$ref": "https://determa.dev/state/schema/core-step-result-v1.schema.json"
+                },
+                "receipt": {
+                  "$ref": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json#/$defs/terminalEventReceipt"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "persistence_commit"
+            },
+            "body": {
+              "type": "object",
+              "required": [
+                "core_result",
+                "receipt",
+                "migration_audit_records"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "core_result": {
+                  "$ref": "https://determa.dev/state/schema/core-step-result-v1.schema.json"
+                },
+                "receipt": {
+                  "$ref": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json#/$defs/terminalEventReceipt"
+                },
+                "migration_audit_records": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json#/$defs/migrationAuditRecord"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "host_acknowledgement"
+            },
+            "body": {
+              "type": "object",
+              "required": [
+                "result"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "result": {
+                  "enum": [
+                    "committed",
+                    "replayed",
+                    "validated",
+                    "released"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "body"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "retained_receipt"
+            },
+            "body": {
+              "$ref": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json#/$defs/terminalEventReceipt"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

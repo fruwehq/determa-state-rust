@@ -1,4 +1,6 @@
-use serde_json::{json, Value};
+#[cfg(any(test, feature = "sqlite", feature = "postgresql"))]
+use serde_json::json;
+use serde_json::Value;
 #[cfg(any(feature = "sqlite", feature = "postgresql"))]
 use sha2::{Digest, Sha256};
 use std::any::Any;
@@ -16,6 +18,22 @@ pub enum ExecutionStoreCapability {
     RootIdentityRetention,
     PermanentOutboxTerminalRetention,
     CompactEffectIdentityRetention,
+}
+
+impl ExecutionStoreCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ephemeral => "ephemeral",
+            Self::RestartPersistent => "restart_persistent",
+            Self::DurableSingleWriter => "durable_single_writer",
+            Self::DurableConcurrent => "durable_concurrent",
+            Self::SharedApplicationTransaction => "shared_application_transaction",
+            Self::PermanentReceiptRetention => "permanent_receipt_retention",
+            Self::RootIdentityRetention => "root_identity_retention",
+            Self::PermanentOutboxTerminalRetention => "permanent_outbox_terminal_retention",
+            Self::CompactEffectIdentityRetention => "compact_effect_identity_retention",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +115,7 @@ pub struct StoreRecord {
 
 impl StoreRecord {
     pub fn from_checkpoint(
-        checkpoint: &super::v2::ExecutionCheckpoint,
+        checkpoint: &super::v1::ExecutionCheckpoint,
     ) -> Result<Self, StoreError> {
         Ok(Self {
             root_instance_id: checkpoint.root_instance_id().to_string(),
@@ -288,6 +306,7 @@ impl std::error::Error for AdapterError {}
 #[derive(Default)]
 pub struct AdapterRegistry {
     factories: RwLock<BTreeMap<String, Arc<dyn ExecutionStoreFactory>>>,
+    descriptors: RwLock<BTreeMap<String, Value>>,
 }
 
 impl AdapterRegistry {
@@ -320,6 +339,59 @@ impl AdapterRegistry {
     pub fn identifiers(&self) -> Result<Vec<String>, AdapterError> {
         let factories = self.factories.read().map_err(|_| registry_poisoned())?;
         Ok(factories.keys().cloned().collect())
+    }
+
+    /// Register a closed public descriptor together with the factory it describes.
+    pub fn register_descriptor(
+        &self,
+        descriptor: Value,
+        factory: Arc<dyn ExecutionStoreFactory>,
+    ) -> Result<Value, AdapterError> {
+        let identifier = descriptor
+            .get("uri_scheme")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorCode::InvalidAdapterConfiguration,
+                    "URI scheme absent",
+                )
+            })?
+            .to_string();
+        self.register(&identifier, factory)?;
+        self.descriptors
+            .write()
+            .map_err(|_| registry_poisoned())?
+            .insert(identifier, descriptor.clone());
+        Ok(descriptor)
+    }
+
+    /// Resolve the configured factory and return its registered descriptor.
+    pub fn resolve_descriptor(
+        &self,
+        uri: &str,
+        configuration: &Value,
+        requested_capabilities: &BTreeSet<ExecutionStoreCapability>,
+    ) -> Result<Value, AdapterError> {
+        let identifier = extract_scheme(uri)?;
+        let descriptor = self
+            .descriptors
+            .read()
+            .map_err(|_| registry_poisoned())?
+            .get(identifier)
+            .cloned()
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorCode::UnknownAdapter,
+                    "adapter descriptor is not registered",
+                )
+            })?;
+        self.resolve_configured(
+            uri,
+            &descriptor["configuration_schema"],
+            configuration,
+            requested_capabilities,
+        )?;
+        Ok(descriptor)
     }
 
     pub fn resolve(
@@ -385,6 +457,19 @@ pub enum HostProfile {
     SharedApplicationTransaction,
 }
 
+impl HostProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DurableEmbeddedProcessing => "durable_embedded_processing",
+            Self::ExactlyOnceCommittedProcessing => "exactly_once_committed_processing",
+            Self::BrokerIntegrated => "broker_integrated",
+            Self::StrictDurableOutbox => "strict_durable_outbox",
+            Self::CompactDurableOutbox => "compact_durable_outbox",
+            Self::SharedApplicationTransaction => "shared_application_transaction",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HostFeature {
     AtomicCheckpointProcessing,
@@ -395,6 +480,21 @@ pub enum HostFeature {
     RetainUnresolvedOutbox,
     RetainReferencedEffectTombstones,
     NativeSharedApplicationTransaction,
+}
+
+impl HostFeature {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AtomicCheckpointProcessing => "atomic_accept_process",
+            Self::AcknowledgeAfterCheckpointCommit => "ingress_ack_after_commit",
+            Self::DurableRedelivery => "durable_redelivery",
+            Self::OutboxWorker => "outbox_worker",
+            Self::TotalOutboxLifecycle => "total_outbox_lifecycle",
+            Self::RetainUnresolvedOutbox => "retain_unresolved_outbox",
+            Self::RetainReferencedEffectTombstones => "retain_receipt_references",
+            Self::NativeSharedApplicationTransaction => "native_shared_transaction_used",
+        }
+    }
 }
 
 pub fn validate_store_host_profile(
@@ -459,7 +559,7 @@ pub fn validate_store_host_profile(
     }
 }
 
-#[cfg(any(feature = "sqlite", feature = "postgresql"))]
+#[cfg(feature = "sqlite")]
 pub(crate) fn parse_durable_store_configuration(
     configuration: &str,
 ) -> Result<(&str, DurableStoreMode), AdapterError> {
@@ -880,8 +980,8 @@ fn receipt_references_effect(checkpoint: &Value, effect_id: &str) -> bool {
 #[cfg(any(feature = "sqlite", feature = "postgresql"))]
 fn outbox_intent_digest(root_instance_id: &Value, intent: &Value) -> Result<Value, StoreError> {
     let bytes = serde_json_canonicalizer::to_vec(&json!([
-        "determa-outbox-intent-digest-2",
-        "2",
+        "determa-outbox-intent-digest-1",
+        "1",
         root_instance_id,
         intent
     ]))
