@@ -1,7 +1,7 @@
 use determa_state::{
-    admit, create, load_bundle, restore_aggregate, step, AdmissionDelivery, Bindings,
-    InMemoryDefinitionResolver, QueueEnvelope, TypedValue, FORMAT_1_CONFORMANCE_COMMIT,
-    FORMAT_1_SPECIFICATION_COMMIT,
+    admit, create, inspect_candidate, load_bundle, restore_aggregate, step, AdmissionDelivery,
+    Bindings, InMemoryDefinitionResolver, InspectionCapabilities, QueueEnvelope, TypedValue,
+    FORMAT_1_CONFORMANCE_COMMIT, FORMAT_1_SPECIFICATION_COMMIT,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -28,6 +28,49 @@ machines:
               transition_to: unlocked
         unlocked: {}
 "#;
+
+#[test]
+fn published_inspection_api_uses_exact_runtime_and_guard_identity() {
+    let bundle = load_bundle(MINIMAL).unwrap();
+    let aggregate = create(
+        &bundle,
+        "turnstile",
+        "turnstile-1",
+        "create-1",
+        &Bindings::default(),
+    )
+    .unwrap();
+    let runtime = &aggregate.value()["runtimes"][0];
+    let request = json!({
+        "mode":"semantic",
+        "aggregate_state_digest":aggregate.value()["aggregate_state_digest"],
+        "runtime_id":runtime["runtime_id"],
+        "runtime_incarnation":runtime["identity_origin"],
+        "envelope":{
+            "event":"coin","event_id":"candidate-1","cause_id":"candidate-1",
+            "source":{"host":true},"target":runtime["target_identity"],
+            "payload":["map",[["amount",["integer","100"]]]]
+        },
+        "limits":{"maximum_guard_evaluations":"1","maximum_evaluation_steps":"100"}
+    });
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let before = aggregate.canonical_bytes().unwrap();
+    let result = inspect_candidate(
+        &aggregate,
+        &request,
+        &resolver,
+        InspectionCapabilities::default(),
+    )
+    .unwrap();
+    assert_eq!(result["disposition"], "handled_now", "{result}");
+    assert_eq!(result["guard_evidence"][0]["value"], true);
+    assert_eq!(
+        result["guard_evidence"][0]["guard_locator"],
+        "/machines/0/root/states/locked/on_events/coin/guard"
+    );
+    assert_eq!(aggregate.canonical_bytes().unwrap(), before);
+}
 
 #[test]
 fn queue_bearing_public_operations_create_admit_step_and_restore() {
@@ -117,7 +160,7 @@ fn examples_and_revision_metadata_are_current() {
     );
     assert_eq!(
         FORMAT_1_CONFORMANCE_COMMIT,
-        "710d5e9bcf517e8a8cc8d7087123bda37a362d6b"
+        "c0e101c86bd71068669df3cd2250d4fec24ff74d"
     );
 }
 
