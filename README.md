@@ -3,13 +3,13 @@
 Rust implementation of the portable [Determa State](https://github.com/fruwehq/determa-state-spec)
 `format: 1` core with an optional synchronous portable execution-checkpoint host.
 
-Repository metadata prepares synchronized version `0.2.0`. The latest published crate
-remains `0.1.0` until the coordinated `v0.2.0` tag runs the release workflow. This
-branch is validated against the merged `0.2.0` metadata revisions at these exact
-normative inputs:
+Repository metadata prepares synchronized version `0.3.0` after the `v0.2.0` release.
+This version adds portable runtime-local event deferral, schema-version-2 aggregate
+artifacts, and durable checkpoint coverage. The implementation is validated against
+these exact normative inputs:
 
-- specification commit `ee38796d5e38e67e350a06548fd50faa530cbb12`;
-- conformance commit `99a4d9ad5256f7330e75b06d48f340cc7239a40d`.
+- specification commit `6796b554b976627c68fc746ec5629629aaf2b38e`;
+- conformance commit `a586417292d0a5cac8d07e1164669688c407a7e1`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 75 mailbox-neutral runtime traces through the shared private RTC kernel,
@@ -72,9 +72,9 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`99a4d9ad5256f7330e75b06d48f340cc7239a40d`. CI also checks that all bundled schemas
+`a586417292d0a5cac8d07e1164669688c407a7e1`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
-`ee38796d5e38e67e350a06548fd50faa530cbb12`. These exact merged commits are the
+`6796b554b976627c68fc746ec5629629aaf2b38e`. These exact merged commits are the
 authoritative release inputs; tag publication is a later coordinated release operation.
 
 ## Library
