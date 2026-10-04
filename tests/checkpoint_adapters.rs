@@ -23,6 +23,51 @@ fn memory_store_runs_the_native_v2_host_contract() {
 }
 
 #[test]
+fn empty_checkpoint_admission_is_malformed_without_mutation() {
+    let directory = Path::new("conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-01-native-lifecycle");
+    let bundle = load_bundle(&fs::read_to_string(directory.join("machine.yaml")).unwrap()).unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle.clone(), true);
+    let checkpoint = determa_state::checkpoint::restore(
+        &fs::read(directory.join("created-checkpoint-v2.json")).unwrap(),
+        &resolver,
+    )
+    .unwrap();
+    assert_eq!(
+        determa_state::checkpoint::admit(&bundle, &checkpoint, &[], Some("stale"), Some("stale"),)
+            .unwrap_err()
+            .code,
+        "malformed_delivery"
+    );
+    let store: Arc<dyn ExecutionStore> = Arc::new(MemoryExecutionStore::new());
+    store.initialize_schema().unwrap();
+    assert_eq!(
+        store
+            .insert_if_absent(StoreRecord::from_checkpoint(&checkpoint).unwrap())
+            .unwrap(),
+        StoreWriteResult::Committed
+    );
+    let host = CheckpointHost::new(store, Arc::new(resolver));
+    assert_eq!(
+        host.admit_checkpoint(
+            checkpoint.root_instance_id(),
+            &[],
+            &MutationGuard::new(checkpoint.revision(), checkpoint.digest()),
+        )
+        .unwrap_err()
+        .code,
+        "malformed_delivery"
+    );
+    assert_eq!(
+        host.load_checkpoint(checkpoint.root_instance_id())
+            .unwrap()
+            .unwrap()
+            .value(),
+        checkpoint.value()
+    );
+}
+
+#[test]
 fn file_store_runs_the_native_v2_host_contract_and_survives_restart() {
     let directory = temporary_path("file-native-v2");
     let store: Arc<dyn ExecutionStore> = Arc::new(FileExecutionStore::new(&directory).unwrap());

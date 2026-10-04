@@ -207,6 +207,9 @@ pub(super) fn checkpoint_admit_v2_with_optional_bundle(
     expected_revision: Option<&str>,
     expected_checkpoint_digest: Option<&str>,
 ) -> Result<Value, ArtifactError> {
+    if deliveries.is_empty() {
+        return Err(failure("malformed_delivery"));
+    }
     let tombstoned = checkpoint.value["root_record"]["status"] == "tombstone";
     let root_instance_id = checkpoint.value["root_instance_id"].as_str().unwrap();
     let parsed = deliveries
