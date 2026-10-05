@@ -220,6 +220,10 @@ fn child_variables(aggregate: &Value, child: &Value) -> Value {
     state(&projected)["variables"].clone()
 }
 pub fn observe_runtime_profile(payload: &Value) -> Value {
+    #[cfg(determa_repository_conformance)]
+    if payload["request"]["operation"] == "compile" {
+        return observe_compilation(payload);
+    }
     let request = &payload["request"];
     let root = Path::new(payload["profile_root"].as_str().unwrap());
     let closure = SourceClosure {
@@ -307,6 +311,29 @@ pub fn observe_runtime_profile(payload: &Value) -> Value {
             stage(&mut observation, "restore");
             observation["result"] = json!("accepted");
             counts(&mut observation, &providers);
+            return Ok(());
+        }
+        #[cfg(determa_repository_conformance)]
+        if request["operation"] == "create" {
+            let creation = &request["setup"]["create_request"];
+            let result = determa_state::format1::providers::repository_create_with_evidence(
+                &bundle,
+                creation["machine_id"].as_str().unwrap(),
+                creation["root_instance_id"].as_str().unwrap(),
+                creation["creation_id"].as_str().unwrap(),
+            )?;
+            stage(&mut observation, "create");
+            counts(&mut observation, &providers);
+            if observation["calls"]["actions"].as_u64().unwrap() > 0 {
+                stage(&mut observation, "evaluate_actions");
+                stage(&mut observation, "validate_output");
+            }
+            observation["state_after"] = state(&result["state"]);
+            observation["result"] = result["status"].clone();
+            if !result["fault"].is_null() {
+                observation["code"] = result["fault"]["code"].clone();
+                observation["value"] = json!({"boundary_code":"runtime_provider_output_invalid","source_locator":result["fault"]["source_locator"],"emissions":result["emissions"].as_array().unwrap().len(),"status":result["status"]});
+            }
             return Ok(());
         }
         if request["operation"] != "step" && request["operation"] != "inspect" {
@@ -409,7 +436,14 @@ pub fn observe_runtime_profile(payload: &Value) -> Value {
         stage(&mut observation, "admit");
         observation["state_before"] = state(aggregate.value());
         stage(&mut observation, "evaluate_cel");
+        #[cfg(not(determa_repository_conformance))]
         let processed = step(
+            &bundle,
+            &aggregate,
+            setup["target_runtime_id"].as_str().unwrap(),
+        )?;
+        #[cfg(determa_repository_conformance)]
+        let (processed, indexes) = determa_state::format1::providers::repository_step_with_indexes(
             &bundle,
             &aggregate,
             setup["target_runtime_id"].as_str().unwrap(),
@@ -501,6 +535,15 @@ pub fn observe_runtime_profile(payload: &Value) -> Value {
                 observation["value"]["component_ready_after_delivery"] =
                     json!(refreshed["ready_mailbox"].as_array().unwrap().len());
             }
+            #[cfg(determa_repository_conformance)]
+            if request["arguments"]["repeat_send"] == true
+                || request["arguments"]["mixed_send"] == true
+            {
+                observation["value"]["emission_identities"] = json!(processed["emissions"].as_array().unwrap().iter().zip(&indexes).map(|(item,index)| {
+                    if item.get("kind").is_some() { json!({"event_id":item["event_id"],"emission_index":item["emission_index"],"acceptance_sequence":item["acceptance_sequence"],"queue_sequence":item["queue_sequence"]}) }
+                    else { json!({"effect_id":item["effect_id"],"sequence":item["sequence"],"emission_index":index}) }
+                }).collect::<Vec<_>>());
+            }
             if request["arguments"]["capture_snapshot"] == true {
                 for provider in &providers {
                     let captured = provider.observation();
@@ -516,6 +559,212 @@ pub fn observe_runtime_profile(payload: &Value) -> Value {
     })();
     if let Err(error) = result {
         eprintln!("production error: {}: {}", error.code, error.message);
+        observation["code"] = json!(error.code);
+    }
+    json!({"observation":observation,"loaded_source":loaded,"loaded_closure_digest":closure.digest().unwrap()})
+}
+#[cfg(determa_repository_conformance)]
+fn observe_compilation(payload: &Value) -> Value {
+    use determa_state::format1::providers::take_compilation_stages;
+    use determa_state::{compile_language_source, load_bundle};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    fn typed(value: &Value) -> Value {
+        match value {
+            Value::Null => json!(["null"]),
+            Value::Bool(v) => json!(["boolean", v]),
+            Value::String(v) => json!(["string", v]),
+            Value::Number(v) => json!(["integer", v.to_string()]),
+            Value::Array(v) => json!(["list", v.iter().map(typed).collect::<Vec<_>>()]),
+            Value::Object(v) => json!([
+                "map",
+                v.iter()
+                    .map(|(k, v)| json!([k, typed(v)]))
+                    .collect::<Vec<_>>()
+            ]),
+        }
+    }
+    fn seal(value: &mut Value) {
+        value["artifact_digest"] = json!(format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                serde_json_canonicalizer::to_vec(&json!([
+                    value["artifact_format"],
+                    "1",
+                    typed(&value["content"])
+                ]))
+                .unwrap()
+            )
+        ));
+    }
+    let request = &payload["request"];
+    let args = &request["arguments"];
+    let root = Path::new(payload["profile_root"].as_str().unwrap());
+    let closure = SourceClosure {
+        root: root.into(),
+        paths: vec![
+            "provider/test_provider.py".into(),
+            "provider/test_provider.rs".into(),
+        ],
+        manifest: "provider-closure.json".into(),
+        domain: b"determa-test-runtime-provider-closure-1\0".to_vec(),
+    };
+    let mut observation = empty();
+    let mut loaded = json!({});
+    let compiler = Arc::new(provider::CompilerFixture {
+        calls: AtomicUsize::new(0),
+    });
+    take_compilation_stages();
+    let result = (|| -> ProviderResult<()> {
+        let mut source: Value = serde_json::from_slice(
+            &std::fs::read(root.join(args["source_file"].as_str().unwrap())).unwrap(),
+        )
+        .unwrap();
+        if let Some(value) = args.get("source_override") {
+            source["content"]["regions"][0]["source"] = value.clone();
+            seal(&mut source);
+        }
+        if let Some(slot) = args.get("invalid_slot") {
+            if slot == "metadata_guard" {
+                source["content"]["template"]["meta"] = json!({"guard":"true"});
+                source["content"]["regions"][0]["locator"] = json!("/meta/guard");
+            } else {
+                source["content"]["template"]["machines"][0]["root"]["variables"] =
+                    json!({"data":{"type":"map","init":{"action":[]}}});
+                source["content"]["regions"][0]["locator"] =
+                    json!("/machines/0/root/variables/data/init/action");
+                source["content"]["regions"][0]["kind"] = json!("actions");
+            }
+            seal(&mut source);
+        }
+        if let Some(value) = args.get("source_digest_override") {
+            source["artifact_digest"] = value.clone();
+        }
+        // The same production preflight runs with an empty registry: valid source
+        // reaches resolution but cannot invoke any compiler before host installation.
+        let preflight = compile_language_source(
+            &source,
+            RuntimeProviderRegistry::new(Arc::new(provider::Verifier {
+                trusted: true,
+                weak_compiler: false,
+            })),
+            None,
+            1000,
+        );
+        observation["stages"] = json!(take_compilation_stages());
+        if let Err(error) = preflight {
+            if error.code != "runtime_provider_unavailable" {
+                return Err(error);
+            }
+        }
+        closure.verify()?;
+        let installed = &request["installed"];
+        if installed["trusted"] != true
+            || installed["closure_digest"] != closure.digest()?
+            || installed["source_digest"] != closure.manifest_digest()?
+        {
+            return Err(unavailable());
+        }
+        let references = installed["providers"].as_array().ok_or_else(unavailable)?;
+        let mut registry = RuntimeProviderRegistry::new(Arc::new(provider::Verifier {
+            trusted: true,
+            weak_compiler: args["weak_compiler"] == true,
+        }));
+        for dependency in source["content"]["dependencies"].as_array().unwrap() {
+            if !references.contains(dependency)
+                || dependency["content_digest"] != closure.digest()?
+            {
+                return Err(unavailable());
+            }
+            registry.register_dependency(dependency.clone(), closure.clone())?;
+        }
+        for region in source["content"]["regions"].as_array().unwrap() {
+            let reference = &region["provider_reference"];
+            if !references.contains(reference) || reference["content_digest"] != closure.digest()? {
+                return Err(unavailable());
+            }
+            registry.register_compiler(reference.clone(), compiler.clone(), closure.clone())?;
+        }
+        loaded["provider/test_provider.rs"] = json!(format!(
+            "sha256:{:x}",
+            Sha256::digest(std::fs::read(root.join("provider/test_provider.rs")).unwrap())
+        ));
+        let mut manifest = args.get("manifest_file").map(|file| {
+            serde_json::from_slice::<Value>(
+                &std::fs::read(root.join(file.as_str().unwrap())).unwrap(),
+            )
+            .unwrap()
+        });
+        if let Some(value) = args.get("manifest_fingerprint_override") {
+            let manifest = manifest.as_mut().unwrap();
+            manifest["content"]["generated_validated_bundle_fingerprint"] = value.clone();
+            seal(manifest);
+        }
+        let compiled = compile_language_source(
+            &source,
+            registry,
+            manifest.as_ref(),
+            args["maximum_compilation_steps"].as_u64().unwrap_or(1000) as usize,
+        );
+        observation["stages"] = json!(take_compilation_stages());
+        let bundle = compiled?;
+        if let Some(file) = args.get("generated_bundle_file") {
+            let supplied =
+                load_bundle(&std::fs::read_to_string(root.join(file.as_str().unwrap())).unwrap())
+                    .map_err(|error| ArtifactError::new(error.code.as_str(), error.message))?;
+            if supplied.fingerprint != bundle.fingerprint {
+                return Err(ArtifactError::new(
+                    "language_compilation_failed",
+                    "generated bundle mismatch",
+                ));
+            }
+        }
+        let evidence = &bundle.source_compilation.as_ref().unwrap()["manifest"]["content"];
+        observation["effective_capabilities"] = evidence["source_capabilities"].clone();
+        observation["result"] = json!("accepted");
+        observation["value"] = json!({"generated_guard":bundle.normalized["machines"][0]["root"]["states"]["pending"]["on_events"]["submit"]["guard"]});
+        if args["without_manifest"] == true && args["weak_compiler"] == true {
+            let generated = load_bundle(&bundle.normalized.to_string())
+                .map_err(|error| ArtifactError::new(error.code.as_str(), error.message))?;
+            let aggregate = create(
+                &generated,
+                "order",
+                "compiled-restore-root",
+                "compiled-create",
+                &Bindings::default(),
+            )?;
+            let mut resolver = InMemoryDefinitionResolver::default();
+            resolver.insert(generated.clone(), true);
+            let before = compiler.calls.load(Ordering::SeqCst);
+            let restored = restore_aggregate(&aggregate.canonical_bytes()?, &resolver)?;
+            let registry = RuntimeProviderRegistry::new(Arc::new(provider::Verifier {
+                trusted: true,
+                weak_compiler: false,
+            }));
+            for key in [
+                "source_artifact_digest",
+                "compiler_providers",
+                "generated_validated_bundle_fingerprint",
+            ] {
+                observation["value"][key] = evidence[key].clone();
+            }
+            observation["value"]["generated_runtime_capabilities"] =
+                json!(registry.effective_capabilities(&generated.normalized)?);
+            // Resolve the actual restored definition before measuring its capabilities.
+            let fingerprint = restored.value()["validated_bundle_fingerprint"]
+                .as_str()
+                .unwrap();
+            if fingerprint != generated.fingerprint {
+                return Err(unavailable());
+            }
+            observation["value"]["restored_runtime_capabilities"] =
+                json!(registry.effective_capabilities(&generated.normalized)?);
+            observation["value"]["restore_compiler_calls"] =
+                json!(compiler.calls.load(Ordering::SeqCst) - before);
+        }
+        Ok(())
+    })();
+    observation["calls"]["compile_region"] = json!(compiler.calls.load(Ordering::SeqCst));
+    if let Err(error) = result {
         observation["code"] = json!(error.code);
     }
     json!({"observation":observation,"loaded_source":loaded,"loaded_closure_digest":closure.digest().unwrap()})
@@ -552,6 +801,11 @@ fn production_driver_runtime_operation_vectors() {
                 && ["repeat_send", "mixed_send"]
                     .iter()
                     .all(|key| args.get(key).is_none());
+        #[cfg(determa_repository_conformance)]
+        let selected = selected
+            || ["step", "compile", "create"]
+                .iter()
+                .any(|operation| request["operation"] == *operation);
         if !selected {
             continue;
         }
@@ -564,5 +818,8 @@ fn production_driver_runtime_operation_vectors() {
         );
         tested += 1;
     }
+    #[cfg(not(determa_repository_conformance))]
     assert_eq!(tested, 36);
+    #[cfg(determa_repository_conformance)]
+    assert_eq!(tested, 50);
 }

@@ -2,6 +2,18 @@
 use super::super::compile::{hash_json, typed_projection};
 use super::*;
 
+#[cfg(determa_repository_conformance)]
+thread_local! {
+    static COMPILATION_STAGES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(determa_repository_conformance)]
+pub fn take_compilation_stages() -> Vec<String> {
+    COMPILATION_STAGES.with(|stages| std::mem::take(&mut *stages.borrow_mut()))
+}
+fn observe_stage(_stage: &str) {
+    #[cfg(determa_repository_conformance)]
+    COMPILATION_STAGES.with(|stages| stages.borrow_mut().push(_stage.to_owned()));
+}
 fn failed() -> Version1Error {
     Version1Error::new(
         "language_compilation_failed",
@@ -140,6 +152,7 @@ pub fn compile_language_source(
     manifest: Option<&Value>,
     maximum_compilation_steps: usize,
 ) -> ProviderResult<Bundle> {
+    observe_stage("validate_source");
     artifact(
         source,
         include_str!("../../../schema/language-source-v1.schema.json"),
@@ -171,6 +184,7 @@ pub fn compile_language_source(
             return Err(failed());
         }
     }
+    observe_stage("resolve_compiler_closure");
     let mut prior = None;
     for dependency in content["dependencies"].as_array().ok_or_else(failed)? {
         let ordered = reference_order(dependency)?;
@@ -193,6 +207,7 @@ pub fn compile_language_source(
         registry.check_compiler(&region["provider_reference"])?;
         compiler_claims_before.push(registry.compiler_capabilities(&region["provider_reference"])?);
     }
+    observe_stage("compile_region");
     for (index, (path, region)) in locations.iter().zip(regions).enumerate() {
         if index >= maximum_compilation_steps {
             return Err(Version1Error::new(
@@ -205,6 +220,7 @@ pub fn compile_language_source(
             region["source"].as_str().ok_or_else(failed)?,
         )?;
     }
+    observe_stage("strict_load");
     let mut bundle = super::super::source::load_bundle_with_providers(
         &generated.to_string(),
         registry.clone(),
@@ -250,6 +266,7 @@ pub fn compile_language_source(
         "content":record,
     });
     if let Some(manifest) = manifest {
+        observe_stage("verify_manifest");
         artifact(
             manifest,
             include_str!("../../../schema/compilation-manifest-v1.schema.json"),

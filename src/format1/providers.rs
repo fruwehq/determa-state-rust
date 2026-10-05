@@ -12,6 +12,37 @@ use std::sync::Arc;
 mod common;
 mod compilation;
 pub use compilation::compile_language_source;
+#[cfg(determa_repository_conformance)]
+pub use compilation::take_compilation_stages;
+
+#[cfg(determa_repository_conformance)]
+pub fn repository_step_with_indexes(
+    bundle: &Bundle,
+    aggregate: &super::runtime::NativeAggregate,
+    runtime_id: &str,
+) -> ProviderResult<(Value, Vec<String>)> {
+    super::v1::step_v1_with_emission_indexes(bundle, aggregate, runtime_id)
+}
+
+#[cfg(determa_repository_conformance)]
+pub fn repository_create_with_evidence(
+    bundle: &Bundle,
+    machine: &str,
+    root: &str,
+    creation: &str,
+) -> ProviderResult<Value> {
+    let result = super::v1::create_v1_with_evidence(
+        bundle,
+        machine,
+        root,
+        creation,
+        &crate::Bindings::default(),
+    )?;
+    Ok(
+        json!({"state":result.aggregate.value(),"status":result.status,
+        "fault":result.fault,"emissions":result.emissions}),
+    )
+}
 
 pub type ProviderResult<T> = Result<T, Version1Error>;
 
