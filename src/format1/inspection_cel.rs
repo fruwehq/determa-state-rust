@@ -432,6 +432,9 @@ fn evaluate(
 fn typed_record(expression: &IdedExpr) -> bool {
     match &expression.expr {
         Expr::Ident(name) => name == "event" || name == "owner",
+        Expr::Select(select) => matches!(&select.operand.expr, Expr::Ident(name)
+            if (name == "event" && select.field == "payload")
+                || (name == "owner" && select.field == "variables")),
         _ => false,
     }
 }
@@ -733,6 +736,20 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn nested_map_lookup_charges_entries_below_a_typed_payload_record() {
+        let blob = Value::Map(BTreeMap::from([("key".into(), Value::String("x".into()))]));
+        let payload = Value::Map(BTreeMap::from([("blob".into(), blob)]));
+        let event = Value::Map(BTreeMap::from([("payload".into(), payload)]));
+        let bindings = BTreeMap::from([("event".into(), event)]);
+        let source = "event.payload.blob.key == \"x\"";
+        assert_eq!(safe_evaluate(source, &bindings, 30, 0), Ok((true, 30)));
+        assert_eq!(
+            safe_evaluate(source, &bindings, 29, 0),
+            Err(InspectionEvaluationError::Limit)
+        );
     }
 
     #[test]

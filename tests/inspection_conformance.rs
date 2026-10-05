@@ -115,7 +115,9 @@ fn gate_rejects_a_sabotaged_production_outcome() {
 }
 
 #[test]
-fn mismatched_component_incarnation_reports_root_definition_fingerprint() {
+fn mismatched_component_incarnation_preserves_public_output_and_state() {
+    // Current restoration requires all current runtime fingerprints to match the
+    // aggregate. This covers stale-component output, not mixed-definition identity.
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("conformance-suite/conformance/core/121-native-v1-migration-totality");
     let source = fs::read_to_string(fixture.join("component-source.yaml")).unwrap();

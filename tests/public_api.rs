@@ -73,7 +73,7 @@ fn published_inspection_api_uses_exact_runtime_and_guard_identity() {
 }
 
 #[test]
-fn inspection_charges_map_entries_beneath_typed_event_record() {
+fn inspection_preserves_typed_payload_record_fuel_boundary() {
     let source = r#"
 format: 1
 namespace: test.inspection_map_cost
@@ -99,7 +99,7 @@ machines:
     )
     .unwrap();
     let runtime = &aggregate.value()["runtimes"][0];
-    let request = json!({
+    let mut request = json!({
         "mode":"semantic",
         "aggregate_state_digest":aggregate.value()["aggregate_state_digest"],
         "runtime_id":runtime["runtime_id"],
@@ -113,6 +113,15 @@ machines:
     });
     let mut resolver = InMemoryDefinitionResolver::default();
     resolver.insert(bundle, true);
+    let result = inspect_candidate(
+        &aggregate,
+        &request,
+        &resolver,
+        InspectionCapabilities::default(),
+    )
+    .unwrap();
+    assert_eq!(result["guard_evidence"][0]["value"], true, "{result}");
+    request["limits"]["maximum_evaluation_steps"] = json!("20");
     let result = inspect_candidate(
         &aggregate,
         &request,
