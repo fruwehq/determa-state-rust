@@ -1,6 +1,6 @@
 use super::cel;
 use super::model::{
-    Action, BindingExpressions, ChoiceBranch, EventDeclaration, EventDirection, HistoryKind,
+    Action, BindingExpressions, ChoiceBranch, EventDeclaration, EventDirection, Guard, HistoryKind,
     InitialTransition, RawBundle, RawComponent, RawMachine, RawState, StateType, TargetExpression,
     Transition, TransitionOrList, TransitionTarget, VariableDeclaration,
 };
@@ -25,6 +25,9 @@ pub struct Bundle {
     pub machine_order: Vec<String>,
     pub fingerprint: String,
     pub normalized: JsonValue,
+    /// Sealed version-1 source and compilation-manifest evidence, when compiled.
+    /// Historical source guarantees do not replace generated runtime guarantees.
+    pub source_compilation: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +39,7 @@ pub struct Machine {
     pub states: BTreeMap<String, State>,
     pub root_pointer: String,
     pub meta: Option<JsonValue>,
+    pub(crate) runtime_providers: Option<super::providers::RuntimeProviderRegistry>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,7 +95,7 @@ pub struct CompiledInitial {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledChoice {
     pub target: CompiledTarget,
-    pub guard: Option<String>,
+    pub guard: Option<Guard>,
     pub guard_pointer: Option<String>,
     pub action: Vec<CompiledAction>,
     pub pointer: String,
@@ -100,7 +104,7 @@ pub struct CompiledChoice {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledTransition {
     pub target: Option<CompiledTarget>,
-    pub guard: Option<String>,
+    pub guard: Option<Guard>,
     pub guard_pointer: Option<String>,
     pub action: Vec<CompiledAction>,
     pub local: bool,
@@ -143,6 +147,7 @@ pub enum CompiledActionKind {
         instance: String,
     },
     Stop,
+    ProviderActions(JsonValue),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -208,6 +213,7 @@ pub fn compile_bundle(mut document: JsonValue) -> Result<Bundle, SemanticError> 
         machine_order,
         fingerprint,
         normalized: document,
+        source_compilation: None,
     })
 }
 
@@ -285,6 +291,7 @@ fn compile_machine(
         states,
         root_pointer,
         meta: raw.meta.clone(),
+        runtime_providers: None,
     };
     resolve_machine_targets(&mut machine)?;
     validate_machine(&machine, bundle_events, all_machine_ids)?;
@@ -561,6 +568,7 @@ fn compile_component(
             states,
             root_pointer: format!("{pointer}/root"),
             meta: raw.meta.clone(),
+            runtime_providers: None,
         };
         resolve_machine_targets(&mut machine)?;
         validate_machine(&machine, bundle_events, all_machine_ids)?;
@@ -687,6 +695,9 @@ fn compile_actions(
                     instance: cancel.instance.clone(),
                 },
                 Action::Stop(_) => CompiledActionKind::Stop,
+                Action::ProviderActions(binding) => {
+                    CompiledActionKind::ProviderActions(binding.clone())
+                }
             };
             Ok(CompiledAction {
                 kind,
@@ -1035,7 +1046,9 @@ fn validate_actions(
                     }
                 }
             }
-            CompiledActionKind::Cancel { .. } | CompiledActionKind::Stop => {}
+            CompiledActionKind::Cancel { .. }
+            | CompiledActionKind::Stop
+            | CompiledActionKind::ProviderActions(_) => {}
         }
     }
     Ok(())
@@ -1244,7 +1257,7 @@ fn validate_machine_cel(
         }
         if let Some(branches) = &state.choice {
             for branch in branches {
-                if let Some(guard) = &branch.guard {
+                if let Some(guard) = branch.guard.as_ref().and_then(Guard::cel) {
                     cel::check(
                         guard,
                         branch
@@ -1279,7 +1292,7 @@ fn validate_machine_cel(
                 )])),
             );
             for transition in transitions {
-                if let Some(guard) = &transition.guard {
+                if let Some(guard) = transition.guard.as_ref().and_then(Guard::cel) {
                     cel::check(
                         guard,
                         transition
@@ -1591,7 +1604,9 @@ fn validate_typed_actions(
                     &cel::CelType::InstanceReference(None),
                 )?;
             }
-            CompiledActionKind::Refresh { .. } | CompiledActionKind::Stop => {}
+            CompiledActionKind::Refresh { .. }
+            | CompiledActionKind::Stop
+            | CompiledActionKind::ProviderActions(_) => {}
         }
     }
     Ok(())
@@ -1860,7 +1875,7 @@ pub fn root_external_variables(machine: &Machine) -> BTreeMap<String, VariableDe
         .collect()
 }
 
-fn scope_survives(
+pub(crate) fn scope_survives(
     machine: &Machine,
     source: &State,
     target: &CompiledTarget,

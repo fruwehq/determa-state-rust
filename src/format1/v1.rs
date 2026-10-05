@@ -178,6 +178,7 @@ pub(crate) fn create_v1_with_evidence(
     creation_id: &str,
     bindings: &Bindings,
 ) -> Result<CreateV1Evidence, Version1Error> {
+    super::providers::check_bundle(bundle)?;
     let result =
         create_native_aggregate(bundle, machine_id, root_instance_id, creation_id, bindings);
     if result.status == ResultStatus::Rejected {
@@ -828,6 +829,7 @@ pub fn admit_v1(
     aggregate: &NativeAggregate,
     deliveries: &[AdmissionDelivery],
 ) -> Result<JsonValue, Version1Error> {
+    super::providers::check_bundle(bundle)?;
     let mut seen = BTreeSet::new();
     if deliveries
         .iter()
@@ -993,6 +995,7 @@ fn step_v1_impl(
     target_runtime_id: &str,
     mut evidence_indexes: Option<&mut Vec<String>>,
 ) -> Result<JsonValue, Version1Error> {
+    super::providers::check_bundle(bundle)?;
     let root_status = aggregate_status(&aggregate.document)?;
     if aggregate.document["validated_bundle_fingerprint"].as_str()
         != Some(bundle.fingerprint.as_str())
@@ -1437,7 +1440,7 @@ fn queue_target_to_core(value: &JsonValue) -> Result<Target, Version1Error> {
     serde_json::from_value(target).map_err(|error| invalid_aggregate(error.to_string()))
 }
 
-fn core_target_to_queue(target: &Target) -> Result<JsonValue, Version1Error> {
+pub(crate) fn core_target_to_queue(target: &Target) -> Result<JsonValue, Version1Error> {
     let mut value =
         serde_json::to_value(target).map_err(|error| invalid_aggregate(error.to_string()))?;
     if let Some(spawned) = value
@@ -1544,6 +1547,15 @@ pub(crate) fn restore_aggregate_v1_value(
     resolver: &(impl DefinitionResolver + ?Sized),
 ) -> Result<NativeAggregate, Version1Error> {
     validate_aggregate_artifact_value(&value)?;
+    let mut fingerprints = BTreeSet::new();
+    collect_bundle_fingerprints(&value, &mut fingerprints);
+    for fingerprint in fingerprints {
+        if let Some(resolved) = resolver.resolve_definition(&fingerprint) {
+            if resolved.trusted && resolved.bundle.fingerprint == fingerprint {
+                super::providers::check_bundle(&resolved.bundle)?;
+            }
+        }
+    }
     let envelope: AggregateEnvelope = serde_json::from_value(value.clone())
         .map_err(|error| invalid_aggregate(error.to_string()))?;
     let mut state =

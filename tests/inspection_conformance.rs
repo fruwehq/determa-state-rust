@@ -169,3 +169,52 @@ fn mismatched_component_incarnation_preserves_public_output_and_state() {
     assert_eq!(result["guard_evidence"], serde_json::json!([]));
     assert_eq!(restored.canonical_bytes().unwrap(), aggregate);
 }
+
+#[path = "support/inspection_provider.rs"]
+mod inspection_provider;
+
+#[test]
+fn all_seven_native_inspection_vectors_use_verified_production_providers() {
+    use std::sync::atomic::Ordering;
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "conformance-suite/conformance/profiles/inspection-provider/provider-01-exact-closure",
+    );
+    let manifest: Value =
+        serde_yaml::from_str(&fs::read_to_string(directory.join("test.yaml")).unwrap()).unwrap();
+    let vectors = manifest["inspection_vectors"].as_array().unwrap();
+    assert_eq!(vectors.len(), 7);
+    for vector in vectors {
+        let (bundle, safe, unsafe_) = inspection_provider::bundle(&directory);
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(bundle, true);
+        let before =
+            fs::read(directory.join(vector["aggregate_before"].as_str().unwrap())).unwrap();
+        let aggregate = restore_aggregate(&before, &resolver).unwrap();
+        let requests = document(&directory.join(vector["request_file"].as_str().unwrap()));
+        let request = pointer(&requests, vector["request_pointer"].as_str().unwrap());
+        let expected = document(&directory.join(vector["outcome_file"].as_str().unwrap()));
+        let outcome = inspect_candidate(
+            &aggregate,
+            request,
+            &resolver,
+            InspectionCapabilities::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            &outcome,
+            pointer(&expected, vector["outcome_pointer"].as_str().unwrap()),
+            "{}",
+            vector["name"]
+        );
+        assert_eq!(
+            safe.inspections.load(Ordering::SeqCst),
+            vector["expect"]["provider_inspections"].as_u64().unwrap() as usize
+        );
+        inspection_provider::assert_unchanged(&safe, &unsafe_);
+        assert_eq!(aggregate.canonical_bytes().unwrap(), before);
+        assert_eq!(
+            before,
+            fs::read(directory.join(vector["aggregate_after"].as_str().unwrap())).unwrap()
+        );
+    }
+}

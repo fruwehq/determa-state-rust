@@ -8,16 +8,17 @@ This version adds portable runtime-local event deferral, the sole current schema
 aggregate artifacts, and durable checkpoint coverage. The implementation is validated against
 these exact normative inputs:
 
-- specification commit `86bb88dd21cb1f799eefe5020b6e49dabf6e7225`;
-- conformance commit `affe3fe3bcc4d13fa7c5374471568e94af36f0d1`.
+- specification commit `77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0`;
+- conformance commit `c6949440f5b9fd6e06ea5571f4e01681dd59ee04`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 75 mailbox-neutral runtime traces through the shared private RTC kernel,
 all 162 applicable native artifact/checkpoint schema-v1 core vectors, and all 142
 durable-host vectors, all 49 exact candidate inspection vectors, plus semantic validation
-of all 484 declared artifact documents, 47 extension negotiation vectors and
-30 runtime-provider vectors. Native guard-provider inspection remains conditional
-on the configured provider.
+of all 487 declared artifact documents, 47 extension negotiation vectors and
+all seven configured native guard-provider inspection vectors. The pinned suite
+also defines 52 runtime-provider vectors; complete production adapter coverage is
+unfinished in this draft implementation checkpoint.
 Durable host profiles remain optional host contracts; memory, file, SQLite, and
 PostgreSQL tests exercise the implemented transactional host surface.
 
@@ -94,9 +95,9 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`c0e101c86bd71068669df3cd2250d4fec24ff74d`. CI also checks that all bundled schemas
+`c6949440f5b9fd6e06ea5571f4e01681dd59ee04`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
-`6bd25e3fcdf068af861aa289903a8489bd8f0139`. These exact reviewed public commits are
+`77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0`. These exact reviewed public commits are
 the current implementation inputs; tag publication is a later coordinated release operation.
 
 ## Library
@@ -130,11 +131,22 @@ must trust every definition retained by the aggregate. Use
 bounded semantic inspection. Neither mode admits the candidate or changes queues,
 receipts, counters, or the supplied aggregate.
 
-The seven native provider inspection vectors require a separately verified runtime
-provider `inspect_guard` capability and belong to the later provider integration.
-Their two portable aggregate fixtures currently receive structural schema and digest
-validation; resolver-backed activation and all seven runtime vectors are required
-before the final release claim.
+All seven native provider inspection vectors run through a separately verified
+`inspect_guard` entrypoint. Their portable aggregates restore through the actual
+provider-backed definition resolver. All 52 exact-source runtime-provider vectors
+also run through production loading, creation, step, inspection, source compilation,
+restoration and durable checkpoint commit/replay operations. The repository-only
+adapter records compiler stages and emission indexes with
+`RUSTFLAGS="--cfg determa_repository_conformance"`; these observations do not add
+members to portable results or artifacts. Full release gates and independent review
+remain required before the final release claim.
+
+`compile_language_source` compiles only executable grammar slots through explicitly
+installed exact-source compilers, then strictly loads the generated format-1 bundle.
+Every successful `Bundle.source_compilation` retains sealed version-1 source and
+manifest artifacts, even without a supplied manifest. The evidence discloses the
+historical source capability profile independently of generated runtime guarantees.
+Generated CEL definitions restore without an installed compiler.
 
 ## Public extensions
 

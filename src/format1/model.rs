@@ -225,12 +225,28 @@ pub struct InitialTransition {
     pub action: Vec<Action>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum Guard {
+    Cel(String),
+    Provider { provider: serde_json::Value },
+}
+
+impl Guard {
+    pub fn cel(&self) -> Option<&str> {
+        match self {
+            Self::Cel(source) => Some(source),
+            Self::Provider { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChoiceBranch {
     pub transition_to: TransitionTarget,
     #[serde(default)]
-    pub guard: Option<String>,
+    pub guard: Option<Guard>,
     #[serde(default)]
     pub action: Vec<Action>,
 }
@@ -248,7 +264,7 @@ pub struct Transition {
     #[serde(default)]
     pub transition_to: Option<TransitionTarget>,
     #[serde(default)]
-    pub guard: Option<String>,
+    pub guard: Option<Guard>,
     #[serde(default)]
     #[serde(rename = "lang")]
     pub _lang: Option<String>,
@@ -274,6 +290,7 @@ pub enum Action {
     Spawn(SpawnAction),
     Cancel(CancelAction),
     Stop(EmptyAction),
+    ProviderActions(serde_json::Value),
 }
 
 #[derive(Debug, Clone, Deserialize)]

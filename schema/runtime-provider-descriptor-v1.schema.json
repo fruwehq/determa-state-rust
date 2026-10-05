@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/runtime-provider-descriptor-v1.schema.json",
+  "title": "Runtime provider registration descriptor version 1",
+  "type": "object",
+  "required": ["kind", "binding"],
+  "additionalProperties": false,
+  "properties": {
+    "kind": {"enum": ["guard", "actions"]},
+    "binding": {"$ref": "machine.schema.json#/$defs/providerBinding"}
+  },
+  "allOf": [
+    {"if": {"properties": {"kind": {"const": "guard"}}, "required": ["kind"]}, "then": {"properties": {"binding": {"properties": {"output_type": {"const": "bool"}}}}}},
+    {"if": {"properties": {"kind": {"const": "actions"}}, "required": ["kind"]}, "then": {"properties": {"binding": {"properties": {"output_type": {"const": "structured_actions"}}}}}}
+  ]
+}

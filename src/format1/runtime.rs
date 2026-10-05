@@ -328,6 +328,7 @@ struct StepContext<'a> {
     cause_id: String,
     next_output_sequence: &'a mut Counter,
     emissions: &'a mut Vec<Emission>,
+    provider_writes: Vec<(String, String, String)>,
 }
 
 pub(crate) fn create_native_aggregate(
@@ -396,6 +397,7 @@ pub(crate) fn create_native_aggregate(
         cause_id: cause_id.clone(),
         next_output_sequence: &mut aggregate.next_output_sequence,
         emissions: &mut emissions,
+        provider_writes: Vec::new(),
     };
     let initialization = initialize_runtime(&mut aggregate.root, bindings, &mut context, true);
     aggregate.next_logical_step_sequence = Counter::from(1_u64);
@@ -566,6 +568,7 @@ pub(crate) fn step_native_aggregate(
             cause_id,
             next_output_sequence,
             emissions: &mut emissions,
+            provider_writes: Vec::new(),
         };
         execute_transition(
             runtime,
@@ -890,6 +893,7 @@ fn fault_dispatch(
             cause_id: envelope.event_id.clone(),
             next_output_sequence: &mut aggregate.next_output_sequence,
             emissions: &mut emissions,
+            provider_writes: Vec::new(),
         };
         let target = runtime_at(&aggregate.root, address)
             .expect("faulted runtime remains retained")
@@ -1694,6 +1698,7 @@ fn action_fault_locator(action: &CompiledAction, locator: &str) -> bool {
             locator == format!("{}/cancel/instance", action.pointer)
         }
         CompiledActionKind::Stop => false,
+        CompiledActionKind::ProviderActions(_) => locator == action.pointer,
     }
 }
 
@@ -2511,10 +2516,9 @@ fn select_handler(
             }
             let state = &runtime.definition.states[&path];
             if let Some(transitions) = state.handlers.get(&envelope.event) {
-                let environment = action_environment(runtime, &path, Some(envelope));
                 for transition in transitions {
                     if let Some(guard) = &transition.guard {
-                        match cel::evaluate_boolean(guard, &environment) {
+                        match super::providers::guard(runtime, &path, guard, Some(envelope)) {
                             Ok(true) => {
                                 return Ok(HandlerSelection::Handled(path, transition.clone()))
                             }
@@ -2582,6 +2586,7 @@ fn execute_transition(
     envelope: &Envelope,
     context: &mut StepContext<'_>,
 ) -> Result<(), StepFault> {
+    let writes_start = context.provider_writes.len();
     run_actions(
         runtime,
         source_path,
@@ -2599,6 +2604,14 @@ fn execute_transition(
     if runtime.status == RuntimeStatus::Completed {
         return Ok(());
     }
+    validate_provider_writes(
+        runtime,
+        source_path,
+        &target,
+        transition.local,
+        writes_start,
+        context,
+    )?;
     perform_transition(
         runtime,
         source_path,
@@ -2652,28 +2665,24 @@ fn choice_enabled(
     runtime: &RuntimeState,
     scope: &str,
     branch: &CompiledChoice,
-    envelope: &Envelope,
+    _envelope: &Envelope,
 ) -> Result<bool, StepFault> {
     let Some(guard) = &branch.guard else {
         return Ok(true);
     };
-    cel::evaluate_boolean(guard, &action_environment(runtime, scope, Some(envelope))).map_err(
-        |_| StepFault {
-            code: EngineFaultCode::GuardFault,
-            source_locator: branch.guard_pointer.clone().expect("guard pointer"),
-        },
-    )
+    super::providers::guard(runtime, scope, guard, None).map_err(|_| StepFault {
+        code: EngineFaultCode::GuardFault,
+        source_locator: branch.guard_pointer.clone().expect("guard pointer"),
+    })
 }
 
-fn perform_transition(
-    runtime: &mut RuntimeState,
+fn transition_boundary(
+    runtime: &RuntimeState,
     source_path: &str,
     target_path: &str,
-    history: bool,
     local: bool,
-    context: &mut StepContext<'_>,
-) -> Result<(), StepFault> {
-    let boundary = if source_path == target_path {
+) -> String {
+    if source_path == target_path {
         runtime.definition.states[source_path]
             .parent
             .clone()
@@ -2691,7 +2700,43 @@ fn perform_transition(
         target_path.to_string()
     } else {
         lowest_common_ancestor(&runtime.definition, source_path, target_path)
-    };
+    }
+}
+
+fn validate_provider_writes(
+    runtime: &RuntimeState,
+    source_path: &str,
+    target_path: &str,
+    local: bool,
+    writes_start: usize,
+    context: &mut StepContext<'_>,
+) -> Result<(), StepFault> {
+    let boundary = transition_boundary(runtime, source_path, target_path, local);
+    for (runtime_id, declaration_path, locator) in &context.provider_writes[writes_start..] {
+        if runtime_id == &runtime.runtime_id
+            && declaration_path != "root"
+            && declaration_path != &boundary
+            && is_descendant(declaration_path, &boundary)
+        {
+            return Err(StepFault {
+                code: EngineFaultCode::ActionFault,
+                source_locator: locator.clone(),
+            });
+        }
+    }
+    context.provider_writes.truncate(writes_start);
+    Ok(())
+}
+
+fn perform_transition(
+    runtime: &mut RuntimeState,
+    source_path: &str,
+    target_path: &str,
+    history: bool,
+    local: bool,
+    context: &mut StepContext<'_>,
+) -> Result<(), StepFault> {
+    let boundary = transition_boundary(runtime, source_path, target_path, local);
     let mut exits = runtime
         .active
         .iter()
@@ -2845,11 +2890,13 @@ fn descend_initial(
             return Ok(());
         }
         let initial = state.initial.expect("validated composite initial");
+        let writes_start = context.provider_writes.len();
         run_actions(runtime, &current, &initial.action, None, context)?;
         if runtime.status == RuntimeStatus::Completed {
             return Ok(());
         }
         let target = initial.target;
+        validate_provider_writes(runtime, &current, &target, false, writes_start, context)?;
         let mut chain = ancestors_to_root(&runtime.definition, &target);
         chain.reverse();
         for path in chain {
@@ -3072,6 +3119,9 @@ fn run_actions(
                     let _ = cancel_owned(runtime, &reference, context)?;
                 }
             }
+            CompiledActionKind::ProviderActions(binding) => {
+                execute_provider_actions(runtime, scope, action, binding, envelope, context)?;
+            }
             CompiledActionKind::Stop => {
                 complete_runtime(runtime, context)?;
                 return Ok(());
@@ -3079,6 +3129,253 @@ fn run_actions(
         }
     }
     Ok(())
+}
+
+fn execute_provider_actions(
+    runtime: &mut RuntimeState,
+    scope: &str,
+    action: &CompiledAction,
+    binding: &JsonValue,
+    envelope: Option<&Envelope>,
+    context: &mut StepContext<'_>,
+) -> Result<(), StepFault> {
+    let fault = || StepFault {
+        code: EngineFaultCode::ActionFault,
+        source_locator: action.pointer.clone(),
+    };
+    let registry = runtime
+        .definition
+        .runtime_providers
+        .as_ref()
+        .ok_or_else(fault)?
+        .clone();
+    let proposals = registry
+        .invoke_actions(
+            binding,
+            &provider_snapshot(runtime, scope, envelope, binding, None),
+        )
+        .map_err(|_| fault())?;
+    let mut ordinals = NativeSendOrdinals::default();
+    for proposal in proposals {
+        if let Some(assign) = proposal.get("assign") {
+            let name = assign["variable"].as_str().ok_or_else(fault)?;
+            let key = resolve_variable_key(runtime, scope, name).ok_or_else(fault)?;
+            let slot = runtime.variables.get_mut(&key).ok_or_else(fault)?;
+            if slot.declaration.external {
+                return Err(fault());
+            }
+            let typed: super::native::TypedValue =
+                serde_json::from_value(assign["value"].clone()).map_err(|_| fault())?;
+            let value = typed
+                .to_value(Some(&slot.declaration))
+                .map_err(|_| fault())?;
+            let value = if slot.declaration.value_type == "instance_reference" {
+                value
+            } else {
+                value
+                    .normalize_for_type(&slot.declaration.value_type)
+                    .ok_or_else(fault)?
+            };
+            context.provider_writes.push((
+                runtime.runtime_id.clone(),
+                slot.declaration_path.clone(),
+                fault().source_locator,
+            ));
+            slot.value = value;
+        } else {
+            let send = &proposal["send"];
+            let event = send["event"].as_str().ok_or_else(fault)?;
+            if matches!(
+                event,
+                "done" | "component_completed" | "component_failed" | "spawned_instance_failed"
+            ) {
+                return Err(fault());
+            }
+            let decode = |value: &JsonValue,
+                          declaration: Option<&VariableDeclaration>|
+             -> Result<Value, StepFault> {
+                let typed: super::native::TypedValue =
+                    serde_json::from_value(value.clone()).map_err(|_| fault())?;
+                typed.to_value(declaration).map_err(|_| fault())
+            };
+            let Value::Map(mut payload) = decode(&send["payload"], None)? else {
+                return Err(fault());
+            };
+            let correlation = send
+                .get("correlation_id")
+                .map(|value| match decode(value, None)? {
+                    Value::String(value) if !value.is_empty() => Ok(value),
+                    _ => Err(fault()),
+                })
+                .transpose()?;
+            let selected = if let Some(target) = send.get("to") {
+                vec![target.clone()]
+            } else if let Some(targets) = send.get("targets").and_then(JsonValue::as_array) {
+                targets.clone()
+            } else {
+                vec![serde_json::json!({"self":true})]
+            };
+            let mut targets = Vec::new();
+            let mut dynamic = Vec::new();
+            for target in selected {
+                dynamic.push(None);
+                targets.push(if target.get("self").is_some() {
+                    CompiledSendTarget::SelfTarget
+                } else if target.get("owner").is_some() {
+                    CompiledSendTarget::Owner
+                } else if target.get("external").is_some() {
+                    CompiledSendTarget::External
+                } else if let Some(component) = target.get("component").and_then(JsonValue::as_str)
+                {
+                    CompiledSendTarget::Component(component.to_owned())
+                } else {
+                    let declaration = VariableDeclaration {
+                        value_type: "instance_reference".into(),
+                        init: None,
+                        input: false,
+                        external: false,
+                        nullable: None,
+                        machine_id: None,
+                    };
+                    *dynamic.last_mut().unwrap() =
+                        Some(decode(&target["instance"], Some(&declaration))?);
+                    CompiledSendTarget::Instance(String::new())
+                });
+            }
+            let external = targets
+                .iter()
+                .any(|target| matches!(target, CompiledSendTarget::External));
+            if external
+                && (!targets
+                    .iter()
+                    .all(|target| matches!(target, CompiledSendTarget::External))
+                    || correlation.is_none())
+            {
+                return Err(fault());
+            }
+            if event == "env" {
+                if send.get("targets").is_some()
+                    || targets.len() != 1
+                    || !matches!(targets[0], CompiledSendTarget::Component(_))
+                    || correlation.is_some()
+                    || payload.len() != 1
+                    || !matches!(payload.get("changed"), Some(Value::Map(changed)) if !changed.is_empty())
+                {
+                    return Err(fault());
+                }
+                let CompiledSendTarget::Component(component_id) = &targets[0] else {
+                    return Err(fault());
+                };
+                let component = runtime
+                    .components
+                    .iter()
+                    .find(|component| component.component_id == *component_id)
+                    .ok_or_else(fault)?;
+                let external = root_external_variables(&component.runtime.definition);
+                let Some(Value::Map(changed)) = payload.get("changed") else {
+                    return Err(fault());
+                };
+                let mut normalized = BTreeMap::new();
+                for (name, value) in changed {
+                    let declaration = external.get(name).ok_or_else(fault)?;
+                    normalized.insert(
+                        name.clone(),
+                        value
+                            .normalize_for_type(&declaration.value_type)
+                            .ok_or_else(fault)?,
+                    );
+                }
+                payload.insert("changed".into(), Value::Map(normalized));
+            } else {
+                let declaration = runtime
+                    .definition
+                    .events
+                    .get(event)
+                    .or_else(|| context.bundle.events.get(event))
+                    .ok_or_else(fault)?;
+                if declaration.direction
+                    != if external {
+                        EventDirection::Output
+                    } else {
+                        EventDirection::Internal
+                    }
+                {
+                    return Err(fault());
+                }
+            }
+            execute_send_values(
+                runtime,
+                action,
+                event,
+                &targets,
+                payload,
+                correlation,
+                dynamic,
+                Some(&mut ordinals),
+                context,
+            )
+            .map_err(|_| fault())?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn provider_snapshot(
+    runtime: &RuntimeState,
+    scope: &str,
+    envelope: Option<&Envelope>,
+    binding: &JsonValue,
+    candidate_envelope: Option<&JsonValue>,
+) -> JsonValue {
+    let inputs = &binding["input_types"];
+    let values = visible_variables(runtime, scope);
+    let mut snapshot = serde_json::Map::new();
+    if inputs.get("variables").is_some() {
+        let variables = values
+            .iter()
+            .filter(|(name, _)| !matches!(name.as_str(), "owner" | "env" | "event"))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        snapshot.insert(
+            "variables".into(),
+            serde_json::to_value(super::native::TypedValue::from_value(&Value::Map(
+                variables,
+            )))
+            .expect("typed values"),
+        );
+    }
+    if inputs.get("event").is_some() {
+        if let Some(envelope) = envelope {
+            let mut event = serde_json::json!({"event":envelope.event,"event_id":envelope.event_id,
+                "target":super::v1::core_target_to_queue(&envelope.target).expect("validated target"),
+                "payload":super::native::TypedValue::from_value(&Value::Map(envelope.payload.clone()))});
+            if let Some(correlation) = &envelope.correlation_id {
+                event["correlation_id"] = serde_json::json!(correlation);
+            }
+            if let Some(queue) = candidate_envelope.or_else(|| {
+                runtime.ready_mailbox.iter().find_map(|entry| {
+                    let queue = &entry["envelope"];
+                    (queue["event_id"].as_str() == Some(envelope.event_id.as_str()))
+                        .then_some(queue)
+                })
+            }) {
+                event = queue.clone();
+            }
+            snapshot.insert("event".into(), event);
+        }
+    }
+    for name in ["owner", "env"] {
+        if inputs.get(name).is_some() {
+            if let Some(value) = values.get(name) {
+                snapshot.insert(
+                    name.into(),
+                    serde_json::to_value(super::native::TypedValue::from_value(value))
+                        .expect("typed values"),
+                );
+            }
+        }
+    }
+    JsonValue::Object(snapshot)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3135,6 +3432,37 @@ fn execute_send(
             dynamic_values.push(None);
         }
     }
+    execute_send_values(
+        runtime,
+        action,
+        event,
+        targets,
+        payload,
+        correlation_id,
+        dynamic_values,
+        None,
+        context,
+    )
+}
+
+#[derive(Default)]
+struct NativeSendOrdinals {
+    internal: usize,
+    external: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_send_values(
+    runtime: &mut RuntimeState,
+    action: &CompiledAction,
+    event: &str,
+    targets: &[CompiledSendTarget],
+    mut payload: BTreeMap<String, Value>,
+    correlation_id: Option<String>,
+    dynamic_values: Vec<Option<Value>>,
+    mut native_ordinals: Option<&mut NativeSendOrdinals>,
+    context: &mut StepContext<'_>,
+) -> Result<(), StepFault> {
     let declaration = if event == "env" {
         None
     } else {
@@ -3162,7 +3490,21 @@ fn execute_send(
             index,
         )?);
     }
-    for (ordinal, target) in resolved.into_iter().enumerate() {
+    let locator = if native_ordinals.is_some() {
+        action.pointer.clone()
+    } else {
+        format!("{}/send", action.pointer)
+    };
+    for (mut ordinal, target) in resolved.into_iter().enumerate() {
+        if let Some(ordinals) = native_ordinals.as_deref_mut() {
+            let counter = if matches!(target, Target::External) {
+                &mut ordinals.external
+            } else {
+                &mut ordinals.internal
+            };
+            ordinal = *counter;
+            *counter += 1;
+        }
         if matches!(target, Target::External) {
             let sequence = context.next_output_sequence.allocate();
             context.emissions.push(Emission {
@@ -3179,7 +3521,7 @@ fn execute_send(
                     context.root_instance_id,
                     &context.cause_id,
                     &context.step_sequence,
-                    &format!("{}/send", action.pointer),
+                    &locator,
                     ordinal,
                 )),
                 sequence: Some(sequence),
@@ -3199,7 +3541,7 @@ fn execute_send(
                     &target_runtime_id,
                     &context.cause_id,
                     &context.step_sequence,
-                    &format!("{}/send", action.pointer),
+                    &locator,
                     ordinal,
                 )),
                 target,

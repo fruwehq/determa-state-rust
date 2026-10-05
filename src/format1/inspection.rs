@@ -414,20 +414,28 @@ pub fn inspect_candidate(
     if !capabilities.safe_semantic_cel {
         return Ok(failure("inspection_capability_unavailable", None));
     }
-    // A guard that cannot be inspected must refuse the whole request before CEL.
-    if states
+    // Resolve every potentially reached native guard before evaluating any CEL.
+    for transition in states
         .iter()
         .flat_map(|state| state.handlers.get(&envelope.event).into_iter().flatten())
-        .any(|branch| branch.guard.is_none() && branch.guard_pointer.is_some())
     {
-        return Ok(failure("inspection_capability_unavailable", None));
+        if let Some(super::model::Guard::Provider { provider }) = &transition.guard {
+            let available = runtime
+                .definition
+                .runtime_providers
+                .as_ref()
+                .is_some_and(|registry| registry.can_inspect(provider).unwrap_or(false));
+            if !available {
+                return Ok(failure("inspection_capability_unavailable", None));
+            }
+        }
     }
     let (mut guard_limit, mut step_limit) = limits(request).expect("validated limits");
     let mut evidence = Vec::new();
     for (state, level) in states.iter().zip(&levels) {
         if let Some(branches) = state.handlers.get(&envelope.event) {
             for (index, transition) in branches.iter().enumerate() {
-                let Some(source) = transition.guard.as_deref() else {
+                let Some(guard) = transition.guard.as_ref() else {
                     return Ok(outcome(
                         request,
                         fingerprint,
@@ -451,21 +459,49 @@ pub fn inspect_candidate(
                     | super::model::Delivery::Internal(envelope) => envelope,
                 };
                 let environment = action_environment(runtime, &state.path, Some(&core_envelope));
-                let value = match inspection_cel::safe_evaluate(
-                    source,
-                    &environment.values,
-                    step_limit,
-                    snapshot,
-                ) {
-                    Ok((value, spent)) => {
-                        step_limit -= spent;
-                        value
-                    }
-                    Err(InspectionEvaluationError::Limit) => {
-                        return Ok(failure("inspection_limit_exceeded", Some(locator)))
-                    }
-                    Err(InspectionEvaluationError::Guard) => {
-                        return Ok(failure("inspection_guard_failure", Some(locator)))
+                let value = match guard {
+                    super::model::Guard::Cel(source) => match inspection_cel::safe_evaluate(
+                        source,
+                        &environment.values,
+                        step_limit,
+                        snapshot,
+                    ) {
+                        Ok((value, spent)) => {
+                            step_limit -= spent;
+                            value
+                        }
+                        Err(InspectionEvaluationError::Limit) => {
+                            return Ok(failure("inspection_limit_exceeded", Some(locator)))
+                        }
+                        Err(InspectionEvaluationError::Guard) => {
+                            return Ok(failure("inspection_guard_failure", Some(locator)))
+                        }
+                    },
+                    super::model::Guard::Provider { provider } => {
+                        let registry = runtime
+                            .definition
+                            .runtime_providers
+                            .as_ref()
+                            .expect("preflight registry");
+                        let snapshot = super::runtime::provider_snapshot(
+                            runtime,
+                            &state.path,
+                            Some(&core_envelope),
+                            provider,
+                            Some(&request["envelope"]),
+                        );
+                        match registry.inspect(provider, &snapshot, guard_limit + 1, step_limit) {
+                            Ok((value, spent)) => {
+                                step_limit -= spent;
+                                value
+                            }
+                            Err(error) if error.code == "inspection_limit_exceeded" => {
+                                return Ok(failure("inspection_limit_exceeded", Some(locator)))
+                            }
+                            Err(_) => {
+                                return Ok(failure("inspection_guard_failure", Some(locator)))
+                            }
+                        }
                     }
                 };
                 evidence.push(

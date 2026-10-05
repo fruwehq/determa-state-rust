@@ -8,8 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: 1
-  SPECIFICATION_COMMIT: 86bb88dd21cb1f799eefe5020b6e49dabf6e7225
-  CONFORMANCE_COMMIT: affe3fe3bcc4d13fa7c5374471568e94af36f0d1
+  SPECIFICATION_COMMIT: 77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0
+  CONFORMANCE_COMMIT: c6949440f5b9fd6e06ea5571f4e01681dd59ee04
 
 jobs:
   msrv:
@@ -156,6 +156,15 @@ jobs:
           cargo build --locked --example adapter_policy_probe
           python3 conformance-suite/scripts/run_adapter_policy_profile.py --adapter target/debug/examples/adapter_policy_probe
 
+      - name: All 52 verified runtime-provider vectors
+        env:
+          RUSTFLAGS: --cfg determa_repository_conformance
+        run: |
+          cargo test --locked --test runtime_provider_conformance
+          cargo test --locked --test source_compilation
+          cargo build --locked --example runtime_provider_adapter
+          python3 conformance-suite/scripts/run_runtime_provider_profile.py --spec-root authoritative-spec --adapter target/debug/examples/runtime_provider_adapter
+
       - name: All 75 authoritative mailbox-neutral RTC scenarios
         env:
           RUSTFLAGS: --cfg determa_repository_conformance
@@ -175,7 +184,7 @@ jobs:
           RUSTFLAGS: --cfg determa_repository_conformance
         run: cargo test --locked --test inspection_conformance -- --nocapture
 
-      - name: All 484 declared artifact documents
+      - name: All 487 declared artifact documents
         run: cargo test --locked --test artifact_manifest -- --nocapture
 
       - name: All 142 durable-host vectors

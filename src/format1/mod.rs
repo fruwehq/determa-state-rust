@@ -9,6 +9,7 @@ mod model;
 pub(crate) mod native;
 mod package;
 mod persistence;
+pub mod providers;
 mod runtime;
 #[cfg(all(test, determa_repository_conformance))]
 mod runtime_conformance;
@@ -33,11 +34,15 @@ pub use persistence::{
     DefinitionResolver, InMemoryDefinitionResolver, MigrationArtifactResolver, ResolvedDefinition,
     ResolvedMigrationDescriptor,
 };
+pub use providers::compile_language_source;
 pub use runtime::{
     CreationRejectionCode, DispatchRejectionCode, Disposition, EngineFaultCode,
     NativeAggregate as Aggregate,
 };
-pub use source::{load_bundle, load_bundle_from_json, parse_document, LoadError, LoadErrorCode};
+pub use source::{
+    load_bundle, load_bundle_from_json, load_bundle_with_providers, parse_document, LoadError,
+    LoadErrorCode,
+};
 pub use v1::{
     admit_v1 as admit, create_v1 as create, migrate_aggregate_v1 as migrate_aggregate,
     migrate_aggregate_v1_route as migrate_aggregate_route,

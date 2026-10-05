@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/language-source-v1.schema.json",
+  "title": "Determa language source version 1",
+  "type": "object",
+  "required": ["artifact_format", "artifact_schema_version", "content", "artifact_digest"],
+  "additionalProperties": false,
+  "properties": {
+    "artifact_format": {"const": "determa.language_source"},
+    "artifact_schema_version": {"const": 1},
+    "content": {
+      "type": "object",
+      "required": ["template", "regions", "dependencies"],
+      "additionalProperties": false,
+      "properties": {
+        "template": {"$ref": "machine.schema.json"},
+        "regions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["kind", "locator", "provider_reference", "source_media_type", "source"],
+            "additionalProperties": false,
+            "properties": {
+              "kind": {"enum": ["guard", "actions"]},
+              "locator": {"type": "string", "pattern": "^/(?:[^~/]|~[01])+(?:/(?:[^~/]|~[01])+)*$"},
+              "provider_reference": {"$ref": "provider-reference-v1.schema.json"},
+              "source_media_type": {"type": "string", "pattern": "^[a-z0-9.+-]+/[a-z0-9.+-]+$"},
+              "source": {"type": "string"}
+            }
+          }
+        },
+        "dependencies": {"type": "array", "items": {"$ref": "provider-reference-v1.schema.json"}}
+      }
+    },
+    "artifact_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}
