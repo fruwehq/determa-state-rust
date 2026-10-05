@@ -1,0 +1,317 @@
+#![cfg(feature = "sqlite")]
+
+use determa_state::authority::{NativeAuthorityInvocation, SqliteLocalAuthority};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn path() -> std::path::PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "determa-authority-{}-{}.sqlite",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+fn invocation(principal: &str) -> NativeAuthorityInvocation {
+    NativeAuthorityInvocation {
+        authenticated_principal: principal.to_owned(),
+        authorized_scopes: BTreeSet::from(["scope".to_owned()]),
+        operation_rights: BTreeSet::from([
+            "read_authority".to_owned(),
+            "guarded_commit".to_owned(),
+        ]),
+    }
+}
+fn sealed(mut request: Value) -> Value {
+    request.as_object_mut().unwrap().remove("request_digest");
+    let bytes =
+        serde_json_canonicalizer::to_vec(&json!(["determa-host-authority-request-1", request]))
+            .unwrap();
+    request["request_digest"] = json!(format!("sha256:{:x}", Sha256::digest(bytes)));
+    request
+}
+fn request(operation: &str, identifier: &str, mutation: &[u8]) -> Value {
+    sealed(
+        json!({"interface": "determa.host_authority", "interface_version": 1,
+        "operation": operation, "operation_id": identifier, "scope_identity": "scope",
+        "expected_authority_epoch": if operation == "read_authority" { Value::Null } else { json!("0") },
+        "expected_scope_generation": if operation == "read_authority" { Value::Null } else { json!("0") },
+        "arguments": if operation == "read_authority" { json!({}) } else { json!({"mutation_digest": format!("sha256:{:x}", Sha256::digest(mutation))}) }}),
+    )
+}
+fn perform(
+    authority: &SqliteLocalAuthority,
+    request: &Value,
+    principal: &str,
+    mutation: Option<&[u8]>,
+) -> Value {
+    authority
+        .perform(
+            &serde_json_canonicalizer::to_vec(request).unwrap(),
+            &invocation(principal),
+            mutation,
+        )
+        .unwrap()
+}
+
+#[test]
+fn native_commit_and_first_receipt_survive_restart_and_exact_replay() {
+    let file = path();
+    let authority = SqliteLocalAuthority::open(&file).unwrap();
+    authority.setup_schema().unwrap();
+    assert!(authority.allocate("scope", "owner", "local-host").unwrap());
+    let command = request("guarded_commit", "commit-a", b"native mutation");
+    let result = perform(&authority, &command, "owner", Some(b"native mutation"));
+    assert_eq!(result["status"], "accepted");
+    assert_eq!(result["scope_generation"], "1");
+    drop(authority);
+    let restarted = SqliteLocalAuthority::open(&file).unwrap();
+    assert_eq!(perform(&restarted, &command, "owner", None), result);
+    let connection = rusqlite::Connection::open(&file).unwrap();
+    let rows: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM determa_authority_mutations",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1);
+    let stored: Vec<u8> = connection
+        .query_row(
+            "SELECT mutation FROM determa_authority_mutations",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, b"native mutation");
+    let changed = request("guarded_commit", "commit-a", b"changed mutation");
+    assert_eq!(
+        perform(&restarted, &changed, "owner", Some(b"changed mutation"))["error_code"],
+        "scope_operation_conflict"
+    );
+    let stale = request("guarded_commit", "commit-b", b"native mutation");
+    assert_eq!(
+        perform(&restarted, &stale, "owner", Some(b"native mutation"))["error_code"],
+        "scope_generation_conflict"
+    );
+    drop(connection);
+    drop(restarted);
+    std::fs::remove_file(file).unwrap();
+}
+
+#[test]
+fn authorized_scope_and_owner_checks_precede_mutation_and_replay_disclosure() {
+    let file = path();
+    let authority = SqliteLocalAuthority::open(&file).unwrap();
+    authority.setup_schema().unwrap();
+    authority.allocate("scope", "owner", "local-host").unwrap();
+    let command = request("guarded_commit", "commit-a", b"native mutation");
+    assert_eq!(
+        perform(
+            &authority,
+            &command,
+            "different-owner",
+            Some(b"native mutation")
+        )["error_code"],
+        "stale_scope_authority"
+    );
+    let mut context = invocation("owner");
+    context.authorized_scopes.clear();
+    let rejected = authority
+        .perform(
+            &serde_json_canonicalizer::to_vec(&command).unwrap(),
+            &context,
+            Some(b"native mutation"),
+        )
+        .unwrap();
+    assert_eq!(rejected["error_code"], "unauthorized_scope");
+    assert!(rejected["scope_identity"].is_null());
+    assert!(rejected["scope_generation"].is_null());
+    let read = request("read_authority", "read-a", b"");
+    assert_eq!(
+        perform(&authority, &read, "owner", None)["scope_generation"],
+        "0"
+    );
+    drop(authority);
+    std::fs::remove_file(file).unwrap();
+}
+
+#[test]
+fn allocation_evidence_cannot_be_deleted_or_reused_after_ledger_removal() {
+    let file = path();
+    let authority = SqliteLocalAuthority::open(&file).unwrap();
+    authority.setup_schema().unwrap();
+    assert!(authority.allocate("scope", "owner", "local-host").unwrap());
+    let connection = rusqlite::Connection::open(&file).unwrap();
+    assert!(connection
+        .execute("DELETE FROM determa_scope_allocations", [])
+        .is_err());
+    assert!(connection
+        .execute(
+            "UPDATE determa_scope_allocations SET scope_identity='replacement'",
+            []
+        )
+        .is_err());
+    connection
+        .execute("DELETE FROM determa_scope_authority", [])
+        .unwrap();
+    assert!(!authority.allocate("scope", "owner", "local-host").unwrap());
+    assert!(!authority
+        .allocate("replacement", "owner", "local-host")
+        .unwrap());
+    drop(connection);
+    drop(authority);
+    std::fs::remove_file(file).unwrap();
+}
+
+#[test]
+fn independent_native_sessions_have_one_generation_cas_winner() {
+    let file = path();
+    let first = SqliteLocalAuthority::open(&file).unwrap();
+    first.setup_schema().unwrap();
+    first.allocate("scope", "owner", "local-host").unwrap();
+    let second = SqliteLocalAuthority::open(&file).unwrap();
+    let outcomes = std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            perform(
+                &first,
+                &request("guarded_commit", "first", b"a"),
+                "owner",
+                Some(b"a"),
+            )
+        });
+        let b = scope.spawn(|| {
+            perform(
+                &second,
+                &request("guarded_commit", "second", b"b"),
+                "owner",
+                Some(b"b"),
+            )
+        });
+        vec![a.join().unwrap(), b.join().unwrap()]
+    });
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|x| x["status"] == "accepted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|x| x["error_code"] == "scope_generation_conflict")
+            .count(),
+        1
+    );
+    drop(first);
+    drop(second);
+    std::fs::remove_file(file).unwrap();
+}
+
+#[test]
+fn request_shape_and_native_mutation_digest_refuse_without_a_commit() {
+    let file = path();
+    let authority = SqliteLocalAuthority::open(&file).unwrap();
+    authority.setup_schema().unwrap();
+    authority.allocate("scope", "owner", "local-host").unwrap();
+    let command = request("guarded_commit", "commit-a", b"expected mutation");
+    assert_eq!(
+        perform(&authority, &command, "owner", Some(b"different mutation"))["error_code"],
+        "invalid_host_request"
+    );
+    let invalid = authority
+        .perform(
+            br#"{"interface":"determa.host_authority","interface":"duplicate"}"#,
+            &invocation("owner"),
+            None,
+        )
+        .unwrap();
+    assert_eq!(invalid["error_code"], "invalid_host_request");
+    assert!(invalid["operation"].is_null());
+    assert_eq!(
+        perform(
+            &authority,
+            &request("read_authority", "read-a", b""),
+            "owner",
+            None
+        )["scope_generation"],
+        "0"
+    );
+    drop(authority);
+    std::fs::remove_file(file).unwrap();
+}
+
+#[test]
+fn copied_database_is_inactive_even_with_matching_scope_and_owner() {
+    let source = path();
+    let copied = path();
+    let authority = SqliteLocalAuthority::open(&source).unwrap();
+    authority.setup_schema().unwrap();
+    authority.allocate("scope", "owner", "local-host").unwrap();
+    let native = rusqlite::Connection::open(&source).unwrap();
+    native
+        .execute("VACUUM INTO ?", [copied.to_str().unwrap()])
+        .unwrap();
+    let inert = SqliteLocalAuthority::open(&copied).unwrap();
+    assert!(inert.validate_schema().is_err());
+    assert!(inert.setup_schema().is_err());
+    let result = perform(
+        &inert,
+        &request("guarded_commit", "copied-write", b"mutation"),
+        "owner",
+        Some(b"mutation"),
+    );
+    assert_eq!(result["error_code"], "host_capability_mismatch");
+    assert!(result["scope_generation"].is_null());
+    assert_eq!(
+        perform(
+            &authority,
+            &request("read_authority", "read-a", b""),
+            "owner",
+            None
+        )["scope_generation"],
+        "0"
+    );
+    drop(native);
+    drop(inert);
+    drop(authority);
+    std::fs::remove_file(source).unwrap();
+    std::fs::remove_file(copied).unwrap();
+}
+
+#[test]
+fn unexpected_trigger_invalidates_authority_before_native_mutation() {
+    let file = path();
+    let authority = SqliteLocalAuthority::open(&file).unwrap();
+    authority.setup_schema().unwrap();
+    authority.allocate("scope", "owner", "local-host").unwrap();
+    let connection = rusqlite::Connection::open(&file).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER extra BEFORE UPDATE ON determa_scope_authority BEGIN SELECT 1; END",
+        )
+        .unwrap();
+    assert_eq!(
+        perform(
+            &authority,
+            &request("guarded_commit", "write", b"mutation"),
+            "owner",
+            Some(b"mutation")
+        )["error_code"],
+        "host_capability_mismatch"
+    );
+    let mutations: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM determa_authority_mutations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mutations, 0);
+    drop(connection);
+    drop(authority);
+    std::fs::remove_file(file).unwrap();
+}

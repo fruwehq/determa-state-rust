@@ -7,6 +7,8 @@
 //! aggregate persistence and definition migration are exposed as pure format-1
 //! operations.
 
+#[cfg(feature = "sqlite")]
+pub mod authority;
 pub mod checkpoint;
 pub mod cli;
 pub mod extensions;
