@@ -2485,6 +2485,7 @@ fn retained_native_responses_replay_without_resolver_or_revoked_runtime_provider
 
 #[cfg(feature = "sqlite")]
 struct EffectWorkerAuthority {
+    report_right: AtomicBool,
     lease_duration: std::sync::atomic::AtomicI64,
     path: std::path::PathBuf,
     now: std::sync::atomic::AtomicI64,
@@ -2529,7 +2530,11 @@ impl determa_state::authority::NativeEffectWorkerAuthority for EffectWorkerAutho
         Ok(determa_state::authority::NativeAuthorityInvocation {
             authenticated_principal: self.principal.lock().unwrap().clone(),
             authorized_scopes: BTreeSet::from(["scope-one".into()]),
-            operation_rights: BTreeSet::from(["claim_effect".into()]),
+            operation_rights: if self.report_right.load(Ordering::SeqCst) {
+                BTreeSet::from(["claim_effect".into(), "submit_effect_result".into()])
+            } else {
+                BTreeSet::from(["claim_effect".into()])
+            },
         })
     }
     fn lease_duration_ns(&self) -> Result<i64, String> {
@@ -2545,6 +2550,7 @@ impl determa_state::authority::NativeEffectWorkerAuthority for EffectWorkerAutho
 #[cfg(feature = "sqlite")]
 fn effect_worker_authority(path: &std::path::Path) -> Arc<EffectWorkerAuthority> {
     Arc::new(EffectWorkerAuthority {
+        report_right: AtomicBool::new(true),
         lease_duration: std::sync::atomic::AtomicI64::new(10),
         path: path.into(),
         now: std::sync::atomic::AtomicI64::new(10),
@@ -2874,4 +2880,470 @@ fn native_claim_host_policy_rejects_invalid_duration_and_overflow_without_mutati
             .unwrap(),
         first
     );
+}
+
+#[cfg(feature = "sqlite")]
+fn native_result_request(document: &Value, kind: &str) -> Value {
+    let record = &document["journal"]["effect_records"][0];
+    json!({"effect_id":record["effect_id"],"operation_token":record["operation_token"],
+        "attempt_fence":record["attempt_fence"],"outcome_kind":kind,
+        "payload":if kind == "succeeded" { json!(["map", [["provider_reference", ["string", "native-receipt-1"]]]]) } else { json!(["map",[]]) }})
+}
+#[cfg(feature = "sqlite")]
+#[test]
+fn authenticated_native_reports_commit_immutable_outcomes_or_ambiguity_without_admitting_results() {
+    for kind in ["succeeded", "cancelled", "ambiguous"] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let fixture = Fixture::new();
+        let bundle = effect_bundle();
+        let resolver = effect_resolver(&bundle);
+        let authority = effect_worker_authority(&path);
+        let host =
+            effect_host(&path, resolver.clone(), &fixture).with_worker_authority(authority.clone());
+        host.setup_schema().unwrap();
+        host.allocate_scope().unwrap();
+        host.create(
+            &bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default(),
+        )
+        .unwrap();
+        let initial = native_snapshot(&path);
+        let claim_request = determa_state::authority::NativeEffectClaimRequest {
+            effect_id: initial.1["journal"]["effect_records"][0]["effect_id"]
+                .as_str()
+                .unwrap()
+                .into(),
+        };
+        host.claim(
+            "root",
+            "claim-1",
+            &claim_request,
+            b"private-native-credential",
+        )
+        .unwrap();
+        let prior = native_snapshot(&path);
+        let request = native_result_request(&prior.1, kind);
+        let first = host
+            .record_result("root", "report-1", &request, b"private-native-credential")
+            .unwrap();
+        let after = native_snapshot(&path);
+        assert_eq!(after.0, prior.0);
+        assert_eq!(after.2["scope_generation"], "3");
+        assert_eq!(
+            after.1["journal"]["effect_records"][0]["attempt_records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            after.1["journal"]["effect_records"][0]["invocation_state"],
+            if kind == "ambiguous" {
+                "ambiguous"
+            } else {
+                "outcome_recorded"
+            }
+        );
+        assert!(after.1["journal"]["effect_records"][0]["admission_receipt"].is_null());
+        assert_eq!(
+            after.1["journal"]["effect_records"][0]["outcome"].is_null(),
+            kind == "ambiguous"
+        );
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+        authority.now.store(20, Ordering::SeqCst);
+        authority.fail_clock.store(true, Ordering::SeqCst);
+        assert_eq!(
+            host.record_result("root", "report-1", &request, b"private-native-credential")
+                .unwrap(),
+            first
+        );
+        let mut changed = request.clone();
+        changed["payload"] = json!(["map", [["other", ["string", "changed"]]]]);
+        assert!(host
+            .record_result("root", "report-1", &changed, b"private-native-credential")
+            .is_err());
+        assert_eq!(native_snapshot(&path), after);
+        drop(host);
+        let reopened = effect_host(&path, resolver, &fixture).with_worker_authority(authority);
+        assert_eq!(
+            reopened
+                .record_result("root", "report-1", &request, b"private-native-credential")
+                .unwrap(),
+            first
+        );
+        assert_eq!(native_snapshot(&path), after);
+    }
+}
+#[cfg(feature = "sqlite")]
+#[test]
+fn native_result_refusals_never_allocate_reports_or_change_the_checkpoint() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let authority = effect_worker_authority(&path);
+    let host = effect_host(&path, effect_resolver(&bundle), &fixture)
+        .with_worker_authority(authority.clone());
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let initial = native_snapshot(&path);
+    let before_claim = native_result_request(&initial.1, "succeeded");
+    assert!(host
+        .record_result(
+            "root",
+            "report-1",
+            &before_claim,
+            b"private-native-credential"
+        )
+        .is_err());
+    assert_eq!(native_snapshot(&path), initial);
+    host.claim(
+        "root",
+        "claim-1",
+        &determa_state::authority::NativeEffectClaimRequest {
+            effect_id: before_claim["effect_id"].as_str().unwrap().into(),
+        },
+        b"private-native-credential",
+    )
+    .unwrap();
+    let prior = native_snapshot(&path);
+    let request = native_result_request(&prior.1, "succeeded");
+    for field in [
+        "operation_token",
+        "attempt_fence",
+        "outcome_kind",
+        "payload",
+        "extra",
+    ] {
+        let mut wrong = request.clone();
+        wrong[field] = match field {
+            "attempt_fence" => json!("0"),
+            "outcome_kind" => json!("retryable_failure"),
+            "payload" => json!(["map", []]),
+            _ => json!("wrong"),
+        };
+        assert!(host
+            .record_result("root", "report-1", &wrong, b"private-native-credential")
+            .is_err());
+        assert_eq!(native_snapshot(&path), prior);
+    }
+    for payload in [
+        json!([
+            "map",
+            [
+                ["duplicate", ["string", "a"]],
+                ["duplicate", ["string", "b"]]
+            ]
+        ]),
+        json!(["map", [["z", ["string", "a"]], ["a", ["string", "b"]]]]),
+    ] {
+        let mut wrong = request.clone();
+        wrong["outcome_kind"] = json!("ambiguous");
+        wrong["payload"] = payload;
+        assert!(host
+            .record_result("root", "report-1", &wrong, b"private-native-credential")
+            .is_err());
+        assert_eq!(native_snapshot(&path), prior);
+    }
+    authority.report_right.store(false, Ordering::SeqCst);
+    assert!(host
+        .record_result("root", "report-1", &request, b"private-native-credential")
+        .is_err());
+    authority.report_right.store(true, Ordering::SeqCst);
+    *authority.principal.lock().unwrap() = "worker-two".into();
+    assert!(host
+        .record_result("root", "report-1", &request, b"private-native-credential")
+        .is_err());
+    *authority.principal.lock().unwrap() = "worker-one".into();
+    authority.now.store(20, Ordering::SeqCst);
+    assert!(host
+        .record_result("root", "report-1", &request, b"private-native-credential")
+        .is_err());
+    assert_eq!(native_snapshot(&path), prior);
+}
+#[cfg(feature = "sqlite")]
+#[test]
+fn actual_result_report_rechecks_final_authentication_and_clock_after_provider_callbacks() {
+    for cut in [1, 2, 3] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let fixture = Fixture::new();
+        let resolver = runtime_effect_resolver(&path);
+        let authority = effect_worker_authority(&path);
+        let host = runtime_effect_host(&path, resolver.clone(), &fixture)
+            .with_worker_authority(authority.clone());
+        host.setup_schema().unwrap();
+        host.allocate_scope().unwrap();
+        host.create(
+            &resolver.bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default(),
+        )
+        .unwrap();
+        let initial = native_snapshot(&path);
+        host.claim(
+            "root",
+            "claim-1",
+            &determa_state::authority::NativeEffectClaimRequest {
+                effect_id: initial.1["journal"]["effect_records"][0]["effect_id"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+            },
+            b"private-native-credential",
+        )
+        .unwrap();
+        let prior = native_snapshot(&path);
+        let request = native_result_request(&prior.1, "succeeded");
+        *resolver.claim_authority.lock().unwrap() = Some(authority);
+        resolver.claim_cut.store(cut, Ordering::SeqCst);
+        assert!(host
+            .record_result("root", "report-1", &request, b"private-native-credential")
+            .is_err());
+        assert_eq!(resolver.staged.load(Ordering::SeqCst), 1);
+        assert_eq!(native_snapshot(&path), prior);
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(all(feature = "sqlite", unix))]
+#[test]
+fn native_effect_outcome_crash_child() {
+    let Some(cut) = std::env::var_os("DETERMA_NATIVE_OUTCOME_TEST_CUT") else {
+        return;
+    };
+    let path =
+        std::path::PathBuf::from(std::env::var_os("DETERMA_NATIVE_OUTCOME_TEST_PATH").unwrap());
+    let marker =
+        std::path::PathBuf::from(std::env::var_os("DETERMA_NATIVE_OUTCOME_TEST_MARKER").unwrap());
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let host = effect_host(&path, effect_resolver(&bundle), &fixture)
+        .with_worker_authority(effect_worker_authority(&path));
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let snapshot = native_snapshot(&path);
+    host.claim(
+        "root",
+        "claim-1",
+        &determa_state::authority::NativeEffectClaimRequest {
+            effect_id: snapshot.1["journal"]["effect_records"][0]["effect_id"]
+                .as_str()
+                .unwrap()
+                .into(),
+        },
+        b"private-native-credential",
+    )
+    .unwrap();
+    let request = native_result_request(&native_snapshot(&path).1, "succeeded");
+    if cut == "staged" {
+        fixture
+            .destination
+            .binding_checks
+            .store(0, Ordering::SeqCst);
+        fixture
+            .destination
+            .fail_binding_at
+            .store(1, Ordering::SeqCst);
+        *fixture.destination.staged_marker.lock().unwrap() = Some(marker.clone());
+    } else {
+        assert_eq!(cut, "committed");
+    }
+    let response = host
+        .record_result("root", "report-1", &request, b"private-native-credential")
+        .unwrap();
+    publish_admission_cut_marker(&marker, &serde_json::to_vec(&response).unwrap());
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+#[cfg(all(feature = "sqlite", unix))]
+#[test]
+fn real_sigkill_outcome_before_and_after_commit_preserves_immutable_report_and_first_response() {
+    for cut in ["staged", "committed"] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let marker = directory.path().join("cut-marker");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_effect_outcome_crash_child",
+                "--nocapture",
+            ])
+            .env("DETERMA_NATIVE_OUTCOME_TEST_CUT", cut)
+            .env("DETERMA_NATIVE_OUTCOME_TEST_PATH", &path)
+            .env("DETERMA_NATIVE_OUTCOME_TEST_MARKER", &marker)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let reached = marker.exists();
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        assert!(reached, "native outcome {cut} cut not reached");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(9));
+        let prior = native_snapshot(&path);
+        assert_eq!(prior.0["revision"], "0");
+        assert_eq!(
+            prior.2["scope_generation"],
+            if cut == "committed" { "3" } else { "2" }
+        );
+        assert_eq!(
+            prior.1["journal"]["effect_records"][0]["outcome"].is_null(),
+            cut != "committed"
+        );
+        let fixture = Fixture::new();
+        let bundle = effect_bundle();
+        let host = effect_host(&path, effect_resolver(&bundle), &fixture)
+            .with_worker_authority(effect_worker_authority(&path));
+        let request = native_result_request(&prior.1, "succeeded");
+        let first = host
+            .record_result("root", "report-1", &request, b"private-native-credential")
+            .unwrap();
+        if cut == "committed" {
+            assert_eq!(
+                first,
+                serde_json::from_slice::<Value>(&std::fs::read(&marker).unwrap()).unwrap()
+            );
+        }
+        let after = native_snapshot(&path);
+        assert_eq!(after.2["scope_generation"], "3");
+        assert_eq!(
+            host.record_result("root", "report-1", &request, b"private-native-credential")
+                .unwrap(),
+            first
+        );
+        assert_eq!(native_snapshot(&path), after);
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn new_native_report_refuses_a_replacement_handle_and_keeps_the_original_route_pin() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let resolver = effect_resolver(&bundle);
+    let authority = effect_worker_authority(&path);
+    let host =
+        effect_host(&path, resolver.clone(), &fixture).with_worker_authority(authority.clone());
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let initial = native_snapshot(&path);
+    host.claim(
+        "root",
+        "claim-1",
+        &determa_state::authority::NativeEffectClaimRequest {
+            effect_id: initial.1["journal"]["effect_records"][0]["effect_id"]
+                .as_str()
+                .unwrap()
+                .into(),
+        },
+        b"private-native-credential",
+    )
+    .unwrap();
+    let prior = native_snapshot(&path);
+    let request = native_result_request(&prior.1, "succeeded");
+    drop(host);
+    let replacement = Fixture::new();
+    *replacement.destination.binding.lock().unwrap() = hash('d');
+    let mut configuration = configuration();
+    configuration["destination_binding_digest"] = json!(hash('d'));
+    let replacement_handler = replacement
+        .registry
+        .configure_native_handler(&descriptor(), &configuration)
+        .unwrap();
+    let mut route = effect_route();
+    route.destination_binding_digest = hash('d');
+    let host = determa_state::authority::SqliteNativeEffectHost::open(
+        &path,
+        "scope-one".into(),
+        "owner".into(),
+        "host-one".into(),
+        resolver.clone(),
+        route,
+        replacement_handler,
+    )
+    .unwrap()
+    .with_worker_authority(authority.clone());
+    assert!(host
+        .record_result("root", "report-1", &request, b"private-native-credential")
+        .is_err());
+    assert_eq!(native_snapshot(&path), prior);
+    assert_eq!(replacement.destination.calls.load(Ordering::SeqCst), 0);
+    drop(host);
+    let mut changed_route = effect_route();
+    changed_route.generation = "999".into();
+    changed_route.result_mapping[0]["event"] = json!("undeclared_replacement_event");
+    changed_route.result_mapping[0]["result_slot"] = json!("replacement-slot");
+    let host = determa_state::authority::SqliteNativeEffectHost::open(
+        &path,
+        "scope-one".into(),
+        "owner".into(),
+        "host-one".into(),
+        resolver,
+        changed_route,
+        fixture.handler(),
+    )
+    .unwrap()
+    .with_worker_authority(authority);
+    let first = host
+        .record_result("root", "report-1", &request, b"private-native-credential")
+        .unwrap();
+    let after = native_snapshot(&path);
+    assert_eq!(
+        after.1["journal"]["effect_records"][0]["result_mapping"],
+        prior.1["journal"]["effect_records"][0]["result_mapping"]
+    );
+    use sha2::{Digest, Sha256};
+    let expected = format!(
+        "sha256:{:x}",
+        Sha256::digest(
+            serde_json_canonicalizer::to_vec(&json!([
+                "determa-effect-result-event-1",
+                request["effect_id"],
+                "success"
+            ]))
+            .unwrap()
+        )
+    );
+    assert_eq!(first["body"]["result_event_id"], expected);
 }

@@ -721,6 +721,123 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             .map_err(failure)?;
         Ok(response)
     }
+    /// Owner-local durable report stage, not a completed public result response.
+    /// Terminal outcomes are committed before a separate result-admission stage.
+    pub fn record_result(
+        &self,
+        root: &str,
+        operation_id: &str,
+        report: &Value,
+        credential: &[u8],
+    ) -> Result<Value, AuthorityError> {
+        if operation_id.is_empty() {
+            return Err(failure("native report identity absent"));
+        }
+        let authority = self
+            .worker_authority
+            .as_ref()
+            .ok_or_else(|| failure("native worker authority absent"))?;
+        let caller = authority.authenticate(credential).map_err(failure)?;
+        if caller.authenticated_principal.is_empty()
+            || !caller.authorized_scopes.contains(&self.scope)
+            || !caller.operation_rights.contains("submit_effect_result")
+        {
+            return Err(failure("unauthorized_scope"));
+        }
+        crate::format1::validate_native_effect_result_request(report).map_err(failure)?;
+        let original = json!({"operation_kind":"effect_report","root_instance_id":root,
+            "worker_principal":caller.authenticated_principal,"report":report});
+        if let Some(saved) = self
+            .store
+            .native_effect_replay(root, operation_id, &original)
+            .map_err(failure)?
+        {
+            return Ok(saved);
+        }
+        let (checkpoint, mut document) =
+            self.store.native_effect_snapshot(root).map_err(failure)?;
+        let prior = document.clone();
+        let selected = document["journal"]["effect_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["effect_id"] == report["effect_id"])
+            .ok_or_else(|| failure("effect_not_outstanding"))?;
+        let claim = current_native_effect_claim(&document, selected)?.clone();
+        let pinned_reference = selected["handler_reference"].clone();
+        let pinned_destination = selected["destination_binding_digest"]
+            .as_str()
+            .ok_or_else(|| failure("pinned destination absent"))?
+            .to_owned();
+        if claim["worker_principal"] != caller.authenticated_principal
+            || claim["scope_identity"] != self.scope
+        {
+            return Err(failure("unauthorized_scope"));
+        }
+        let expiry = canonical_native_time(&claim["expires_at"])?;
+        if authority.trusted_now().map_err(failure)? >= expiry {
+            return Err(failure("stale_attempt_fence"));
+        }
+        let fingerprint = checkpoint
+            .bundle_fingerprint()
+            .ok_or_else(|| failure("native definition absent"))?;
+        let resolved = self
+            .resolver
+            .resolve_definition(fingerprint)
+            .ok_or_else(|| failure("native definition unavailable"))?;
+        if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
+            return Err(failure("native definition not trusted"));
+        }
+        let record = document["journal"]["effect_records"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|record| record["effect_id"] == report["effect_id"])
+            .unwrap();
+        record_native_effect_report(record, report)?;
+        let response = json!({"kind":"effect_report","body":{
+            "attempt_report":record["attempt_records"].as_array().unwrap().last().unwrap(),
+            "outcome":record["outcome"],"result_event_id":record["result_event_id"]}});
+        retain_native_effect_response(&mut document, operation_id, &original, &response)?;
+        self.store
+            .update_native_effect_checkpoint_with_final_guard(
+                &checkpoint,
+                &prior,
+                &checkpoint,
+                &document,
+                || {
+                    let current = self
+                        .resolver
+                        .resolve_definition(fingerprint)
+                        .ok_or_else(|| failure("native definition unavailable at commit"))?;
+                    if !current.trusted
+                        || current.bundle.fingerprint != fingerprint
+                        || current.bundle.normalized != resolved.bundle.normalized
+                    {
+                        return Err(failure("native definition changed at commit"));
+                    }
+                    crate::format1::providers::check_bundle(&current.bundle).map_err(failure)?;
+                    self.handler
+                        .verify(&pinned_reference, &pinned_destination)
+                        .map_err(failure)
+                },
+                || {
+                    let current = authority.authenticate(credential).map_err(failure)?;
+                    if current.authenticated_principal != caller.authenticated_principal
+                        || !current.authorized_scopes.contains(&self.scope)
+                        || !current.operation_rights.contains("submit_effect_result")
+                    {
+                        return Err(failure("unauthorized_scope"));
+                    }
+                    if authority.trusted_now().map_err(failure)? >= expiry {
+                        return Err(failure("stale_attempt_fence"));
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(failure)?;
+        Ok(response)
+    }
 }
 
 fn retain_native_effect_response(
@@ -757,5 +874,97 @@ fn retain_native_effect_response(
         "determa-host-effect-journal-digest-1",
         journal
     ]))?);
+    Ok(())
+}
+
+// Only native committed helper history supplies this current claim. Historic
+// replayed response bodies are never caller credentials or renewed lease rights.
+pub(super) fn current_native_effect_claim<'a>(
+    document: &'a Value,
+    record: &Value,
+) -> Result<&'a Value, AuthorityError> {
+    let mut matches = document["responses"]
+        .as_object()
+        .ok_or_else(|| failure("native responses absent"))?
+        .values()
+        .filter(|response| response["kind"] == "effect_claim")
+        .map(|response| &response["body"]["claim"])
+        .filter(|claim| {
+            claim["work_identity"] == record["effect_id"]
+                && claim["attempt_fence"] == record["attempt_fence"]
+        });
+    let claim = matches
+        .next()
+        .ok_or_else(|| failure("stale_attempt_fence"))?;
+    if matches.next().is_some()
+        || claim["state"] != "active"
+        || claim["scope_authority_epoch"] != "0"
+        || claim["operation_token"] != record["operation_token"]
+    {
+        return Err(failure("stale_attempt_fence"));
+    }
+    Ok(claim)
+}
+
+pub(super) fn record_native_effect_report(
+    record: &mut Value,
+    request: &Value,
+) -> Result<(), AuthorityError> {
+    if record["invocation_state"] != "leased"
+        || record["attempt_fence"] != request["attempt_fence"]
+        || record["operation_token"] != request["operation_token"]
+        || record["effect_id"] != request["effect_id"]
+    {
+        return Err(failure("effect_not_outstanding"));
+    }
+    let kind = request["outcome_kind"]
+        .as_str()
+        .ok_or_else(|| failure("native report kind absent"))?;
+    if kind == "retryable_failure" {
+        // A worker's assertion is not independent no-call or deduplication proof.
+        return Err(failure("native safe retry evidence absent"));
+    }
+    let reason = if kind == "ambiguous" {
+        json!("provider_acceptance_unknown")
+    } else {
+        Value::Null
+    };
+    let report = json!({"attempt_fence":request["attempt_fence"],"report_kind":kind,"reason":reason,
+        "report_digest":hash(&json!(["determa-effect-attempt-report-1",record["effect_id"],record["operation_token"],
+            request["attempt_fence"],kind,request["payload"],reason]))?});
+    let reports = record["attempt_records"]
+        .as_array_mut()
+        .ok_or_else(|| failure("native attempt history absent"))?;
+    if reports
+        .iter()
+        .any(|report| report["attempt_fence"] == request["attempt_fence"])
+        || !record["outcome"].is_null()
+    {
+        return Err(failure("effect_result_conflict"));
+    }
+    record["attempt_records"]
+        .as_array_mut()
+        .unwrap()
+        .push(report);
+    if kind == "ambiguous" {
+        record["invocation_state"] = json!("ambiguous");
+    } else {
+        let mapping = record["result_mapping"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mapping| mapping["outcome_kind"] == kind)
+            .ok_or_else(|| failure("native result mapping absent"))?;
+        let event_id = hash(&json!([
+            "determa-effect-result-event-1",
+            record["effect_id"],
+            mapping["result_slot"]
+        ]))?;
+        record["outcome"] = json!({"kind":kind,"payload":request["payload"],"attempt_fence":request["attempt_fence"],
+            "digest":hash(&json!(["determa-effect-outcome-1",record["effect_id"],record["operation_token"],kind,
+                request["payload"],request["attempt_fence"]]))?});
+        record["result_event_id"] = json!(event_id);
+        record["invocation_state"] = json!("outcome_recorded");
+    }
     Ok(())
 }

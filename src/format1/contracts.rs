@@ -184,6 +184,31 @@ fn validate_embedded_artifacts(
     Ok(())
 }
 
+#[cfg(feature = "sqlite")]
+pub(crate) fn validate_native_effect_result_request(
+    value: &Value,
+) -> Result<(), super::ArtifactError> {
+    validate_schema(
+        "effect_result_request_v1",
+        value,
+        include_str!("../../schema/effect-result-request-v1.schema.json"),
+    )?;
+    let payload: super::TypedValue = serde_json::from_value(value["payload"].clone())
+        .map_err(|error| invalid_contract("effect_result_request_v1", error.to_string()))?;
+    let canonical = serde_json::to_value(&payload)
+        .map_err(|error| invalid_contract("effect_result_request_v1", error.to_string()))?;
+    if !matches!(payload, super::TypedValue::Map(_)) || canonical != value["payload"] {
+        return Err(invalid_contract(
+            "effect_result_request_v1",
+            "noncanonical portable result map",
+        ));
+    }
+    payload
+        .to_value(None)
+        .map_err(|error| invalid_contract("effect_result_request_v1", error.to_string()))?;
+    Ok(())
+}
+
 fn contract_schema(kind: &str) -> Option<&'static str> {
     match kind {
         "host_effect_journal_v1" => Some(include_str!(

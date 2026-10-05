@@ -1156,6 +1156,16 @@ fn validate_native_effect_transition(
     let request = requests
         .get(id)
         .ok_or_else(|| failure("new native request absent"))?;
+    if request["operation_kind"] == "effect_report" {
+        return validate_native_effect_report_transition(
+            prior,
+            prior_checkpoint,
+            document,
+            checkpoint,
+            request,
+            body,
+        );
+    }
     if request["operation_kind"] == "effect_claim" {
         return validate_native_effect_claim_transition(
             prior,
@@ -1597,6 +1607,54 @@ fn validate_native_effect_claim_transition(
     record["invocation_state"] = json!("leased");
     if claim["attempt_fence"] != "1" || document["journal"]["effect_records"] != expected {
         return Err(failure("native effect claim changed unrelated evidence"));
+    }
+    Ok(())
+}
+
+fn validate_native_effect_report_transition(
+    prior: &Value,
+    prior_checkpoint: &Value,
+    document: &Value,
+    checkpoint: &Value,
+    request: &Value,
+    body: &Value,
+) -> Result<(), AuthorityError> {
+    if checkpoint != prior_checkpoint
+        || !closed(
+            request,
+            &[
+                "operation_kind",
+                "root_instance_id",
+                "worker_principal",
+                "report",
+            ],
+        )
+        || request["root_instance_id"] != checkpoint["root_instance_id"]
+        || request["worker_principal"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    {
+        return Err(failure("native report transition malformed"));
+    }
+    let report = &request["report"];
+    crate::format1::validate_native_effect_result_request(report).map_err(failure)?;
+    let mut expected = prior["journal"]["effect_records"].clone();
+    let record = expected
+        .as_array_mut()
+        .ok_or_else(|| failure("prior effects absent"))?
+        .iter_mut()
+        .find(|record| record["effect_id"] == report["effect_id"])
+        .ok_or_else(|| failure("effect_not_outstanding"))?;
+    let claim = effects::current_native_effect_claim(prior, record)?;
+    if claim["worker_principal"] != request["worker_principal"] {
+        return Err(failure("unauthorized_scope"));
+    }
+    effects::record_native_effect_report(record, report)?;
+    let expected_body = json!({"kind":"effect_report","body":{
+        "attempt_report":record["attempt_records"].as_array().unwrap().last().unwrap(),
+        "outcome":record["outcome"],"result_event_id":record["result_event_id"]}});
+    if document["journal"]["effect_records"] != expected || body != &expected_body {
+        return Err(failure("native report changed unrelated evidence"));
     }
     Ok(())
 }
