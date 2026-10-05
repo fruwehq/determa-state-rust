@@ -88,6 +88,19 @@ impl SqliteLocalAuthority {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(failure)?;
+        let existing: u64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(failure)?;
+        if existing != 0 {
+            // Existing authority data must retain its original allocation and
+            // storage-boundary evidence. Setup never repairs missing evidence.
+            validate_schema(&transaction, &self.storage_binding)?;
+            return transaction.commit().map_err(failure);
+        }
         for sql in [
             RECORDS,
             ALLOCATIONS,
@@ -200,10 +213,15 @@ impl SqliteLocalAuthority {
         let Some(bytes) = bytes else {
             return response(Some(&request), None, Some("unauthorized_scope"));
         };
-        let mut record = strict_json::parse(&bytes).map_err(failure)?;
-        if canonical(&record)? != bytes {
-            return Err(failure("authority ledger is not canonical"));
-        }
+        let mut record = match strict_json::parse(&bytes) {
+            Ok(record)
+                if canonical(&record)? == bytes
+                    && validate_record(&transaction, scope, &record).is_ok() =>
+            {
+                record
+            }
+            _ => return response(Some(&request), None, Some("host_capability_mismatch")),
+        };
         if operation != "read_authority" {
             if let Some(receipt) = record["receipts"]
                 .as_array()
@@ -400,6 +418,125 @@ fn validate_request(request: &Value) -> Result<Option<&'static str>, AuthorityEr
         return Ok(Some("invalid_host_request"));
     }
     Ok(None)
+}
+
+fn closed(value: &Value, members: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == members.len() && members.iter().all(|member| object.contains_key(*member))
+    })
+}
+
+fn validate_record(
+    connection: &Connection,
+    scope: &str,
+    record: &Value,
+) -> Result<(), AuthorityError> {
+    if !closed(
+        record,
+        &[
+            "scope_identity",
+            "ownership_binding_digest",
+            "authority_epoch",
+            "owner_binding",
+            "state",
+            "scope_generation",
+            "active_transfer_id",
+            "receipts",
+        ],
+    ) || record["scope_identity"] != scope
+        || record["authority_epoch"] != "0"
+        || !record["active_transfer_id"].is_null()
+        || !matches!(
+            record["state"].as_str(),
+            Some("active" | "transaction_in_doubt")
+        )
+        || !closed(
+            &record["owner_binding"],
+            &["owner_principal", "host_binding"],
+        )
+        || ["owner_principal", "host_binding"].iter().any(|key| {
+            record["owner_binding"][key]
+                .as_str()
+                .is_none_or(str::is_empty)
+        })
+        || record["ownership_binding_digest"] != hash(&record["owner_binding"])?
+    {
+        return Err(failure("authority identity/ownership record mismatch"));
+    }
+    let allocated: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM determa_scope_allocations WHERE scope_identity=?)",
+            [scope],
+            |row| row.get(0),
+        )
+        .map_err(failure)?;
+    if !allocated {
+        return Err(failure("authority permanent allocation absent"));
+    }
+    let receipts = record["receipts"]
+        .as_array()
+        .ok_or_else(|| failure("authority receipts must be an array"))?;
+    if record["scope_generation"].as_str() != Some(receipts.len().to_string().as_str()) {
+        return Err(failure(
+            "authority generation does not match complete receipt history",
+        ));
+    }
+    let mutations: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM determa_authority_mutations",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(failure)?;
+    if mutations != receipts.len() as u64 {
+        return Err(failure("native authority mutation inventory mismatch"));
+    }
+    let mut identifiers = BTreeSet::new();
+    for (index, receipt) in receipts.iter().enumerate() {
+        if !closed(
+            receipt,
+            &["operation_id", "request_digest", "request", "result"],
+        ) {
+            return Err(failure("authority receipt shape mismatch"));
+        }
+        let request = &receipt["request"];
+        if validate_request(request)?.is_some()
+            || request["operation"] != "guarded_commit"
+            || request["scope_identity"] != scope
+            || request["expected_authority_epoch"] != "0"
+            || request["expected_scope_generation"].as_str() != Some(index.to_string().as_str())
+            || receipt["request_digest"] != request["request_digest"]
+            || receipt["operation_id"] != request["operation_id"]
+        {
+            return Err(failure("authority receipt request binding mismatch"));
+        }
+        let identifier = receipt["operation_id"]
+            .as_str()
+            .ok_or_else(|| failure("receipt operation id absent"))?;
+        if !identifiers.insert(identifier) {
+            return Err(failure("duplicate authority receipt identity"));
+        }
+        let mut historical = record.clone();
+        historical["state"] = json!("active");
+        historical["scope_generation"] = json!((index + 1).to_string());
+        if receipt["result"] != response(Some(request), Some(&historical), None)? {
+            return Err(failure(
+                "authority retained result/evidence digest mismatch",
+            ));
+        }
+        let native: Option<(String, Vec<u8>)> = connection.query_row(
+            "SELECT mutation_digest,mutation FROM determa_authority_mutations WHERE scope_identity=? AND operation_id=?",
+            params![scope, identifier], |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(failure)?;
+        let Some((digest, bytes)) = native else {
+            return Err(failure("retained native mutation absent"));
+        };
+        if request["arguments"]["mutation_digest"] != digest
+            || digest != format!("sha256:{:x}", Sha256::digest(bytes))
+        {
+            return Err(failure("retained native mutation digest mismatch"));
+        }
+    }
+    Ok(())
 }
 
 fn response(

@@ -41,6 +41,139 @@ fn request(operation: &str, identifier: &str, mutation: &[u8]) -> Value {
         "arguments": if operation == "read_authority" { json!({}) } else { json!({"mutation_digest": format!("sha256:{:x}", Sha256::digest(mutation))}) }}),
     )
 }
+
+#[test]
+fn damaged_existing_authority_is_never_reinitialized() {
+    for table in ["determa_authority_boundary", "determa_scope_allocations"] {
+        let source = path();
+        let copied = path();
+        let authority = SqliteLocalAuthority::open(&source).unwrap();
+        authority.setup_schema().unwrap();
+        authority.allocate("scope", "owner", "local-host").unwrap();
+        let native = rusqlite::Connection::open(&source).unwrap();
+        native
+            .execute("VACUUM INTO ?", [copied.to_str().unwrap()])
+            .unwrap();
+        let damaged = rusqlite::Connection::open(&copied).unwrap();
+        damaged.execute(&format!("DROP TABLE {table}"), []).unwrap();
+        let before: Vec<u8> = damaged
+            .query_row("SELECT ledger FROM determa_scope_authority", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let inert = SqliteLocalAuthority::open(&copied).unwrap();
+        assert!(inert.setup_schema().is_err());
+        let count: u64 = damaged
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name=?",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let after: Vec<u8> = damaged
+            .query_row("SELECT ledger FROM determa_scope_authority", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            perform(
+                &authority,
+                &request("read_authority", "read", b""),
+                "owner",
+                None
+            )["status"],
+            "accepted"
+        );
+        drop(inert);
+        drop(damaged);
+        drop(native);
+        drop(authority);
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(copied).unwrap();
+    }
+}
+
+#[test]
+fn canonical_ledger_or_native_mutation_corruption_refuses_read_replay_and_commit() {
+    for corruption in [
+        "result", "request", "digest", "scope", "owner", "delete", "bytes",
+    ] {
+        let file = path();
+        let authority = SqliteLocalAuthority::open(&file).unwrap();
+        authority.setup_schema().unwrap();
+        authority.allocate("scope", "owner", "local-host").unwrap();
+        let command = request("guarded_commit", "first", b"native mutation");
+        assert_eq!(
+            perform(&authority, &command, "owner", Some(b"native mutation"))["status"],
+            "accepted"
+        );
+        let native = rusqlite::Connection::open(&file).unwrap();
+        let bytes: Vec<u8> = native
+            .query_row("SELECT ledger FROM determa_scope_authority", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let mut ledger: Value = serde_json::from_slice(&bytes).unwrap();
+        match corruption {
+            "result" => ledger["receipts"][0]["result"]["scope_generation"] = json!("999"),
+            "request" => ledger["receipts"][0]["request"]["operation_id"] = json!("forged"),
+            "digest" => {
+                ledger["receipts"][0]["request_digest"] =
+                    json!(format!("sha256:{}", "0".repeat(64)))
+            }
+            "scope" => ledger["scope_identity"] = json!("different"),
+            "owner" => ledger["owner_binding"]["owner_principal"] = json!("different"),
+            "delete" => {
+                native
+                    .execute("DELETE FROM determa_authority_mutations", [])
+                    .unwrap();
+            }
+            "bytes" => {
+                native
+                    .execute(
+                        "UPDATE determa_authority_mutations SET mutation=?",
+                        [b"forged".as_slice()],
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        native
+            .execute(
+                "UPDATE determa_scope_authority SET ledger=?",
+                [serde_json_canonicalizer::to_vec(&ledger).unwrap()],
+            )
+            .unwrap();
+        let mut next = request("guarded_commit", "next", b"next");
+        next["expected_scope_generation"] = json!("1");
+        next = sealed(next);
+        for (attempt, mutation) in [
+            (request("read_authority", "read", b""), None),
+            (command.clone(), None),
+            (next, Some(b"next".as_slice())),
+        ] {
+            let result = perform(&authority, &attempt, "owner", mutation);
+            assert_eq!(
+                result["error_code"], "host_capability_mismatch",
+                "{corruption}"
+            );
+            assert!(result["scope_generation"].is_null(), "{corruption}");
+        }
+        let count: u64 = native
+            .query_row(
+                "SELECT COUNT(*) FROM determa_authority_mutations WHERE operation_id='next'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(native);
+        drop(authority);
+        std::fs::remove_file(file).unwrap();
+    }
+}
 fn perform(
     authority: &SqliteLocalAuthority,
     request: &Value,
