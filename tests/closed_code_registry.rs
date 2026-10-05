@@ -3,7 +3,8 @@ use determa_state::checkpoint::{
     StoreErrorCode,
 };
 use determa_state::{
-    CreationRejectionCode, DispatchRejectionCode, Disposition, EngineFaultCode, LoadErrorCode,
+    CreationRejectionCode, DispatchRejectionCode, Disposition, EngineFaultCode,
+    InspectionDispositionCode, InspectionFailureCode, InspectionReasonCode, LoadErrorCode,
     PersistenceErrorCode,
 };
 use serde::Deserialize;
@@ -77,6 +78,20 @@ fn b0_production_exports_match_the_authoritative_registry_exactly() {
         (
             "execution_store_failure",
             projected(StoreErrorCode::PORTABLE_CODES, |code| code.as_str()),
+        ),
+        (
+            "inspection_disposition",
+            projected(InspectionDispositionCode::PORTABLE_CODES, |code| {
+                code.as_str()
+            }),
+        ),
+        (
+            "inspection_failure",
+            projected(InspectionFailureCode::PORTABLE_CODES, |code| code.as_str()),
+        ),
+        (
+            "inspection_reason",
+            projected(InspectionReasonCode::PORTABLE_CODES, |code| code.as_str()),
         ),
         (
             "machine_load_failure",

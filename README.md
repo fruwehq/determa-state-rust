@@ -9,12 +9,13 @@ aggregate artifacts, and durable checkpoint coverage. The implementation is vali
 these exact normative inputs:
 
 - specification commit `6bd25e3fcdf068af861aa289903a8489bd8f0139`;
-- conformance commit `710d5e9bcf517e8a8cc8d7087123bda37a362d6b`.
+- conformance commit `c0e101c86bd71068669df3cd2250d4fec24ff74d`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 75 mailbox-neutral runtime traces through the shared private RTC kernel,
 all 162 applicable native artifact/checkpoint schema-v1 core vectors, and all 142
-durable-host vectors, plus semantic validation of all 403 declared artifact documents.
+durable-host vectors, all 49 exact candidate inspection vectors, plus semantic validation
+of all 420 declared artifact documents.
 Durable host profiles remain optional host contracts; memory, file, SQLite, and
 PostgreSQL tests exercise the implemented transactional host surface.
 
@@ -32,6 +33,9 @@ PostgreSQL tests exercise the implemented transactional host surface.
 - Pure queue-bearing `create`, `admit`, and `step` operations over one native aggregate
   model that owns runtime mailboxes and their allocation counters, with deterministic
   runtime, cause, event, and external-effect identities.
+- Read-only `inspect_candidate` over an exact runtime incarnation and normalized
+  candidate envelope. Structural inspection reports ordered possible dispositions;
+  configured semantic inspection evaluates reached CEL guards with portable fuel.
 - Portable aggregate serialization and restoration with strict typed values, canonical
   JSON, content-addressed definitions, sole schema-v1 artifacts, and
   self-contained aggregate packages.
@@ -73,7 +77,7 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`710d5e9bcf517e8a8cc8d7087123bda37a362d6b`. CI also checks that all bundled schemas
+`c0e101c86bd71068669df3cd2250d4fec24ff74d`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
 `6bd25e3fcdf068af861aa289903a8489bd8f0139`. These exact reviewed public commits are
 the current implementation inputs; tag publication is a later coordinated release operation.
@@ -100,6 +104,20 @@ assert_eq!(aggregate.value()["aggregate_state_schema_version"], 1);
 Input and internal envelopes are caller-owned. `admit` retains accepted work in the
 aggregate and `step` processes one ready event. External emissions are deterministic
 output intents for the host to persist and deliver.
+
+`inspect_candidate(&aggregate, &request, &resolver, InspectionCapabilities::default())`
+accepts the closed six-member request in `schema/inspection-v1.schema.json` and returns
+the exact closed outcome or `{code, source_locator}` operation failure. The resolver
+must trust every definition retained by the aggregate. Use
+`InspectionCapabilities { safe_semantic_cel: false }` when a host does not offer
+bounded semantic inspection. Neither mode admits the candidate or changes queues,
+receipts, counters, or the supplied aggregate.
+
+The seven native provider inspection vectors require a separately verified runtime
+provider `inspect_guard` capability and belong to the later provider integration.
+Their two portable aggregate fixtures currently receive structural schema and digest
+validation; resolver-backed activation and all seven runtime vectors are required
+before the final release claim.
 
 ## Public extensions
 

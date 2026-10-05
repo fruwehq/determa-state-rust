@@ -1,0 +1,572 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/inspection-v1.schema.json",
+  "title": "Determa State exact candidate inspection version 1",
+  "description": "Closed request and result shapes; inspect_candidate performs the semantic checks in SPEC.md section 12.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/outcome"
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "positiveDecimal": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "pointer": {
+      "type": "string",
+      "pattern": "^/(?:[^~/]|~[01])*(?:/(?:[^~/]|~[01])*)*$"
+    },
+    "incarnation": {
+      "$ref": "aggregate-state-v1.schema.json#/$defs/identityOrigin"
+    },
+    "request": {
+      "type": "object",
+      "required": [
+        "mode",
+        "aggregate_state_digest",
+        "runtime_id",
+        "runtime_incarnation",
+        "envelope",
+        "limits"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "structural",
+            "semantic"
+          ]
+        },
+        "aggregate_state_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "runtime_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "runtime_incarnation": {
+          "$ref": "#/$defs/incarnation"
+        },
+        "envelope": {
+          "$ref": "aggregate-state-v1.schema.json#/$defs/envelope"
+        },
+        "limits": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "required": [
+                "maximum_guard_evaluations",
+                "maximum_evaluation_steps"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "maximum_guard_evaluations": {
+                  "$ref": "#/$defs/positiveDecimal"
+                },
+                "maximum_evaluation_steps": {
+                  "$ref": "#/$defs/positiveDecimal"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "structural"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "limits": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "semantic"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "limits": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "disposition": {
+      "enum": [
+        "handled_now",
+        "deferred",
+        "unhandled",
+        "invalid"
+      ]
+    },
+    "branch": {
+      "type": "object",
+      "required": [
+        "branch_index",
+        "guard_locator",
+        "guard_binding_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "branch_index": {
+          "$ref": "#/$defs/decimal"
+        },
+        "guard_locator": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/pointer"
+            }
+          ]
+        },
+        "guard_binding_digest": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/sha256"
+            }
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "guard_locator": {
+              "type": "null"
+            },
+            "guard_binding_digest": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "guard_locator": {
+              "$ref": "#/$defs/pointer"
+            },
+            "guard_binding_digest": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        }
+      ]
+    },
+    "level": {
+      "type": "object",
+      "required": [
+        "state_id",
+        "handler_branches",
+        "defers"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state_id": {
+          "$ref": "#/$defs/pointer"
+        },
+        "handler_branches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/branch"
+          }
+        },
+        "defers": {
+          "type": "boolean"
+        }
+      }
+    },
+    "guardEvidence": {
+      "type": "object",
+      "required": [
+        "state_id",
+        "branch_index",
+        "guard_locator",
+        "guard_binding_digest",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state_id": {
+          "$ref": "#/$defs/pointer"
+        },
+        "branch_index": {
+          "$ref": "#/$defs/decimal"
+        },
+        "guard_locator": {
+          "$ref": "#/$defs/pointer"
+        },
+        "guard_binding_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "value": {
+          "type": "boolean"
+        }
+      }
+    },
+    "success": {
+      "type": "object",
+      "required": [
+        "aggregate_state_digest",
+        "definition_fingerprint",
+        "runtime_id",
+        "runtime_incarnation",
+        "classification",
+        "possible_dispositions",
+        "disposition",
+        "reason",
+        "levels",
+        "guard_evidence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "aggregate_state_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "definition_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "runtime_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "runtime_incarnation": {
+          "$ref": "#/$defs/incarnation"
+        },
+        "classification": {
+          "enum": [
+            "definitive",
+            "conditional"
+          ]
+        },
+        "possible_dispositions": {
+          "enum": [
+            [
+              "handled_now"
+            ],
+            [
+              "deferred"
+            ],
+            [
+              "unhandled"
+            ],
+            [
+              "handled_now",
+              "deferred"
+            ],
+            [
+              "handled_now",
+              "unhandled"
+            ],
+            [
+              "deferred",
+              "unhandled"
+            ],
+            [
+              "handled_now",
+              "deferred",
+              "unhandled"
+            ],
+            [
+              "invalid"
+            ]
+          ]
+        },
+        "disposition": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/disposition"
+            }
+          ]
+        },
+        "reason": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "enum": [
+                "target_not_found",
+                "target_incarnation_mismatch",
+                "invalid_envelope",
+                "runtime_inactive"
+              ]
+            }
+          ]
+        },
+        "levels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/level"
+          }
+        },
+        "guard_evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/guardEvidence"
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "classification": {
+              "const": "definitive"
+            },
+            "possible_dispositions": {
+              "maxItems": 1
+            },
+            "disposition": {
+              "$ref": "#/$defs/disposition"
+            }
+          },
+          "oneOf": [
+            {
+              "properties": {
+                "possible_dispositions": {
+                  "const": [
+                    "handled_now"
+                  ]
+                },
+                "disposition": {
+                  "const": "handled_now"
+                }
+              }
+            },
+            {
+              "properties": {
+                "possible_dispositions": {
+                  "const": [
+                    "deferred"
+                  ]
+                },
+                "disposition": {
+                  "const": "deferred"
+                }
+              }
+            },
+            {
+              "properties": {
+                "possible_dispositions": {
+                  "const": [
+                    "unhandled"
+                  ]
+                },
+                "disposition": {
+                  "const": "unhandled"
+                }
+              }
+            },
+            {
+              "properties": {
+                "possible_dispositions": {
+                  "const": [
+                    "invalid"
+                  ]
+                },
+                "disposition": {
+                  "const": "invalid"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "properties": {
+            "classification": {
+              "const": "conditional"
+            },
+            "possible_dispositions": {
+              "minItems": 2
+            },
+            "disposition": {
+              "type": "null"
+            },
+            "reason": {
+              "type": "null"
+            }
+          }
+        }
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "possible_dispositions": {
+                "contains": {
+                  "const": "invalid"
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "classification": {
+                "const": "definitive"
+              },
+              "possible_dispositions": {
+                "prefixItems": [
+                  {
+                    "const": "invalid"
+                  }
+                ],
+                "maxItems": 1
+              },
+              "disposition": {
+                "const": "invalid"
+              },
+              "reason": {
+                "enum": [
+                  "target_not_found",
+                  "target_incarnation_mismatch",
+                  "invalid_envelope",
+                  "runtime_inactive"
+                ]
+              },
+              "levels": {
+                "maxItems": 0
+              },
+              "guard_evidence": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "possible_dispositions": {
+                "not": {
+                  "contains": {
+                    "const": "invalid"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "type": "null"
+              },
+              "levels": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "failure": {
+      "type": "object",
+      "required": [
+        "code",
+        "source_locator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_inspection_request",
+            "inspection_capability_unavailable",
+            "inspection_guard_failure",
+            "inspection_limit_exceeded"
+          ]
+        },
+        "source_locator": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/pointer"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "invalid_inspection_request",
+                  "inspection_capability_unavailable"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "source_locator": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "inspection_guard_failure",
+                  "inspection_limit_exceeded"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "source_locator": {
+                "$ref": "#/$defs/pointer"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "outcome": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/success"
+        },
+        {
+          "$ref": "#/$defs/failure"
+        }
+      ]
+    }
+  }
+}

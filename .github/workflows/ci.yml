@@ -8,8 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: 1
-  SPECIFICATION_COMMIT: 6207362e879ccca70f709e1eb4cc90448d910c0b
-  CONFORMANCE_COMMIT: e499a99c3ced88f29008049ea9dddcc17a0d9f51
+  SPECIFICATION_COMMIT: 86bb88dd21cb1f799eefe5020b6e49dabf6e7225
+  CONFORMANCE_COMMIT: 7f09321fb483a22eb677a4342f8d9537a7a18e82
 
 jobs:
   msrv:
@@ -102,6 +102,7 @@ jobs:
           cmp schema/extension-descriptor-v1.schema.json authoritative-spec/schema/extension-descriptor-v1.schema.json
           cmp schema/extension-capability-report-v1.schema.json authoritative-spec/schema/extension-capability-report-v1.schema.json
           cmp schema/extension-capability-requirement-v1.schema.json authoritative-spec/schema/extension-capability-requirement-v1.schema.json
+          cmp schema/inspection-v1.schema.json authoritative-spec/schema/inspection-v1.schema.json
           cmp schema/durable-host-call-log-v1.schema.json conformance-suite/scripts/schemas/durable-host-call-log-v1.schema.json
           cmp schema/durable-host-inputs-v1.schema.json conformance-suite/scripts/schemas/durable-host-inputs-v1.schema.json
           cmp schema/durable-host-results-v1.schema.json conformance-suite/scripts/schemas/durable-host-results-v1.schema.json
@@ -143,7 +144,12 @@ jobs:
       - name: All 162 native artifact/checkpoint schema-v1 vectors
         run: cargo test --locked --test native_v1_conformance -- --nocapture
 
-      - name: All 420 declared artifact documents
+      - name: All 49 exact candidate inspection vectors
+        env:
+          RUSTFLAGS: --cfg determa_repository_conformance
+        run: cargo test --locked --test inspection_conformance -- --nocapture
+
+      - name: All 484 declared artifact documents
         run: cargo test --locked --test artifact_manifest -- --nocapture
 
       - name: All 142 durable-host vectors

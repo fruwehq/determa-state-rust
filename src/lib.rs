@@ -14,18 +14,21 @@ pub mod format1;
 pub mod value;
 
 /// Exact normative specification revision implemented by this crate.
-pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "6bd25e3fcdf068af861aa289903a8489bd8f0139";
+pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "86bb88dd21cb1f799eefe5020b6e49dabf6e7225";
 
 /// Exact core conformance revision exercised by this crate.
-pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "710d5e9bcf517e8a8cc8d7087123bda37a362d6b";
+pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "7f09321fb483a22eb677a4342f8d9537a7a18e82";
 
+#[cfg(determa_repository_conformance)]
+pub use format1::observed_inspection_guards;
 pub use format1::{
-    admit, create, load_bundle, load_bundle_from_json, migrate_aggregate, migrate_aggregate_route,
-    restore_aggregate, restore_package, step, validate_artifact, validate_contract_artifact,
-    validate_migration_descriptor, AdmissionDelivery, Aggregate, ArtifactError, Bindings, Bundle,
-    Counter, CreationRejectionCode, DefinitionResolver, DispatchRejectionCode, Disposition,
-    EngineFaultCode, InMemoryDefinitionResolver, LoadError, LoadErrorCode,
-    MigrationArtifactResolver, MigrationRequest, PersistenceError, PersistenceErrorCode,
-    QueueEnvelope, ResourceLimits, RestoredPackage, Target, TypedValue,
+    admit, create, inspect_candidate, load_bundle, load_bundle_from_json, migrate_aggregate,
+    migrate_aggregate_route, restore_aggregate, restore_package, step, validate_artifact,
+    validate_contract_artifact, validate_migration_descriptor, AdmissionDelivery, Aggregate,
+    ArtifactError, Bindings, Bundle, Counter, CreationRejectionCode, DefinitionResolver,
+    DispatchRejectionCode, Disposition, EngineFaultCode, InMemoryDefinitionResolver,
+    InspectionCapabilities, InspectionDispositionCode, InspectionFailureCode, InspectionReasonCode,
+    LoadError, LoadErrorCode, MigrationArtifactResolver, MigrationRequest, PersistenceError,
+    PersistenceErrorCode, QueueEnvelope, ResourceLimits, RestoredPackage, Target, TypedValue,
 };
 pub use value::{string_from_utf16, InstanceReference, InvalidUnicodeString, Value};

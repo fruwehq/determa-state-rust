@@ -14,8 +14,8 @@ Repository metadata prepares the synchronized State `0.3.0` release after the
 
 The current draft is validated against these exact immutable inputs:
 
-- specification: `6bd25e3fcdf068af861aa289903a8489bd8f0139`;
-- conformance: `710d5e9bcf517e8a8cc8d7087123bda37a362d6b`.
+- specification: `86bb88dd21cb1f799eefe5020b6e49dabf6e7225`;
+- conformance: `7f09321fb483a22eb677a4342f8d9537a7a18e82`.
 
 The conformance suite is the arbiter of behavior. These exact reviewed public commits are
 the current implementation inputs; tag publication is a later coordinated release operation.
@@ -36,9 +36,12 @@ Never invent a release tag or weaken an exact revision check.
 - `src/format1/runtime_conformance.rs`: repository-only driver for all 75 mailbox-neutral
   runtime traces through the private RTC kernel shared by the sole queue-bearing public API;
   it is explicitly configured by CI and excluded from the published crate.
-- `tests/artifact_manifest.rs`: schema and semantic routing gate for all 403 declared
+- `tests/artifact_manifest.rs`: schema and semantic routing gate for all 484 declared
   conformance artifact documents. Operation admissibility is checked separately by
   the native schema-v1 vectors through public operations.
+- `tests/inspection_conformance.rs`: all 49 mandatory exact-target inspection vectors
+  through the production operation. Seven native provider vectors remain conditional
+  on the separately verified provider capability.
 - `tests/durable_host_conformance.rs`: production-host driver for all 142 optional
   durable-host vectors, including SQLite shared transactions.
 - `tests/checkpoint_adapters.rs`: shared memory/file/SQLite setup, restart, and CAS
@@ -63,7 +66,7 @@ Never invent a release tag or weaken an exact revision check.
 ```sh
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
-  "710d5e9bcf517e8a8cc8d7087123bda37a362d6b"
+  "7f09321fb483a22eb677a4342f8d9537a7a18e82"
 cargo +1.86.0 build --release --locked --all-features
 cargo +1.86.0 test --locked --all-features
 cargo clippy --locked --all-features --all-targets -- -D warnings
@@ -73,7 +76,7 @@ The declared MSRV is Rust `1.86`. CI must keep the locked default and all-featur
 including PostgreSQL, buildable and testable with that toolchain.
 
 CI runs all 162 applicable native schema-v1 core vectors, all 142 durable-host vectors,
-and all 403 declared artifact documents.
+and all 484 declared artifact documents.
 It also checks every local schema byte-for-byte against the exact specification commit
 and runs the optional PostgreSQL adapter against a service.
 
@@ -81,6 +84,7 @@ and runs the optional PostgreSQL adapter against a service.
 
 The portable API exposes only queue-bearing schema-v1 create, admission, step,
 serialization/restoration, package restoration, and definition migration operations.
+It also exposes read-only exact candidate inspection with bounded CEL guard evaluation.
 The optional synchronous host wraps those unchanged
 operations with portable checkpoint transactions. It owns no broker, timer, worker,
 daemon, socket, subprocess protocol, package imports, or scheduling. Execution stores
