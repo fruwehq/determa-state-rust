@@ -40,8 +40,8 @@ Never invent a release tag or weaken an exact revision check.
   conformance artifact documents. Operation admissibility is checked separately by
   the native schema-v1 vectors through public operations.
 - `tests/inspection_conformance.rs`: all 49 mandatory exact-target inspection vectors
-  through the production operation. Seven native provider vectors remain conditional
-  on the separately verified provider capability.
+  through the production operation. Seven native provider vectors execute through separately verified provider
+  capabilities.
 - `tests/durable_host_conformance.rs`: production-host driver for all 142 optional
   durable-host vectors, including SQLite shared transactions.
 - `tests/checkpoint_adapters.rs`: shared memory/file/SQLite setup, restart, and CAS

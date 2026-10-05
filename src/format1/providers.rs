@@ -443,69 +443,94 @@ impl RuntimeProviderRegistry {
         Ok((value, spent))
     }
 }
+fn executable_slots(document: &Value) -> BTreeMap<Vec<String>, &'static str> {
+    fn at(path: &[String], name: &str) -> Vec<String> {
+        let mut result = path.to_vec();
+        result.push(name.to_owned());
+        result
+    }
+    fn transition(value: &Value, path: &[String], slots: &mut BTreeMap<Vec<String>, &'static str>) {
+        if let Some(items) = value.as_array() {
+            for (index, item) in items.iter().enumerate() {
+                transition(item, &at(path, &index.to_string()), slots);
+            }
+        } else if value.is_object() {
+            if value.get("guard").is_some() {
+                slots.insert(at(path, "guard"), "guard");
+            }
+            if value.get("action").is_some() {
+                slots.insert(at(path, "action"), "actions");
+            }
+        }
+    }
+    fn state(value: &Value, path: &[String], slots: &mut BTreeMap<Vec<String>, &'static str>) {
+        if !value.is_object() {
+            return;
+        }
+        for name in ["entry", "exit"] {
+            if value.get(name).is_some() {
+                slots.insert(at(path, name), "actions");
+            }
+        }
+        for name in ["initial", "choice"] {
+            transition(&value[name], &at(path, name), slots);
+        }
+        if let Some(handlers) = value["on_events"].as_object() {
+            for (name, handler) in handlers {
+                transition(handler, &at(&at(path, "on_events"), name), slots);
+            }
+        }
+        if let Some(children) = value["states"].as_object() {
+            for (name, child) in children {
+                state(child, &at(&at(path, "states"), name), slots);
+            }
+        }
+        if let Some(components) = value["components"].as_array() {
+            for (index, component) in components.iter().enumerate() {
+                if let Some(root) = component.get("root") {
+                    state(
+                        root,
+                        &at(&at(&at(path, "components"), &index.to_string()), "root"),
+                        slots,
+                    );
+                }
+            }
+        }
+    }
+    let mut slots = BTreeMap::new();
+    if let Some(machines) = document["machines"].as_array() {
+        for (index, machine) in machines.iter().enumerate() {
+            state(
+                &machine["root"],
+                &["machines".to_owned(), index.to_string(), "root".to_owned()],
+                &mut slots,
+            );
+        }
+    }
+    slots
+}
 fn visit_bindings(
     document: &Value,
     call: &mut impl FnMut(&str, &Value) -> ProviderResult<()>,
 ) -> ProviderResult<()> {
-    fn actions(
-        value: &Value,
-        call: &mut impl FnMut(&str, &Value) -> ProviderResult<()>,
-    ) -> ProviderResult<()> {
-        if let Some(items) = value.as_array() {
+    for (path, kind) in executable_slots(document) {
+        let value = path.iter().fold(document, |value, token| {
+            if let Some(items) = value.as_array() {
+                &items[token.parse::<usize>().expect("grammar array index")]
+            } else {
+                &value[token]
+            }
+        });
+        if kind == "guard" {
+            if let Some(binding) = value.get("provider") {
+                call(kind, binding)?;
+            }
+        } else if let Some(items) = value.as_array() {
             for action in items {
                 if let Some(binding) = action.get("provider_actions") {
-                    call("actions", binding)?;
+                    call(kind, binding)?;
                 }
             }
-        }
-        Ok(())
-    }
-    fn transition(
-        value: &Value,
-        call: &mut impl FnMut(&str, &Value) -> ProviderResult<()>,
-    ) -> ProviderResult<()> {
-        if let Some(items) = value.as_array() {
-            for item in items {
-                transition(item, call)?;
-            }
-        } else {
-            if let Some(binding) = value.get("guard").and_then(|guard| guard.get("provider")) {
-                call("guard", binding)?;
-            }
-            actions(&value["action"], call)?;
-        }
-        Ok(())
-    }
-    fn state(
-        value: &Value,
-        call: &mut impl FnMut(&str, &Value) -> ProviderResult<()>,
-    ) -> ProviderResult<()> {
-        actions(&value["entry"], call)?;
-        actions(&value["exit"], call)?;
-        transition(&value["initial"], call)?;
-        transition(&value["choice"], call)?;
-        if let Some(handlers) = value["on_events"].as_object() {
-            for handler in handlers.values() {
-                transition(handler, call)?;
-            }
-        }
-        if let Some(children) = value["states"].as_object() {
-            for child in children.values() {
-                state(child, call)?;
-            }
-        }
-        if let Some(components) = value["components"].as_array() {
-            for component in components {
-                if let Some(root) = component.get("root") {
-                    state(root, call)?;
-                }
-            }
-        }
-        Ok(())
-    }
-    if let Some(machines) = document["machines"].as_array() {
-        for machine in machines {
-            state(&machine["root"], call)?;
         }
     }
     Ok(())

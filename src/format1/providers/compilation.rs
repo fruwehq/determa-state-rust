@@ -159,7 +159,18 @@ pub fn compile_language_source(
             return Err(failed());
         }
     }
-    let mut closure_keys = BTreeSet::new();
+    let mut generated = content["template"].clone();
+    let slots = executable_slots(&generated);
+    for (path, region) in locations.iter().zip(regions) {
+        let kind = region["kind"].as_str().ok_or_else(failed)?;
+        if slots.get(path).copied() != Some(kind) {
+            return Err(failed());
+        }
+        let slot = slot_mut(&mut generated, path)?;
+        if !(kind == "guard" && slot.is_string() || kind == "actions" && slot.is_array()) {
+            return Err(failed());
+        }
+    }
     let mut prior = None;
     for dependency in content["dependencies"].as_array().ok_or_else(failed)? {
         let ordered = reference_order(dependency)?;
@@ -167,7 +178,6 @@ pub fn compile_language_source(
             return Err(failed());
         }
         prior = Some(ordered.clone());
-        closure_keys.insert(ordered);
         let closure = registry
             .0
             .dependencies
@@ -178,20 +188,10 @@ pub fn compile_language_source(
             return Err(unavailable());
         }
     }
-    let mut generated = content["template"].clone();
-    for (path, region) in locations.iter().zip(regions) {
-        let slot = slot_mut(&mut generated, path)?;
-        let name = path.last().ok_or_else(failed)?.as_str();
-        let valid = match region["kind"].as_str() {
-            Some("guard") => name == "guard" && slot.is_string(),
-            Some("actions") => matches!(name, "action" | "entry" | "exit") && slot.is_array(),
-            _ => false,
-        };
-        if !valid {
-            return Err(failed());
-        }
+    let mut compiler_claims_before = Vec::new();
+    for region in regions {
         registry.check_compiler(&region["provider_reference"])?;
-        closure_keys.insert(reference_order(&region["provider_reference"])?);
+        compiler_claims_before.push(registry.compiler_capabilities(&region["provider_reference"])?);
     }
     for (index, (path, region)) in locations.iter().zip(regions).enumerate() {
         if index >= maximum_compilation_steps {
@@ -205,44 +205,60 @@ pub fn compile_language_source(
             region["source"].as_str().ok_or_else(failed)?,
         )?;
     }
-    let bundle = super::super::source::load_bundle_with_providers(
+    let mut bundle = super::super::source::load_bundle_with_providers(
         &generated.to_string(),
         registry.clone(),
         &BTreeSet::new(),
     )
     .map_err(|_| failed())?;
+    let mut effective = registry.effective_capabilities(&bundle.normalized)?;
+    let compiler_claims_after = regions
+        .iter()
+        .map(|region| registry.compiler_capabilities(&region["provider_reference"]))
+        .collect::<ProviderResult<Vec<_>>>()?;
+    for claims in compiler_claims_before
+        .into_iter()
+        .chain(compiler_claims_after)
+    {
+        for (name, claim) in claims {
+            let value = effective.get_mut(&name).ok_or_else(failed)?;
+            if name == "external_io_capable" {
+                *value |= claim;
+            } else {
+                *value &= claim;
+            }
+        }
+    }
+    let mut references = BTreeMap::new();
+    for reference in content["dependencies"]
+        .as_array()
+        .ok_or_else(failed)?
+        .iter()
+        .chain(regions.iter().map(|region| &region["provider_reference"]))
+    {
+        references.insert(reference_order(reference)?, reference.clone());
+    }
+    let record = json!({
+        "source_artifact_digest": source["artifact_digest"],
+        "compiler_providers": references.into_values().collect::<Vec<_>>(),
+        "generated_validated_bundle_fingerprint": bundle.fingerprint,
+        "source_capabilities": effective,
+    });
+    let computed = json!({
+        "artifact_format":"determa.compilation_manifest", "artifact_schema_version":1,
+        "artifact_digest":hash_json(json!(["determa.compilation_manifest","1",typed_projection(&record)])),
+        "content":record,
+    });
     if let Some(manifest) = manifest {
         artifact(
             manifest,
             include_str!("../../../schema/compilation-manifest-v1.schema.json"),
             "determa.compilation_manifest",
         )?;
-        let record = &manifest["content"];
-        let recorded_keys = record["compiler_providers"]
-            .as_array()
-            .ok_or_else(failed)?
-            .iter()
-            .map(reference_order)
-            .collect::<ProviderResult<Vec<_>>>()?;
-        let mut effective = registry.effective_capabilities(&bundle.normalized)?;
-        for region in regions {
-            for (name, claim) in registry.compiler_capabilities(&region["provider_reference"])? {
-                let value = effective.get_mut(&name).ok_or_else(failed)?;
-                if name == "external_io_capable" {
-                    *value |= claim;
-                } else {
-                    *value &= claim;
-                }
-            }
-        }
-        if record["source_artifact_digest"] != source["artifact_digest"]
-            || recorded_keys != closure_keys.into_iter().collect::<Vec<_>>()
-            || record["generated_validated_bundle_fingerprint"] != bundle.fingerprint
-            || record["source_capabilities"]
-                != serde_json::to_value(effective).map_err(|_| failed())?
-        {
+        if manifest != &computed {
             return Err(failed());
         }
     }
+    bundle.source_compilation = Some(json!({"source":source,"manifest":computed}));
     Ok(bundle)
 }

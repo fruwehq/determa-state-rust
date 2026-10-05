@@ -95,9 +95,9 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`c0e101c86bd71068669df3cd2250d4fec24ff74d`. CI also checks that all bundled schemas
+`cf7e673b26ebb162dfdc54d9d235300cd3350438`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
-`6bd25e3fcdf068af861aa289903a8489bd8f0139`. These exact reviewed public commits are
+`77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0`. These exact reviewed public commits are
 the current implementation inputs; tag publication is a later coordinated release operation.
 
 ## Library
@@ -131,11 +131,17 @@ must trust every definition retained by the aggregate. Use
 bounded semantic inspection. Neither mode admits the candidate or changes queues,
 receipts, counters, or the supplied aggregate.
 
-The seven native provider inspection vectors require a separately verified runtime
-provider `inspect_guard` capability and belong to the later provider integration.
-Their two portable aggregate fixtures currently receive structural schema and digest
-validation; resolver-backed activation and all seven runtime vectors are required
-before the final release claim.
+All seven native provider inspection vectors run through a separately verified
+`inspect_guard` entrypoint. Their portable aggregates restore through the actual
+provider-backed definition resolver. Complete runtime-provider profile coverage
+remains unfinished and is required before the final release claim.
+
+`compile_language_source` compiles only executable grammar slots through explicitly
+installed exact-source compilers, then strictly loads the generated format-1 bundle.
+Every successful `Bundle.source_compilation` retains sealed version-1 source and
+manifest artifacts, even without a supplied manifest. The evidence discloses the
+historical source capability profile independently of generated runtime guarantees.
+Generated CEL definitions restore without an installed compiler.
 
 ## Public extensions
 

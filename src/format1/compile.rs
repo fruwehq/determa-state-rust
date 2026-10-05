@@ -25,6 +25,9 @@ pub struct Bundle {
     pub machine_order: Vec<String>,
     pub fingerprint: String,
     pub normalized: JsonValue,
+    /// Sealed version-1 source and compilation-manifest evidence, when compiled.
+    /// Historical source guarantees do not replace generated runtime guarantees.
+    pub source_compilation: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -210,6 +213,7 @@ pub fn compile_bundle(mut document: JsonValue) -> Result<Bundle, SemanticError> 
         machine_order,
         fingerprint,
         normalized: document,
+        source_compilation: None,
     })
 }
 
