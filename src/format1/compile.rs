@@ -1,7 +1,7 @@
 use super::cel;
 use super::model::{
-    Action, BindingExpressions, ChoiceBranch, EventDeclaration, EventDirection, HistoryKind,
-    Guard, InitialTransition, RawBundle, RawComponent, RawMachine, RawState, StateType, TargetExpression,
+    Action, BindingExpressions, ChoiceBranch, EventDeclaration, EventDirection, Guard, HistoryKind,
+    InitialTransition, RawBundle, RawComponent, RawMachine, RawState, StateType, TargetExpression,
     Transition, TransitionOrList, TransitionTarget, VariableDeclaration,
 };
 use super::source::{escape_pointer, LoadErrorCode};
@@ -564,6 +564,7 @@ fn compile_component(
             states,
             root_pointer: format!("{pointer}/root"),
             meta: raw.meta.clone(),
+            runtime_providers: None,
         };
         resolve_machine_targets(&mut machine)?;
         validate_machine(&machine, bundle_events, all_machine_ids)?;
@@ -690,7 +691,9 @@ fn compile_actions(
                     instance: cancel.instance.clone(),
                 },
                 Action::Stop(_) => CompiledActionKind::Stop,
-                Action::ProviderActions(binding) => CompiledActionKind::ProviderActions(binding.clone()),
+                Action::ProviderActions(binding) => {
+                    CompiledActionKind::ProviderActions(binding.clone())
+                }
             };
             Ok(CompiledAction {
                 kind,
@@ -1039,7 +1042,9 @@ fn validate_actions(
                     }
                 }
             }
-            CompiledActionKind::Cancel { .. } | CompiledActionKind::Stop | CompiledActionKind::ProviderActions(_) => {}
+            CompiledActionKind::Cancel { .. }
+            | CompiledActionKind::Stop
+            | CompiledActionKind::ProviderActions(_) => {}
         }
     }
     Ok(())
@@ -1595,7 +1600,9 @@ fn validate_typed_actions(
                     &cel::CelType::InstanceReference(None),
                 )?;
             }
-            CompiledActionKind::Refresh { .. } | CompiledActionKind::Stop | CompiledActionKind::ProviderActions(_) => {}
+            CompiledActionKind::Refresh { .. }
+            | CompiledActionKind::Stop
+            | CompiledActionKind::ProviderActions(_) => {}
         }
     }
     Ok(())
@@ -1864,7 +1871,7 @@ pub fn root_external_variables(machine: &Machine) -> BTreeMap<String, VariableDe
         .collect()
 }
 
-fn scope_survives(
+pub(crate) fn scope_survives(
     machine: &Machine,
     source: &State,
     target: &CompiledTarget,

@@ -27,24 +27,13 @@ fn all_484_manifest_artifacts_receive_applicable_validation() {
             let path = directory.join(document["file"].as_str().unwrap());
             let bytes = fs::read(&path).unwrap();
             let expected_valid = document["valid"].as_bool().unwrap();
-            let native_inspection_fixture = directory
-                .to_string_lossy()
-                .contains("profiles/inspection-provider/provider-01-exact-closure")
-                && kind == "aggregate_state_v1";
-            let validation = if native_inspection_fixture {
-                // The seven native provider vectors are conditional until a
-                // configured, verified runtime provider is implemented. These
-                // two portable snapshots still receive schema and seal checks.
-                validate_conditional_inspection_snapshot(&bytes)
-            } else {
-                validate_artifact(
-                    kind,
-                    &bytes,
-                    &resolver,
-                    document["verify_digest"].as_bool().unwrap_or(true),
-                )
-                .map(|_| ())
-            };
+            let validation = validate_artifact(
+                kind,
+                &bytes,
+                &resolver,
+                document["verify_digest"].as_bool().unwrap_or(true),
+            )
+            .map(|_| ());
             let failure = if expected_valid {
                 validation.err()
             } else {
@@ -73,42 +62,6 @@ fn all_484_manifest_artifacts_receive_applicable_validation() {
         failures.len(),
         failures.join("\n")
     );
-}
-
-fn validate_conditional_inspection_snapshot(bytes: &[u8]) -> Result<(), ArtifactError> {
-    let value = validate_artifact(
-        "json_value",
-        bytes,
-        &InMemoryDefinitionResolver::default(),
-        true,
-    )?;
-    let schema: Value =
-        serde_json::from_str(include_str!("../schema/aggregate-state-v1.schema.json"))
-            .expect("bundled aggregate schema parses");
-    let validator = jsonschema::validator_for(&schema).expect("bundled aggregate schema compiles");
-    validator
-        .validate(&value)
-        .map_err(|error| ArtifactError::new("invalid_aggregate_state", error.to_string()))?;
-    let mut unsigned = value.clone();
-    let actual = unsigned["aggregate_state_digest"]
-        .as_str()
-        .ok_or_else(|| ArtifactError::new("invalid_aggregate_state", "digest is absent"))?
-        .to_string();
-    unsigned
-        .as_object_mut()
-        .expect("schema-valid aggregate")
-        .remove("aggregate_state_digest");
-    let material =
-        serde_json_canonicalizer::to_vec(&json!(["determa-aggregate-state-digest-1", unsigned]))
-            .map_err(|error| ArtifactError::new("invalid_aggregate_state", error.to_string()))?;
-    let expected = format!("sha256:{:x}", Sha256::digest(material));
-    if actual != expected {
-        return Err(ArtifactError::new(
-            "aggregate_state_digest_mismatch",
-            "seal differs",
-        ));
-    }
-    Ok(())
 }
 
 #[test]
@@ -245,8 +198,14 @@ fn replace_fingerprints(value: &mut Value, replacement: &str) {
     }
 }
 
+#[path = "support/inspection_provider.rs"]
+mod inspection_provider;
+
 fn definition_resolver(root: &Path) -> InMemoryDefinitionResolver {
     let mut resolver = InMemoryDefinitionResolver::default();
+    let directory = root.join("profiles/inspection-provider/provider-01-exact-closure");
+    let (bundle, _, _) = inspection_provider::bundle(&directory);
+    resolver.insert(bundle, true);
     for path in find_extension(root, "yaml") {
         if let Ok(bundle) = load_bundle(&fs::read_to_string(path).unwrap()) {
             resolver.insert(bundle, true);

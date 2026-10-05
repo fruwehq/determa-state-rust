@@ -234,7 +234,10 @@ pub enum Guard {
 
 impl Guard {
     pub fn cel(&self) -> Option<&str> {
-        match self { Self::Cel(source) => Some(source), Self::Provider { .. } => None }
+        match self {
+            Self::Cel(source) => Some(source),
+            Self::Provider { .. } => None,
+        }
     }
 }
 
