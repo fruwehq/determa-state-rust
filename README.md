@@ -9,7 +9,7 @@ aggregate artifacts, and durable checkpoint coverage. The implementation is vali
 these exact normative inputs:
 
 - specification commit `77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0`;
-- conformance commit `cf7e673b26ebb162dfdc54d9d235300cd3350438`.
+- conformance commit `c6949440f5b9fd6e06ea5571f4e01681dd59ee04`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 75 mailbox-neutral runtime traces through the shared private RTC kernel,
@@ -17,7 +17,7 @@ all 162 applicable native artifact/checkpoint schema-v1 core vectors, and all 14
 durable-host vectors, all 49 exact candidate inspection vectors, plus semantic validation
 of all 487 declared artifact documents, 47 extension negotiation vectors and
 all seven configured native guard-provider inspection vectors. The pinned suite
-also defines 41 runtime-provider vectors; complete production adapter coverage is
+also defines 52 runtime-provider vectors; complete production adapter coverage is
 unfinished in this draft implementation checkpoint.
 Durable host profiles remain optional host contracts; memory, file, SQLite, and
 PostgreSQL tests exercise the implemented transactional host surface.
@@ -95,7 +95,7 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`cf7e673b26ebb162dfdc54d9d235300cd3350438`. CI also checks that all bundled schemas
+`c6949440f5b9fd6e06ea5571f4e01681dd59ee04`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
 `77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0`. These exact reviewed public commits are
 the current implementation inputs; tag publication is a later coordinated release operation.

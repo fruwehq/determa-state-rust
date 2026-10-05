@@ -1698,9 +1698,7 @@ fn action_fault_locator(action: &CompiledAction, locator: &str) -> bool {
             locator == format!("{}/cancel/instance", action.pointer)
         }
         CompiledActionKind::Stop => false,
-        CompiledActionKind::ProviderActions(_) => {
-            locator == format!("{}/provider_actions", action.pointer)
-        }
+        CompiledActionKind::ProviderActions(_) => locator == action.pointer,
     }
 }
 
