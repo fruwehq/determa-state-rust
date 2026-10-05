@@ -9,6 +9,12 @@ use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
+mod native_handler;
+pub use native_handler::{
+    NativeDeduplicationEvidence, NativeHandler, NativeHandlerAttempt, NativeHandlerMetadata,
+    NativeHandlerReport, NativeHandlerReportKind, VerifiedNativeHandler,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionErrorCode {
     DuplicateExtensionRegistration,
@@ -70,6 +76,18 @@ pub trait ExtensionFactory: Send + Sync {
 /// Return false when source identity cannot be established. `prove_claims` may
 /// return only claims independently exercised for this exact instance/topology.
 pub trait HostVerifier: Send + Sync {
+    /// Independently authenticate retained destination evidence for this exact
+    /// configured native handler and scoped effect. Equal caller bytes, provider
+    /// claims and type identity alone are not proof. No proof is assumed by default.
+    fn prove_native_destination_deduplication(
+        &self,
+        _descriptor: &Value,
+        _configuration: &Value,
+        _instance: &Instance,
+        _evidence: &NativeDeduplicationEvidence<'_>,
+    ) -> bool {
+        false
+    }
     /// Independently established host guarantees for composition.
     fn host_guarantees(&self) -> BTreeMap<String, bool> {
         BTreeMap::new()
