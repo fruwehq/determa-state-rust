@@ -191,6 +191,57 @@ fn local_sqlite_host_executes_exact_delivery_goldens() {
             case["response"],
             "{name}: exact replay"
         );
+        if name == "admit_declared_event" {
+            use serde_json::json;
+            use sha2::{Digest, Sha256};
+            let mut duplicate = case["request"].clone();
+            duplicate["operation_id"] = json!("duplicate-delivery-new-operation");
+            let replayed = host.handle(&duplicate, "alice").unwrap();
+            assert_eq!(
+                replayed["value"]["result"],
+                case["response"]["value"]["result"]
+            );
+            let mut batch = duplicate.clone();
+            batch["operation_id"] = json!("batch-new-deliveries");
+            let current = &replayed["value"]["result"]["checkpoint"];
+            batch["precondition"] = json!({"revision":current["revision"],"checkpoint_digest":current["execution_checkpoint_digest"]});
+            let first = batch["arguments"]["ordered_deliveries"][0].clone();
+            let mut deliveries = Vec::new();
+            for id in ["batch-event-1", "batch-event-2"] {
+                let mut delivery = first.clone();
+                delivery["envelope"]["event_id"] = json!(id);
+                delivery["envelope"]["cause_id"] = json!(id);
+                let operand = json!([
+                    "determa-inbox-envelope-digest-1",
+                    "1",
+                    checkpoint["root_instance_id"],
+                    "input",
+                    delivery["envelope"]
+                ]);
+                delivery["envelope_digest"] = json!(format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json_canonicalizer::to_vec(&operand).unwrap())
+                ));
+                deliveries.push(delivery);
+            }
+            batch["arguments"]["ordered_deliveries"] = json!(deliveries);
+            let admitted = host.handle(&batch, "alice").unwrap();
+            assert_eq!(admitted["status"], "committed");
+            assert_eq!(
+                admitted["value"]["result"]["acceptance_receipts"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(admitted["value"]["result"]["checkpoint"]["revision"], "2");
+            assert_eq!(host.handle(&batch, "alice").unwrap(), admitted);
+            batch["operation_id"] = json!("batch-replay-new-operation");
+            assert_eq!(
+                host.handle(&batch, "alice").unwrap()["value"]["result"],
+                admitted["value"]["result"]
+            );
+        }
         drop(host);
         fs::remove_dir_all(directory).unwrap();
     }

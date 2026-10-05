@@ -225,12 +225,19 @@ impl<R: DefinitionResolver> SqlitePublicExecutionHost<R> {
         }
         let operation = request["operation"].as_str().unwrap();
         let binding = &request["scope_binding_identity"];
-        if operation == "capabilities" && binding.is_null() {
+        if operation == "capabilities" {
             if request["arguments"]["scope_alias"] != self.scope_alias {
                 return Ok(Self::response(
                     request,
                     Value::Null,
                     Some("unauthorized_scope"),
+                ));
+            }
+            if !binding.is_null() && binding != &self.scope_binding_identity {
+                return Ok(Self::response(
+                    request,
+                    Value::Null,
+                    Some("binding_unavailable"),
                 ));
             }
         } else if binding != &self.scope_binding_identity {
@@ -519,8 +526,15 @@ impl<R: DefinitionResolver> SqlitePublicExecutionHost<R> {
                     return Err(refusal("invalid_host_request"));
                 }
             }
-            let updated =
+            let admitted =
                 checkpoint::admit(&resolved.bundle, &checkpoint, deliveries, revision, digest)?;
+            let updated = if admitted.get("checkpoint").is_some() {
+                admitted["checkpoint"].clone()
+            } else if admitted.get("execution_checkpoint_digest").is_some() {
+                admitted
+            } else {
+                document.clone()
+            };
             let mut receipts = Vec::new();
             for delivery in deliveries {
                 receipts.push(
@@ -532,7 +546,7 @@ impl<R: DefinitionResolver> SqlitePublicExecutionHost<R> {
                             r["operation_kind"] == "acceptance"
                                 && r["event_id"] == delivery["envelope"]["event_id"]
                         })
-                        .ok_or_else(|| error("missing acceptance receipt"))?
+                        .ok_or_else(|| refusal("replay_evidence_expired"))?
                         .clone(),
                 );
             }
