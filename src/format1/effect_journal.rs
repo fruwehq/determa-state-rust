@@ -237,44 +237,7 @@ fn validate_record(
     let machine = native::find_machine_by_root_pointer(&bundle, &machine_pointer)
         .ok_or_else(|| failure("pinned machine absent"))?;
     let mappings = array(record, "result_mapping")?;
-    let mut kinds = BTreeSet::new();
-    let mut slots = BTreeSet::new();
-    for mapping in mappings {
-        require(
-            kinds.insert(text(mapping, "outcome_kind")?)
-                && slots.insert(text(mapping, "result_slot")?),
-            "duplicate result mapping kind/slot",
-        )?;
-        let declaration = machine
-            .events
-            .get(text(mapping, "event")?)
-            .or_else(|| bundle.events.get(mapping["event"].as_str().unwrap()))
-            .ok_or_else(|| failure("undeclared result event"))?;
-        require(
-            declaration.direction == EventDirection::Input,
-            "result event is not declared input",
-        )?;
-        let location = &mapping["operation_token_location"];
-        if location["kind"] == "payload" {
-            // Format1 declared payload fields are flat. A pointer into a nested
-            // map cannot establish a declared string slot.
-            let name = text(location, "pointer")?
-                .strip_prefix('/')
-                .ok_or_else(|| failure("token pointer must name a declared field"))?;
-            require(
-                !name.contains('/'),
-                "token pointer does not name a declared string field",
-            )?;
-            let name = name.replace("~1", "/").replace("~0", "~");
-            require(
-                declaration
-                    .payload
-                    .get(&name)
-                    .is_some_and(|field| field.value_type == "string"),
-                "token slot is not a declared string",
-            )?;
-        }
-    }
+    validate_result_mappings(&bundle, machine, mappings)?;
     if outcome.is_null() {
         return Ok(());
     }
@@ -509,4 +472,68 @@ fn pinned_target(
     }
     let pointer = pointer.to_owned();
     Ok((envelope_target, resolved.bundle, pointer))
+}
+
+/// Resolve and validate the complete route before producing core actions.
+/// Empty outboxes cannot waive configuration checks.
+pub(crate) fn validate_route_mapping(
+    bundle: &super::Bundle,
+    machine_id: &str,
+    mappings: &Value,
+) -> Result<(), EffectJournalError> {
+    let machine = bundle
+        .machines
+        .get(machine_id)
+        .ok_or_else(|| failure("route root machine absent"))?;
+    let mappings = mappings
+        .as_array()
+        .ok_or_else(|| failure("result mappings are not an array"))?;
+    validate_result_mappings(bundle, machine, mappings)
+}
+
+fn validate_result_mappings(
+    bundle: &super::Bundle,
+    machine: &super::compile::Machine,
+    mappings: &[Value],
+) -> Result<(), EffectJournalError> {
+    let mut kinds = BTreeSet::new();
+    let mut slots = BTreeSet::new();
+    for mapping in mappings {
+        super::contracts::validate_effect_result_mapping(mapping).map_err(failure)?;
+        require(
+            kinds.insert(text(mapping, "outcome_kind")?)
+                && slots.insert(text(mapping, "result_slot")?),
+            "duplicate result mapping kind/slot",
+        )?;
+        let declaration = machine
+            .events
+            .get(text(mapping, "event")?)
+            .or_else(|| bundle.events.get(mapping["event"].as_str().unwrap()))
+            .ok_or_else(|| failure("undeclared result event"))?;
+        require(
+            declaration.direction == EventDirection::Input,
+            "result event is not declared input",
+        )?;
+        let location = &mapping["operation_token_location"];
+        if location["kind"] == "payload" {
+            // Format1 declared payload fields are flat. A pointer into a nested
+            // map cannot establish a declared string slot.
+            let name = text(location, "pointer")?
+                .strip_prefix('/')
+                .ok_or_else(|| failure("token pointer must name a declared field"))?;
+            require(
+                !name.contains('/'),
+                "token pointer does not name a declared string field",
+            )?;
+            let name = name.replace("~1", "/").replace("~0", "~");
+            require(
+                declaration
+                    .payload
+                    .get(&name)
+                    .is_some_and(|field| field.value_type == "string"),
+                "token slot is not a declared string",
+            )?;
+        }
+    }
+    Ok(())
 }

@@ -128,6 +128,12 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         // Caller bundle fields cannot substitute executable compiled structures.
         // The configured trusted resolver supplies the actual source to execute.
         let bundle = &resolved.bundle;
+        crate::format1::effect_journal::validate_route_mapping(
+            bundle,
+            machine_id,
+            &self.route.result_mapping,
+        )
+        .map_err(failure)?;
         self.handler
             .verify(
                 &self.route.handler_reference,
@@ -188,6 +194,12 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         let document = json!({"journal":validated.value(),"responses":responses,"original_requests":{creation_id:original_request}});
         self.store
             .insert_native_effect_checkpoint(&checkpoint, &document, || {
+                crate::format1::effect_journal::validate_route_mapping(
+                    bundle,
+                    machine_id,
+                    &self.route.result_mapping,
+                )
+                .map_err(failure)?;
                 self.handler
                     .verify(
                         &self.route.handler_reference,

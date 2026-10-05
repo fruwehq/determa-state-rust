@@ -130,6 +130,12 @@ fn validate_schema(kind: &str, value: &Value, schema: &str) -> Result<(), super:
     })
 }
 
+/// The pinned journal's mapping definition, without inventing another wire kind.
+pub(super) fn validate_effect_result_mapping(value: &Value) -> Result<(), super::ArtifactError> {
+    const SCHEMA: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"https://determa.dev/state/schema/host-effect-journal-v1.schema.json#/$defs/resultMapping"}"#;
+    validate_schema("host_effect_journal_v1", value, SCHEMA)
+}
+
 fn validate_embedded_artifacts(
     value: &Value,
     resolver: &(impl DefinitionResolver + ?Sized),

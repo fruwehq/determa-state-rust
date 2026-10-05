@@ -798,6 +798,96 @@ fn inconsistent_caller_bundle_metadata_refuses_before_native_creation() {
     }
 }
 
+#[cfg(feature = "sqlite")]
+#[test]
+fn complete_result_route_refuses_before_core_even_without_initial_emissions() {
+    for emits in [true, false] {
+        for invalid in [
+            "extra_field",
+            "outcome",
+            "duplicate_kind",
+            "duplicate_slot",
+            "missing_event",
+            "output_event",
+            "missing_token_field",
+            "wrong_token_type",
+        ] {
+            let directory = EffectTestDirectory::new();
+            let path = directory.path().join("authority.sqlite");
+            let fixture = Fixture::new();
+            let mut source = effect_bundle().normalized;
+            if !emits {
+                source["machines"][0]["root"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("entry");
+            }
+            source["events"]["native_succeeded"]["payload"]["number"] =
+                json!({"type":"int","required":false});
+            let bundle = determa_state::format1::load_bundle_from_json(source).unwrap();
+            let mut route = effect_route();
+            match invalid {
+                "extra_field" => route.result_mapping[0]["unexpected"] = json!(true),
+                "outcome" => route.result_mapping[0]["outcome_kind"] = json!("invented_outcome"),
+                "duplicate_kind" => route.result_mapping[1]["outcome_kind"] = json!("succeeded"),
+                "duplicate_slot" => route.result_mapping[1]["result_slot"] = json!("success"),
+                "missing_event" => route.result_mapping[0]["event"] = json!("undeclared"),
+                "output_event" => route.result_mapping[0]["event"] = json!("native_request"),
+                "missing_token_field" => {
+                    route.result_mapping[0]["operation_token_location"] =
+                        json!({"kind":"payload","pointer":"/missing"})
+                }
+                "wrong_token_type" => {
+                    route.result_mapping[0]["operation_token_location"] =
+                        json!({"kind":"payload","pointer":"/number"})
+                }
+                _ => unreachable!(),
+            }
+            let host = determa_state::authority::SqliteNativeEffectHost::open(
+                &path,
+                "scope-one".into(),
+                "owner".into(),
+                "host-one".into(),
+                effect_resolver(&bundle),
+                route,
+                fixture.handler(),
+            )
+            .unwrap();
+            host.setup_schema().unwrap();
+            host.allocate_scope().unwrap();
+            fixture
+                .destination
+                .binding_checks
+                .store(0, Ordering::SeqCst);
+            assert!(
+                host.create(
+                    &bundle,
+                    "workflow",
+                    "root",
+                    "create-root",
+                    &determa_state::Bindings::default()
+                )
+                .is_err(),
+                "{emits}/{invalid}"
+            );
+            assert_eq!(
+                fixture.destination.binding_checks.load(Ordering::SeqCst),
+                0,
+                "{emits}/{invalid}"
+            );
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let count: u64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM determa_execution_checkpoints",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{emits}/{invalid}");
+        }
+    }
+}
+
 #[cfg(all(feature = "sqlite", unix))]
 #[test]
 fn native_effect_creation_crash_child() {
