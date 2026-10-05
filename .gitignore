@@ -27,3 +27,6 @@ target
 
 # Python native gate harness bytecode
 __pycache__/
+
+# Pinned specification checkout used only by repository CI
+/authoritative-spec/
