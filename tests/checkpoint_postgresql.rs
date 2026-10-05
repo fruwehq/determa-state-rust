@@ -728,3 +728,57 @@ fn independent_postgresql_sessions_commit_exactly_one_cas_winner() {
         Some(winner.clone())
     );
 }
+
+#[test]
+fn postgresql_rechecks_native_configuration_and_rolls_back_weakened_commit() {
+    let Some(base_url) = postgresql_url() else {
+        return;
+    };
+    let url = isolated_schema_url(&base_url, "configuration");
+    let store =
+        PostgresqlExecutionStore::connect_no_tls(&url, DurableStoreMode::bounded()).unwrap();
+    store.initialize_schema().unwrap();
+    assert!(store.health().unwrap().healthy);
+    store
+        .with_native_transaction(|tx| {
+            tx.batch_execute("CREATE TABLE native_gate_application (value TEXT)")
+                .map_err(pg_error)
+        })
+        .unwrap();
+    let failed = store.with_native_transaction(|tx| {
+        tx.batch_execute("INSERT INTO native_gate_application VALUES ('must roll back'); SET LOCAL synchronous_commit = off").map_err(pg_error)
+    });
+    assert!(failed
+        .unwrap_err()
+        .to_string()
+        .contains("synchronous_commit"));
+    let weakened = store.with_native_transaction(|tx| {
+        tx.batch_execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED; INSERT INTO native_gate_application VALUES ('must also roll back')").map_err(pg_error)
+    });
+    assert!(weakened.unwrap_err().to_string().contains("serializable"));
+    let mut observer = Client::connect(&url, NoTls).unwrap();
+    assert_eq!(
+        observer
+            .query_one("SELECT COUNT(*) FROM native_gate_application", &[])
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    assert!(store.health().unwrap().healthy);
+    observer
+        .batch_execute("ALTER TABLE determa_execution_checkpoints ADD COLUMN unexpected TEXT")
+        .unwrap();
+    assert!(store.health().is_err());
+    for (name, value) in [
+        ("synchronous_commit", "off"),
+        ("default_transaction_read_only", "on"),
+        ("default_transaction_isolation", "serializable"),
+    ] {
+        let separator = if base_url.contains('?') { '&' } else { '?' };
+        let incompatible = format!("{base_url}{separator}options=-c%20{name}%3D{value}");
+        let changed =
+            PostgresqlExecutionStore::connect_no_tls(&incompatible, DurableStoreMode::bounded())
+                .unwrap();
+        assert!(changed.health().unwrap_err().to_string().contains(name));
+    }
+}

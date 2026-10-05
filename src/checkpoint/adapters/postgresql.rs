@@ -62,6 +62,7 @@ impl PostgresqlExecutionStore {
             .start()
             .map_err(pg_error)?;
         let result = operation(&mut transaction)?;
+        verify_transaction_contract(&mut transaction)?;
         transaction.commit().map_err(pg_error)?;
         Ok(result)
     }
@@ -187,6 +188,7 @@ impl PostgresqlExecutionStore {
             .map_err(pg_error)
             .map_err(&map_store_error)?;
         let result = operation(&mut transaction)?;
+        verify_transaction_contract(&mut transaction).map_err(&map_store_error)?;
         transaction
             .commit()
             .map_err(pg_error)
@@ -403,10 +405,50 @@ where
     }
 }
 
+fn verify_transaction_contract(
+    client: &mut impl postgres::GenericClient,
+) -> Result<(), StoreError> {
+    verify_connection_contract(client)?;
+    let isolation: String = client
+        .query_one("SHOW transaction_isolation", &[])
+        .map_err(pg_error)?
+        .get(0);
+    if isolation != "serializable" {
+        return Err(StoreError::new(
+            "shared PostgreSQL transaction must remain serializable",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_connection_contract(client: &mut impl postgres::GenericClient) -> Result<(), StoreError> {
+    // These are current server/session facts, not URI declarations. In particular
+    // asynchronous commit must never obtain a durable store claim.
+    for (setting, allowed) in [
+        ("synchronous_commit", &["on", "remote_apply"][..]),
+        ("fsync", &["on"][..]),
+        ("full_page_writes", &["on"][..]),
+        ("default_transaction_read_only", &["off"][..]),
+        ("default_transaction_isolation", &["read committed"][..]),
+    ] {
+        let observed: String = client
+            .query_one("SELECT current_setting($1)", &[&setting])
+            .map_err(pg_error)?
+            .get(0);
+        if !allowed.contains(&observed.as_str()) {
+            return Err(StoreError::new(format!(
+                "unsupported PostgreSQL setting {setting}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn verify_schema_contract(
     client: &mut impl postgres::GenericClient,
     mode: DurableStoreMode,
 ) -> Result<(), StoreError> {
+    verify_connection_contract(client)?;
     let metadata_rows = client
         .query(
             "
