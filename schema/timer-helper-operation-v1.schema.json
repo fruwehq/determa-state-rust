@@ -1,0 +1,579 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/timer-helper-operation-v1.schema.json",
+  "title": "Optional external timer helper operation version 1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/result"
+    },
+    {
+      "$ref": "#/$defs/earlyError"
+    }
+  ],
+  "$defs": {
+    "request": {
+      "type": "object",
+      "properties": {
+        "interface": {
+          "const": "determa.timer_helper"
+        },
+        "interface_version": {
+          "const": 1
+        },
+        "operation": {
+          "enum": [
+            "schedule",
+            "cancel",
+            "claim_fire",
+            "complete_fire",
+            "read_timer"
+          ]
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope_identity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "root_instance_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "root_runtime_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timer_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "arguments": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "interface",
+        "interface_version",
+        "operation",
+        "operation_id",
+        "scope_identity",
+        "root_instance_id",
+        "root_runtime_id",
+        "timer_id",
+        "request_digest",
+        "arguments"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "schedule"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "arguments": {
+                "type": "object",
+                "properties": {
+                  "clock_basis": {
+                    "const": "unix_nanoseconds"
+                  },
+                  "deadline_at": {
+                    "type": "string",
+                    "pattern": "^(0|[1-9][0-9]*|-[1-9][0-9]*)$"
+                  },
+                  "delay_nanoseconds": {
+                    "type": "string",
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "event_name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "payload": {
+                    "$ref": "aggregate-state-v1.schema.json#/$defs/typedMap"
+                  },
+                  "correlation_id": {
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "clock_basis",
+                  "event_name",
+                  "payload",
+                  "correlation_id"
+                ],
+                "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "required": [
+                      "deadline_at"
+                    ],
+                    "not": {
+                      "required": [
+                        "delay_nanoseconds"
+                      ]
+                    }
+                  },
+                  {
+                    "required": [
+                      "delay_nanoseconds"
+                    ],
+                    "not": {
+                      "required": [
+                        "deadline_at"
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "cancel"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "arguments": {
+                "type": "object",
+                "properties": {
+                  "expected_revision": {
+                    "type": "string",
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  }
+                },
+                "required": [
+                  "expected_revision"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "claim_fire"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "arguments": {
+                "type": "object",
+                "properties": {
+                  "expected_revision": {
+                    "type": "string",
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "clock_basis": {
+                    "const": "unix_nanoseconds"
+                  },
+                  "worker_principal": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "expected_revision",
+                  "clock_basis",
+                  "worker_principal"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "complete_fire"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "arguments": {
+                "type": "object",
+                "properties": {
+                  "expected_revision": {
+                    "type": "string",
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "attempt_fence": {
+                    "type": "string",
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "worker_principal": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "event_id": {
+                    "type": "string",
+                    "pattern": "^sha256:[0-9a-f]{64}$"
+                  },
+                  "admission_receipt_digest": {
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "pattern": "^sha256:[0-9a-f]{64}$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "expected_revision",
+                  "attempt_fence",
+                  "worker_principal",
+                  "event_id",
+                  "admission_receipt_digest"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "read_timer"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "arguments": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+              }
+            }
+          }
+        }
+      ]
+    },
+    "result": {
+      "type": "object",
+      "properties": {
+        "interface": {
+          "const": "determa.timer_helper"
+        },
+        "interface_version": {
+          "const": 1
+        },
+        "operation": {
+          "enum": [
+            "schedule",
+            "cancel",
+            "claim_fire",
+            "complete_fire",
+            "read_timer"
+          ]
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope_identity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "root_instance_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "root_runtime_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timer_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "accepted",
+            "rejected"
+          ]
+        },
+        "record_revision": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "attempt_fence": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "clock_basis": {
+          "const": "unix_nanoseconds"
+        },
+        "expires_at": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*|-[1-9][0-9]*)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "event_id": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "delivery_state": {
+          "enum": [
+            "none",
+            "pending",
+            "admitted",
+            "ambiguous"
+          ]
+        },
+        "error_code": {
+          "enum": [
+            null,
+            "invalid_timer_request",
+            "unsupported_timer_protocol",
+            "unsupported_timer_protocol_version",
+            "unauthorized_timer_scope",
+            "invalid_timer_time",
+            "timer_deadline_overflow",
+            "timer_clock_unavailable",
+            "timer_operation_conflict",
+            "timer_id_conflict",
+            "timer_not_found",
+            "timer_revision_conflict",
+            "timer_not_due",
+            "timer_fire_in_progress",
+            "timer_already_fired",
+            "timer_cancelled",
+            "timer_stale_fence",
+            "timer_worker_mismatch",
+            "timer_event_conflict",
+            "timer_admission_rejected",
+            "delivery_ambiguous",
+            "timer_capability_mismatch"
+          ]
+        },
+        "result_digest": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "interface",
+        "interface_version",
+        "operation",
+        "operation_id",
+        "scope_identity",
+        "root_instance_id",
+        "root_runtime_id",
+        "timer_id",
+        "status",
+        "record_revision",
+        "attempt_fence",
+        "clock_basis",
+        "expires_at",
+        "event_id",
+        "delivery_state",
+        "error_code",
+        "result_digest"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "accepted"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "error_code": {
+                "type": "null"
+              },
+              "result_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "error_code": {
+                "not": {
+                  "type": "null"
+                }
+              },
+              "result_digest": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "earlyError": {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "type": "null"
+        },
+        "operation_id": {
+          "type": "null"
+        },
+        "scope_identity": {
+          "type": "null"
+        },
+        "root_instance_id": {
+          "type": "null"
+        },
+        "root_runtime_id": {
+          "type": "null"
+        },
+        "timer_id": {
+          "type": "null"
+        },
+        "interface": {
+          "const": "determa.timer_helper"
+        },
+        "interface_version": {
+          "const": 1
+        },
+        "status": {
+          "const": "rejected"
+        },
+        "record_revision": {
+          "type": "null"
+        },
+        "attempt_fence": {
+          "type": "null"
+        },
+        "clock_basis": {
+          "const": "unix_nanoseconds"
+        },
+        "expires_at": {
+          "type": "null"
+        },
+        "event_id": {
+          "type": "null"
+        },
+        "delivery_state": {
+          "const": "none"
+        },
+        "error_code": {
+          "enum": [
+            "invalid_timer_request",
+            "unsupported_timer_protocol",
+            "unsupported_timer_protocol_version"
+          ]
+        },
+        "result_digest": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "operation",
+        "operation_id",
+        "scope_identity",
+        "root_instance_id",
+        "root_runtime_id",
+        "timer_id",
+        "interface",
+        "interface_version",
+        "status",
+        "record_revision",
+        "attempt_fence",
+        "clock_basis",
+        "expires_at",
+        "event_id",
+        "delivery_state",
+        "error_code",
+        "result_digest"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

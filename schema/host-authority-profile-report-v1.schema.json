@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/host-authority-profile-report-v1.schema.json",
+  "title": "Composed host authority profile report version 1",
+  "type": "object",
+  "required": ["profile_report_format", "profile_report_schema_version", "scope_identity", "authority_epoch", "scope_generation", "extension_report", "authority_storage_boundary", "topology", "source_binding_digest", "destination_binding_digest", "required_participants", "guarantees"],
+  "properties": {
+    "profile_report_format": { "const": "determa.host_authority_profile_report" },
+    "profile_report_schema_version": { "const": 1 },
+    "scope_identity": { "type": "string", "minLength": 1 },
+    "authority_epoch": { "oneOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }] },
+    "scope_generation": { "oneOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }] },
+    "extension_report": {
+      "oneOf": [
+        { "allOf": [
+          { "$ref": "extension-capability-report-v1.schema.json" },
+          { "properties": { "category": { "const": "authority" } }, "required": ["category"] }
+        ] },
+        { "type": "null" }
+      ]
+    },
+    "authority_storage_boundary": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+    "topology": {
+      "type": "object",
+      "required": ["identifier", "configuration_digest", "process_boundary", "host_boundary"],
+      "properties": {
+        "identifier": { "type": "string", "minLength": 1 },
+        "configuration_digest": { "$ref": "#/$defs/digest" },
+        "process_boundary": { "type": "string", "minLength": 1 },
+        "host_boundary": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "source_binding_digest": { "$ref": "#/$defs/digest" },
+    "destination_binding_digest": { "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+    "required_participants": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": ["role", "provider_reference", "instance_id"],
+        "properties": {
+          "role": { "enum": ["journal", "worker", "archive", "helper"] },
+          "provider_reference": { "$ref": "provider-reference-v1.schema.json" },
+          "instance_id": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "guarantees": {
+      "type": "object",
+      "required": ["guarded_local_writes", "worker_fencing", "complete_scope_inventory", "safe_relocation"],
+      "properties": {
+        "guarded_local_writes": { "type": "boolean" },
+        "worker_fencing": { "type": "boolean" },
+        "complete_scope_inventory": { "type": "boolean" },
+        "safe_relocation": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "extension_report": { "type": "null" } } },
+      "then": { "properties": { "authority_epoch": { "type": "null" }, "scope_generation": { "type": "null" }, "authority_storage_boundary": { "type": "null" }, "guarantees": { "properties": { "guarded_local_writes": { "const": false }, "worker_fencing": { "const": false }, "complete_scope_inventory": { "const": false }, "safe_relocation": { "const": false } } } } },
+      "else": { "properties": { "authority_epoch": { "$ref": "#/$defs/decimal" }, "scope_generation": { "$ref": "#/$defs/decimal" }, "authority_storage_boundary": { "type": "string", "minLength": 1 } } }
+    },
+    {
+      "if": { "properties": { "guarantees": { "properties": { "guarded_local_writes": { "const": true } }, "required": ["guarded_local_writes"] } } },
+      "then": { "properties": { "extension_report": { "type": "object", "properties": { "health": { "const": "healthy" }, "claims": { "contains": { "const": "authoritative_scope_fencing" } } } } } }
+    },
+    {
+      "if": { "properties": { "guarantees": { "properties": { "worker_fencing": { "const": true } }, "required": ["worker_fencing"] } } },
+      "then": { "properties": { "guarantees": { "properties": { "guarded_local_writes": { "const": true } } } } }
+    },
+    {
+      "if": { "properties": { "guarantees": { "properties": { "complete_scope_inventory": { "const": true } }, "required": ["complete_scope_inventory"] } } },
+      "then": { "properties": { "extension_report": { "type": "object", "properties": { "health": { "const": "healthy" }, "claims": { "contains": { "const": "consistent_scope_inventory" } } } } } }
+    },
+    {
+      "if": { "properties": { "guarantees": { "properties": { "safe_relocation": { "const": true } }, "required": ["safe_relocation"] } } },
+      "then": {
+        "properties": {
+          "destination_binding_digest": { "$ref": "#/$defs/digest" },
+          "guarantees": { "properties": { "guarded_local_writes": { "const": true }, "complete_scope_inventory": { "const": true } } },
+          "extension_report": { "type": "object", "properties": { "health": { "const": "healthy" }, "claims": { "contains": { "const": "safe_relocation" } } } }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "decimal": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

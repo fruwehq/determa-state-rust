@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/effect-cancellation-request-v1.schema.json",
+  "title": "Determa State version 1 effect cancellation request v1",
+  "type": "object",
+  "required": [
+    "operation_id",
+    "effect_id",
+    "reason",
+    "payload"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "operation_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "effect_id": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "payload": {
+      "$ref": "aggregate-state-v1.schema.json#/$defs/typedMap"
+    }
+  }
+}

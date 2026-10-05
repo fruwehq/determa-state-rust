@@ -1,0 +1,3390 @@
+{
+  "type": "object",
+  "required": [
+    "protocol",
+    "protocol_version",
+    "operation_id",
+    "status",
+    "receipt",
+    "value",
+    "error"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "protocol": {
+      "const": "determa.execution_host"
+    },
+    "protocol_version": {
+      "const": 1
+    },
+    "operation_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": [
+        "committed",
+        "pending",
+        "rejected"
+      ]
+    },
+    "receipt": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "scope_binding_identity",
+            "operation_id",
+            "request_digest",
+            "receipt_kind",
+            "evidence_digest",
+            "acceptance_receipt"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "scope_binding_identity": {
+              "type": "string",
+              "minLength": 1
+            },
+            "operation_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "request_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "receipt_kind": {
+              "enum": [
+                "committed",
+                "accepted"
+              ]
+            },
+            "evidence_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "acceptance_receipt": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                }
+              ]
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "receipt_kind": {
+                    "const": "accepted"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "acceptance_receipt": {
+                    "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "acceptance_receipt": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "value": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/capabilitiesValue"
+            },
+            {
+              "$ref": "#/$defs/createValue"
+            },
+            {
+              "$ref": "#/$defs/admitValue"
+            },
+            {
+              "$ref": "#/$defs/processValue"
+            },
+            {
+              "$ref": "#/$defs/readValue"
+            },
+            {
+              "$ref": "#/$defs/inspectValue"
+            },
+            {
+              "$ref": "#/$defs/receiptValue"
+            },
+            {
+              "$ref": "#/$defs/effect_resultValue"
+            },
+            {
+              "$ref": "#/$defs/cancel_effectValue"
+            },
+            {
+              "$ref": "#/$defs/timer_commandValue"
+            },
+            {
+              "$ref": "#/$defs/scope_operationValue"
+            }
+          ]
+        }
+      ]
+    },
+    "error": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "operation",
+            "code"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "enum": [
+                "capabilities",
+                "create",
+                "admit",
+                "process",
+                "read",
+                "inspect",
+                "receipt",
+                "effect_result",
+                "cancel_effect",
+                "timer_command",
+                "scope_operation"
+              ]
+            },
+            "code": {
+              "enum": [
+                "archive_capability_mismatch",
+                "archive_consistency_unavailable",
+                "archive_digest_mismatch",
+                "archive_host_journal_inventory_mismatch",
+                "archive_manifest_mismatch",
+                "archive_participant_contract_mismatch",
+                "archive_payload_digest_mismatch",
+                "archive_selection_invalid",
+                "archive_source_profile_mismatch",
+                "archive_source_provenance_mismatch",
+                "archive_staging_failure",
+                "binding_unavailable",
+                "checkpoint_revision_conflict",
+                "clone_has_unresolved_work",
+                "clone_isolation_unproven",
+                "creation_id_conflict",
+                "delivery_ambiguous",
+                "delivery_digest_mismatch",
+                "duplicate_event_id_in_batch",
+                "effect_not_outstanding",
+                "effect_outcome_ambiguous",
+                "effect_result_conflict",
+                "event_disposition_missing",
+                "event_id_conflict",
+                "host_capability_mismatch",
+                "inactive_component_target",
+                "inspection_capability_unavailable",
+                "inspection_guard_failure",
+                "inspection_limit_exceeded",
+                "invalid_archive",
+                "invalid_archive_attachment",
+                "invalid_archive_checkpoint",
+                "invalid_archive_participant",
+                "invalid_correlation",
+                "invalid_delivery_mode",
+                "invalid_delivery_source",
+                "invalid_event",
+                "invalid_host_request",
+                "invalid_inspection_request",
+                "invalid_instance_target",
+                "invalid_payload",
+                "invalid_recovery_request",
+                "invalid_timer_request",
+                "invalid_timer_time",
+                "language_provider_unavailable",
+                "malformed_delivery",
+                "missing_required_artifact",
+                "missing_required_provider",
+                "operation_id_conflict",
+                "outcome_unknown",
+                "portable_value_required",
+                "projection_not_lossless",
+                "replay_evidence_expired",
+                "runtime_provider_output_invalid",
+                "runtime_provider_unavailable",
+                "scope_archive_digest_mismatch",
+                "scope_archive_incomplete",
+                "scope_destination_not_empty",
+                "scope_fence_unproven",
+                "scope_generation_conflict",
+                "scope_not_active",
+                "scope_operation_conflict",
+                "scope_restore_requires_quarantine",
+                "scope_transaction_in_doubt",
+                "scope_transfer_consumed",
+                "scope_transfer_target_mismatch",
+                "stale_attempt_fence",
+                "stale_scope_authority",
+                "standalone_takeover_ambiguous_work",
+                "standalone_takeover_requires_fresh_scope",
+                "terminal_root",
+                "timer_admission_rejected",
+                "timer_already_fired",
+                "timer_cancelled",
+                "timer_capability_mismatch",
+                "timer_clock_unavailable",
+                "timer_deadline_overflow",
+                "timer_event_conflict",
+                "timer_fire_in_progress",
+                "timer_id_conflict",
+                "timer_not_due",
+                "timer_not_found",
+                "timer_operation_conflict",
+                "timer_revision_conflict",
+                "timer_stale_fence",
+                "timer_worker_mismatch",
+                "tombstoned_root",
+                "unauthorized_scope",
+                "unauthorized_timer_scope",
+                "unsupported_archive_format",
+                "unsupported_archive_participant_format",
+                "unsupported_archive_participant_schema_version",
+                "unsupported_archive_schema_version",
+                "unsupported_host_protocol",
+                "unsupported_host_protocol_version",
+                "unsupported_recovery_format",
+                "unsupported_recovery_version",
+                "unsupported_timer_protocol",
+                "unsupported_timer_protocol_version",
+                "wrong_root"
+              ]
+            },
+            "timer_result": {
+              "allOf": [
+                {
+                  "$ref": "timer-helper-operation-v1.schema.json#/$defs/result"
+                },
+                {
+                  "properties": {
+                    "status": {
+                      "const": "rejected"
+                    }
+                  }
+                }
+              ]
+            },
+            "authority_result": {
+              "allOf": [
+                {
+                  "$ref": "host-authority-operation-v1.schema.json#/$defs/result"
+                },
+                {
+                  "properties": {
+                    "status": {
+                      "const": "rejected"
+                    }
+                  }
+                }
+              ]
+            },
+            "effect_result": {
+              "allOf": [
+                {
+                  "$ref": "effect-result-response-v1.schema.json"
+                },
+                {
+                  "properties": {
+                    "status": {
+                      "const": "rejected"
+                    }
+                  }
+                }
+              ]
+            },
+            "cancellation_result": {
+              "allOf": [
+                {
+                  "$ref": "effect-cancellation-response-v1.schema.json"
+                },
+                {
+                  "properties": {
+                    "status": {
+                      "const": "rejected"
+                    }
+                  }
+                }
+              ]
+            },
+            "recovery_result": {
+              "allOf": [
+                {
+                  "$ref": "recovery-operation-v1.schema.json"
+                },
+                {
+                  "properties": {
+                    "result_format": {
+                      "const": "determa.recovery_result"
+                    },
+                    "status": {
+                      "const": "refused"
+                    }
+                  }
+                }
+              ]
+            },
+            "archive_result": {
+              "allOf": [
+                {
+                  "$ref": "archive-result-v1.schema.json"
+                },
+                {
+                  "properties": {
+                    "status": {
+                      "const": "refused"
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "operation": {
+                    "const": "capabilities"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "unsupported_host_protocol",
+                      "unsupported_host_protocol_version",
+                      "invalid_host_request",
+                      "host_capability_mismatch",
+                      "unauthorized_scope",
+                      "operation_id_conflict",
+                      "binding_unavailable",
+                      "outcome_unknown",
+                      "replay_evidence_expired"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "operation": {
+                    "const": "create"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "unsupported_host_protocol",
+                      "unsupported_host_protocol_version",
+                      "invalid_host_request",
+                      "host_capability_mismatch",
+                      "unauthorized_scope",
+                      "operation_id_conflict",
+                      "binding_unavailable",
+                      "outcome_unknown",
+                      "replay_evidence_expired",
+                      "creation_id_conflict",
+                      "projection_not_lossless",
+                      "checkpoint_revision_conflict",
+                      "runtime_provider_unavailable",
+                      "language_provider_unavailable"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "operation": {
+                    "const": "admit"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "unsupported_host_protocol",
+                      "unsupported_host_protocol_version",
+                      "invalid_host_request",
+                      "host_capability_mismatch",
+                      "unauthorized_scope",
+                      "operation_id_conflict",
+                      "binding_unavailable",
+                      "outcome_unknown",
+                      "replay_evidence_expired",
+                      "event_id_conflict",
+                      "checkpoint_revision_conflict",
+                      "event_disposition_missing",
+                      "portable_value_required",
+                      "malformed_delivery",
+                      "wrong_root",
+                      "duplicate_event_id_in_batch",
+                      "terminal_root",
+                      "tombstoned_root",
+                      "invalid_delivery_mode",
+                      "invalid_delivery_source",
+                      "invalid_instance_target",
+                      "inactive_component_target",
+                      "invalid_event",
+                      "invalid_payload",
+                      "invalid_correlation",
+                      "delivery_digest_mismatch"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "operation": {
+                    "const": "process"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "unsupported_host_protocol",
+                      "unsupported_host_protocol_version",
+                      "invalid_host_request",
+                      "host_capability_mismatch",
+                      "unauthorized_scope",
+                      "operation_id_conflict",
+                      "binding_unavailable",
+                      "outcome_unknown",
+                      "replay_evidence_expired",
+                      "checkpoint_revision_conflict",
+                      "runtime_provider_output_invalid",
+                      "event_disposition_missing"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "operation": {
+                    "const": "read"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "unsupported_host_protocol",
+                      "unsupported_host_protocol_version",
+                      "invalid_host_request",
+                      "host_capability_mismatch",
+                      "unauthorized_scope",
+                      "operation_id_conflict",
+                      "binding_unavailable",
+                      "outcome_unknown",
+                      "replay_evidence_expired",
+                      "checkpoint_revision_conflict"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "operation": {
+                    "const": "inspect"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "unsupported_host_protocol",
+                      "unsupported_host_protocol_version",
+                      "invalid_host_request",
+                      "host_capability_mismatch",
+                      "unauthorized_scope",
+                      "operation_id_conflict",
+                      "binding_unavailable",
+                      "outcome_unknown",
+                      "replay_evidence_expired",
+                      "checkpoint_revision_conflict",
+                      "invalid_inspection_request",
+                      "inspection_capability_unavailable",
+                      "inspection_guard_failure",
+                      "inspection_limit_exceeded"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "operation": {
+                    "const": "receipt"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "unsupported_host_protocol",
+                      "unsupported_host_protocol_version",
+                      "invalid_host_request",
+                      "host_capability_mismatch",
+                      "unauthorized_scope",
+                      "operation_id_conflict",
+                      "binding_unavailable",
+                      "outcome_unknown",
+                      "replay_evidence_expired"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "operation": {
+                    "const": "effect_result"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "unsupported_host_protocol",
+                      "unsupported_host_protocol_version",
+                      "invalid_host_request",
+                      "host_capability_mismatch",
+                      "unauthorized_scope",
+                      "operation_id_conflict",
+                      "binding_unavailable",
+                      "outcome_unknown",
+                      "replay_evidence_expired",
+                      "checkpoint_revision_conflict",
+                      "scope_not_active",
+                      "stale_scope_authority",
+                      "effect_not_outstanding",
+                      "effect_result_conflict",
+                      "stale_attempt_fence",
+                      "runtime_provider_output_invalid",
+                      "portable_value_required"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "operation": {
+                    "const": "cancel_effect"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "unsupported_host_protocol",
+                      "unsupported_host_protocol_version",
+                      "invalid_host_request",
+                      "host_capability_mismatch",
+                      "unauthorized_scope",
+                      "operation_id_conflict",
+                      "binding_unavailable",
+                      "outcome_unknown",
+                      "replay_evidence_expired",
+                      "checkpoint_revision_conflict",
+                      "scope_not_active",
+                      "stale_scope_authority",
+                      "effect_not_outstanding",
+                      "effect_result_conflict"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "operation": {
+                    "const": "timer_command"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "unsupported_host_protocol",
+                      "unsupported_host_protocol_version",
+                      "invalid_host_request",
+                      "host_capability_mismatch",
+                      "unauthorized_scope",
+                      "operation_id_conflict",
+                      "binding_unavailable",
+                      "outcome_unknown",
+                      "replay_evidence_expired",
+                      "delivery_ambiguous",
+                      "invalid_timer_request",
+                      "invalid_timer_time",
+                      "timer_admission_rejected",
+                      "timer_already_fired",
+                      "timer_cancelled",
+                      "timer_capability_mismatch",
+                      "timer_clock_unavailable",
+                      "timer_deadline_overflow",
+                      "timer_event_conflict",
+                      "timer_fire_in_progress",
+                      "timer_id_conflict",
+                      "timer_not_due",
+                      "timer_not_found",
+                      "timer_operation_conflict",
+                      "timer_revision_conflict",
+                      "timer_stale_fence",
+                      "timer_worker_mismatch",
+                      "unauthorized_timer_scope",
+                      "unsupported_timer_protocol",
+                      "unsupported_timer_protocol_version"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "operation": {
+                    "const": "scope_operation"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "unsupported_host_protocol",
+                      "unsupported_host_protocol_version",
+                      "invalid_host_request",
+                      "host_capability_mismatch",
+                      "unauthorized_scope",
+                      "operation_id_conflict",
+                      "binding_unavailable",
+                      "outcome_unknown",
+                      "replay_evidence_expired",
+                      "archive_capability_mismatch",
+                      "archive_consistency_unavailable",
+                      "archive_digest_mismatch",
+                      "archive_host_journal_inventory_mismatch",
+                      "archive_manifest_mismatch",
+                      "archive_participant_contract_mismatch",
+                      "archive_payload_digest_mismatch",
+                      "archive_selection_invalid",
+                      "archive_source_profile_mismatch",
+                      "archive_source_provenance_mismatch",
+                      "archive_staging_failure",
+                      "clone_has_unresolved_work",
+                      "clone_isolation_unproven",
+                      "effect_not_outstanding",
+                      "effect_outcome_ambiguous",
+                      "host_capability_mismatch",
+                      "invalid_archive",
+                      "invalid_archive_attachment",
+                      "invalid_archive_checkpoint",
+                      "invalid_archive_participant",
+                      "invalid_recovery_request",
+                      "missing_required_artifact",
+                      "missing_required_provider",
+                      "scope_archive_digest_mismatch",
+                      "scope_archive_incomplete",
+                      "scope_destination_not_empty",
+                      "scope_fence_unproven",
+                      "scope_generation_conflict",
+                      "scope_not_active",
+                      "scope_operation_conflict",
+                      "scope_restore_requires_quarantine",
+                      "scope_transaction_in_doubt",
+                      "scope_transfer_consumed",
+                      "scope_transfer_target_mismatch",
+                      "stale_attempt_fence",
+                      "stale_scope_authority",
+                      "standalone_takeover_ambiguous_work",
+                      "standalone_takeover_requires_fresh_scope",
+                      "unauthorized_scope",
+                      "unsupported_archive_format",
+                      "unsupported_archive_participant_format",
+                      "unsupported_archive_participant_schema_version",
+                      "unsupported_archive_schema_version",
+                      "unsupported_recovery_format",
+                      "unsupported_recovery_version"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "unsupported_archive_format",
+                      "unsupported_archive_schema_version",
+                      "unsupported_archive_participant_format",
+                      "unsupported_archive_participant_schema_version",
+                      "invalid_archive",
+                      "archive_digest_mismatch",
+                      "invalid_archive_checkpoint",
+                      "invalid_archive_attachment",
+                      "invalid_archive_participant",
+                      "archive_payload_digest_mismatch",
+                      "missing_required_artifact",
+                      "missing_required_provider",
+                      "archive_capability_mismatch",
+                      "archive_consistency_unavailable",
+                      "archive_staging_failure",
+                      "archive_source_profile_mismatch",
+                      "archive_participant_contract_mismatch",
+                      "archive_source_provenance_mismatch",
+                      "archive_selection_invalid",
+                      "archive_host_journal_inventory_mismatch",
+                      "archive_manifest_mismatch"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "archive_result"
+                ]
+              }
+            },
+            {
+              "if": {
+                "required": [
+                  "archive_result"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "operation": {
+                    "const": "scope_operation"
+                  },
+                  "code": {
+                    "enum": [
+                      "unsupported_archive_format",
+                      "unsupported_archive_schema_version",
+                      "unsupported_archive_participant_format",
+                      "unsupported_archive_participant_schema_version",
+                      "invalid_archive",
+                      "archive_digest_mismatch",
+                      "invalid_archive_checkpoint",
+                      "invalid_archive_attachment",
+                      "invalid_archive_participant",
+                      "archive_payload_digest_mismatch",
+                      "missing_required_artifact",
+                      "missing_required_provider",
+                      "archive_capability_mismatch",
+                      "archive_consistency_unavailable",
+                      "archive_staging_failure",
+                      "archive_source_profile_mismatch",
+                      "archive_participant_contract_mismatch",
+                      "archive_source_provenance_mismatch",
+                      "archive_selection_invalid",
+                      "archive_host_journal_inventory_mismatch",
+                      "archive_manifest_mismatch"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "required": [
+                  "recovery_result"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "operation": {
+                    "const": "scope_operation"
+                  },
+                  "code": {
+                    "enum": [
+                      "clone_has_unresolved_work",
+                      "clone_isolation_unproven",
+                      "effect_not_outstanding",
+                      "effect_outcome_ambiguous",
+                      "host_capability_mismatch",
+                      "invalid_recovery_request",
+                      "scope_archive_digest_mismatch",
+                      "scope_archive_incomplete",
+                      "scope_destination_not_empty",
+                      "scope_fence_unproven",
+                      "scope_generation_conflict",
+                      "scope_not_active",
+                      "scope_operation_conflict",
+                      "scope_restore_requires_quarantine",
+                      "scope_transaction_in_doubt",
+                      "scope_transfer_consumed",
+                      "scope_transfer_target_mismatch",
+                      "stale_attempt_fence",
+                      "stale_scope_authority",
+                      "standalone_takeover_ambiguous_work",
+                      "standalone_takeover_requires_fresh_scope",
+                      "unauthorized_scope",
+                      "unsupported_recovery_format",
+                      "unsupported_recovery_version"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "required": [
+                  "timer_result"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "operation": {
+                    "const": "timer_command"
+                  },
+                  "code": {
+                    "enum": [
+                      "invalid_timer_request",
+                      "unsupported_timer_protocol",
+                      "unsupported_timer_protocol_version",
+                      "unauthorized_timer_scope",
+                      "invalid_timer_time",
+                      "timer_deadline_overflow",
+                      "timer_clock_unavailable",
+                      "timer_operation_conflict",
+                      "timer_id_conflict",
+                      "timer_not_found",
+                      "timer_revision_conflict",
+                      "timer_not_due",
+                      "timer_fire_in_progress",
+                      "timer_already_fired",
+                      "timer_cancelled",
+                      "timer_stale_fence",
+                      "timer_worker_mismatch",
+                      "timer_event_conflict",
+                      "timer_admission_rejected",
+                      "delivery_ambiguous",
+                      "timer_capability_mismatch"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "required": [
+                  "authority_result"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "operation": {
+                    "const": "scope_operation"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "required": [
+                  "effect_result"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "operation": {
+                    "const": "effect_result"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "required": [
+                  "cancellation_result"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "operation": {
+                    "const": "cancel_effect"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "committed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/capabilitiesValue"
+              },
+              {
+                "$ref": "#/$defs/createValue"
+              },
+              {
+                "$ref": "#/$defs/admitValue"
+              },
+              {
+                "$ref": "#/$defs/processValue"
+              },
+              {
+                "$ref": "#/$defs/readValue"
+              },
+              {
+                "$ref": "#/$defs/inspectValue"
+              },
+              {
+                "$ref": "#/$defs/receiptValue"
+              },
+              {
+                "$ref": "#/$defs/effect_resultValue"
+              },
+              {
+                "$ref": "#/$defs/cancel_effectValue"
+              },
+              {
+                "$ref": "#/$defs/timer_commandValue"
+              },
+              {
+                "$ref": "#/$defs/scope_operationValue"
+              }
+            ]
+          },
+          "error": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "pending"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "receipt": {
+            "allOf": [
+              {
+                "type": "object",
+                "required": [
+                  "scope_binding_identity",
+                  "operation_id",
+                  "request_digest",
+                  "receipt_kind",
+                  "evidence_digest",
+                  "acceptance_receipt"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "scope_binding_identity": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "operation_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "request_digest": {
+                    "type": "string",
+                    "pattern": "^sha256:[0-9a-f]{64}$"
+                  },
+                  "receipt_kind": {
+                    "enum": [
+                      "committed",
+                      "accepted"
+                    ]
+                  },
+                  "evidence_digest": {
+                    "type": "string",
+                    "pattern": "^sha256:[0-9a-f]{64}$"
+                  },
+                  "acceptance_receipt": {
+                    "oneOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                      }
+                    ]
+                  }
+                },
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "receipt_kind": {
+                          "const": "accepted"
+                        }
+                      }
+                    },
+                    "then": {
+                      "properties": {
+                        "acceptance_receipt": {
+                          "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                        }
+                      }
+                    },
+                    "else": {
+                      "properties": {
+                        "acceptance_receipt": {
+                          "type": "null"
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "properties": {
+                  "receipt_kind": {
+                    "const": "accepted"
+                  }
+                }
+              }
+            ]
+          },
+          "value": {
+            "type": "null"
+          },
+          "error": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "rejected"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "receipt": {
+            "type": "null"
+          },
+          "value": {
+            "type": "null"
+          },
+          "error": {
+            "type": "object",
+            "required": [
+              "operation",
+              "code"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "enum": [
+                  "capabilities",
+                  "create",
+                  "admit",
+                  "process",
+                  "read",
+                  "inspect",
+                  "receipt",
+                  "effect_result",
+                  "cancel_effect",
+                  "timer_command",
+                  "scope_operation"
+                ]
+              },
+              "code": {
+                "enum": [
+                  "archive_capability_mismatch",
+                  "archive_consistency_unavailable",
+                  "archive_digest_mismatch",
+                  "archive_host_journal_inventory_mismatch",
+                  "archive_manifest_mismatch",
+                  "archive_participant_contract_mismatch",
+                  "archive_payload_digest_mismatch",
+                  "archive_selection_invalid",
+                  "archive_source_profile_mismatch",
+                  "archive_source_provenance_mismatch",
+                  "archive_staging_failure",
+                  "binding_unavailable",
+                  "checkpoint_revision_conflict",
+                  "clone_has_unresolved_work",
+                  "clone_isolation_unproven",
+                  "creation_id_conflict",
+                  "delivery_ambiguous",
+                  "delivery_digest_mismatch",
+                  "duplicate_event_id_in_batch",
+                  "effect_not_outstanding",
+                  "effect_outcome_ambiguous",
+                  "effect_result_conflict",
+                  "event_disposition_missing",
+                  "event_id_conflict",
+                  "host_capability_mismatch",
+                  "inactive_component_target",
+                  "inspection_capability_unavailable",
+                  "inspection_guard_failure",
+                  "inspection_limit_exceeded",
+                  "invalid_archive",
+                  "invalid_archive_attachment",
+                  "invalid_archive_checkpoint",
+                  "invalid_archive_participant",
+                  "invalid_correlation",
+                  "invalid_delivery_mode",
+                  "invalid_delivery_source",
+                  "invalid_event",
+                  "invalid_host_request",
+                  "invalid_inspection_request",
+                  "invalid_instance_target",
+                  "invalid_payload",
+                  "invalid_recovery_request",
+                  "invalid_timer_request",
+                  "invalid_timer_time",
+                  "language_provider_unavailable",
+                  "malformed_delivery",
+                  "missing_required_artifact",
+                  "missing_required_provider",
+                  "operation_id_conflict",
+                  "outcome_unknown",
+                  "portable_value_required",
+                  "projection_not_lossless",
+                  "replay_evidence_expired",
+                  "runtime_provider_output_invalid",
+                  "runtime_provider_unavailable",
+                  "scope_archive_digest_mismatch",
+                  "scope_archive_incomplete",
+                  "scope_destination_not_empty",
+                  "scope_fence_unproven",
+                  "scope_generation_conflict",
+                  "scope_not_active",
+                  "scope_operation_conflict",
+                  "scope_restore_requires_quarantine",
+                  "scope_transaction_in_doubt",
+                  "scope_transfer_consumed",
+                  "scope_transfer_target_mismatch",
+                  "stale_attempt_fence",
+                  "stale_scope_authority",
+                  "standalone_takeover_ambiguous_work",
+                  "standalone_takeover_requires_fresh_scope",
+                  "terminal_root",
+                  "timer_admission_rejected",
+                  "timer_already_fired",
+                  "timer_cancelled",
+                  "timer_capability_mismatch",
+                  "timer_clock_unavailable",
+                  "timer_deadline_overflow",
+                  "timer_event_conflict",
+                  "timer_fire_in_progress",
+                  "timer_id_conflict",
+                  "timer_not_due",
+                  "timer_not_found",
+                  "timer_operation_conflict",
+                  "timer_revision_conflict",
+                  "timer_stale_fence",
+                  "timer_worker_mismatch",
+                  "tombstoned_root",
+                  "unauthorized_scope",
+                  "unauthorized_timer_scope",
+                  "unsupported_archive_format",
+                  "unsupported_archive_participant_format",
+                  "unsupported_archive_participant_schema_version",
+                  "unsupported_archive_schema_version",
+                  "unsupported_host_protocol",
+                  "unsupported_host_protocol_version",
+                  "unsupported_recovery_format",
+                  "unsupported_recovery_version",
+                  "unsupported_timer_protocol",
+                  "unsupported_timer_protocol_version",
+                  "wrong_root"
+                ]
+              },
+              "timer_result": {
+                "allOf": [
+                  {
+                    "$ref": "timer-helper-operation-v1.schema.json#/$defs/result"
+                  },
+                  {
+                    "properties": {
+                      "status": {
+                        "const": "rejected"
+                      }
+                    }
+                  }
+                ]
+              },
+              "authority_result": {
+                "allOf": [
+                  {
+                    "$ref": "host-authority-operation-v1.schema.json#/$defs/result"
+                  },
+                  {
+                    "properties": {
+                      "status": {
+                        "const": "rejected"
+                      }
+                    }
+                  }
+                ]
+              },
+              "effect_result": {
+                "allOf": [
+                  {
+                    "$ref": "effect-result-response-v1.schema.json"
+                  },
+                  {
+                    "properties": {
+                      "status": {
+                        "const": "rejected"
+                      }
+                    }
+                  }
+                ]
+              },
+              "cancellation_result": {
+                "allOf": [
+                  {
+                    "$ref": "effect-cancellation-response-v1.schema.json"
+                  },
+                  {
+                    "properties": {
+                      "status": {
+                        "const": "rejected"
+                      }
+                    }
+                  }
+                ]
+              },
+              "recovery_result": {
+                "allOf": [
+                  {
+                    "$ref": "recovery-operation-v1.schema.json"
+                  },
+                  {
+                    "properties": {
+                      "result_format": {
+                        "const": "determa.recovery_result"
+                      },
+                      "status": {
+                        "const": "refused"
+                      }
+                    }
+                  }
+                ]
+              },
+              "archive_result": {
+                "allOf": [
+                  {
+                    "$ref": "archive-result-v1.schema.json"
+                  },
+                  {
+                    "properties": {
+                      "status": {
+                        "const": "refused"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "capabilities"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unsupported_host_protocol",
+                        "unsupported_host_protocol_version",
+                        "invalid_host_request",
+                        "host_capability_mismatch",
+                        "unauthorized_scope",
+                        "operation_id_conflict",
+                        "binding_unavailable",
+                        "outcome_unknown",
+                        "replay_evidence_expired"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "create"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unsupported_host_protocol",
+                        "unsupported_host_protocol_version",
+                        "invalid_host_request",
+                        "host_capability_mismatch",
+                        "unauthorized_scope",
+                        "operation_id_conflict",
+                        "binding_unavailable",
+                        "outcome_unknown",
+                        "replay_evidence_expired",
+                        "creation_id_conflict",
+                        "projection_not_lossless",
+                        "checkpoint_revision_conflict",
+                        "runtime_provider_unavailable",
+                        "language_provider_unavailable"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "admit"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unsupported_host_protocol",
+                        "unsupported_host_protocol_version",
+                        "invalid_host_request",
+                        "host_capability_mismatch",
+                        "unauthorized_scope",
+                        "operation_id_conflict",
+                        "binding_unavailable",
+                        "outcome_unknown",
+                        "replay_evidence_expired",
+                        "event_id_conflict",
+                        "checkpoint_revision_conflict",
+                        "event_disposition_missing",
+                        "portable_value_required",
+                        "malformed_delivery",
+                        "wrong_root",
+                        "duplicate_event_id_in_batch",
+                        "terminal_root",
+                        "tombstoned_root",
+                        "invalid_delivery_mode",
+                        "invalid_delivery_source",
+                        "invalid_instance_target",
+                        "inactive_component_target",
+                        "invalid_event",
+                        "invalid_payload",
+                        "invalid_correlation",
+                        "delivery_digest_mismatch"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "process"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unsupported_host_protocol",
+                        "unsupported_host_protocol_version",
+                        "invalid_host_request",
+                        "host_capability_mismatch",
+                        "unauthorized_scope",
+                        "operation_id_conflict",
+                        "binding_unavailable",
+                        "outcome_unknown",
+                        "replay_evidence_expired",
+                        "checkpoint_revision_conflict",
+                        "runtime_provider_output_invalid",
+                        "event_disposition_missing"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "read"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unsupported_host_protocol",
+                        "unsupported_host_protocol_version",
+                        "invalid_host_request",
+                        "host_capability_mismatch",
+                        "unauthorized_scope",
+                        "operation_id_conflict",
+                        "binding_unavailable",
+                        "outcome_unknown",
+                        "replay_evidence_expired",
+                        "checkpoint_revision_conflict"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "inspect"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unsupported_host_protocol",
+                        "unsupported_host_protocol_version",
+                        "invalid_host_request",
+                        "host_capability_mismatch",
+                        "unauthorized_scope",
+                        "operation_id_conflict",
+                        "binding_unavailable",
+                        "outcome_unknown",
+                        "replay_evidence_expired",
+                        "checkpoint_revision_conflict",
+                        "invalid_inspection_request",
+                        "inspection_capability_unavailable",
+                        "inspection_guard_failure",
+                        "inspection_limit_exceeded"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "receipt"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unsupported_host_protocol",
+                        "unsupported_host_protocol_version",
+                        "invalid_host_request",
+                        "host_capability_mismatch",
+                        "unauthorized_scope",
+                        "operation_id_conflict",
+                        "binding_unavailable",
+                        "outcome_unknown",
+                        "replay_evidence_expired"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "effect_result"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unsupported_host_protocol",
+                        "unsupported_host_protocol_version",
+                        "invalid_host_request",
+                        "host_capability_mismatch",
+                        "unauthorized_scope",
+                        "operation_id_conflict",
+                        "binding_unavailable",
+                        "outcome_unknown",
+                        "replay_evidence_expired",
+                        "checkpoint_revision_conflict",
+                        "scope_not_active",
+                        "stale_scope_authority",
+                        "effect_not_outstanding",
+                        "effect_result_conflict",
+                        "stale_attempt_fence",
+                        "runtime_provider_output_invalid",
+                        "portable_value_required"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "cancel_effect"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unsupported_host_protocol",
+                        "unsupported_host_protocol_version",
+                        "invalid_host_request",
+                        "host_capability_mismatch",
+                        "unauthorized_scope",
+                        "operation_id_conflict",
+                        "binding_unavailable",
+                        "outcome_unknown",
+                        "replay_evidence_expired",
+                        "checkpoint_revision_conflict",
+                        "scope_not_active",
+                        "stale_scope_authority",
+                        "effect_not_outstanding",
+                        "effect_result_conflict"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "timer_command"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unsupported_host_protocol",
+                        "unsupported_host_protocol_version",
+                        "invalid_host_request",
+                        "host_capability_mismatch",
+                        "unauthorized_scope",
+                        "operation_id_conflict",
+                        "binding_unavailable",
+                        "outcome_unknown",
+                        "replay_evidence_expired",
+                        "delivery_ambiguous",
+                        "invalid_timer_request",
+                        "invalid_timer_time",
+                        "timer_admission_rejected",
+                        "timer_already_fired",
+                        "timer_cancelled",
+                        "timer_capability_mismatch",
+                        "timer_clock_unavailable",
+                        "timer_deadline_overflow",
+                        "timer_event_conflict",
+                        "timer_fire_in_progress",
+                        "timer_id_conflict",
+                        "timer_not_due",
+                        "timer_not_found",
+                        "timer_operation_conflict",
+                        "timer_revision_conflict",
+                        "timer_stale_fence",
+                        "timer_worker_mismatch",
+                        "unauthorized_timer_scope",
+                        "unsupported_timer_protocol",
+                        "unsupported_timer_protocol_version"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "operation": {
+                      "const": "scope_operation"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unsupported_host_protocol",
+                        "unsupported_host_protocol_version",
+                        "invalid_host_request",
+                        "host_capability_mismatch",
+                        "unauthorized_scope",
+                        "operation_id_conflict",
+                        "binding_unavailable",
+                        "outcome_unknown",
+                        "replay_evidence_expired",
+                        "archive_capability_mismatch",
+                        "archive_consistency_unavailable",
+                        "archive_digest_mismatch",
+                        "archive_host_journal_inventory_mismatch",
+                        "archive_manifest_mismatch",
+                        "archive_participant_contract_mismatch",
+                        "archive_payload_digest_mismatch",
+                        "archive_selection_invalid",
+                        "archive_source_profile_mismatch",
+                        "archive_source_provenance_mismatch",
+                        "archive_staging_failure",
+                        "clone_has_unresolved_work",
+                        "clone_isolation_unproven",
+                        "effect_not_outstanding",
+                        "effect_outcome_ambiguous",
+                        "host_capability_mismatch",
+                        "invalid_archive",
+                        "invalid_archive_attachment",
+                        "invalid_archive_checkpoint",
+                        "invalid_archive_participant",
+                        "invalid_recovery_request",
+                        "missing_required_artifact",
+                        "missing_required_provider",
+                        "scope_archive_digest_mismatch",
+                        "scope_archive_incomplete",
+                        "scope_destination_not_empty",
+                        "scope_fence_unproven",
+                        "scope_generation_conflict",
+                        "scope_not_active",
+                        "scope_operation_conflict",
+                        "scope_restore_requires_quarantine",
+                        "scope_transaction_in_doubt",
+                        "scope_transfer_consumed",
+                        "scope_transfer_target_mismatch",
+                        "stale_attempt_fence",
+                        "stale_scope_authority",
+                        "standalone_takeover_ambiguous_work",
+                        "standalone_takeover_requires_fresh_scope",
+                        "unauthorized_scope",
+                        "unsupported_archive_format",
+                        "unsupported_archive_participant_format",
+                        "unsupported_archive_participant_schema_version",
+                        "unsupported_archive_schema_version",
+                        "unsupported_recovery_format",
+                        "unsupported_recovery_version"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "unsupported_archive_format",
+                        "unsupported_archive_schema_version",
+                        "unsupported_archive_participant_format",
+                        "unsupported_archive_participant_schema_version",
+                        "invalid_archive",
+                        "archive_digest_mismatch",
+                        "invalid_archive_checkpoint",
+                        "invalid_archive_attachment",
+                        "invalid_archive_participant",
+                        "archive_payload_digest_mismatch",
+                        "missing_required_artifact",
+                        "missing_required_provider",
+                        "archive_capability_mismatch",
+                        "archive_consistency_unavailable",
+                        "archive_staging_failure",
+                        "archive_source_profile_mismatch",
+                        "archive_participant_contract_mismatch",
+                        "archive_source_provenance_mismatch",
+                        "archive_selection_invalid",
+                        "archive_host_journal_inventory_mismatch",
+                        "archive_manifest_mismatch"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "archive_result"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "required": [
+                    "archive_result"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "operation": {
+                      "const": "scope_operation"
+                    },
+                    "code": {
+                      "enum": [
+                        "unsupported_archive_format",
+                        "unsupported_archive_schema_version",
+                        "unsupported_archive_participant_format",
+                        "unsupported_archive_participant_schema_version",
+                        "invalid_archive",
+                        "archive_digest_mismatch",
+                        "invalid_archive_checkpoint",
+                        "invalid_archive_attachment",
+                        "invalid_archive_participant",
+                        "archive_payload_digest_mismatch",
+                        "missing_required_artifact",
+                        "missing_required_provider",
+                        "archive_capability_mismatch",
+                        "archive_consistency_unavailable",
+                        "archive_staging_failure",
+                        "archive_source_profile_mismatch",
+                        "archive_participant_contract_mismatch",
+                        "archive_source_provenance_mismatch",
+                        "archive_selection_invalid",
+                        "archive_host_journal_inventory_mismatch",
+                        "archive_manifest_mismatch"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "required": [
+                    "recovery_result"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "operation": {
+                      "const": "scope_operation"
+                    },
+                    "code": {
+                      "enum": [
+                        "clone_has_unresolved_work",
+                        "clone_isolation_unproven",
+                        "effect_not_outstanding",
+                        "effect_outcome_ambiguous",
+                        "host_capability_mismatch",
+                        "invalid_recovery_request",
+                        "scope_archive_digest_mismatch",
+                        "scope_archive_incomplete",
+                        "scope_destination_not_empty",
+                        "scope_fence_unproven",
+                        "scope_generation_conflict",
+                        "scope_not_active",
+                        "scope_operation_conflict",
+                        "scope_restore_requires_quarantine",
+                        "scope_transaction_in_doubt",
+                        "scope_transfer_consumed",
+                        "scope_transfer_target_mismatch",
+                        "stale_attempt_fence",
+                        "stale_scope_authority",
+                        "standalone_takeover_ambiguous_work",
+                        "standalone_takeover_requires_fresh_scope",
+                        "unauthorized_scope",
+                        "unsupported_recovery_format",
+                        "unsupported_recovery_version"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "required": [
+                    "timer_result"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "operation": {
+                      "const": "timer_command"
+                    },
+                    "code": {
+                      "enum": [
+                        "invalid_timer_request",
+                        "unsupported_timer_protocol",
+                        "unsupported_timer_protocol_version",
+                        "unauthorized_timer_scope",
+                        "invalid_timer_time",
+                        "timer_deadline_overflow",
+                        "timer_clock_unavailable",
+                        "timer_operation_conflict",
+                        "timer_id_conflict",
+                        "timer_not_found",
+                        "timer_revision_conflict",
+                        "timer_not_due",
+                        "timer_fire_in_progress",
+                        "timer_already_fired",
+                        "timer_cancelled",
+                        "timer_stale_fence",
+                        "timer_worker_mismatch",
+                        "timer_event_conflict",
+                        "timer_admission_rejected",
+                        "delivery_ambiguous",
+                        "timer_capability_mismatch"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "required": [
+                    "authority_result"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "operation": {
+                      "const": "scope_operation"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "required": [
+                    "effect_result"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "operation": {
+                      "const": "effect_result"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "required": [
+                    "cancellation_result"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "operation": {
+                      "const": "cancel_effect"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "committed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "receipt": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "allOf": [
+                  {
+                    "type": "object",
+                    "required": [
+                      "scope_binding_identity",
+                      "operation_id",
+                      "request_digest",
+                      "receipt_kind",
+                      "evidence_digest",
+                      "acceptance_receipt"
+                    ],
+                    "additionalProperties": false,
+                    "properties": {
+                      "scope_binding_identity": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "operation_id": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "request_digest": {
+                        "type": "string",
+                        "pattern": "^sha256:[0-9a-f]{64}$"
+                      },
+                      "receipt_kind": {
+                        "enum": [
+                          "committed",
+                          "accepted"
+                        ]
+                      },
+                      "evidence_digest": {
+                        "type": "string",
+                        "pattern": "^sha256:[0-9a-f]{64}$"
+                      },
+                      "acceptance_receipt": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                          }
+                        ]
+                      }
+                    },
+                    "allOf": [
+                      {
+                        "if": {
+                          "properties": {
+                            "receipt_kind": {
+                              "const": "accepted"
+                            }
+                          }
+                        },
+                        "then": {
+                          "properties": {
+                            "acceptance_receipt": {
+                              "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                            }
+                          }
+                        },
+                        "else": {
+                          "properties": {
+                            "acceptance_receipt": {
+                              "type": "null"
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "receipt_kind": {
+                        "const": "committed"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "committed"
+          },
+          "value": {
+            "properties": {
+              "operation": {
+                "enum": [
+                  "create",
+                  "admit",
+                  "effect_result",
+                  "cancel_effect"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "receipt": {
+            "type": "object",
+            "required": [
+              "scope_binding_identity",
+              "operation_id",
+              "request_digest",
+              "receipt_kind",
+              "evidence_digest",
+              "acceptance_receipt"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "scope_binding_identity": {
+                "type": "string",
+                "minLength": 1
+              },
+              "operation_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "request_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "receipt_kind": {
+                "enum": [
+                  "committed",
+                  "accepted"
+                ]
+              },
+              "evidence_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "acceptance_receipt": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                  }
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "receipt_kind": {
+                      "const": "accepted"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "acceptance_receipt": {
+                      "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                    }
+                  }
+                },
+                "else": {
+                  "properties": {
+                    "acceptance_receipt": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "committed"
+          },
+          "value": {
+            "properties": {
+              "operation": {
+                "const": "scope_operation"
+              },
+              "result": {
+                "properties": {
+                  "action": {
+                    "enum": [
+                      "archive_export",
+                      "archive_import"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "receipt": {
+            "type": "object",
+            "required": [
+              "scope_binding_identity",
+              "operation_id",
+              "request_digest",
+              "receipt_kind",
+              "evidence_digest",
+              "acceptance_receipt"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "scope_binding_identity": {
+                "type": "string",
+                "minLength": 1
+              },
+              "operation_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "request_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "receipt_kind": {
+                "enum": [
+                  "committed",
+                  "accepted"
+                ]
+              },
+              "evidence_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "acceptance_receipt": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                  }
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "receipt_kind": {
+                      "const": "accepted"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "acceptance_receipt": {
+                      "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                    }
+                  }
+                },
+                "else": {
+                  "properties": {
+                    "acceptance_receipt": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "committed"
+          },
+          "value": {
+            "properties": {
+              "operation": {
+                "const": "scope_operation"
+              },
+              "result": {
+                "properties": {
+                  "action": {
+                    "const": "recovery"
+                  },
+                  "recovery_result": {
+                    "properties": {
+                      "operation": {
+                        "enum": [
+                          "strict_restore",
+                          "standalone_takeover",
+                          "resume_takeover",
+                          "reconcile_work",
+                          "clone_scope",
+                          "activate_clone",
+                          "prepare_transfer",
+                          "stage_transfer",
+                          "commit_transfer",
+                          "activate_import"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "receipt": {
+            "type": "object",
+            "required": [
+              "scope_binding_identity",
+              "operation_id",
+              "request_digest",
+              "receipt_kind",
+              "evidence_digest",
+              "acceptance_receipt"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "scope_binding_identity": {
+                "type": "string",
+                "minLength": 1
+              },
+              "operation_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "request_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "receipt_kind": {
+                "enum": [
+                  "committed",
+                  "accepted"
+                ]
+              },
+              "evidence_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "acceptance_receipt": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                  }
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "receipt_kind": {
+                      "const": "accepted"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "acceptance_receipt": {
+                      "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                    }
+                  }
+                },
+                "else": {
+                  "properties": {
+                    "acceptance_receipt": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "committed"
+          },
+          "value": {
+            "properties": {
+              "operation": {
+                "const": "timer_command"
+              },
+              "result": {
+                "properties": {
+                  "timer_result": {
+                    "properties": {
+                      "operation": {
+                        "enum": [
+                          "schedule",
+                          "cancel",
+                          "claim_fire",
+                          "complete_fire"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "receipt": {
+            "type": "object",
+            "required": [
+              "scope_binding_identity",
+              "operation_id",
+              "request_digest",
+              "receipt_kind",
+              "evidence_digest",
+              "acceptance_receipt"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "scope_binding_identity": {
+                "type": "string",
+                "minLength": 1
+              },
+              "operation_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "request_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "receipt_kind": {
+                "enum": [
+                  "committed",
+                  "accepted"
+                ]
+              },
+              "evidence_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "acceptance_receipt": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                  }
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "receipt_kind": {
+                      "const": "accepted"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "acceptance_receipt": {
+                      "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                    }
+                  }
+                },
+                "else": {
+                  "properties": {
+                    "acceptance_receipt": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "committed"
+          },
+          "value": {
+            "properties": {
+              "operation": {
+                "const": "process"
+              },
+              "result": {
+                "properties": {
+                  "core_result": {
+                    "properties": {
+                      "disposition": {
+                        "enum": [
+                          "handled",
+                          "deferred",
+                          "unhandled",
+                          "faulted"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "receipt": {
+            "type": "object",
+            "required": [
+              "scope_binding_identity",
+              "operation_id",
+              "request_digest",
+              "receipt_kind",
+              "evidence_digest",
+              "acceptance_receipt"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "scope_binding_identity": {
+                "type": "string",
+                "minLength": 1
+              },
+              "operation_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "request_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "receipt_kind": {
+                "enum": [
+                  "committed",
+                  "accepted"
+                ]
+              },
+              "evidence_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "acceptance_receipt": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                  }
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "receipt_kind": {
+                      "const": "accepted"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "acceptance_receipt": {
+                      "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                    }
+                  }
+                },
+                "else": {
+                  "properties": {
+                    "acceptance_receipt": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "committed"
+          },
+          "value": {
+            "properties": {
+              "operation": {
+                "const": "scope_operation"
+              },
+              "result": {
+                "properties": {
+                  "action": {
+                    "const": "authority"
+                  },
+                  "authority_result": {
+                    "properties": {
+                      "operation": {
+                        "enum": [
+                          "guarded_commit",
+                          "freeze_scope",
+                          "fence_worker",
+                          "prove_retirement"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "receipt": {
+            "type": "object",
+            "required": [
+              "scope_binding_identity",
+              "operation_id",
+              "request_digest",
+              "receipt_kind",
+              "evidence_digest",
+              "acceptance_receipt"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "scope_binding_identity": {
+                "type": "string",
+                "minLength": 1
+              },
+              "operation_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "request_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "receipt_kind": {
+                "enum": [
+                  "committed",
+                  "accepted"
+                ]
+              },
+              "evidence_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "acceptance_receipt": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                  }
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "receipt_kind": {
+                      "const": "accepted"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "acceptance_receipt": {
+                      "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+                    }
+                  }
+                },
+                "else": {
+                  "properties": {
+                    "acceptance_receipt": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/public-host-response-v1.schema.json",
+  "title": "Determa State execution host response version 1",
+  "$defs": {
+    "capabilitiesValue": {
+      "type": "object",
+      "required": [
+        "operation",
+        "result"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "capabilities"
+        },
+        "result": {
+          "type": "object",
+          "required": [
+            "scope_binding_identity",
+            "supported_operations",
+            "supported_scope_actions",
+            "supported_determa_capabilities",
+            "supported_timer_commands",
+            "profile_digest",
+            "extension_reports",
+            "authority_profile",
+            "guarantees"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "scope_binding_identity": {
+              "type": "string",
+              "minLength": 1
+            },
+            "supported_operations": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "capabilities",
+                  "create",
+                  "admit",
+                  "process",
+                  "read",
+                  "inspect",
+                  "receipt",
+                  "effect_result",
+                  "cancel_effect",
+                  "timer_command",
+                  "scope_operation"
+                ]
+              }
+            },
+            "supported_scope_actions": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "authority",
+                  "archive_export",
+                  "archive_import",
+                  "recovery"
+                ]
+              }
+            },
+            "supported_determa_capabilities": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "$ref": "archive-v1.schema.json#/$defs/capability"
+              }
+            },
+            "supported_timer_commands": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "schedule",
+                  "cancel",
+                  "claim_fire",
+                  "complete_fire",
+                  "read_timer"
+                ]
+              }
+            },
+            "profile_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "extension_reports": {
+              "type": "array",
+              "items": {
+                "$ref": "extension-capability-report-v1.schema.json"
+              }
+            },
+            "authority_profile": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "host-authority-profile-report-v1.schema.json"
+                }
+              ]
+            },
+            "guarantees": {
+              "type": "object",
+              "required": [
+                "inspection_structural",
+                "inspection_semantic",
+                "retained_history",
+                "saved_response_replay",
+                "deterministic_reexecution"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "inspection_structural": {
+                  "type": "boolean"
+                },
+                "inspection_semantic": {
+                  "type": "boolean"
+                },
+                "retained_history": {
+                  "type": "boolean"
+                },
+                "saved_response_replay": {
+                  "type": "boolean"
+                },
+                "deterministic_reexecution": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "createValue": {
+      "type": "object",
+      "required": [
+        "operation",
+        "result"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "create"
+        },
+        "result": {
+          "type": "object",
+          "required": [
+            "checkpoint",
+            "creation_receipt",
+            "status",
+            "emissions",
+            "lifecycle_dispositions",
+            "fault"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "checkpoint": {
+              "$ref": "execution-checkpoint-v1.schema.json"
+            },
+            "creation_receipt": {
+              "$ref": "execution-checkpoint-v1.schema.json#/$defs/creationReceipt"
+            },
+            "status": {
+              "enum": [
+                "running",
+                "completed",
+                "faulted"
+              ]
+            },
+            "emissions": {
+              "type": "array",
+              "items": {
+                "$ref": "core-step-result-v1.schema.json#/$defs/emission"
+              }
+            },
+            "lifecycle_dispositions": {
+              "type": "array",
+              "items": {
+                "$ref": "core-step-result-v1.schema.json#/$defs/lifecycleDisposition"
+              }
+            },
+            "fault": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "aggregate-state-v1.schema.json#/$defs/fault"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "admitValue": {
+      "type": "object",
+      "required": [
+        "operation",
+        "result"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "admit"
+        },
+        "result": {
+          "type": "object",
+          "required": [
+            "checkpoint",
+            "acceptance_receipts",
+            "status",
+            "accepted"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "checkpoint": {
+              "$ref": "execution-checkpoint-v1.schema.json"
+            },
+            "acceptance_receipts": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+              }
+            },
+            "status": {
+              "enum": [
+                "running",
+                "completed",
+                "faulted"
+              ]
+            },
+            "accepted": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "aggregate-state-v1.schema.json#/$defs/envelope"
+              }
+            }
+          }
+        }
+      }
+    },
+    "processValue": {
+      "type": "object",
+      "required": [
+        "operation",
+        "result"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "process"
+        },
+        "result": {
+          "type": "object",
+          "required": [
+            "checkpoint",
+            "core_result",
+            "terminal_receipt"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "checkpoint": {
+              "$ref": "execution-checkpoint-v1.schema.json"
+            },
+            "core_result": {
+              "$ref": "core-step-result-v1.schema.json"
+            },
+            "terminal_receipt": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "execution-checkpoint-v1.schema.json#/$defs/terminalEventReceipt"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "readValue": {
+      "type": "object",
+      "required": [
+        "operation",
+        "result"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "read"
+        },
+        "result": {
+          "type": "object",
+          "required": [
+            "checkpoint",
+            "observed_checkpoint_digest"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "checkpoint": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "execution-checkpoint-v1.schema.json"
+                }
+              ]
+            },
+            "observed_checkpoint_digest": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "pattern": "^sha256:[0-9a-f]{64}$"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "inspectValue": {
+      "type": "object",
+      "required": [
+        "operation",
+        "result"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "inspect"
+        },
+        "result": {
+          "type": "object",
+          "required": [
+            "outcome",
+            "observed_aggregate_state_digest"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "outcome": {
+              "$ref": "inspection-v1.schema.json#/$defs/outcome"
+            },
+            "observed_aggregate_state_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          }
+        }
+      }
+    },
+    "receiptValue": {
+      "type": "object",
+      "required": [
+        "operation",
+        "result"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "receipt"
+        },
+        "result": {
+          "type": "object",
+          "required": [
+            "saved_response",
+            "retention"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "saved_response": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "public-host-response-v1.schema.json"
+                }
+              ]
+            },
+            "retention": {
+              "enum": [
+                "retained",
+                "expired",
+                "never_recorded",
+                "unknown"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "effect_resultValue": {
+      "type": "object",
+      "required": [
+        "operation",
+        "result"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "effect_result"
+        },
+        "result": {
+          "type": "object",
+          "required": [
+            "result"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "result": {
+              "allOf": [
+                {
+                  "$ref": "effect-result-response-v1.schema.json"
+                },
+                {
+                  "properties": {
+                    "status": {
+                      "enum": [
+                        "committed",
+                        "report_recorded"
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "cancel_effectValue": {
+      "type": "object",
+      "required": [
+        "operation",
+        "result"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "cancel_effect"
+        },
+        "result": {
+          "type": "object",
+          "required": [
+            "result"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "result": {
+              "allOf": [
+                {
+                  "$ref": "effect-cancellation-response-v1.schema.json"
+                },
+                {
+                  "properties": {
+                    "status": {
+                      "enum": [
+                        "committed",
+                        "reconciliation_required"
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "timer_commandValue": {
+      "type": "object",
+      "required": [
+        "operation",
+        "result"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "timer_command"
+        },
+        "result": {
+          "type": "object",
+          "required": [
+            "timer_result"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "timer_result": {
+              "allOf": [
+                {
+                  "$ref": "timer-helper-operation-v1.schema.json#/$defs/result"
+                },
+                {
+                  "properties": {
+                    "status": {
+                      "const": "accepted"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "scope_operationValue": {
+      "type": "object",
+      "required": [
+        "operation",
+        "result"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "scope_operation"
+        },
+        "result": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "action",
+                "authority_result"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "const": "authority"
+                },
+                "authority_result": {
+                  "allOf": [
+                    {
+                      "$ref": "host-authority-operation-v1.schema.json#/$defs/result"
+                    },
+                    {
+                      "properties": {
+                        "status": {
+                          "const": "accepted"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "action",
+                "archive_result",
+                "archive"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "const": "archive_export"
+                },
+                "archive_result": {
+                  "allOf": [
+                    {
+                      "$ref": "archive-result-v1.schema.json"
+                    },
+                    {
+                      "properties": {
+                        "status": {
+                          "const": "exported"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "archive": {
+                  "$ref": "archive-v1.schema.json"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "action",
+                "archive_result"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "const": "archive_import"
+                },
+                "archive_result": {
+                  "allOf": [
+                    {
+                      "$ref": "archive-result-v1.schema.json"
+                    },
+                    {
+                      "properties": {
+                        "status": {
+                          "const": "staged"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "action",
+                "recovery_result",
+                "recovery_record"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "const": "recovery"
+                },
+                "recovery_result": {
+                  "allOf": [
+                    {
+                      "$ref": "recovery-operation-v1.schema.json"
+                    },
+                    {
+                      "properties": {
+                        "result_format": {
+                          "const": "determa.recovery_result"
+                        },
+                        "status": {
+                          "const": "succeeded"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "recovery_record": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "recovery-record-v1.schema.json"
+                    }
+                  ]
+                }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "recovery_result": {
+                        "properties": {
+                          "record_digest": {
+                            "type": "string",
+                            "pattern": "^sha256:[0-9a-f]{64}$"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "recovery_record": {
+                        "$ref": "recovery-record-v1.schema.json"
+                      }
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "recovery_record": {
+                        "type": "null"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

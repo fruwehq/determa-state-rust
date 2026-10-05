@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/effect-cancellation-response-v1.schema.json",
+  "title": "Determa State version 1 effect cancellation response v1",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "status",
+        "operation_id",
+        "effect_id",
+        "cancellation",
+        "outcome",
+        "result_event_id",
+        "journal_revision",
+        "error_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "committed"
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effect_id": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "cancellation": {
+          "type": "object",
+          "required": [
+            "operation_id",
+            "reason",
+            "state"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "operation_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            },
+            "state": {
+              "enum": [
+                "prevented_start",
+                "too_late"
+              ]
+            }
+          }
+        },
+        "outcome": {
+          "$ref": "host-effect-journal-v1.schema.json#/$defs/outcome"
+        },
+        "result_event_id": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "journal_revision": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "error_code": {
+          "type": "null"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "status",
+        "operation_id",
+        "effect_id",
+        "cancellation",
+        "outcome",
+        "result_event_id",
+        "journal_revision",
+        "error_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "reconciliation_required"
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effect_id": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "cancellation": {
+          "type": "object",
+          "required": [
+            "operation_id",
+            "reason",
+            "state"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "operation_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            },
+            "state": {
+              "const": "reconciliation_required"
+            }
+          }
+        },
+        "outcome": {
+          "type": "null"
+        },
+        "result_event_id": {
+          "type": "null"
+        },
+        "journal_revision": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "error_code": {
+          "type": "null"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "status",
+        "operation_id",
+        "effect_id",
+        "cancellation",
+        "outcome",
+        "result_event_id",
+        "journal_revision",
+        "error_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "rejected"
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effect_id": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "cancellation": {
+          "type": "null"
+        },
+        "outcome": {
+          "type": "null"
+        },
+        "result_event_id": {
+          "type": "null"
+        },
+        "journal_revision": {
+          "type": "null"
+        },
+        "error_code": {
+          "enum": [
+            "unauthorized_scope",
+            "scope_not_active",
+            "stale_scope_authority",
+            "host_capability_mismatch",
+            "effect_not_outstanding",
+            "effect_result_conflict",
+            "operation_id_conflict",
+            "invalid_host_request"
+          ]
+        }
+      }
+    }
+  ]
+}

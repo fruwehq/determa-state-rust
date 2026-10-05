@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/effect-result-response-v1.schema.json",
+  "title": "Determa State version 1 effect result response",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "status",
+        "effect_id",
+        "attempt_fence",
+        "attempt_report",
+        "outcome",
+        "result_event_id",
+        "admission_receipt",
+        "checkpoint_revision",
+        "journal_revision",
+        "error_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "committed"
+        },
+        "effect_id": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "attempt_fence": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "attempt_report": {
+          "type": "null"
+        },
+        "outcome": {
+          "$ref": "host-effect-journal-v1.schema.json#/$defs/outcome"
+        },
+        "result_event_id": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "admission_receipt": {
+          "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+        },
+        "checkpoint_revision": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "journal_revision": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "error_code": {
+          "type": "null"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "status",
+        "effect_id",
+        "attempt_fence",
+        "attempt_report",
+        "outcome",
+        "result_event_id",
+        "admission_receipt",
+        "checkpoint_revision",
+        "journal_revision",
+        "error_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "report_recorded"
+        },
+        "effect_id": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "attempt_fence": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "attempt_report": {
+          "$ref": "host-effect-journal-v1.schema.json#/$defs/attemptRecord"
+        },
+        "outcome": {
+          "type": "null"
+        },
+        "result_event_id": {
+          "type": "null"
+        },
+        "admission_receipt": {
+          "type": "null"
+        },
+        "checkpoint_revision": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "journal_revision": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "error_code": {
+          "type": "null"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "status",
+        "effect_id",
+        "attempt_fence",
+        "attempt_report",
+        "outcome",
+        "result_event_id",
+        "admission_receipt",
+        "checkpoint_revision",
+        "journal_revision",
+        "error_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "rejected"
+        },
+        "effect_id": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "attempt_fence": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "attempt_report": {
+          "type": "null"
+        },
+        "outcome": {
+          "type": "null"
+        },
+        "result_event_id": {
+          "type": "null"
+        },
+        "admission_receipt": {
+          "type": "null"
+        },
+        "checkpoint_revision": {
+          "type": "null"
+        },
+        "journal_revision": {
+          "type": "null"
+        },
+        "error_code": {
+          "enum": [
+            "unauthorized_scope",
+            "scope_not_active",
+            "stale_scope_authority",
+            "host_capability_mismatch",
+            "effect_not_outstanding",
+            "effect_result_conflict",
+            "stale_attempt_fence",
+            "runtime_provider_output_invalid",
+            "portable_value_required",
+            "invalid_host_request"
+          ]
+        }
+      }
+    }
+  ]
+}

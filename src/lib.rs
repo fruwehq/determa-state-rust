@@ -11,6 +11,7 @@ pub mod checkpoint;
 pub mod cli;
 pub mod extensions;
 pub mod format1;
+pub mod public_host;
 pub mod value;
 
 /// Exact normative specification revision implemented by this crate.
