@@ -26,6 +26,8 @@ pub fn validate_artifact(
     verify_digest: bool,
 ) -> Result<Value, super::ArtifactError> {
     match kind {
+        "json_value" => super::strict_json::parse(source)
+            .map_err(|error| invalid_contract(kind, error.to_string())),
         "aggregate_state_v1" => super::v1::validate_aggregate_artifact(source, resolver),
         "aggregate_state_package_v1" if verify_digest => {
             let package = super::package::validate_package_artifact_v1(source)?;
@@ -170,6 +172,7 @@ fn validate_embedded_artifacts(
 fn contract_schema(kind: &str) -> Option<&'static str> {
     match kind {
         "core_step_result_v1" => Some(include_str!("../../schema/core-step-result-v1.schema.json")),
+        "inspection_v1" => Some(include_str!("../../schema/inspection-v1.schema.json")),
         "durable_host_call_log_v1" => Some(include_str!(
             "../../schema/durable-host-call-log-v1.schema.json"
         )),
@@ -198,11 +201,12 @@ fn contract_schema(kind: &str) -> Option<&'static str> {
     }
 }
 
-fn schema_resources() -> [&'static str; 14] {
+fn schema_resources() -> [&'static str; 15] {
     [
         include_str!("../../schema/aggregate-state-v1.schema.json"),
         include_str!("../../schema/aggregate-state-package-v1.schema.json"),
         include_str!("../../schema/core-step-result-v1.schema.json"),
+        include_str!("../../schema/inspection-v1.schema.json"),
         include_str!("../../schema/execution-checkpoint-v1.schema.json"),
         include_str!("../../schema/migration-descriptor-v1.schema.json"),
         include_str!("../../schema/durable-host-call-log-v1.schema.json"),
@@ -220,6 +224,7 @@ fn schema_resources() -> [&'static str; 14] {
 fn invalid_contract(kind: &str, message: impl Into<String>) -> super::ArtifactError {
     let code = match kind {
         "core_step_result_v1" => "invalid_core_step_result",
+        "inspection_v1" => "invalid_inspection_request",
         "durable_host_call_log_v1" => "invalid_durable_host_call_log_v1",
         "durable_host_inputs_v1" => "invalid_durable_host_inputs_v1",
         "durable_host_results_v1" => "invalid_durable_host_results_v1",

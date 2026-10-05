@@ -1730,7 +1730,7 @@ pub(crate) fn envelope_digest(
     .map_err(map_persistence)
 }
 
-fn core_delivery(delivery: &AdmissionDelivery) -> Result<Delivery, Version1Error> {
+pub(crate) fn core_delivery(delivery: &AdmissionDelivery) -> Result<Delivery, Version1Error> {
     let payload = delivery
         .envelope
         .payload
@@ -1759,7 +1759,7 @@ fn core_delivery(delivery: &AdmissionDelivery) -> Result<Delivery, Version1Error
     }
 }
 
-fn validate_source(
+pub(crate) fn validate_source(
     delivery: &AdmissionDelivery,
     aggregate: &JsonValue,
 ) -> Result<(), Version1Error> {

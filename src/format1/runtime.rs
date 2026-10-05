@@ -4248,7 +4248,7 @@ fn push_parallel_done(
     });
 }
 
-fn action_environment(
+pub(crate) fn action_environment(
     runtime: &RuntimeState,
     scope: &str,
     envelope: Option<&Envelope>,
@@ -4266,7 +4266,7 @@ fn action_environment(
     Environment { values }
 }
 
-fn visible_variables(runtime: &RuntimeState, scope: &str) -> BTreeMap<String, Value> {
+pub(crate) fn visible_variables(runtime: &RuntimeState, scope: &str) -> BTreeMap<String, Value> {
     let mut values = BTreeMap::new();
     let mut current = Some(scope.to_string());
     while let Some(path) = current {

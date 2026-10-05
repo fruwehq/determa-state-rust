@@ -2,6 +2,8 @@ mod cel;
 mod compile;
 mod contracts;
 mod counter;
+mod inspection;
+mod inspection_cel;
 pub(crate) mod migration;
 mod model;
 pub(crate) mod native;
@@ -17,6 +19,12 @@ pub(crate) mod v1;
 pub use compile::{Bundle, SemanticError};
 pub use contracts::{validate_artifact, validate_contract_artifact};
 pub use counter::Counter;
+pub use inspection::{
+    inspect_candidate, InspectionCapabilities, InspectionDispositionCode, InspectionFailureCode,
+    InspectionReasonCode,
+};
+#[cfg(determa_repository_conformance)]
+pub use inspection_cel::observed_inspection_guards;
 pub use migration::{MigrationRequest, ResourceLimits};
 pub use model::{Bindings, DefinitionBinding, IdentityOrigin, MachineIdentity, Target};
 pub use native::{PersistenceError, PersistenceErrorCode, TypedValue};
