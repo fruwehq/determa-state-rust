@@ -500,7 +500,14 @@ fn damaged_existing_authority_is_never_reinitialized() {
 #[test]
 fn canonical_ledger_or_native_mutation_corruption_refuses_read_replay_and_commit() {
     for corruption in [
-        "result", "request", "digest", "scope", "owner", "delete", "bytes",
+        "result",
+        "request",
+        "digest",
+        "scope",
+        "owner",
+        "owner-resealed",
+        "delete",
+        "bytes",
     ] {
         let file = path();
         let authority = SqliteLocalAuthority::open(&file).unwrap();
@@ -527,6 +534,15 @@ fn canonical_ledger_or_native_mutation_corruption_refuses_read_replay_and_commit
             }
             "scope" => ledger["scope_identity"] = json!("different"),
             "owner" => ledger["owner_binding"]["owner_principal"] = json!("different"),
+            "owner-resealed" => {
+                ledger["owner_binding"]["owner_principal"] = json!("different");
+                ledger["ownership_binding_digest"] = json!(format!(
+                    "sha256:{:x}",
+                    Sha256::digest(
+                        serde_json_canonicalizer::to_vec(&ledger["owner_binding"]).unwrap()
+                    )
+                ));
+            }
             "delete" => {
                 native
                     .execute("DELETE FROM determa_authority_mutations", [])

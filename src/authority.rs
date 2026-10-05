@@ -20,7 +20,7 @@ use std::sync::{Mutex, OnceLock};
 
 const RECORDS: &str = "CREATE TABLE determa_scope_authority (scope_identity TEXT PRIMARY KEY NOT NULL, ledger BLOB NOT NULL)";
 const ALLOCATIONS: &str =
-    "CREATE TABLE determa_scope_allocations (scope_identity TEXT PRIMARY KEY NOT NULL)";
+    "CREATE TABLE determa_scope_allocations (scope_identity TEXT PRIMARY KEY NOT NULL, ownership_binding_digest TEXT NOT NULL, owner_binding BLOB NOT NULL)";
 const MUTATIONS: &str = "CREATE TABLE determa_authority_mutations (scope_identity TEXT NOT NULL, operation_id TEXT NOT NULL, mutation_digest TEXT NOT NULL, mutation BLOB NOT NULL, PRIMARY KEY(scope_identity, operation_id))";
 const NO_DELETE: &str = "CREATE TRIGGER determa_scope_allocations_forbid_delete BEFORE DELETE ON determa_scope_allocations BEGIN SELECT RAISE(ABORT, 'scope_allocation_immutable'); END";
 const NO_UPDATE: &str = "CREATE TRIGGER determa_scope_allocations_forbid_update BEFORE UPDATE ON determa_scope_allocations BEGIN SELECT RAISE(ABORT, 'scope_allocation_immutable'); END";
@@ -168,7 +168,10 @@ impl SqliteLocalAuthority {
             "authority_epoch": "0", "owner_binding": owner, "state": "active",
             "scope_generation": "0", "active_transfer_id": null, "receipts": []});
         transaction
-            .execute("INSERT INTO determa_scope_allocations VALUES (?)", [scope])
+            .execute(
+                "INSERT INTO determa_scope_allocations VALUES (?,?,?)",
+                params![scope, hash(&owner)?, canonical(&owner)?],
+            )
             .map_err(failure)?;
         transaction
             .execute(
@@ -589,15 +592,22 @@ fn validate_record(
     {
         return Err(failure("authority identity/ownership record mismatch"));
     }
-    let allocated: bool = connection
+    let allocation: Option<(String, Vec<u8>)> = connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM determa_scope_allocations WHERE scope_identity=?)",
+            "SELECT ownership_binding_digest, owner_binding FROM determa_scope_allocations WHERE scope_identity=?",
             [scope],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
+        .optional()
         .map_err(failure)?;
-    if !allocated {
+    let Some((digest, owner)) = allocation else {
         return Err(failure("authority permanent allocation absent"));
+    };
+    if record["ownership_binding_digest"] != digest || canonical(&record["owner_binding"])? != owner
+    {
+        return Err(failure(
+            "authority ownership differs from immutable allocation",
+        ));
     }
     let receipts = record["receipts"]
         .as_array()

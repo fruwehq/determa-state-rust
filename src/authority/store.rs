@@ -71,25 +71,19 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
         }
     }
 
-    fn authority_snapshot(&self) -> Result<Value, StoreError> {
-        let mut request = json!({"interface":"determa.host_authority","interface_version":1,
-            "operation":"read_authority","operation_id":"configured-checkpoint-store-read",
-            "scope_identity":self.scope,"expected_authority_epoch":null,
-            "expected_scope_generation":null,"arguments":{}});
-        request["request_digest"] =
-            json!(hash(&json!(["determa-host-authority-request-1", request])).map_err(error)?);
-        let result = self
-            .authority
-            .perform(&canonical(&request).map_err(error)?, &self.caller(), None)
+    /// Validation and the consuming read share the same native SQLite snapshot.
+    /// No checkpoint bytes may escape via the separate raw store connection.
+    fn with_authority_snapshot<T>(
+        &self,
+        read: impl FnOnce(&rusqlite::Connection, &Value) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let mut connection = self.authority.connection.lock().map_err(error)?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(error)?;
-        if result["status"] != "accepted"
-            || result["state"] != "active"
-            || result["authority_epoch"] != "0"
-        {
-            return Err(error("configured scope authority is not active"));
-        }
-        let connection = self.authority.connection.lock().map_err(error)?;
-        let bytes: Vec<u8> = connection
+        super::validate_schema(&transaction, &self.authority.storage_binding).map_err(error)?;
+        checkpoint::verify_sqlite_schema(&transaction, self.mode)?;
+        let bytes: Vec<u8> = transaction
             .query_row(
                 "SELECT ledger FROM determa_scope_authority WHERE scope_identity=?",
                 [&self.scope],
@@ -97,12 +91,31 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
             )
             .map_err(error)?;
         let ledger = strict_json::parse(&bytes).map_err(error)?;
+        if canonical(&ledger).map_err(error)? != bytes {
+            return Err(error("authority ledger is not canonical"));
+        }
+        super::validate_record(&transaction, &self.scope, &ledger).map_err(error)?;
+        if ledger["state"] != "active" || ledger["authority_epoch"] != "0" {
+            return Err(error("configured scope authority is not active"));
+        }
         if ledger["owner_binding"]
             != json!({"owner_principal":self.owner,"host_binding":self.host_binding})
         {
             return Err(error("configured authority owner binding differs"));
         }
+        let result = read(&transaction, &ledger)?;
+        transaction.commit().map_err(error)?;
         Ok(result)
+    }
+
+    fn authority_snapshot(&self) -> Result<Value, StoreError> {
+        self.with_authority_snapshot(|_, ledger| Ok(ledger.clone()))
+    }
+
+    fn guarded_load(&self, root: &str) -> Result<Option<StoreRecord>, StoreError> {
+        self.with_authority_snapshot(|connection, _| {
+            checkpoint::load_sqlite_record(connection, root)
+        })
     }
 
     fn commit(
@@ -142,14 +155,14 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
         ) {
             Ok(result) if result["status"] == "accepted" => Ok(StoreWriteResult::Committed),
             Ok(result) if result["error_code"] == "scope_generation_conflict" => Ok(
-                StoreWriteResult::Conflict(self.checkpoints.load(&record.root_instance_id)?),
+                StoreWriteResult::Conflict(self.guarded_load(&record.root_instance_id)?),
             ),
             Ok(result) => Err(error(format!(
                 "authority refused checkpoint commit: {}",
                 result["error_code"]
             ))),
             Err(failure) if failure.to_string() == "checkpoint_revision_conflict" => Ok(
-                StoreWriteResult::Conflict(self.checkpoints.load(&record.root_instance_id)?),
+                StoreWriteResult::Conflict(self.guarded_load(&record.root_instance_id)?),
             ),
             Err(failure) => Err(error(failure)),
         }
@@ -197,8 +210,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> ExecutionStore
     }
 
     fn load(&self, root: &str) -> Result<Option<StoreRecord>, StoreError> {
-        self.health()?;
-        self.checkpoints.load(root)
+        self.guarded_load(root)
     }
 
     fn insert_if_absent(&self, record: StoreRecord) -> Result<StoreWriteResult, StoreError> {
@@ -216,5 +228,67 @@ impl<R: DefinitionResolver + Send + Sync + 'static> ExecutionStore
             return Err(error("checkpoint replacement belongs to another root"));
         }
         self.commit(replacement, Some(&MutationGuard::new(revision, digest)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{load_bundle, Bindings, InMemoryDefinitionResolver};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn guarded_read_keeps_validated_bytes_when_native_writer_commits_between_checks_and_read() {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "determa-authority-snapshot-{}-{}.sqlite",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let bundle = load_bundle(
+            &json!({"format":1,"namespace":"authority.snapshot.tests",
+            "machines":[{"machine_id":"simple","root":{"type":"composite",
+                "initial":{"transition_to":"waiting"},"states":{"waiting":{}}}}]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(bundle.clone(), true);
+        let resolver = Arc::new(resolver);
+        let store = Arc::new(
+            GuardedSqliteExecutionStore::open(
+                &path,
+                DurableStoreMode::bounded(),
+                "scope".into(),
+                "owner".into(),
+                "local-host".into(),
+                resolver.clone(),
+            )
+            .unwrap(),
+        );
+        store.initialize_schema().unwrap();
+        store.allocate_scope().unwrap();
+        let host = checkpoint::CheckpointHost::new(store.clone(), resolver);
+        host.create_checkpoint(&bundle, "simple", "root", "create", &Bindings::default(), None,
+            json!({"mode":"bounded","permanent_replay_eligible":false,"pruned_through_receipt_sequence":null,"policy_identifier":"test-bounded"})).unwrap();
+        let original = store.load("root").unwrap().unwrap();
+        let captured = store.with_authority_snapshot(|connection, _| {
+            // A separate native writer actually commits AFTER complete authority
+            // validation, BEFORE the consuming read, while the WAL reader remains open.
+            let writer_path = path.clone();
+            std::thread::spawn(move || {
+                let writer = rusqlite::Connection::open(writer_path).unwrap();
+                writer.execute("UPDATE determa_execution_checkpoints SET checkpoint_bytes=? WHERE root_instance_id='root'",
+                    [b"unchecked replacement".as_slice()]).unwrap();
+            }).join().unwrap();
+            checkpoint::load_sqlite_record(connection, "root")
+        }).unwrap().unwrap();
+        assert_eq!(captured, original);
+        // The next snapshot sees the corruption and refuses; it never silently
+        // repairs the native writer's untracked change.
+        assert!(store.load("root").is_err());
+        drop(host);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
     }
 }
