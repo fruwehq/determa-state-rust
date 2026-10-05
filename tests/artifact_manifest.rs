@@ -204,7 +204,8 @@ mod inspection_provider;
 fn definition_resolver(root: &Path) -> InMemoryDefinitionResolver {
     let mut resolver = InMemoryDefinitionResolver::default();
     let directory = root.join("profiles/inspection-provider/provider-01-exact-closure");
-    let (bundle, _, _) = inspection_provider::bundle(&directory);
+    let (bundle, safe, unsafe_) = inspection_provider::bundle(&directory);
+    inspection_provider::assert_unchanged(&safe, &unsafe_);
     resolver.insert(bundle, true);
     for path in find_extension(root, "yaml") {
         if let Ok(bundle) = load_bundle(&fs::read_to_string(path).unwrap()) {

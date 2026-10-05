@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
 
+mod common;
+
 pub type ProviderResult<T> = Result<T, Version1Error>;
 
 /// Host policy independently binds the installed native object to reviewed code and
@@ -129,6 +131,8 @@ struct Entry {
     descriptor: Value,
     provider: Arc<dyn NativeRuntimeProvider>,
     closure: SourceClosure,
+    common: Arc<crate::extensions::ExtensionRegistry>,
+    configured: crate::extensions::ConfiguredExtension,
 }
 struct Registry {
     entries: BTreeMap<(String, String), Entry>,
@@ -205,13 +209,32 @@ impl RuntimeProviderRegistry {
         closure: SourceClosure,
     ) -> ProviderResult<()> {
         super::source::validate_runtime_descriptor(&descriptor)?;
-        let kind = descriptor["kind"].as_str().unwrap().to_owned();
         let key = reference_key(&descriptor["binding"]["provider_reference"])?;
+        if self
+            .0
+            .entries
+            .contains_key(&("runtime_provider".into(), key.clone()))
+        {
+            return Err(Version1Error::new(
+                "duplicate_extension_registration",
+                "provider already installed",
+            ));
+        }
         closure.verify()?;
+        let (common, configured) = guarded(|| {
+            common::configure(
+                &descriptor,
+                provider.clone(),
+                closure.clone(),
+                self.0.verifier.clone(),
+            )
+        })?;
         let entry = Entry {
             descriptor,
             provider,
             closure,
+            common,
+            configured,
         };
         self.verify_entry(&entry)?;
         let registry = Arc::get_mut(&mut self.0).ok_or_else(unavailable)?;
@@ -224,7 +247,6 @@ impl RuntimeProviderRegistry {
                 "provider already installed",
             ));
         }
-        let _ = kind;
         registry
             .entries
             .insert(("runtime_provider".into(), key), entry);
@@ -263,9 +285,19 @@ impl RuntimeProviderRegistry {
             return Err(unavailable());
         }
         guarded(|| {
-            self.0
-                .verifier
-                .verify(entry.provider.as_ref(), &entry.descriptor, &entry.closure)
+            let report = entry
+                .common
+                .report(&entry.configured)
+                .map_err(|error| Version1Error::new(error.code.as_str(), error.message))?;
+            if report["health"] != "healthy" {
+                return Err(unavailable());
+            }
+            Ok(report["claims"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|claim| claim.as_str().unwrap().to_owned())
+                .collect())
         })
     }
     fn select(&self, kind: &str, binding: &Value) -> ProviderResult<(&Entry, BTreeSet<String>)> {
@@ -386,27 +418,69 @@ impl RuntimeProviderRegistry {
     }
 }
 fn visit_bindings(
-    value: &Value,
+    document: &Value,
     call: &mut impl FnMut(&str, &Value) -> ProviderResult<()>,
 ) -> ProviderResult<()> {
-    match value {
-        Value::Object(fields) => {
-            if let Some(binding) = fields.get("guard").and_then(|g| g.get("provider")) {
+    fn actions(
+        value: &Value,
+        call: &mut impl FnMut(&str, &Value) -> ProviderResult<()>,
+    ) -> ProviderResult<()> {
+        if let Some(items) = value.as_array() {
+            for action in items {
+                if let Some(binding) = action.get("provider_actions") {
+                    call("actions", binding)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn transition(
+        value: &Value,
+        call: &mut impl FnMut(&str, &Value) -> ProviderResult<()>,
+    ) -> ProviderResult<()> {
+        if let Some(items) = value.as_array() {
+            for item in items {
+                transition(item, call)?;
+            }
+        } else {
+            if let Some(binding) = value.get("guard").and_then(|guard| guard.get("provider")) {
                 call("guard", binding)?;
             }
-            if let Some(binding) = fields.get("provider_actions") {
-                call("actions", binding)?;
-            }
-            for child in fields.values() {
-                visit_bindings(child, call)?;
+            actions(&value["action"], call)?;
+        }
+        Ok(())
+    }
+    fn state(
+        value: &Value,
+        call: &mut impl FnMut(&str, &Value) -> ProviderResult<()>,
+    ) -> ProviderResult<()> {
+        actions(&value["entry"], call)?;
+        actions(&value["exit"], call)?;
+        transition(&value["initial"], call)?;
+        transition(&value["choice"], call)?;
+        if let Some(handlers) = value["on_events"].as_object() {
+            for handler in handlers.values() {
+                transition(handler, call)?;
             }
         }
-        Value::Array(items) => {
-            for item in items {
-                visit_bindings(item, call)?;
+        if let Some(children) = value["states"].as_object() {
+            for child in children.values() {
+                state(child, call)?;
             }
         }
-        _ => {}
+        if let Some(components) = value["components"].as_array() {
+            for component in components {
+                if let Some(root) = component.get("root") {
+                    state(root, call)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    if let Some(machines) = document["machines"].as_array() {
+        for machine in machines {
+            state(&machine["root"], call)?;
+        }
     }
     Ok(())
 }
