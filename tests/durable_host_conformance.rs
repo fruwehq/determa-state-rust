@@ -834,7 +834,12 @@ fn run_persistence_inner(
             .unwrap()
             .insert("unexpected_member".to_string(), Value::Bool(true));
     }
-    let store = sqlite
+    // Observe transaction fate through a fresh native connection after both
+    // writer handles have closed, including the application rows.
+    drop(host);
+    drop(sqlite);
+    let reopened = SqliteExecutionStore::open(&database, mode).map_err(load_error)?;
+    let store = reopened
         .export_durable_host_snapshot(
             request["expected_checkpoint"]["root_instance_id"]
                 .as_str()

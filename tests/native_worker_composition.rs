@@ -249,7 +249,9 @@ machines:
                 replacement.bytes = serde_json::to_vec(&corrupted).unwrap();
                 assert!(store
                     .compare_and_swap(&root, compact.revision(), compact.digest(), replacement)
-                    .is_err());
+                    .unwrap_err()
+                    .message
+                    .contains("referenced tombstone removal"));
             }
             let reopened = SqliteExecutionStore::open(&database, native_mode).unwrap();
             assert_eq!(reopened.load(&root).unwrap(), store.load(&root).unwrap());

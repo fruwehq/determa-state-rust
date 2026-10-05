@@ -762,3 +762,41 @@ fn normalize_sql(value: &str) -> String {
 fn sql_error(error: rusqlite::Error) -> StoreError {
     StoreError::new(error.to_string())
 }
+
+#[cfg(test)]
+mod native_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn changed_native_connection_settings_remove_sqlite_health() {
+        for pragma in [
+            "PRAGMA synchronous = OFF",
+            "PRAGMA journal_mode = DELETE",
+            "PRAGMA foreign_keys = OFF",
+            "PRAGMA busy_timeout = 0",
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "determa-native-config-{}-{}.sqlite",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let store = SqliteExecutionStore::open(
+                &path,
+                DurableStoreMode::new(
+                    super::super::super::store::ReceiptRetentionMode::Bounded,
+                    super::super::super::store::OutboxRetentionMode::Bounded,
+                ),
+            )
+            .unwrap();
+            store.initialize_schema().unwrap();
+            assert!(store.health().unwrap().healthy);
+            store.connection().unwrap().execute_batch(pragma).unwrap();
+            assert!(store.health().is_err(), "{pragma}");
+            drop(store);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+}

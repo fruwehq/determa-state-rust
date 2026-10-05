@@ -46,14 +46,22 @@ def completed_tests(listing, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--report', required=True, type=Path)
-    parser.add_argument('--test', action='append', required=True)
+    parser.add_argument('--test', action='append', default=[])
+    parser.add_argument('--lib', action='store_true')
     parser.add_argument('--require-postgresql', action='store_true')
     args = parser.parse_args()
     if args.require_postgresql and not os.environ.get('DETERMA_TEST_POSTGRES_URL'):
         parser.error('DETERMA_TEST_POSTGRES_URL is required; PostgreSQL cannot be skipped')
     if len(args.test) != len(set(args.test)):
         parser.error('duplicate test binary')
+    if not args.test and not args.lib:
+        parser.error('at least one native test binary is required')
+    requested = args.test + (['determa_state'] if args.lib else [])
+    if len(requested) != len(set(requested)):
+        parser.error('duplicate native binary name')
     command = ['cargo', 'test', '--locked', '--all-features', '--no-run', '--message-format=json']
+    if args.lib:
+        command.append('--lib')
     for name in args.test:
         command.extend(['--test', name])
     artifacts = {}
@@ -61,14 +69,15 @@ def main():
         item = json.loads(line)
         if item.get('reason') == 'compiler-artifact' and item.get('executable'):
             target = item['target']
-            if target['name'] in args.test and target['kind'] == ['test']:
+            if (target['name'] in requested
+                    and target['kind'] == (['lib'] if target['name'] == 'determa_state' else ['test'])):
                 if target['name'] in artifacts:
                     raise RuntimeError('duplicate native binary artifact')
                 artifacts[target['name']] = item['executable']
-    if set(artifacts) != set(args.test):
+    if set(artifacts) != set(requested):
         raise RuntimeError('not all requested native binaries were built')
     report = ET.Element('testsuites')
-    for name in args.test:
+    for name in requested:
         binary = artifacts[name]
         listing = execute([binary, '--list', '--format=terse'])
         output = execute([binary, '--test-threads=1', '--format=pretty', '--color=never'])
