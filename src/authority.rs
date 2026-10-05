@@ -5,7 +5,7 @@
 //! inventories, worker fences, relocation and verified registration remain unfinished.
 //! No completed authority profile or capability claim is advertised.
 
-use crate::checkpoint::{DurableStoreMode, MutationGuard, StoreRecord};
+use crate::checkpoint::{DurableStoreMode, ExecutionCheckpoint, MutationGuard, StoreRecord};
 use crate::format1::strict_json;
 use num_bigint::BigUint;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -192,15 +192,28 @@ impl SqliteLocalAuthority {
     /// Bind an actual root checkpoint insert or CAS to the authority commit.
     /// The request digest covers `checkpoint_mutation_bytes`; no SQL or native
     /// transaction is supplied through the portable request.
+    /// Only a checkpoint returned by validated create/restore APIs is accepted.
+    /// Public storage records cannot bypass this boundary, including bounded mode.
+    ///
+    /// ```compile_fail
+    /// use determa_state::authority::{NativeAuthorityInvocation, SqliteLocalAuthority};
+    /// use determa_state::checkpoint::{DurableStoreMode, StoreRecord};
+    /// fn invalid(authority: &SqliteLocalAuthority, caller: &NativeAuthorityInvocation,
+    ///            record: &StoreRecord) {
+    ///     authority.commit_checkpoint(b"{}", caller, DurableStoreMode::bounded(), record, None);
+    /// }
+    /// ```
     pub fn commit_checkpoint(
         &self,
         request_bytes: &[u8],
         invocation: &NativeAuthorityInvocation,
         mode: DurableStoreMode,
-        replacement: &StoreRecord,
+        replacement: &ExecutionCheckpoint,
         guard: Option<&MutationGuard>,
     ) -> Result<Value, AuthorityError> {
         let mutation = checkpoint_mutation_bytes(replacement, guard)?;
+        let native_record = StoreRecord::from_checkpoint(replacement).map_err(failure)?;
+        let replacement = &native_record;
         self.perform_native(request_bytes, invocation, Some(&mutation), true, |transaction| {
             crate::checkpoint::verify_sqlite_schema(transaction, mode)
                 .map_err(failure)?;
@@ -399,9 +412,10 @@ impl SqliteLocalAuthority {
 /// Exact native checkpoint mutation identity, including root and CAS preconditions.
 /// This host envelope is not added to the portable checkpoint or machine grammar.
 pub fn checkpoint_mutation_bytes(
-    record: &StoreRecord,
+    validated: &ExecutionCheckpoint,
     guard: Option<&MutationGuard>,
 ) -> Result<Vec<u8>, AuthorityError> {
+    let record = StoreRecord::from_checkpoint(validated).map_err(failure)?;
     let checkpoint = strict_json::parse(&record.bytes).map_err(failure)?;
     if canonical(&checkpoint)? != record.bytes
         || checkpoint["root_instance_id"] != record.root_instance_id

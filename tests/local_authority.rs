@@ -72,14 +72,14 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
     let created = checkpoint::create(&bundle,"counter","root","create", &Bindings::default(), None,
         json!({"mode":"permanent","permanent_replay_eligible":true,"pruned_through_receipt_sequence":null,"policy_identifier":null})).unwrap();
     let native = StoreRecord::from_checkpoint(&created).unwrap();
-    let mutation = checkpoint_mutation_bytes(&native, None).unwrap();
+    let mutation = checkpoint_mutation_bytes(&created, None).unwrap();
     let insert = request("guarded_commit", "insert", &mutation);
     let accepted = authority
         .commit_checkpoint(
             &serde_json_canonicalizer::to_vec(&insert).unwrap(),
             &invocation("owner"),
             mode,
-            &native,
+            &created,
             None,
         )
         .unwrap();
@@ -91,7 +91,7 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
                 &serde_json_canonicalizer::to_vec(&insert).unwrap(),
                 &invocation("owner"),
                 mode,
-                &native,
+                &created,
                 None
             )
             .unwrap(),
@@ -129,7 +129,7 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
     .unwrap();
     let replacement = StoreRecord::from_checkpoint(&restored).unwrap();
     let guard = MutationGuard::new(created.revision(), created.digest());
-    let mutation = checkpoint_mutation_bytes(&replacement, Some(&guard)).unwrap();
+    let mutation = checkpoint_mutation_bytes(&restored, Some(&guard)).unwrap();
     let mut replace = request("guarded_commit", "replace", &mutation);
     replace["expected_scope_generation"] = json!("1");
     replace = sealed(replace);
@@ -143,7 +143,7 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
                 &serde_json_canonicalizer::to_vec(&replace).unwrap(),
                 &invocation("owner"),
                 mode,
-                &replacement,
+                &restored,
                 Some(&guard)
             )
             .unwrap()["error_code"],
@@ -159,7 +159,7 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
             &serde_json_canonicalizer::to_vec(&replace).unwrap(),
             &invocation("owner"),
             mode,
-            &replacement,
+            &restored,
             Some(&guard)
         )
         .is_err());
@@ -168,7 +168,7 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
         .execute_batch("DROP TRIGGER unexpected_checkpoint_writer;")
         .unwrap();
     let wrong_guard = MutationGuard::new("999", created.digest());
-    let wrong_mutation = checkpoint_mutation_bytes(&replacement, Some(&wrong_guard)).unwrap();
+    let wrong_mutation = checkpoint_mutation_bytes(&restored, Some(&wrong_guard)).unwrap();
     let mut wrong_cas = request("guarded_commit", "wrong-cas", &wrong_mutation);
     wrong_cas["expected_scope_generation"] = json!("1");
     wrong_cas = sealed(wrong_cas);
@@ -177,7 +177,7 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
             &serde_json_canonicalizer::to_vec(&wrong_cas).unwrap(),
             &invocation("owner"),
             mode,
-            &replacement,
+            &restored,
             Some(&wrong_guard)
         )
         .is_err());
@@ -196,7 +196,7 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
             &serde_json_canonicalizer::to_vec(&replace).unwrap(),
             &invocation("owner"),
             mode,
-            &replacement,
+            &restored,
             Some(&guard),
         )
         .unwrap();
@@ -257,7 +257,7 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
                 &serde_json_canonicalizer::to_vec(&replace).unwrap(),
                 &invocation("owner"),
                 mode,
-                &replacement,
+                &restored,
                 Some(&guard)
             )
             .unwrap()["error_code"],
