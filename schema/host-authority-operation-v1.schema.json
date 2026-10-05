@@ -1,0 +1,610 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/host-authority-operation-v1.schema.json",
+  "title": "Optional host scope authority operation and result",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/result"
+    },
+    {
+      "$ref": "#/$defs/earlyError"
+    }
+  ],
+  "$defs": {
+    "identity": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "operation": {
+      "enum": [
+        "read_authority",
+        "guarded_commit",
+        "freeze_scope",
+        "fence_worker",
+        "prove_retirement"
+      ]
+    },
+    "emptyArguments": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "guardedCommitArguments": {
+      "type": "object",
+      "required": [
+        "mutation_digest"
+      ],
+      "properties": {
+        "mutation_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "fenceWorkerArguments": {
+      "type": "object",
+      "required": [
+        "root_instance_id",
+        "work_kind",
+        "work_identity",
+        "operation_token",
+        "expected_attempt_fence",
+        "expected_worker_principal"
+      ],
+      "properties": {
+        "root_instance_id": {
+          "$ref": "#/$defs/identity"
+        },
+        "work_kind": {
+          "const": "effect"
+        },
+        "work_identity": {
+          "$ref": "#/$defs/identity"
+        },
+        "operation_token": {
+          "$ref": "#/$defs/identity"
+        },
+        "expected_attempt_fence": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/decimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expected_worker_principal": {
+          "$ref": "#/$defs/identity"
+        }
+      },
+      "additionalProperties": false
+    },
+    "proveRetirementArguments": {
+      "type": "object",
+      "required": [
+        "destination_binding_digest",
+        "freeze_evidence_digest"
+      ],
+      "properties": {
+        "destination_binding_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "freeze_evidence_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "request": {
+      "type": "object",
+      "required": [
+        "interface",
+        "interface_version",
+        "operation",
+        "operation_id",
+        "scope_identity",
+        "expected_authority_epoch",
+        "expected_scope_generation",
+        "request_digest",
+        "arguments"
+      ],
+      "properties": {
+        "interface": {
+          "const": "determa.host_authority"
+        },
+        "interface_version": {
+          "const": 1
+        },
+        "operation": {
+          "$ref": "#/$defs/operation"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/identity"
+        },
+        "scope_identity": {
+          "$ref": "#/$defs/identity"
+        },
+        "expected_authority_epoch": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/decimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expected_scope_generation": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/decimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "arguments": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "read_authority"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "arguments": {
+                "$ref": "#/$defs/emptyArguments"
+              },
+              "expected_authority_epoch": {
+                "type": "null"
+              },
+              "expected_scope_generation": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "expected_authority_epoch": {
+                "$ref": "#/$defs/decimal"
+              },
+              "expected_scope_generation": {
+                "$ref": "#/$defs/decimal"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "guarded_commit"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "arguments": {
+                "$ref": "#/$defs/guardedCommitArguments"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "freeze_scope"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "arguments": {
+                "$ref": "#/$defs/emptyArguments"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "fence_worker"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "arguments": {
+                "$ref": "#/$defs/fenceWorkerArguments"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "prove_retirement"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "arguments": {
+                "$ref": "#/$defs/proveRetirementArguments"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "result": {
+      "type": "object",
+      "required": [
+        "interface",
+        "interface_version",
+        "operation",
+        "operation_id",
+        "status",
+        "scope_identity",
+        "authority_epoch",
+        "scope_generation",
+        "state",
+        "evidence_digest",
+        "error_code",
+        "claim"
+      ],
+      "properties": {
+        "interface": {
+          "const": "determa.host_authority"
+        },
+        "interface_version": {
+          "const": 1
+        },
+        "operation": {
+          "$ref": "#/$defs/operation"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/identity"
+        },
+        "status": {
+          "enum": [
+            "accepted",
+            "rejected"
+          ]
+        },
+        "scope_identity": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/identity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "authority_epoch": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/decimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope_generation": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/decimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "enum": [
+            "active",
+            "freezing",
+            "frozen",
+            "retired",
+            "transaction_in_doubt",
+            null
+          ]
+        },
+        "evidence_digest": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error_code": {
+          "enum": [
+            null,
+            "host_capability_mismatch",
+            "unauthorized_scope",
+            "scope_not_active",
+            "stale_scope_authority",
+            "scope_operation_conflict",
+            "scope_generation_conflict",
+            "scope_transaction_in_doubt",
+            "scope_fence_unproven",
+            "replay_evidence_expired",
+            "stale_attempt_fence",
+            "worker_principal_mismatch"
+          ]
+        },
+        "claim": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/workerClaim"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "accepted"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "evidence_digest": {
+                "$ref": "#/$defs/digest"
+              },
+              "error_code": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "rejected"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "evidence_digest": {
+                "type": "null"
+              },
+              "error_code": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "error_code": {
+                "const": "unauthorized_scope"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "scope_identity": {
+                "type": "null"
+              },
+              "authority_epoch": {
+                "type": "null"
+              },
+              "scope_generation": {
+                "type": "null"
+              },
+              "state": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "scope_identity": {
+                "$ref": "#/$defs/identity"
+              },
+              "authority_epoch": {
+                "$ref": "#/$defs/decimal"
+              },
+              "scope_generation": {
+                "$ref": "#/$defs/decimal"
+              },
+              "state": {
+                "enum": [
+                  "active",
+                  "freezing",
+                  "frozen",
+                  "retired",
+                  "transaction_in_doubt"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "accepted"
+              },
+              "operation": {
+                "const": "fence_worker"
+              }
+            },
+            "required": [
+              "status",
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "claim": {
+                "$ref": "#/$defs/workerClaim"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "claim": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "workerClaim": {
+      "type": "object",
+      "required": [
+        "scope_identity",
+        "root_instance_id",
+        "work_kind",
+        "work_identity",
+        "operation_token",
+        "scope_authority_epoch",
+        "attempt_fence",
+        "worker_principal",
+        "expires_at",
+        "state"
+      ],
+      "properties": {
+        "scope_identity": {
+          "$ref": "#/$defs/identity"
+        },
+        "root_instance_id": {
+          "$ref": "#/$defs/identity"
+        },
+        "work_kind": {
+          "const": "effect"
+        },
+        "work_identity": {
+          "$ref": "#/$defs/identity"
+        },
+        "operation_token": {
+          "$ref": "#/$defs/identity"
+        },
+        "scope_authority_epoch": {
+          "$ref": "#/$defs/decimal"
+        },
+        "attempt_fence": {
+          "$ref": "#/$defs/decimal"
+        },
+        "worker_principal": {
+          "$ref": "#/$defs/identity"
+        },
+        "expires_at": {
+          "type": "string",
+          "pattern": "^(0|-?[1-9][0-9]*)$",
+          "description": "Canonical signed Unix-epoch nanoseconds; normative signed 64-bit bounds are checked semantically."
+        },
+        "state": {
+          "const": "active"
+        }
+      },
+      "additionalProperties": false
+    },
+    "earlyError": {
+      "type": "object",
+      "required": [
+        "interface",
+        "interface_version",
+        "operation",
+        "operation_id",
+        "status",
+        "scope_identity",
+        "authority_epoch",
+        "scope_generation",
+        "state",
+        "evidence_digest",
+        "error_code",
+        "claim"
+      ],
+      "properties": {
+        "interface": {
+          "const": "determa.host_authority"
+        },
+        "interface_version": {
+          "const": 1
+        },
+        "operation": {
+          "type": "null"
+        },
+        "operation_id": {
+          "type": "null"
+        },
+        "status": {
+          "const": "rejected"
+        },
+        "scope_identity": {
+          "type": "null"
+        },
+        "authority_epoch": {
+          "type": "null"
+        },
+        "scope_generation": {
+          "type": "null"
+        },
+        "state": {
+          "type": "null"
+        },
+        "evidence_digest": {
+          "type": "null"
+        },
+        "error_code": {
+          "enum": [
+            "invalid_host_request",
+            "unsupported_host_protocol",
+            "unsupported_host_protocol_version"
+          ]
+        },
+        "claim": {
+          "type": "null"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,767 @@
+{
+  "type": "object",
+  "required": [
+    "protocol",
+    "protocol_version",
+    "operation_id",
+    "scope_binding_identity",
+    "operation",
+    "target",
+    "precondition",
+    "arguments"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "protocol": {
+      "const": "determa.execution_host"
+    },
+    "protocol_version": {
+      "const": 1
+    },
+    "operation_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scope_binding_identity": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "minLength": 1
+        }
+      ]
+    },
+    "operation": {
+      "enum": [
+        "capabilities",
+        "create",
+        "admit",
+        "process",
+        "read",
+        "inspect",
+        "receipt",
+        "effect_result",
+        "cancel_effect",
+        "timer_command",
+        "scope_operation"
+      ]
+    },
+    "target": {
+      "type": "object",
+      "required": [
+        "root_instance_id",
+        "runtime_id",
+        "runtime_incarnation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "root_instance_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1
+            }
+          ]
+        },
+        "runtime_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1
+            }
+          ]
+        },
+        "runtime_incarnation": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "aggregate-state-v1.schema.json#/$defs/identityOrigin"
+            }
+          ]
+        }
+      }
+    },
+    "precondition": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "revision",
+            "checkpoint_digest"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "revision": {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$"
+            },
+            "checkpoint_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          }
+        }
+      ]
+    },
+    "arguments": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/capabilitiesArguments"
+        },
+        {
+          "$ref": "#/$defs/createArguments"
+        },
+        {
+          "$ref": "#/$defs/admitArguments"
+        },
+        {
+          "$ref": "#/$defs/processArguments"
+        },
+        {
+          "$ref": "#/$defs/readArguments"
+        },
+        {
+          "$ref": "#/$defs/inspectArguments"
+        },
+        {
+          "$ref": "#/$defs/receiptArguments"
+        },
+        {
+          "$ref": "#/$defs/effect_resultArguments"
+        },
+        {
+          "$ref": "#/$defs/cancel_effectArguments"
+        },
+        {
+          "$ref": "#/$defs/timer_commandArguments"
+        },
+        {
+          "$ref": "#/$defs/scope_operationArguments"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "capabilities"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "$ref": "#/$defs/capabilitiesArguments"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "create"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "$ref": "#/$defs/createArguments"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "admit"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "$ref": "#/$defs/admitArguments"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "process"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "$ref": "#/$defs/processArguments"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "read"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "$ref": "#/$defs/readArguments"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "inspect"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "$ref": "#/$defs/inspectArguments"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "receipt"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "$ref": "#/$defs/receiptArguments"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "effect_result"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "$ref": "#/$defs/effect_resultArguments"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "cancel_effect"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "$ref": "#/$defs/cancel_effectArguments"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "timer_command"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "$ref": "#/$defs/timer_commandArguments"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "scope_operation"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "$ref": "#/$defs/scope_operationArguments"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "enum": [
+              "capabilities",
+              "scope_operation"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "properties": {
+              "root_instance_id": {
+                "type": "null"
+              },
+              "runtime_id": {
+                "type": "null"
+              },
+              "runtime_incarnation": {
+                "type": "null"
+              }
+            }
+          },
+          "precondition": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "create"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "properties": {
+              "root_instance_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "runtime_id": {
+                "type": "null"
+              },
+              "runtime_incarnation": {
+                "type": "null"
+              }
+            }
+          },
+          "precondition": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "enum": [
+              "admit",
+              "process",
+              "effect_result",
+              "cancel_effect"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "properties": {
+              "root_instance_id": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "precondition": {
+            "type": "object",
+            "required": [
+              "revision",
+              "checkpoint_digest"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "revision": {
+                "type": "string",
+                "pattern": "^(0|[1-9][0-9]*)$"
+              },
+              "checkpoint_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "process"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "properties": {
+              "runtime_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "runtime_incarnation": {
+                "$ref": "aggregate-state-v1.schema.json#/$defs/identityOrigin"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "receipt"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "precondition": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "capabilities"
+          }
+        }
+      },
+      "then": {},
+      "else": {
+        "properties": {
+          "scope_binding_identity": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/public-host-request-v1.schema.json",
+  "title": "Determa State execution host request version 1",
+  "$defs": {
+    "capabilitiesArguments": {
+      "type": "object",
+      "required": [
+        "scope_alias"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "scope_alias": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "createArguments": {
+      "type": "object",
+      "required": [
+        "validated_bundle_fingerprint",
+        "namespace",
+        "machine_id",
+        "machine_version",
+        "root_instance_id",
+        "creation_id",
+        "bindings"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "validated_bundle_fingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "namespace": {
+          "type": "string",
+          "minLength": 1
+        },
+        "machine_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "machine_version": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "root_instance_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "creation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bindings": {
+          "$ref": "aggregate-state-v1.schema.json#/$defs/typedMap"
+        }
+      }
+    },
+    "admitArguments": {
+      "type": "object",
+      "required": [
+        "ordered_deliveries"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "ordered_deliveries": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "delivery_mode",
+              "envelope",
+              "envelope_digest"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "delivery_mode": {
+                "enum": [
+                  "input",
+                  "internal"
+                ]
+              },
+              "envelope": {
+                "$ref": "aggregate-state-v1.schema.json#/$defs/envelope"
+              },
+              "envelope_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      }
+    },
+    "processArguments": {
+      "type": "object",
+      "required": [],
+      "additionalProperties": false,
+      "properties": {}
+    },
+    "readArguments": {
+      "type": "object",
+      "required": [],
+      "additionalProperties": false,
+      "properties": {}
+    },
+    "inspectArguments": {
+      "type": "object",
+      "required": [
+        "candidate"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "candidate": {
+          "$ref": "inspection-v1.schema.json#/$defs/request"
+        }
+      }
+    },
+    "receiptArguments": {
+      "type": "object",
+      "required": [
+        "request_digest",
+        "queried_operation_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "request_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "queried_operation_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "effect_resultArguments": {
+      "type": "object",
+      "required": [
+        "result",
+        "expected_journal_revision"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "result": {
+          "$ref": "effect-result-request-v1.schema.json"
+        },
+        "expected_journal_revision": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        }
+      }
+    },
+    "cancel_effectArguments": {
+      "type": "object",
+      "required": [
+        "request",
+        "expected_journal_revision"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "request": {
+          "$ref": "effect-cancellation-request-v1.schema.json"
+        },
+        "expected_journal_revision": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        }
+      }
+    },
+    "timer_commandArguments": {
+      "type": "object",
+      "required": [
+        "timer_request"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "timer_request": {
+          "$ref": "timer-helper-operation-v1.schema.json#/$defs/request"
+        }
+      }
+    },
+    "scope_operationArguments": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "action",
+            "authority_request"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "authority"
+            },
+            "authority_request": {
+              "$ref": "host-authority-operation-v1.schema.json#/$defs/request"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "action",
+            "archive_request"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "archive_export"
+            },
+            "archive_request": {
+              "$ref": "archive-export-request-v1.schema.json"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "action",
+            "archive_request",
+            "archive"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "archive_import"
+            },
+            "archive_request": {
+              "$ref": "archive-import-request-v1.schema.json"
+            },
+            "archive": {
+              "$ref": "archive-v1.schema.json"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "action",
+            "recovery_request"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "recovery"
+            },
+            "recovery_request": {
+              "allOf": [
+                {
+                  "$ref": "recovery-operation-v1.schema.json"
+                },
+                {
+                  "properties": {
+                    "operation_format": {
+                      "const": "determa.recovery_operation"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

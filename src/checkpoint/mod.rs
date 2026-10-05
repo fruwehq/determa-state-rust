@@ -11,6 +11,9 @@ mod store;
 mod types;
 mod v1;
 
+#[cfg(feature = "sqlite")]
+pub(crate) use v1::{checkpoint_step_v1_with_core, create_with_response};
+
 pub use adapter_policy::{
     adapter_registration_policy, adapter_resolution_policy, conditional_adapter_policy,
 };

@@ -1094,7 +1094,6 @@ fn step_v1_impl(
             );
         }
         let mut value = aggregate.document.clone();
-        allocate_counter(&mut value, "next_logical_step_sequence")?;
         let mut entry = remove_ready_head(&mut value, target_runtime_id)?;
         let queue_sequence = allocate_counter(&mut value, "next_queue_sequence")?;
         entry["queue_sequence"] = json!(queue_sequence.to_string());

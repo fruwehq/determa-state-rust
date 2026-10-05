@@ -65,8 +65,48 @@ pub fn create_execution_checkpoint_v1(
     supplied_request_digest: Option<&str>,
     replay_retention: Value,
 ) -> Result<ExecutionCheckpoint, ArtifactError> {
-    let request_digest =
-        creation_request_digest(bundle, machine_id, root_instance_id, creation_id, bindings)?;
+    create_with_response(
+        bundle,
+        machine_id,
+        root_instance_id,
+        creation_id,
+        bindings,
+        (supplied_request_digest, None),
+        replay_retention,
+    )
+    .map(|(checkpoint, _)| checkpoint)
+}
+
+pub(crate) fn create_with_response(
+    bundle: &Bundle,
+    machine_id: &str,
+    root_instance_id: &str,
+    creation_id: &str,
+    bindings: &Bindings,
+    binding_evidence: (Option<&str>, Option<&Value>),
+    replay_retention: Value,
+) -> Result<(ExecutionCheckpoint, Value), ArtifactError> {
+    let (supplied_request_digest, normalized_bindings) = binding_evidence;
+    let request_digest = if let Some(normalized_bindings) = normalized_bindings {
+        let machine = bundle
+            .machines
+            .get(machine_id)
+            .ok_or_else(|| invalid("missing creation machine"))?;
+        jcs_hash(&json!([
+            "determa-creation-request-digest-1",
+            "1",
+            bundle.fingerprint,
+            bundle.namespace,
+            machine_id,
+            machine.version.to_string(),
+            root_instance_id,
+            creation_id,
+            normalized_bindings
+        ]))
+        .map_err(|e| invalid(e.to_string()))?
+    } else {
+        creation_request_digest(bundle, machine_id, root_instance_id, creation_id, bindings)?
+    };
     if supplied_request_digest.is_some_and(|supplied| supplied != request_digest) {
         return Err(invalid(
             "supplied creation request digest does not match canonical content",
@@ -139,7 +179,12 @@ pub fn create_execution_checkpoint_v1(
     seal_checkpoint(&mut value)?;
     let mut resolver = crate::format1::InMemoryDefinitionResolver::default();
     resolver.insert(bundle.clone(), true);
-    restore_value(value, &resolver)
+    let checkpoint = restore_value(value, &resolver)?;
+    let response = json!({"checkpoint":checkpoint.value(),
+        "creation_receipt":checkpoint.value()["operation_receipts"][0],
+        "status":created.status,"emissions":created.emissions,
+        "lifecycle_dispositions":created.lifecycle_dispositions,"fault":created.fault});
+    Ok((checkpoint, response))
 }
 
 pub fn creation_request_digest(

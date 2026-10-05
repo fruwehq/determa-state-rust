@@ -1,0 +1,311 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/archive-result-v1.schema.json",
+  "title": "Determa archive operation result version 1",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "result_format",
+        "result_schema_version",
+        "status",
+        "archive_digest",
+        "staged",
+        "included_participant_ids",
+        "absent_optional_participants",
+        "unsupported_optional_participants"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "result_format": {
+          "const": "determa.archive_result"
+        },
+        "result_schema_version": {
+          "const": 1
+        },
+        "status": {
+          "const": "staged"
+        },
+        "archive_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "staged": {
+          "const": true
+        },
+        "absent_optional_participants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "participant_id",
+              "reason"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "participant_id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9.-]*$"
+              },
+              "reason": {
+                "enum": [
+                  "not_present",
+                  "provider_unavailable",
+                  "schema_unsupported",
+                  "capability_unsupported",
+                  "payload_unavailable"
+                ]
+              }
+            }
+          }
+        },
+        "unsupported_optional_participants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "participant_id",
+              "reason"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "participant_id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9.-]*$"
+              },
+              "reason": {
+                "enum": [
+                  "not_present",
+                  "provider_unavailable",
+                  "schema_unsupported",
+                  "capability_unsupported",
+                  "payload_unavailable"
+                ]
+              }
+            }
+          }
+        },
+        "included_participant_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9.-]*$"
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "result_format",
+        "result_schema_version",
+        "status",
+        "archive_digest",
+        "staged",
+        "included_participant_ids",
+        "absent_optional_participants",
+        "unsupported_optional_participants"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "result_format": {
+          "const": "determa.archive_result"
+        },
+        "result_schema_version": {
+          "const": 1
+        },
+        "status": {
+          "const": "exported"
+        },
+        "archive_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "staged": {
+          "const": false
+        },
+        "absent_optional_participants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "participant_id",
+              "reason"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "participant_id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9.-]*$"
+              },
+              "reason": {
+                "enum": [
+                  "not_present",
+                  "provider_unavailable",
+                  "schema_unsupported",
+                  "capability_unsupported",
+                  "payload_unavailable"
+                ]
+              }
+            }
+          }
+        },
+        "unsupported_optional_participants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "participant_id",
+              "reason"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "participant_id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9.-]*$"
+              },
+              "reason": {
+                "enum": [
+                  "not_present",
+                  "provider_unavailable",
+                  "schema_unsupported",
+                  "capability_unsupported",
+                  "payload_unavailable"
+                ]
+              }
+            }
+          }
+        },
+        "included_participant_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9.-]*$"
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "result_format",
+        "result_schema_version",
+        "status",
+        "code",
+        "participant_id",
+        "staged",
+        "included_participant_ids",
+        "absent_optional_participants",
+        "unsupported_optional_participants"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "result_format": {
+          "const": "determa.archive_result"
+        },
+        "result_schema_version": {
+          "const": 1
+        },
+        "status": {
+          "const": "refused"
+        },
+        "code": {
+          "enum": [
+            "unsupported_archive_format",
+            "unsupported_archive_schema_version",
+            "unsupported_archive_participant_format",
+            "unsupported_archive_participant_schema_version",
+            "invalid_archive",
+            "archive_digest_mismatch",
+            "invalid_archive_checkpoint",
+            "invalid_archive_attachment",
+            "invalid_archive_participant",
+            "archive_payload_digest_mismatch",
+            "missing_required_artifact",
+            "missing_required_provider",
+            "archive_capability_mismatch",
+            "archive_consistency_unavailable",
+            "archive_staging_failure",
+            "archive_source_profile_mismatch",
+            "archive_participant_contract_mismatch",
+            "archive_source_provenance_mismatch",
+            "archive_selection_invalid",
+            "archive_host_journal_inventory_mismatch",
+            "archive_manifest_mismatch"
+          ]
+        },
+        "participant_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9.-]*$"
+            }
+          ]
+        },
+        "staged": {
+          "const": false
+        },
+        "absent_optional_participants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "participant_id",
+              "reason"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "participant_id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9.-]*$"
+              },
+              "reason": {
+                "enum": [
+                  "not_present",
+                  "provider_unavailable",
+                  "schema_unsupported",
+                  "capability_unsupported",
+                  "payload_unavailable"
+                ]
+              }
+            }
+          }
+        },
+        "unsupported_optional_participants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "participant_id",
+              "reason"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "participant_id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9.-]*$"
+              },
+              "reason": {
+                "enum": [
+                  "not_present",
+                  "provider_unavailable",
+                  "schema_unsupported",
+                  "capability_unsupported",
+                  "payload_unavailable"
+                ]
+              }
+            }
+          }
+        },
+        "included_participant_ids": {
+          "const": []
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/recovery-record-v1.schema.json",
+  "title": "Recovery state record version 1",
+  "type": "object",
+  "required": [
+    "record_format",
+    "record_schema_version",
+    "destination_scope_identity",
+    "external_idempotency_namespace",
+    "mode",
+    "state",
+    "source",
+    "work",
+    "retained_checkpoint_digests",
+    "risk_acknowledged",
+    "isolation_evidence_digest",
+    "decisions",
+    "destination_binding_digest",
+    "authority_epoch",
+    "operation_ledger_identity",
+    "active_claims"
+  ],
+  "properties": {
+    "record_format": {
+      "const": "determa.recovery_record"
+    },
+    "record_schema_version": {
+      "const": 1
+    },
+    "destination_scope_identity": {
+      "type": "string",
+      "minLength": 1
+    },
+    "external_idempotency_namespace": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "mode": {
+      "enum": [
+        "strict",
+        "standalone",
+        "clone",
+        "relocation"
+      ]
+    },
+    "state": {
+      "enum": [
+        "quarantined",
+        "inactive",
+        "active",
+        "retired"
+      ]
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "logical_scope_identity",
+        "ownership_binding_digest",
+        "profile_digest",
+        "participant_contract_digest",
+        "archive_digest"
+      ],
+      "properties": {
+        "logical_scope_identity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ownership_binding_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "profile_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "participant_contract_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "archive_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "work": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "work_kind",
+          "work_identity",
+          "source_attempt",
+          "disposition",
+          "evidence_digest"
+        ],
+        "properties": {
+          "work_kind": {
+            "enum": [
+              "effect",
+              "delivery",
+              "helper"
+            ]
+          },
+          "work_identity": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source_attempt": {
+            "enum": [
+              "unattempted",
+              "submitted",
+              "accepted",
+              "pending",
+              "unknown",
+              "terminal"
+            ]
+          },
+          "disposition": {
+            "enum": [
+              "unattempted",
+              "ambiguous",
+              "terminal",
+              "reconciled",
+              "abandoned",
+              "cancelled"
+            ]
+          },
+          "evidence_digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "retained_checkpoint_digests": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^sha256:[0-9a-f]{64}$"
+      }
+    },
+    "risk_acknowledged": {
+      "type": "boolean"
+    },
+    "isolation_evidence_digest": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "destination_binding_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "authority_epoch": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "operation_ledger_identity": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "active_claims": {
+      "type": "array",
+      "maxItems": 0
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "work_kind",
+          "work_identity",
+          "resolution",
+          "evidence_digest",
+          "operator_principal"
+        ],
+        "properties": {
+          "work_kind": {
+            "enum": [
+              "effect",
+              "delivery",
+              "helper"
+            ]
+          },
+          "work_identity": {
+            "type": "string",
+            "minLength": 1
+          },
+          "resolution": {
+            "enum": [
+              "reconciled",
+              "abandoned",
+              "cancelled"
+            ]
+          },
+          "evidence_digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "operator_principal": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "strict"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "state": {
+            "const": "quarantined"
+          },
+          "external_idempotency_namespace": {
+            "type": "null"
+          },
+          "operation_ledger_identity": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "standalone"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "risk_acknowledged": {
+            "const": true
+          },
+          "external_idempotency_namespace": {
+            "type": "string",
+            "minLength": 1
+          },
+          "operation_ledger_identity": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "enum": [
+              "clone",
+              "relocation"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "external_idempotency_namespace": {
+            "type": "string",
+            "minLength": 1
+          },
+          "operation_ledger_identity": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  ]
+}

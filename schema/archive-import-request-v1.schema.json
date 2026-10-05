@@ -1,0 +1,56 @@
+{
+  "type": "object",
+  "required": [
+    "request_format",
+    "request_schema_version",
+    "archive_digest",
+    "trusted_source_profile_digest",
+    "trusted_participant_contract_digest",
+    "expected_source",
+    "allow_optional_omission",
+    "requested_optional_participant_ids",
+    "staging_identity"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "request_format": {
+      "const": "determa.archive_import_request"
+    },
+    "request_schema_version": {
+      "const": 1
+    },
+    "archive_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "trusted_source_profile_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "trusted_participant_contract_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "expected_source": {
+      "$ref": "archive-v1.schema.json#/$defs/source"
+    },
+    "allow_optional_omission": {
+      "type": "boolean"
+    },
+    "requested_optional_participant_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9.-]*$"
+      },
+      "uniqueItems": true
+    },
+    "staging_identity": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/archive-import-request-v1.schema.json",
+  "title": "Determa archive import request version 1"
+}

@@ -1,0 +1,109 @@
+{
+  "type": "object",
+  "required": [
+    "participant_format",
+    "participant_schema_version",
+    "participant_id",
+    "required",
+    "provider_reference",
+    "participant_schema_digest",
+    "dependencies",
+    "storage",
+    "payload_digest",
+    "payload"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "participant_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9.-]*$"
+    },
+    "required": {
+      "type": "boolean"
+    },
+    "provider_reference": {
+      "$ref": "provider-reference-v1.schema.json"
+    },
+    "participant_schema_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9.-]*$"
+      },
+      "uniqueItems": true
+    },
+    "storage": {
+      "enum": [
+        "embedded",
+        "external"
+      ]
+    },
+    "payload_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "payload": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "aggregate-state-v1.schema.json#/$defs/typedValue"
+        }
+      ]
+    },
+    "participant_format": {
+      "const": "determa.archive_participant"
+    },
+    "participant_schema_version": {
+      "const": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "storage": {
+            "const": "embedded"
+          }
+        },
+        "required": [
+          "storage"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "aggregate-state-v1.schema.json#/$defs/typedValue"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "storage": {
+            "const": "external"
+          }
+        },
+        "required": [
+          "storage"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/archive-participant-v1.schema.json",
+  "title": "Determa archive participant record version 1"
+}
