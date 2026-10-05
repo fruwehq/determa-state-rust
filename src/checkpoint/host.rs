@@ -5,9 +5,8 @@ use super::adapters::SqliteExecutionStore;
 #[cfg(feature = "postgresql")]
 use super::store::DurableStoreMode;
 use super::store::{
-    validate_store_host_profile, AdapterError, AdapterRegistry, ExecutionStore,
-    ExecutionStoreCapability, ExecutionStoreFactory, HostFeature, HostProfile, StoreError,
-    StoreErrorCode, StoreRecord, StoreWriteResult,
+    validate_store_host_profile, AdapterError, ExecutionStore, HostFeature, HostProfile,
+    StoreError, StoreErrorCode, StoreRecord, StoreWriteResult,
 };
 use super::types::{
     AdmissionSource, DurableCheckpointExecution, DurableContractExecution, DurableHostResult,
@@ -109,38 +108,6 @@ fn contract_failure(code: &str) -> DurableContractExecution {
     DurableContractExecution {
         result: DurableHostResult::validation_rejected(code),
         caller_response: json!({"kind":"typed_failure","body":{"code":code}}),
-    }
-}
-
-/// Register an adapter and return the exact descriptor retained by the registry.
-pub fn execute_adapter_registration(
-    registry: &AdapterRegistry,
-    descriptor: JsonValue,
-    factory: Arc<dyn ExecutionStoreFactory>,
-) -> DurableContractExecution {
-    match registry.register_descriptor(descriptor, factory) {
-        Ok(registered) => contract_success("registration", registered),
-        Err(error) => contract_failure(error.code.as_str()),
-    }
-}
-
-/// Resolve an adapter through its registered factory and return its verified configuration.
-pub fn execute_adapter_resolution(
-    registry: &AdapterRegistry,
-    uri: &str,
-    configuration: &JsonValue,
-    requested_capabilities: &BTreeSet<ExecutionStoreCapability>,
-) -> DurableContractExecution {
-    match registry.resolve_descriptor(uri, configuration, requested_capabilities) {
-        Ok(registration) => contract_success(
-            "resolution",
-            json!({
-                "registration":registration,
-                "configuration":configuration,
-                "requested_capabilities": requested_capabilities.iter().map(|capability| capability.as_str()).collect::<Vec<_>>()
-            }),
-        ),
-        Err(error) => contract_failure(error.code.as_str()),
     }
 }
 
@@ -699,6 +666,8 @@ impl<'client> PostgresqlHostTransaction<'_, 'client> {
 pub struct CheckpointHost<R> {
     store: Arc<dyn ExecutionStore>,
     resolver: Arc<R>,
+    verified: Option<crate::extensions::VerifiedExecutionStore>,
+    ingress_acknowledger: Option<crate::extensions::VerifiedIngressAcknowledger>,
 }
 
 impl<R> CheckpointHost<R>
@@ -706,7 +675,39 @@ where
     R: MigrationArtifactResolver + Send + Sync + 'static,
 {
     pub fn new(store: Arc<dyn ExecutionStore>, resolver: Arc<R>) -> Self {
-        Self { store, resolver }
+        Self {
+            store,
+            resolver,
+            verified: None,
+            ingress_acknowledger: None,
+        }
+    }
+
+    pub fn from_verified(
+        verified: crate::extensions::VerifiedExecutionStore,
+        resolver: Arc<R>,
+    ) -> Self {
+        let store = verified.store();
+        Self {
+            store,
+            resolver,
+            verified: Some(verified),
+            ingress_acknowledger: None,
+        }
+    }
+
+    pub fn with_ingress_acknowledger(
+        mut self,
+        acknowledger: crate::extensions::VerifiedIngressAcknowledger,
+    ) -> Self {
+        self.ingress_acknowledger = Some(acknowledger);
+        self
+    }
+
+    fn acknowledge_ingress(&self, root_instance_id: &str, operation: &str) -> bool {
+        self.ingress_acknowledger
+            .as_ref()
+            .is_some_and(|adapter| adapter.acknowledge(root_instance_id, operation))
     }
 
     pub fn store(&self) -> &Arc<dyn ExecutionStore> {
@@ -716,15 +717,23 @@ where
     pub fn validate_profile(
         &self,
         profile: HostProfile,
-        features: &std::collections::BTreeSet<HostFeature>,
         permanent_replay_retention: bool,
     ) -> Result<(), AdapterError> {
-        validate_store_host_profile(
-            self.store.as_ref(),
-            profile,
-            features,
-            permanent_replay_retention,
-        )
+        self.validate_profile_context(profile, permanent_replay_retention, "general")
+    }
+    fn validate_profile_context(
+        &self,
+        profile: HostProfile,
+        permanent_replay_retention: bool,
+        context: &str,
+    ) -> Result<(), AdapterError> {
+        let verified = self.verified.as_ref().ok_or_else(|| {
+            AdapterError::new(
+                super::store::AdapterErrorCode::AdapterCapabilityMismatch,
+                "store has no verified public extension binding",
+            )
+        })?;
+        validate_store_host_profile(verified, profile, permanent_replay_retention, context)
     }
 
     /// Runs application work and exactly one root-bound host mutation in one
@@ -736,6 +745,12 @@ where
         root_instance_id: &str,
         operation: impl FnOnce(&mut PostgresqlHostTransaction<'_, '_>) -> Result<T, HostFailure>,
     ) -> Result<PostgresqlTransactionOutcome<T>, HostFailure> {
+        self.validate_profile_context(
+            HostProfile::SharedApplicationTransaction,
+            false,
+            "native_shared_transaction",
+        )
+        .map_err(|error| HostFailure::new(HostFailureCode::ExecutionStoreFailure, error.message))?;
         let store = self
             .store
             .as_any()
@@ -1035,13 +1050,20 @@ where
         configured_host_guarantees: &[String],
         permanent_replay_retention: bool,
     ) -> DurableContractExecution {
-        let actual_store_capabilities = self
-            .store
-            .capabilities()
+        let Some(verified) = self.verified.as_ref() else {
+            return contract_failure("adapter_capability_mismatch");
+        };
+        let Ok(proven_store) = verified.current_capabilities() else {
+            return contract_failure("adapter_capability_mismatch");
+        };
+        let Ok(proven_features) = verified.current_host_features("general") else {
+            return contract_failure("adapter_capability_mismatch");
+        };
+        let actual_store_capabilities = proven_store
             .iter()
             .map(|capability| capability.as_str())
             .collect::<BTreeSet<_>>();
-        let actual_host_guarantees = features
+        let actual_host_guarantees = proven_features
             .iter()
             .map(|feature| feature.as_str())
             .collect::<BTreeSet<_>>();
@@ -1058,13 +1080,16 @@ where
         {
             return contract_failure("adapter_capability_mismatch");
         }
-        match validate_store_host_profile(
-            self.store.as_ref(),
+        if !features.is_subset(&proven_features) {
+            return contract_failure("adapter_capability_mismatch");
+        }
+        if super::store::hypothetical_host_profile_matches(
+            &proven_store,
+            &proven_features,
             profile,
-            features,
             permanent_replay_retention,
         ) {
-            Ok(()) => contract_success(
+            contract_success(
                 "capability_report",
                 json!({
                     "adapter_identifier":adapter_identifier,
@@ -1074,8 +1099,9 @@ where
                     "store_capabilities":configured_store_capabilities,
                     "validated":true
                 }),
-            ),
-            Err(error) => contract_failure(error.code.as_str()),
+            )
+        } else {
+            contract_failure("adapter_capability_mismatch")
         }
     }
 
@@ -1132,7 +1158,6 @@ where
     pub fn execute_checkpoint_operation(
         &self,
         operation: DurableCheckpointOperation<'_>,
-        acknowledge_after_commit: bool,
     ) -> DurableCheckpointExecution {
         let root_instance_id = operation.root_instance_id().to_string();
         let operation_kind = match &operation {
@@ -1315,8 +1340,8 @@ where
                 },
                 if changed { "atomic" } else { "none" },
                 core_calls,
-                acknowledge_after_commit
-                    && (committed || (replayed && operation_kind != "processing")),
+                (committed || (replayed && operation_kind != "processing"))
+                    && self.acknowledge_ingress(&root_instance_id, operation_kind),
                 code,
             ),
             operation_response: result.ok(),
@@ -1342,11 +1367,27 @@ where
         let mut calls = vec!["select_scope".to_string(), "resolve_artifacts".to_string()];
         self.resolve_durable_process_artifacts(request)?;
         calls.push("validate_capabilities".to_string());
-        validate_store_host_profile(
-            sqlite,
+        let proven_features = self
+            .verified
+            .as_ref()
+            .ok_or_else(|| {
+                v1_failure(
+                    "adapter_capability_mismatch",
+                    "store has no verified public extension binding",
+                )
+            })?
+            .current_host_features("native_shared_transaction")
+            .map_err(|error| v1_failure("adapter_capability_mismatch", &error.to_string()))?;
+        if !request.host_features.is_subset(&proven_features) {
+            return Err(v1_failure(
+                "adapter_capability_mismatch",
+                "host feature unproved",
+            ));
+        }
+        self.validate_profile_context(
             request.profile,
-            &request.host_features,
             request.permanent_retention,
+            "native_shared_transaction",
         )
         .map_err(|error| ArtifactError::new(error.code.as_str(), error.message))?;
 
@@ -1381,7 +1422,7 @@ where
                     if let Some((digest, disposition)) = retained {
                         if disposition != "quarantined" || !quarantine_released {
                             return Ok(Some(if digest == request.envelope_digest {
-                                DurableHostResult::new("replayed", "none", 0, true, None)
+                                DurableHostResult::new("replayed", "none", 0, false, None)
                             } else {
                                 DurableHostResult::new(
                                     "rejected",
@@ -1417,7 +1458,14 @@ where
                     Ok(None)
                 })
                 .map_err(v1_store_error)?;
-            if let Some(result) = retained_result {
+            if let Some(mut result) = retained_result {
+                if result.result == "replayed" {
+                    result.broker_acknowledged =
+                        self.acknowledge_ingress(&request.root_instance_id, "processing");
+                    if result.broker_acknowledged {
+                        calls.push("acknowledge".to_string());
+                    }
+                }
                 let caller_response = Some(
                     json!({"kind":"typed_failure","body":{"code":result.code.as_deref().unwrap_or("event_id_conflict")}}),
                 );
@@ -1476,7 +1524,7 @@ where
                 if let Some((digest, disposition)) = retained {
                     if disposition != "quarantined" || !quarantine_released {
                         let result = if digest == request.envelope_digest {
-                            DurableHostResult::new("replayed", "none", 0, true, None)
+                            DurableHostResult::new("replayed", "none", 0, false, None)
                         } else {
                             DurableHostResult::new(
                                 "rejected",
@@ -1615,7 +1663,7 @@ where
                             },
                             "atomic",
                             1,
-                            !post_commit_loss,
+                            false,
                             post_commit_loss.then_some("response_lost_after_commit"),
                         ),
                         calls: Vec::new(),
@@ -1627,7 +1675,13 @@ where
             .map_err(v1_store_error)?;
 
         match execution.result.result.as_str() {
-            "replayed" => calls.push("acknowledge".to_string()),
+            "replayed" => {
+                execution.result.broker_acknowledged =
+                    self.acknowledge_ingress(&request.root_instance_id, "processing");
+                if execution.result.broker_acknowledged {
+                    calls.push("acknowledge".to_string());
+                }
+            }
             "rejected"
                 if execution.result.code.as_deref() == Some("transient_processing_failure") =>
             {
@@ -1655,6 +1709,10 @@ where
                         calls.push("stage_application_rows".to_string());
                     }
                     calls.push("commit".to_string());
+                    if execution.result.result == "committed" {
+                        execution.result.broker_acknowledged =
+                            self.acknowledge_ingress(&request.root_instance_id, "processing");
+                    }
                     if execution.result.broker_acknowledged {
                         calls.push("acknowledge".to_string());
                     }

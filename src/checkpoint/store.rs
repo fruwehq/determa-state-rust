@@ -5,7 +5,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExecutionStoreCapability {
@@ -21,6 +21,20 @@ pub enum ExecutionStoreCapability {
 }
 
 impl ExecutionStoreCapability {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "ephemeral" => Some(Self::Ephemeral),
+            "restart_persistent" => Some(Self::RestartPersistent),
+            "durable_single_writer" => Some(Self::DurableSingleWriter),
+            "durable_concurrent" => Some(Self::DurableConcurrent),
+            "shared_application_transaction" => Some(Self::SharedApplicationTransaction),
+            "permanent_receipt_retention" => Some(Self::PermanentReceiptRetention),
+            "root_identity_retention" => Some(Self::RootIdentityRetention),
+            "permanent_outbox_terminal_retention" => Some(Self::PermanentOutboxTerminalRetention),
+            "compact_effect_identity_retention" => Some(Self::CompactEffectIdentityRetention),
+            _ => None,
+        }
+    }
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ephemeral => "ephemeral",
@@ -302,151 +316,6 @@ impl std::fmt::Display for AdapterError {
 
 impl std::error::Error for AdapterError {}
 
-/// Public execution-store registry. A new registry is intentionally empty.
-#[derive(Default)]
-pub struct AdapterRegistry {
-    factories: RwLock<BTreeMap<String, Arc<dyn ExecutionStoreFactory>>>,
-    descriptors: RwLock<BTreeMap<String, Value>>,
-}
-
-impl AdapterRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn register(
-        &self,
-        identifier: &str,
-        factory: Arc<dyn ExecutionStoreFactory>,
-    ) -> Result<(), AdapterError> {
-        if !valid_identifier(identifier) {
-            return Err(AdapterError::new(
-                AdapterErrorCode::InvalidAdapterConfiguration,
-                "adapter identifier must be a lowercase URI scheme",
-            ));
-        }
-        let mut factories = self.factories.write().map_err(|_| registry_poisoned())?;
-        if factories.contains_key(identifier) {
-            return Err(AdapterError::new(
-                AdapterErrorCode::DuplicateAdapterRegistration,
-                format!("adapter {identifier} is already registered"),
-            ));
-        }
-        factories.insert(identifier.to_string(), factory);
-        Ok(())
-    }
-
-    pub fn identifiers(&self) -> Result<Vec<String>, AdapterError> {
-        let factories = self.factories.read().map_err(|_| registry_poisoned())?;
-        Ok(factories.keys().cloned().collect())
-    }
-
-    /// Register a closed public descriptor together with the factory it describes.
-    pub fn register_descriptor(
-        &self,
-        descriptor: Value,
-        factory: Arc<dyn ExecutionStoreFactory>,
-    ) -> Result<Value, AdapterError> {
-        let identifier = descriptor
-            .get("uri_scheme")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                AdapterError::new(
-                    AdapterErrorCode::InvalidAdapterConfiguration,
-                    "URI scheme absent",
-                )
-            })?
-            .to_string();
-        self.register(&identifier, factory)?;
-        self.descriptors
-            .write()
-            .map_err(|_| registry_poisoned())?
-            .insert(identifier, descriptor.clone());
-        Ok(descriptor)
-    }
-
-    /// Resolve the configured factory and return its registered descriptor.
-    pub fn resolve_descriptor(
-        &self,
-        uri: &str,
-        configuration: &Value,
-        requested_capabilities: &BTreeSet<ExecutionStoreCapability>,
-    ) -> Result<Value, AdapterError> {
-        let identifier = extract_scheme(uri)?;
-        let descriptor = self
-            .descriptors
-            .read()
-            .map_err(|_| registry_poisoned())?
-            .get(identifier)
-            .cloned()
-            .ok_or_else(|| {
-                AdapterError::new(
-                    AdapterErrorCode::UnknownAdapter,
-                    "adapter descriptor is not registered",
-                )
-            })?;
-        self.resolve_configured(
-            uri,
-            &descriptor["configuration_schema"],
-            configuration,
-            requested_capabilities,
-        )?;
-        Ok(descriptor)
-    }
-
-    pub fn resolve(
-        &self,
-        configuration: &str,
-        requested_capabilities: &BTreeSet<ExecutionStoreCapability>,
-    ) -> Result<Arc<dyn ExecutionStore>, AdapterError> {
-        let identifier = extract_scheme(configuration)?;
-        let factory = {
-            let factories = self.factories.read().map_err(|_| registry_poisoned())?;
-            factories.get(identifier).cloned().ok_or_else(|| {
-                AdapterError::new(
-                    AdapterErrorCode::UnknownAdapter,
-                    format!("adapter {identifier} is not registered"),
-                )
-            })?
-        };
-        // The factory validates configuration before capability evaluation.
-        let store = factory.create(configuration)?;
-        let capabilities = store.capabilities();
-        if !requested_capabilities.is_subset(&capabilities) {
-            return Err(AdapterError::new(
-                AdapterErrorCode::AdapterCapabilityMismatch,
-                "configured store does not provide every requested capability",
-            ));
-        }
-        Ok(store)
-    }
-
-    pub fn resolve_configured(
-        &self,
-        uri: &str,
-        configuration_schema: &Value,
-        configuration: &Value,
-        requested_capabilities: &BTreeSet<ExecutionStoreCapability>,
-    ) -> Result<Arc<dyn ExecutionStore>, AdapterError> {
-        jsonschema::options()
-            .build(configuration_schema)
-            .map_err(|error| {
-                AdapterError::new(
-                    AdapterErrorCode::InvalidAdapterConfiguration,
-                    format!("invalid adapter configuration schema: {error}"),
-                )
-            })?
-            .validate(configuration)
-            .map_err(|error| {
-                AdapterError::new(
-                    AdapterErrorCode::InvalidAdapterConfiguration,
-                    format!("adapter configuration is invalid: {error}"),
-                )
-            })?;
-        self.resolve(uri, requested_capabilities)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostProfile {
     DurableEmbeddedProcessing,
@@ -483,6 +352,19 @@ pub enum HostFeature {
 }
 
 impl HostFeature {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "atomic_accept_process" => Some(Self::AtomicCheckpointProcessing),
+            "ingress_ack_after_commit" => Some(Self::AcknowledgeAfterCheckpointCommit),
+            "durable_redelivery" => Some(Self::DurableRedelivery),
+            "outbox_worker" => Some(Self::OutboxWorker),
+            "total_outbox_lifecycle" => Some(Self::TotalOutboxLifecycle),
+            "retain_unresolved_outbox" => Some(Self::RetainUnresolvedOutbox),
+            "retain_receipt_references" => Some(Self::RetainReferencedEffectTombstones),
+            "native_shared_transaction_used" => Some(Self::NativeSharedApplicationTransaction),
+            _ => None,
+        }
+    }
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AtomicCheckpointProcessing => "atomic_accept_process",
@@ -497,18 +379,54 @@ impl HostFeature {
     }
 }
 
-pub fn validate_store_host_profile(
-    store: &dyn ExecutionStore,
+pub(crate) fn validate_store_host_profile(
+    verified: &crate::extensions::VerifiedExecutionStore,
     profile: HostProfile,
-    features: &BTreeSet<HostFeature>,
     permanent_replay_retention: bool,
+    context: &str,
 ) -> Result<(), AdapterError> {
-    let capabilities = store.capabilities();
+    let capabilities = verified.current_capabilities().map_err(|error| {
+        AdapterError::new(
+            AdapterErrorCode::AdapterCapabilityMismatch,
+            error.to_string(),
+        )
+    })?;
+    let features = verified.current_host_features(context).map_err(|error| {
+        AdapterError::new(
+            AdapterErrorCode::AdapterCapabilityMismatch,
+            error.to_string(),
+        )
+    })?;
+    if hypothetical_host_profile_matches(
+        &capabilities,
+        &features,
+        profile,
+        permanent_replay_retention,
+    ) {
+        Ok(())
+    } else {
+        Err(AdapterError::new(
+            AdapterErrorCode::AdapterCapabilityMismatch,
+            "store and host composition does not satisfy the requested profile",
+        ))
+    }
+}
+
+/// Evaluate explicit composition premises without certifying any provider or host.
+/// This pure predicate is useful for conformance vectors whose input guarantees
+/// are hypotheses. Operational callers must use `CheckpointHost::validate_profile`.
+#[doc(hidden)]
+pub fn hypothetical_host_profile_matches(
+    capabilities: &BTreeSet<ExecutionStoreCapability>,
+    features: &BTreeSet<HostFeature>,
+    profile: HostProfile,
+    permanent_replay_retention: bool,
+) -> bool {
     let durable = capabilities.contains(&ExecutionStoreCapability::DurableSingleWriter)
         || capabilities.contains(&ExecutionStoreCapability::DurableConcurrent);
     let root_retained = capabilities.contains(&ExecutionStoreCapability::RootIdentityRetention);
     let atomic = features.contains(&HostFeature::AtomicCheckpointProcessing);
-    let valid = match profile {
+    match profile {
         HostProfile::DurableEmbeddedProcessing => durable && root_retained && atomic,
         HostProfile::ExactlyOnceCommittedProcessing => {
             durable
@@ -548,14 +466,6 @@ pub fn validate_store_host_profile(
                 && capabilities.contains(&ExecutionStoreCapability::SharedApplicationTransaction)
                 && features.contains(&HostFeature::NativeSharedApplicationTransaction)
         }
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(AdapterError::new(
-            AdapterErrorCode::AdapterCapabilityMismatch,
-            "store and host composition does not satisfy the requested profile",
-        ))
     }
 }
 
@@ -976,7 +886,6 @@ fn receipt_references_effect(checkpoint: &Value, effect_id: &str) -> bool {
                 && reference["effect_id"].as_str() == Some(effect_id)
         })
 }
-
 #[cfg(any(feature = "sqlite", feature = "postgresql"))]
 fn outbox_intent_digest(root_instance_id: &Value, intent: &Value) -> Result<Value, StoreError> {
     let bytes = serde_json_canonicalizer::to_vec(&json!([
@@ -987,35 +896,4 @@ fn outbox_intent_digest(root_instance_id: &Value, intent: &Value) -> Result<Valu
     ]))
     .map_err(|error| StoreError::new(error.to_string()))?;
     Ok(Value::String(format!("sha256:{:x}", Sha256::digest(bytes))))
-}
-
-fn extract_scheme(configuration: &str) -> Result<&str, AdapterError> {
-    let Some((scheme, _)) = configuration.split_once(':') else {
-        return Err(AdapterError::new(
-            AdapterErrorCode::InvalidAdapterConfiguration,
-            "adapter configuration has no URI scheme",
-        ));
-    };
-    if !valid_identifier(scheme) {
-        return Err(AdapterError::new(
-            AdapterErrorCode::InvalidAdapterConfiguration,
-            "adapter configuration has an invalid URI scheme",
-        ));
-    }
-    Ok(scheme)
-}
-
-fn valid_identifier(value: &str) -> bool {
-    let mut bytes = value.bytes();
-    matches!(bytes.next(), Some(first) if first.is_ascii_lowercase())
-        && bytes.all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'+' | b'.' | b'-')
-        })
-}
-
-fn registry_poisoned() -> AdapterError {
-    AdapterError::new(
-        AdapterErrorCode::InvalidAdapterConfiguration,
-        "adapter registry lock is poisoned",
-    )
 }

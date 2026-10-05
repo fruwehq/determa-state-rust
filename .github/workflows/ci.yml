@@ -8,8 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: 1
-  SPECIFICATION_COMMIT: 6bd25e3fcdf068af861aa289903a8489bd8f0139
-  CONFORMANCE_COMMIT: c0e101c86bd71068669df3cd2250d4fec24ff74d
+  SPECIFICATION_COMMIT: 86bb88dd21cb1f799eefe5020b6e49dabf6e7225
+  CONFORMANCE_COMMIT: 7f09321fb483a22eb677a4342f8d9537a7a18e82
 
 jobs:
   msrv:
@@ -32,6 +32,7 @@ jobs:
         run: |
           python3 scripts/verify_msrv.py --expected 1.86
           python3 scripts/test_release_metadata.py
+          python3 -m unittest discover -s scripts -p test_native_gate_report.py
           cargo metadata --locked --all-features --format-version 1 > /dev/null
 
       - name: Build default features
@@ -98,7 +99,15 @@ jobs:
           cmp schema/migration-descriptor-v1.schema.json authoritative-spec/schema/migration-descriptor-v1.schema.json
           cmp schema/core-step-result-v1.schema.json authoritative-spec/schema/core-step-result-v1.schema.json
           cmp schema/execution-checkpoint-v1.schema.json authoritative-spec/schema/execution-checkpoint-v1.schema.json
+          cmp schema/provider-reference-v1.schema.json authoritative-spec/schema/provider-reference-v1.schema.json
+          cmp schema/extension-descriptor-v1.schema.json authoritative-spec/schema/extension-descriptor-v1.schema.json
+          cmp schema/extension-capability-report-v1.schema.json authoritative-spec/schema/extension-capability-report-v1.schema.json
+          cmp schema/extension-capability-requirement-v1.schema.json authoritative-spec/schema/extension-capability-requirement-v1.schema.json
           cmp schema/inspection-v1.schema.json authoritative-spec/schema/inspection-v1.schema.json
+          cmp schema/delivery-v1.schema.json authoritative-spec/schema/delivery-v1.schema.json
+          cmp schema/host-effect-journal-v1.schema.json authoritative-spec/schema/host-effect-journal-v1.schema.json
+          cmp schema/application-projection-v1.schema.json conformance-suite/scripts/schemas/application-projection-v1.schema.json
+          cmp schema/lossless-delivery-v1.schema.json conformance-suite/scripts/schemas/lossless-delivery-v1.schema.json
           cmp schema/durable-host-call-log-v1.schema.json conformance-suite/scripts/schemas/durable-host-call-log-v1.schema.json
           cmp schema/durable-host-inputs-v1.schema.json conformance-suite/scripts/schemas/durable-host-inputs-v1.schema.json
           cmp schema/durable-host-results-v1.schema.json conformance-suite/scripts/schemas/durable-host-results-v1.schema.json
@@ -123,6 +132,17 @@ jobs:
       - name: Unit and public API tests
         run: cargo test --locked --lib --bins --test public_api --test closed_code_registry --test checkpoint_adapters
 
+      - name: Install pinned conformance runner dependencies
+        run: python3 -m pip install -r conformance-suite/scripts/validation-requirements.txt
+
+      - name: Public extension negotiation vectors
+        run: |
+          cargo test --locked --test extension_conformance
+          cargo build --locked --example extension_profile_adapter
+          python3 conformance-suite/scripts/run_extension_negotiation_profile.py --spec-root authoritative-spec --adapter target/debug/examples/extension_profile_adapter
+          cargo build --locked --example adapter_policy_probe
+          python3 conformance-suite/scripts/run_adapter_policy_profile.py --adapter target/debug/examples/adapter_policy_probe
+
       - name: All 75 authoritative mailbox-neutral RTC scenarios
         env:
           RUSTFLAGS: --cfg determa_repository_conformance
@@ -139,7 +159,7 @@ jobs:
           RUSTFLAGS: --cfg determa_repository_conformance
         run: cargo test --locked --test inspection_conformance -- --nocapture
 
-      - name: All 420 declared artifact documents
+      - name: All 484 declared artifact documents
         run: cargo test --locked --test artifact_manifest -- --nocapture
 
       - name: All 142 durable-host vectors
@@ -174,7 +194,10 @@ jobs:
       - name: Build with PostgreSQL
         run: cargo build --release --locked --features postgresql
 
-      - name: PostgreSQL transaction and CAS contract
+      - name: Install native gate runner dependencies
+        run: python3 -m pip install -r conformance-suite/scripts/validation-requirements.txt
+
+      - name: All required native execution-store gates with live PostgreSQL
         env:
           DETERMA_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/determa
-        run: cargo test --locked --features postgresql --test checkpoint_postgresql -- --nocapture
+        run: python3 conformance-suite/scripts/run_execution_store_gates.py --implementation-root . --mapping scripts/native-gates.json

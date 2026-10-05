@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[test]
-fn all_420_manifest_artifacts_receive_applicable_validation() {
+fn all_484_manifest_artifacts_receive_applicable_validation() {
     // Artifact validity is intentionally narrower than operation admissibility.
     // Valid operands that a later operation must reject are exercised by the 162
     // operation vectors through the corresponding public operation.
@@ -66,7 +66,7 @@ fn all_420_manifest_artifacts_receive_applicable_validation() {
             }
         }
     }
-    assert_eq!(count, 420, "artifact manifest entry count changed");
+    assert_eq!(count, 484, "artifact manifest entry count changed");
     assert!(
         failures.is_empty(),
         "{} artifact(s) failed validation:\n{}",

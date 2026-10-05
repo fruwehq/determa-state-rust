@@ -6,6 +6,7 @@ use determa_state::checkpoint::{
     PostgresqlHostMutationResult, ProcessingRequest, PruneRequest, StoreError,
     TerminalOutboxOutcome, TransactionalProcessRequest,
 };
+use determa_state::extensions::bundled_store_registry;
 use determa_state::{
     load_bundle, Bindings, InMemoryDefinitionResolver, MigrationRequest, ResourceLimits,
 };
@@ -72,7 +73,18 @@ machines:
     resolver.insert(outbox_bundle.clone(), true);
     resolver.insert(terminal_bundle.clone(), true);
     let store: Arc<dyn ExecutionStore> = concrete.clone();
-    let host = CheckpointHost::new(store.clone(), Arc::new(resolver));
+    let registry = Arc::new(bundled_store_registry().unwrap());
+    let descriptor = registry
+        .descriptors()
+        .unwrap()
+        .into_iter()
+        .find(|item| item["provider_reference"]["identifier"] == "determa.postgresql")
+        .unwrap();
+    let configuration = json!({"instance_id":"native-v1", "uri":format!("{url}#receipt_retention=bounded&outbox_retention=bounded&tls=no_tls")});
+    let verified = registry
+        .configure_execution_store(&descriptor, &configuration)
+        .unwrap();
+    let host = CheckpointHost::from_verified(verified, Arc::new(resolver));
     let bindings = Bindings::default();
     let retention = retention();
 
@@ -603,4 +615,170 @@ fn isolated_schema_url(base_url: &str, label: &str) -> String {
 
 fn pg_error(error: postgres::Error) -> StoreError {
     StoreError::new(error.to_string())
+}
+
+#[test]
+fn independent_postgresql_sessions_commit_exactly_one_cas_winner() {
+    use determa_state::checkpoint::{StoreRecord, StoreWriteResult};
+    use std::sync::Barrier;
+
+    let Some(base_url) = postgresql_url() else {
+        return;
+    };
+    let url = isolated_schema_url(&base_url, "concurrent_cas");
+    let initial = StoreRecord {
+        root_instance_id: "competing-root".into(),
+        revision: "0".into(),
+        execution_checkpoint_digest: format!("sha256:{}", "a".repeat(64)),
+        bytes: b"original committed bytes".to_vec(),
+    };
+    let first =
+        PostgresqlExecutionStore::connect_no_tls(&url, DurableStoreMode::bounded()).unwrap();
+    first.initialize_schema().unwrap();
+    assert_eq!(
+        first.insert_if_absent(initial.clone()).unwrap(),
+        StoreWriteResult::Committed
+    );
+    let second =
+        PostgresqlExecutionStore::connect_no_tls(&url, DurableStoreMode::bounded()).unwrap();
+    // These are separate physical sessions, not two references to one mutex.
+    let first_pid = first
+        .with_native_transaction(|tx| {
+            Ok(tx
+                .query_one("SELECT pg_backend_pid()", &[])
+                .map_err(pg_error)?
+                .get::<_, i32>(0))
+        })
+        .unwrap();
+    let second_pid = second
+        .with_native_transaction(|tx| {
+            Ok(tx
+                .query_one("SELECT pg_backend_pid()", &[])
+                .map_err(pg_error)?
+                .get::<_, i32>(0))
+        })
+        .unwrap();
+    assert_ne!(first_pid, second_pid);
+    let barrier = Arc::new(Barrier::new(2));
+    let threads: Vec<_> = [first, second]
+        .into_iter()
+        .enumerate()
+        .map(|(index, store)| {
+            let initial = initial.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let candidate = StoreRecord {
+                    revision: "1".into(),
+                    execution_checkpoint_digest: format!(
+                        "sha256:{}",
+                        if index == 0 { "b" } else { "c" }.repeat(64)
+                    ),
+                    bytes: format!("winner candidate {index}").into_bytes(),
+                    ..initial.clone()
+                };
+                barrier.wait();
+                let result = store
+                    .compare_and_swap(
+                        &initial.root_instance_id,
+                        &initial.revision,
+                        &initial.execution_checkpoint_digest,
+                        candidate.clone(),
+                    )
+                    .unwrap();
+                (result, candidate)
+            })
+        })
+        .collect();
+    let results: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(result, _)| *result == StoreWriteResult::Committed)
+            .count(),
+        1
+    );
+    let winner = &results
+        .iter()
+        .find(|(result, _)| *result == StoreWriteResult::Committed)
+        .unwrap()
+        .1;
+    let loser = results
+        .iter()
+        .find(|(result, _)| *result != StoreWriteResult::Committed)
+        .unwrap();
+    assert_eq!(loser.0, StoreWriteResult::Conflict(Some(winner.clone())));
+    // A fresh session observes only the winner; the losing transaction changed no bytes.
+    let reopened =
+        PostgresqlExecutionStore::connect_no_tls(&url, DurableStoreMode::bounded()).unwrap();
+    assert_eq!(
+        reopened.load(&initial.root_instance_id).unwrap(),
+        Some(winner.clone())
+    );
+    let failed: Result<(), StoreError> = reopened.with_native_transaction(|tx| {
+        tx.execute("UPDATE determa_execution_checkpoints SET checkpoint_bytes = $1 WHERE root_instance_id = $2",
+            &[&b"must roll back".to_vec(), &initial.root_instance_id]).map_err(pg_error)?;
+        Err(StoreError::new("abort native application transaction"))
+    });
+    assert!(failed.is_err());
+    assert_eq!(
+        reopened.load(&initial.root_instance_id).unwrap(),
+        Some(winner.clone())
+    );
+}
+
+#[test]
+fn postgresql_rechecks_native_configuration_and_rolls_back_weakened_commit() {
+    let Some(base_url) = postgresql_url() else {
+        return;
+    };
+    let url = isolated_schema_url(&base_url, "configuration");
+    let store =
+        PostgresqlExecutionStore::connect_no_tls(&url, DurableStoreMode::bounded()).unwrap();
+    store.initialize_schema().unwrap();
+    assert!(store.health().unwrap().healthy);
+    store
+        .with_native_transaction(|tx| {
+            tx.batch_execute("CREATE TABLE native_gate_application (value TEXT)")
+                .map_err(pg_error)
+        })
+        .unwrap();
+    let failed = store.with_native_transaction(|tx| {
+        tx.batch_execute("INSERT INTO native_gate_application VALUES ('must roll back'); SET LOCAL synchronous_commit = off").map_err(pg_error)
+    });
+    assert!(failed
+        .unwrap_err()
+        .to_string()
+        .contains("synchronous_commit"));
+    let weakened = store.with_native_transaction(|tx| {
+        tx.batch_execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED; INSERT INTO native_gate_application VALUES ('must also roll back')").map_err(pg_error)
+    });
+    assert!(weakened.unwrap_err().to_string().contains("serializable"));
+    let mut observer = Client::connect(&url, NoTls).unwrap();
+    assert_eq!(
+        observer
+            .query_one("SELECT COUNT(*) FROM native_gate_application", &[])
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    assert!(store.health().unwrap().healthy);
+    observer
+        .batch_execute("ALTER TABLE determa_execution_checkpoints ADD COLUMN unexpected TEXT")
+        .unwrap();
+    assert!(store.health().is_err());
+    for (name, value) in [
+        ("synchronous_commit", "off"),
+        ("default_transaction_read_only", "on"),
+        ("default_transaction_isolation", "serializable"),
+    ] {
+        let separator = if base_url.contains('?') { '&' } else { '?' };
+        let incompatible = format!("{base_url}{separator}options=-c%20{name}%3D{value}");
+        let changed =
+            PostgresqlExecutionStore::connect_no_tls(&incompatible, DurableStoreMode::bounded())
+                .unwrap();
+        assert!(changed.health().unwrap_err().to_string().contains(name));
+    }
 }

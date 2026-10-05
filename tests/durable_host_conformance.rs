@@ -1,22 +1,29 @@
 use determa_state::checkpoint::{
-    execute_adapter_registration, execute_adapter_resolution, AdapterError, AdapterErrorCode,
-    AdapterRegistry, AdmissionSource, CheckpointHost, DurableCheckpointOperation,
+    conditional_adapter_policy, AdmissionSource, CheckpointHost, DurableCheckpointOperation,
     DurableContractExecution, DurableFailurePolicy, DurableHostResult, DurableProcessRequest,
     DurableQuarantineReleaseRequest, DurableStoreMode, ExecutionStore, ExecutionStoreCapability,
-    ExecutionStoreFactory, HealthStatus, HostFeature, HostProfile, MemoryExecutionStore,
-    MutationGuard, OutboxRetentionMode, PendingOutboxState, ProcessingRequest, PruneRequest,
-    ReceiptRetentionMode, ScopedStoreRecord, SqliteExecutionStore, StoreError, StoreRecord,
-    StoreScope, StoreWriteResult, TerminalOutboxOutcome,
+    HealthStatus, HostFeature, HostProfile, MemoryExecutionStore, MutationGuard,
+    OutboxRetentionMode, PendingOutboxState, ProcessingRequest, PruneRequest, ReceiptRetentionMode,
+    ScopedStoreRecord, SqliteExecutionStore, StoreError, StoreRecord, StoreScope, StoreWriteResult,
+    TerminalOutboxOutcome,
+};
+use determa_state::extensions::{
+    bundled_store_registry, ExtensionError, ExtensionFactory, ExtensionInstance, ExtensionProvider,
+    ExtensionRegistry, HostVerifier, IngressAcknowledger, VerifiedIngressAcknowledger,
 };
 use determa_state::{
     load_bundle, Bindings, InMemoryDefinitionResolver, MigrationRequest, ResourceLimits,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, OnceLock,
+};
 
 #[test]
 fn all_142_durable_host_vectors_execute_exactly() {
@@ -45,6 +52,28 @@ fn all_142_durable_host_vectors_execute_exactly() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+#[test]
+fn native_lifecycle_acknowledgement_is_observed_after_commit_or_replay() {
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("conformance-suite/conformance/profiles/execution-checkpoint/checkpoint-01-native-lifecycle");
+    let manifest = yaml(&fs::read_to_string(directory.join("test.yaml")).unwrap());
+    for vector in manifest["durable_host_vectors"].as_array().unwrap() {
+        run_vector(&directory, vector)
+            .unwrap_or_else(|error| panic!("{}: {error}", vector["name"]));
+    }
+}
+
+#[test]
+fn persistence_acknowledges_only_after_commit() {
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("conformance-suite/conformance/profiles/persistence/persistence-02-atomic-aggregate-inbox-outbox-audit");
+    let manifest = yaml(&fs::read_to_string(directory.join("test.yaml")).unwrap());
+    for vector in manifest["durable_host_vectors"].as_array().unwrap() {
+        run_vector(&directory, vector)
+            .unwrap_or_else(|error| panic!("{}: {error}", vector["name"]));
+    }
 }
 
 #[test]
@@ -210,11 +239,16 @@ fn permanent_quarantine_obeys_retained_replay_and_conflict_precedence() {
     );
     sqlite.initialize_schema().unwrap();
     sqlite.import_durable_host_snapshot(&committed).unwrap();
-    let host = CheckpointHost::new(sqlite.clone(), Arc::new(resolver(&directory)));
+    let (host, acknowledgement_calls) = verified_sqlite_host(
+        &database,
+        ReceiptRetentionMode::Permanent,
+        Arc::new(resolver(&directory)),
+    );
 
     let mut replay = process_request(request);
     replay.failure_policy = DurableFailurePolicy::PermanentQuarantine;
     let replayed = host.execute_durable_process(&replay).unwrap();
+    assert_eq!(acknowledgement_calls.load(Ordering::SeqCst), 1);
     assert_eq!(replayed.result.result, "replayed");
     assert_eq!(replayed.result.mutation, "none");
     assert_eq!(
@@ -229,6 +263,7 @@ fn permanent_quarantine_obeys_retained_replay_and_conflict_precedence() {
         "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
     conflict.delivery["envelope_digest"] = json!(conflict.envelope_digest);
     let rejected = host.execute_durable_process(&conflict).unwrap();
+    assert_eq!(acknowledgement_calls.load(Ordering::SeqCst), 1);
     assert_eq!(rejected.result.result, "rejected");
     assert_eq!(rejected.result.code.as_deref(), Some("event_id_conflict"));
     assert_eq!(rejected.result.mutation, "none");
@@ -268,6 +303,122 @@ fn run_vector(directory: &Path, vector: &Value) -> Result<(), String> {
     (actual == expected)
         .then_some(())
         .ok_or_else(|| format!("result mismatch: expected {expected}, got {actual}"))
+}
+
+// A compiled in-memory ingress adapter performs the acknowledgement operation.
+// Its source and exact injected object are pinned by the test host verifier.
+struct TestIngress(Arc<AtomicUsize>);
+impl IngressAcknowledger for TestIngress {
+    fn acknowledge(&self, _root_instance_id: &str, _operation: &str) -> Result<(), ExtensionError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+struct TestIngressProvider(Value, Arc<AtomicUsize>);
+impl ExtensionProvider for TestIngressProvider {
+    fn descriptor(&self) -> Value {
+        self.0.clone()
+    }
+    fn validate_configuration(
+        &self,
+        configuration: &Value,
+    ) -> Result<ExtensionInstance, ExtensionError> {
+        assert_eq!(configuration, &json!({"instance_id":"conformance-ingress"}));
+        let adapter: Arc<dyn IngressAcknowledger> = Arc::new(TestIngress(self.1.clone()));
+        Ok(Arc::new(adapter))
+    }
+    fn instance_id(&self, _: &ExtensionInstance) -> Result<String, ExtensionError> {
+        Ok("conformance-ingress".into())
+    }
+    fn capabilities(&self, _: &ExtensionInstance) -> Result<Vec<String>, ExtensionError> {
+        Ok(Vec::new())
+    }
+    fn health(&self, _: &ExtensionInstance) -> Result<String, ExtensionError> {
+        Ok("healthy".into())
+    }
+}
+struct TestIngressVerifier {
+    provider: Arc<dyn ExtensionProvider>,
+    digest: String,
+    calls: Arc<AtomicUsize>,
+    prove: bool,
+}
+impl HostVerifier for TestIngressVerifier {
+    fn prove_ingress_acknowledgement(
+        &self,
+        _: &Value,
+        _: &Value,
+        _: &ExtensionInstance,
+        _: &str,
+        _: &str,
+    ) -> bool {
+        self.prove && self.calls.load(Ordering::SeqCst) > 0
+    }
+    fn verify_factory(&self, _: &Value, _: &Arc<dyn ExtensionFactory>) -> bool {
+        false
+    }
+    fn verify_source(
+        &self,
+        descriptor: &Value,
+        _: &Arc<dyn ExtensionFactory>,
+        provider: &Arc<dyn ExtensionProvider>,
+    ) -> bool {
+        Arc::ptr_eq(provider, &self.provider)
+            && descriptor["provider_reference"]["content_digest"] == self.digest
+    }
+    fn prove_claims(
+        &self,
+        _: &Value,
+        _: &Value,
+        _: &ExtensionInstance,
+        _: &str,
+        _: &[String],
+    ) -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+}
+fn test_ingress_acknowledger() -> (VerifiedIngressAcknowledger, Arc<AtomicUsize>) {
+    test_ingress_acknowledger_with_proof(true)
+}
+fn test_ingress_acknowledger_with_proof(
+    prove: bool,
+) -> (VerifiedIngressAcknowledger, Arc<AtomicUsize>) {
+    const SOURCE: &[u8] = include_bytes!("durable_host_conformance.rs");
+    assert_eq!(
+        Sha256::digest(fs::read(file!()).unwrap()),
+        Sha256::digest(SOURCE)
+    );
+    let digest = format!("sha256:{:x}", Sha256::digest(SOURCE));
+    let descriptor = json!({"category":"transport", "provider_reference":{
+        "identifier":"conformance.ingress", "version":"1.0.0", "content_digest":digest
+    }, "interface_version":1, "supported_capabilities":[]});
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn ExtensionProvider> =
+        Arc::new(TestIngressProvider(descriptor.clone(), calls.clone()));
+    let verifier = Arc::new(TestIngressVerifier {
+        provider: provider.clone(),
+        digest,
+        calls: calls.clone(),
+        prove,
+    });
+    let registry = Arc::new(ExtensionRegistry::with_verifier(verifier));
+    registry.inject(descriptor.clone(), provider).unwrap();
+    (
+        registry
+            .configure_ingress_acknowledger(
+                &descriptor,
+                &json!({"instance_id":"conformance-ingress"}),
+            )
+            .unwrap(),
+        calls,
+    )
+}
+
+#[test]
+fn ingress_callback_without_host_operational_proof_cannot_claim_acknowledgement() {
+    let (adapter, calls) = test_ingress_acknowledger_with_proof(false);
+    assert!(!adapter.acknowledge("root", "processing"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 fn run_checkpoint(directory: &Path, vector: &Value, request: &Value) -> Result<Value, String> {
@@ -311,7 +462,13 @@ fn run_checkpoint_inner(
     }
     let boundary = vector["failure_boundary"].as_str();
     let store: Arc<dyn ExecutionStore> = Arc::new(FaultStore::new(memory.clone(), boundary));
-    let host = CheckpointHost::new(store, Arc::new(resolver(directory)));
+    let mut host = CheckpointHost::new(store, Arc::new(resolver(directory)));
+    let mut acknowledgement_calls = None;
+    if directory.file_name().unwrap() == "checkpoint-01-native-lifecycle" {
+        let (adapter, calls) = test_ingress_acknowledger();
+        acknowledgement_calls = Some(calls);
+        host = host.with_ingress_acknowledger(adapter);
+    }
     let guard = request.get("expected_checkpoint").map_or_else(
         || MutationGuard::new("", ""),
         |value| {
@@ -322,8 +479,6 @@ fn run_checkpoint_inner(
         },
     );
     let operation = vector["operation"].as_str().unwrap();
-    let acknowledge_after_commit =
-        directory.file_name().unwrap() == "checkpoint-01-native-lifecycle";
     let mut result = match operation {
         "checkpoint_create_v1" => {
             let bundle = load_bundle(
@@ -342,85 +497,76 @@ fn run_checkpoint_inner(
                     supplied_request_digest: None,
                     replay_retention: json!({"mode":"permanent","permanent_replay_eligible":true,"pruned_through_receipt_sequence":null,"policy_identifier":null}),
                 },
-                acknowledge_after_commit,
             )
         }
         "checkpoint_admit_v1" => {
             let sources = admission_sources(request);
-            host.execute_checkpoint_operation(
-                DurableCheckpointOperation::Admit {
-                    root_instance_id: &root,
-                    sources: &sources,
-                    guard: &guard,
-                },
-                acknowledge_after_commit,
-            )
+            host.execute_checkpoint_operation(DurableCheckpointOperation::Admit {
+                root_instance_id: &root,
+                sources: &sources,
+                guard: &guard,
+            })
         }
         "checkpoint_step_v1" => {
             let processing = processing_request(request);
-            host.execute_checkpoint_operation(
-                DurableCheckpointOperation::Step {
-                    root_instance_id: &root,
-                    request: &processing,
-                    guard: &guard,
-                },
-                acknowledge_after_commit,
-            )
+            host.execute_checkpoint_operation(DurableCheckpointOperation::Step {
+                root_instance_id: &root,
+                request: &processing,
+                guard: &guard,
+            })
         }
-        "checkpoint_update_outbox_v1" => host.execute_checkpoint_operation(
-            DurableCheckpointOperation::UpdatePendingOutbox {
+        "checkpoint_update_outbox_v1" => {
+            host.execute_checkpoint_operation(DurableCheckpointOperation::UpdatePendingOutbox {
                 root_instance_id: &root,
                 effect_id: request["effect_id"].as_str().unwrap(),
                 desired: pending_state(request),
                 guard: &guard,
-            },
-            acknowledge_after_commit,
-        ),
-        "checkpoint_terminalize_outbox_v1" => host.execute_checkpoint_operation(
-            DurableCheckpointOperation::TerminalizeOutbox {
+            })
+        }
+        "checkpoint_terminalize_outbox_v1" => {
+            host.execute_checkpoint_operation(DurableCheckpointOperation::TerminalizeOutbox {
                 root_instance_id: &root,
                 effect_id: request["effect_id"].as_str().unwrap(),
                 outcome: terminal_outcome(request),
                 guard: &guard,
-            },
-            acknowledge_after_commit,
-        ),
-        "checkpoint_compact_outbox_v1" => host.execute_checkpoint_operation(
-            DurableCheckpointOperation::CompactOutbox {
+            })
+        }
+        "checkpoint_compact_outbox_v1" => {
+            host.execute_checkpoint_operation(DurableCheckpointOperation::CompactOutbox {
                 root_instance_id: &root,
                 effect_id: request["effect_id"].as_str().unwrap(),
                 guard: &guard,
-            },
-            acknowledge_after_commit,
-        ),
+            })
+        }
         "checkpoint_prune_v1" => {
             let prune = prune_request(request);
-            host.execute_checkpoint_operation(
-                DurableCheckpointOperation::Prune {
-                    root_instance_id: &root,
-                    request: &prune,
-                    guard: &guard,
-                },
-                acknowledge_after_commit,
-            )
+            host.execute_checkpoint_operation(DurableCheckpointOperation::Prune {
+                root_instance_id: &root,
+                request: &prune,
+                guard: &guard,
+            })
         }
-        "checkpoint_tombstone_v1" => host.execute_checkpoint_operation(
-            DurableCheckpointOperation::Tombstone {
+        "checkpoint_tombstone_v1" => {
+            host.execute_checkpoint_operation(DurableCheckpointOperation::Tombstone {
                 root_instance_id: &root,
                 operation_id: request["tombstone_operation_id"].as_str().unwrap(),
                 guard: &guard,
-            },
-            acknowledge_after_commit,
-        ),
-        "checkpoint_delete_retained_record_v1" => host.execute_checkpoint_operation(
-            DurableCheckpointOperation::DeleteRetainedRecord {
+            })
+        }
+        "checkpoint_delete_retained_record_v1" => {
+            host.execute_checkpoint_operation(DurableCheckpointOperation::DeleteRetainedRecord {
                 root_instance_id: &root,
                 guard: &guard,
-            },
-            acknowledge_after_commit,
-        ),
+            })
+        }
         other => return Err(format!("unsupported checkpoint operation {other}")),
     };
+    if let Some(calls) = acknowledgement_calls {
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            usize::from(result.result.broker_acknowledged)
+        );
+    }
     if let Some(field) = corrupt_response {
         let response = if vector.get("raw_response").is_some() {
             result.caller_response.as_mut()
@@ -523,45 +669,21 @@ fn invoke_contract(directory: &Path, vector: &Value, request: &Value) -> Durable
             );
             host.injected_store_contract()
         }
-        "checkpoint_register_adapter_v1" => {
-            let registry = AdapterRegistry::new();
-            if let Err(execution) = register_all(&registry, &request["existing_registrations"]) {
-                return execution;
+        "checkpoint_register_adapter_v1"
+        | "checkpoint_resolve_adapter_v1"
+        | "checkpoint_validate_capabilities_v1" => {
+            let caller_response = conditional_adapter_policy(request);
+            let result = if caller_response["kind"] == "typed_failure" {
+                DurableHostResult::validation_rejected(
+                    caller_response["body"]["code"].as_str().unwrap(),
+                )
+            } else {
+                DurableHostResult::validated()
+            };
+            DurableContractExecution {
+                result,
+                caller_response,
             }
-            let descriptor = request["registration"].clone();
-            let factory = Arc::new(DeclaredFactory {
-                capabilities: capabilities(&descriptor["capabilities"]),
-                valid: true,
-            });
-            execute_adapter_registration(&registry, descriptor, factory)
-        }
-        "checkpoint_resolve_adapter_v1" => {
-            let registry = AdapterRegistry::new();
-            if let Err(execution) = register_all(&registry, &request["registrations"]) {
-                return execution;
-            }
-            execute_adapter_resolution(
-                &registry,
-                request["uri"].as_str().unwrap(),
-                &request["configuration"],
-                &capabilities(&request["requested_capabilities"]),
-            )
-        }
-        "checkpoint_validate_capabilities_v1" => {
-            let host: CheckpointHost<InMemoryDefinitionResolver> = CheckpointHost::new(
-                Arc::new(StaticStore::new(capabilities(
-                    &request["store_capabilities"],
-                ))),
-                Arc::new(InMemoryDefinitionResolver::default()),
-            );
-            host.validate_capabilities_contract(
-                request["adapter_identifier"].as_str().unwrap(),
-                profile(request["host_profile"].as_str().unwrap()),
-                &features(&request["host_guarantees"]),
-                &string_array(&request["store_capabilities"]),
-                &string_array(&request["host_guarantees"]),
-                request["retention_mode"] == "permanent",
-            )
         }
         "checkpoint_scope_operation_v1" => {
             let host: CheckpointHost<InMemoryDefinitionResolver> = CheckpointHost::new(
@@ -599,6 +721,37 @@ fn run_persistence(directory: &Path, vector: &Value, request: &Value) -> Result<
     run_persistence_inner(directory, vector, request, false)
 }
 
+#[cfg(feature = "sqlite")]
+fn verified_sqlite_host<R: determa_state::MigrationArtifactResolver + Send + Sync + 'static>(
+    database: &Path,
+    receipt_retention: ReceiptRetentionMode,
+    resolver: Arc<R>,
+) -> (CheckpointHost<R>, Arc<AtomicUsize>) {
+    let registry = Arc::new(bundled_store_registry().unwrap());
+    let descriptor = registry
+        .descriptors()
+        .unwrap()
+        .into_iter()
+        .find(|descriptor| descriptor["provider_reference"]["identifier"] == "determa.sqlite")
+        .unwrap();
+    let receipt = match receipt_retention {
+        ReceiptRetentionMode::Permanent => "permanent",
+        ReceiptRetentionMode::Bounded => "bounded",
+    };
+    let configuration = json!({
+        "instance_id": "conformance-sqlite",
+        "uri": format!("sqlite:{}#receipt_retention={receipt}&outbox_retention=bounded", database.display()),
+    });
+    let verified = registry
+        .configure_execution_store(&descriptor, &configuration)
+        .unwrap();
+    let (adapter, calls) = test_ingress_acknowledger();
+    (
+        CheckpointHost::from_verified(verified, resolver).with_ingress_acknowledger(adapter),
+        calls,
+    )
+}
+
 fn run_persistence_inner(
     directory: &Path,
     vector: &Value,
@@ -633,7 +786,11 @@ fn run_persistence_inner(
     sqlite
         .import_durable_host_snapshot(&before)
         .map_err(load_error)?;
-    let host = CheckpointHost::new(sqlite.clone(), Arc::new(resolver(directory)));
+    let (host, acknowledgement_calls) = verified_sqlite_host(
+        &database,
+        mode.receipt_retention,
+        Arc::new(resolver(directory)),
+    );
     let mut execution = if vector["operation"] == "persistence_release_quarantine_v1" {
         host.release_durable_quarantine(&DurableQuarantineReleaseRequest {
             root_instance_id: request["expected_checkpoint"]["root_instance_id"]
@@ -664,6 +821,10 @@ fn run_persistence_inner(
         };
         host.execute_durable_process(&process).map_err(load_error)?
     };
+    assert_eq!(
+        acknowledgement_calls.load(Ordering::SeqCst),
+        usize::from(execution.result.broker_acknowledged)
+    );
     if corrupt {
         execution
             .caller_response
@@ -673,7 +834,12 @@ fn run_persistence_inner(
             .unwrap()
             .insert("unexpected_member".to_string(), Value::Bool(true));
     }
-    let store = sqlite
+    // Observe transaction fate through a fresh native connection after both
+    // writer handles have closed, including the application rows.
+    drop(host);
+    drop(sqlite);
+    let reopened = SqliteExecutionStore::open(&database, mode).map_err(load_error)?;
+    let store = reopened
         .export_durable_host_snapshot(
             request["expected_checkpoint"]["root_instance_id"]
                 .as_str()
@@ -1007,41 +1173,8 @@ fn collect_machine_documents(directory: &Path, resolver: &mut InMemoryDefinition
     }
 }
 
-fn register_all(
-    registry: &AdapterRegistry,
-    registrations: &Value,
-) -> Result<(), DurableContractExecution> {
-    for item in registrations.as_array().unwrap() {
-        let execution = execute_adapter_registration(
-            registry,
-            item.clone(),
-            Arc::new(DeclaredFactory {
-                capabilities: capabilities(&item["capabilities"]),
-                valid: true,
-            }),
-        );
-        if execution.result.code.is_some() {
-            return Err(execution);
-        }
-    }
-    Ok(())
-}
-struct DeclaredFactory {
-    capabilities: BTreeSet<ExecutionStoreCapability>,
-    valid: bool,
-}
-impl ExecutionStoreFactory for DeclaredFactory {
-    fn create(&self, _: &str) -> Result<Arc<dyn ExecutionStore>, AdapterError> {
-        if self.valid {
-            Ok(Arc::new(StaticStore::new(self.capabilities.clone())))
-        } else {
-            Err(AdapterError::new(
-                AdapterErrorCode::InvalidAdapterConfiguration,
-                "invalid configuration",
-            ))
-        }
-    }
-}
+// The B0 decision vectors supply hypothetical registration premises. This
+// interpreter exists only in the conformance driver; it is not a host registry.
 struct StaticStore {
     capabilities: BTreeSet<ExecutionStoreCapability>,
 }

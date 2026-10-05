@@ -1,0 +1,393 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/host-effect-journal-v1.schema.json",
+  "title": "Determa State version 1 host effect journal",
+  "description": "Closed host-owned native-effect execution evidence; separate from portable checkpoint.",
+  "$ref": "#/$defs/hostEffectJournal",
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "canonicalDecimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "portableValue": {
+      "$ref": "aggregate-state-v1.schema.json#/$defs/typedValue"
+    },
+    "portablePayload": {
+      "$ref": "aggregate-state-v1.schema.json#/$defs/typedMap"
+    },
+    "handlerReference": {
+      "$ref": "provider-reference-v1.schema.json"
+    },
+    "operationTokenLocation": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "correlation_id"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "pointer"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "payload"
+            },
+            "pointer": {
+              "type": "string",
+              "pattern": "^(|(/([^~]|~0|~1)*)*)$"
+            }
+          }
+        }
+      ]
+    },
+    "resultMapping": {
+      "type": "object",
+      "required": [
+        "outcome_kind",
+        "event",
+        "result_slot",
+        "operation_token_location"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "outcome_kind": {
+          "enum": [
+            "succeeded",
+            "domain_rejected",
+            "terminal_failure",
+            "cancelled"
+          ]
+        },
+        "event": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "result_slot": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "operation_token_location": {
+          "$ref": "#/$defs/operationTokenLocation"
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "required": [
+        "root_instance_id",
+        "runtime_id",
+        "runtime_incarnation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "root_instance_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "runtime_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "runtime_incarnation": {
+          "$ref": "aggregate-state-v1.schema.json#/$defs/identityOrigin"
+        }
+      }
+    },
+    "attemptRecord": {
+      "type": "object",
+      "required": [
+        "attempt_fence",
+        "report_kind",
+        "report_digest",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "attempt_fence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "report_kind": {
+          "enum": [
+            "succeeded",
+            "domain_rejected",
+            "retryable_failure",
+            "terminal_failure",
+            "cancelled",
+            "ambiguous"
+          ]
+        },
+        "report_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "reason": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          ]
+        }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "required": [
+        "kind",
+        "payload",
+        "digest",
+        "attempt_fence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "succeeded",
+            "domain_rejected",
+            "terminal_failure",
+            "cancelled"
+          ]
+        },
+        "payload": {
+          "$ref": "aggregate-state-v1.schema.json#/$defs/typedMap"
+        },
+        "digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "attempt_fence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        }
+      }
+    },
+    "cancellation": {
+      "type": "object",
+      "required": [
+        "operation_id",
+        "reason",
+        "state"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "reason": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "state": {
+          "enum": [
+            "requested",
+            "prevented_start",
+            "too_late",
+            "reconciliation_required"
+          ]
+        }
+      }
+    },
+    "effectRecord": {
+      "type": "object",
+      "required": [
+        "effect_id",
+        "operation_token",
+        "intent_digest",
+        "handler_reference",
+        "destination_binding_digest",
+        "route_configuration_generation",
+        "result_mapping",
+        "target",
+        "idempotency_policy",
+        "attempt_fence",
+        "attempt_records",
+        "invocation_state",
+        "outcome",
+        "result_event_id",
+        "admission_receipt",
+        "cancellation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "effect_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "operation_token": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "intent_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "handler_reference": {
+          "$ref": "#/$defs/handlerReference"
+        },
+        "destination_binding_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "route_configuration_generation": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "result_mapping": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/resultMapping"
+          }
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "idempotency_policy": {
+          "enum": [
+            "destination_deduplicates",
+            "reconcile_before_retry"
+          ]
+        },
+        "attempt_fence": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "attempt_records": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/attemptRecord"
+          }
+        },
+        "invocation_state": {
+          "enum": [
+            "unclaimed",
+            "leased",
+            "ambiguous",
+            "outcome_recorded",
+            "result_admitted",
+            "closed"
+          ]
+        },
+        "outcome": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/outcome"
+            }
+          ]
+        },
+        "result_event_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/sha256"
+            }
+          ]
+        },
+        "admission_receipt": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "execution-checkpoint-v1.schema.json#/$defs/acceptanceReceipt"
+            }
+          ]
+        },
+        "cancellation": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/cancellation"
+            }
+          ]
+        }
+      }
+    },
+    "operationResponseReference": {
+      "type": "object",
+      "required": [
+        "operation_id",
+        "response_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "response_digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "hostEffectJournal": {
+      "type": "object",
+      "required": [
+        "host_effect_journal_format",
+        "host_effect_journal_schema_version",
+        "scope_identity",
+        "root_instance_id",
+        "checkpoint_revision",
+        "checkpoint_digest",
+        "journal_revision",
+        "effect_records",
+        "operation_response_references",
+        "host_effect_journal_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "host_effect_journal_format": {
+          "const": "determa.host_effect_journal"
+        },
+        "host_effect_journal_schema_version": {
+          "const": 1
+        },
+        "scope_identity": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "root_instance_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "checkpoint_revision": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "checkpoint_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "journal_revision": {
+          "$ref": "#/$defs/canonicalDecimal"
+        },
+        "effect_records": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/effectRecord"
+          }
+        },
+        "operation_response_references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/operationResponseReference"
+          }
+        },
+        "host_effect_journal_digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  }
+}

@@ -9,14 +9,15 @@
 
 pub mod checkpoint;
 pub mod cli;
+pub mod extensions;
 pub mod format1;
 pub mod value;
 
 /// Exact normative specification revision implemented by this crate.
-pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "6bd25e3fcdf068af861aa289903a8489bd8f0139";
+pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "86bb88dd21cb1f799eefe5020b6e49dabf6e7225";
 
 /// Exact core conformance revision exercised by this crate.
-pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "c0e101c86bd71068669df3cd2250d4fec24ff74d";
+pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "7f09321fb483a22eb677a4342f8d9537a7a18e82";
 
 #[cfg(determa_repository_conformance)]
 pub use format1::observed_inspection_guards;
