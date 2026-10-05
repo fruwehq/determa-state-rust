@@ -7,6 +7,7 @@ use crate::checkpoint::{
     SqliteExecutionStore, StoreError, StoreRecord, StoreWriteResult,
 };
 use crate::format1::{strict_json, DefinitionResolver};
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use std::{any::Any, collections::BTreeSet, path::Path, sync::Arc};
 
@@ -73,7 +74,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
 
     /// Validation and the consuming read share the same native SQLite snapshot.
     /// No checkpoint bytes may escape via the separate raw store connection.
-    fn with_authority_snapshot<T>(
+    pub(super) fn with_authority_snapshot<T>(
         &self,
         read: impl FnOnce(&rusqlite::Connection, &Value) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
@@ -116,6 +117,97 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
         self.with_authority_snapshot(|connection, _| {
             checkpoint::load_sqlite_record(connection, root)
         })
+    }
+
+    pub(super) fn native_effect_creation_replay(
+        &self,
+        root: &str,
+        operation_id: &str,
+        original: &Value,
+    ) -> Result<Option<Value>, StoreError> {
+        self.with_authority_snapshot(|connection, _| {
+            let document: Option<Vec<u8>> = connection.query_row("SELECT document FROM determa_authority_effect_journals WHERE root_instance_id=?",[root],|row|row.get(0)).optional().map_err(error)?;
+            let Some(bytes) = document else {
+                if checkpoint::load_sqlite_record(connection,root)?.is_some() { return Err(error("existing root has no native effect participant")); }
+                return Ok(None);
+            };
+            let document = strict_json::parse(&bytes).map_err(error)?;
+            let checkpoint = checkpoint::load_sqlite_record(connection,root)?.ok_or_else(||error("native effect checkpoint absent"))?;
+            let checkpoint = checkpoint::restore(&checkpoint.bytes,self.resolver.as_ref()).map_err(error)?;
+            let responses = serde_json::from_value(document["responses"].clone()).map_err(error)?;
+            crate::format1::effect_journal::ValidatedEffectJournal::restore(&canonical(&document["journal"]).map_err(error)?,&checkpoint,&self.scope,&responses,self.resolver.as_ref()).map_err(error)?;
+            if document["original_requests"].get(operation_id) != Some(original) { return Err(error("operation_id_conflict")); }
+            Ok(Some(document["responses"].get(operation_id).cloned().ok_or_else(||error("retained creation response absent"))?))
+        })
+    }
+
+    pub(super) fn insert_native_effect_checkpoint(
+        &self,
+        checkpoint: &checkpoint::ExecutionCheckpoint,
+        document: &Value,
+        precommit: impl FnOnce() -> Result<(), super::AuthorityError>,
+    ) -> Result<(), StoreError> {
+        let checkpoint = checkpoint::restore(
+            &checkpoint.canonical_bytes().map_err(error)?,
+            self.resolver.as_ref(),
+        )
+        .map_err(error)?;
+        super::validate_native_effect_document(document, checkpoint.value(), &self.scope)
+            .map_err(error)?;
+        let responses = serde_json::from_value(document["responses"].clone()).map_err(error)?;
+        crate::format1::effect_journal::ValidatedEffectJournal::restore(
+            &canonical(&document["journal"]).map_err(error)?,
+            &checkpoint,
+            &self.scope,
+            &responses,
+            self.resolver.as_ref(),
+        )
+        .map_err(error)?;
+        let authority = self.authority_snapshot()?;
+        let record = StoreRecord::from_checkpoint(&checkpoint)?;
+        let mutation = json!({"native_mutation":"checkpoint_effect_journal","root_instance_id":record.root_instance_id,"expected_revision":null,"expected_checkpoint_digest":null,"checkpoint":checkpoint.value(),"effect_document":document});
+        let mutation = canonical(&mutation).map_err(error)?;
+        let operation_id = hash(&json!([
+            "determa-authority-effect-creation-1",
+            self.scope,
+            authority["authority_epoch"],
+            authority["scope_generation"],
+            strict_json::parse(&mutation).map_err(error)?
+        ]))
+        .map_err(error)?;
+        let mut request = json!({"interface":"determa.host_authority","interface_version":1,"operation":"guarded_commit","operation_id":operation_id,"scope_identity":self.scope,"expected_authority_epoch":"0","expected_scope_generation":authority["scope_generation"],"arguments":{"mutation_digest":format!("sha256:{:x}",<sha2::Sha256 as sha2::Digest>::digest(&mutation))}});
+        request["request_digest"] =
+            json!(hash(&json!(["determa-host-authority-request-1", request])).map_err(error)?);
+        let result = self
+            .authority
+            .perform_native(
+                &canonical(&request).map_err(error)?,
+                &self.caller(),
+                Some(&mutation),
+                Some("checkpoint_effect_journal"),
+                |transaction| {
+                    super::apply_checkpoint(transaction, self.mode, &record, None)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO determa_authority_effect_journals VALUES (?,?,?)",
+                            rusqlite::params![
+                                record.root_instance_id,
+                                self.scope,
+                                canonical(document)?
+                            ],
+                        )
+                        .map_err(super::failure)?;
+                    precommit()
+                },
+            )
+            .map_err(error)?;
+        if result["status"] != "accepted" {
+            return Err(error(format!(
+                "native effect creation refused: {}",
+                result["error_code"]
+            )));
+        }
+        Ok(())
     }
 
     fn commit(

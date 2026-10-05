@@ -76,15 +76,20 @@ fn failure_after_actual_checkpoint_staging_rolls_back_checkpoint_and_authority()
     let value = checkpoint();
     let (request, mutation, caller) = command(&value);
     let record = StoreRecord::from_checkpoint(&value).unwrap();
-    let result =
-        authority.perform_native(&request, &caller, Some(&mutation), true, |transaction| {
+    let result = authority.perform_native(
+        &request,
+        &caller,
+        Some(&mutation),
+        Some("checkpoint"),
+        |transaction| {
             apply_checkpoint(transaction, DurableStoreMode::bounded(), &record, None)?;
             assert_eq!(
                 crate::checkpoint::load_sqlite_record(transaction, "root").unwrap(),
                 Some(record.clone())
             );
             Err(failure("injected failure after actual checkpoint staging"))
-        });
+        },
+    );
     assert!(result.is_err());
     assert_eq!(ledger(&authority), before);
     let store = SqliteExecutionStore::open(&path, DurableStoreMode::bounded()).unwrap();
@@ -122,11 +127,17 @@ fn native_crash_child() {
     if cut == "staged" {
         let record = StoreRecord::from_checkpoint(&value).unwrap();
         authority
-            .perform_native(&request, &caller, Some(&mutation), true, |transaction| {
-                apply_checkpoint(transaction, DurableStoreMode::bounded(), &record, None)?;
-                signal_and_wait(&marker);
-                Ok(())
-            })
+            .perform_native(
+                &request,
+                &caller,
+                Some(&mutation),
+                Some("checkpoint"),
+                |transaction| {
+                    apply_checkpoint(transaction, DurableStoreMode::bounded(), &record, None)?;
+                    signal_and_wait(&marker);
+                    Ok(())
+                },
+            )
             .unwrap();
     } else {
         assert_eq!(cut, "committed");

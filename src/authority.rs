@@ -5,7 +5,9 @@
 //! inventories, worker fences, relocation and verified registration remain unfinished.
 //! No completed authority profile or capability claim is advertised.
 
+mod effects;
 mod store;
+pub use effects::{NativeEffectRoute, SqliteNativeEffectHost};
 pub use store::GuardedSqliteExecutionStore;
 
 use crate::checkpoint::{DurableStoreMode, ExecutionCheckpoint, MutationGuard, StoreRecord};
@@ -17,6 +19,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+
+const EFFECT_JOURNALS: &str = "CREATE TABLE determa_authority_effect_journals (root_instance_id TEXT PRIMARY KEY NOT NULL, scope_identity TEXT NOT NULL, document BLOB NOT NULL)";
 
 const RECORDS: &str = "CREATE TABLE determa_scope_authority (scope_identity TEXT PRIMARY KEY NOT NULL, ledger BLOB NOT NULL)";
 const ALLOCATIONS: &str =
@@ -107,6 +111,7 @@ impl SqliteLocalAuthority {
         }
         for sql in [
             RECORDS,
+            EFFECT_JOURNALS,
             ALLOCATIONS,
             MUTATIONS,
             NO_DELETE,
@@ -195,7 +200,7 @@ impl SqliteLocalAuthority {
             request_bytes,
             invocation,
             proposed_native_mutation,
-            false,
+            None,
             |_| Ok(()),
         )
     }
@@ -229,7 +234,7 @@ impl SqliteLocalAuthority {
             request_bytes,
             invocation,
             Some(&mutation),
-            true,
+            Some("checkpoint"),
             |transaction| apply_checkpoint(transaction, mode, replacement, guard),
         )
     }
@@ -239,7 +244,7 @@ impl SqliteLocalAuthority {
         request_bytes: &[u8],
         invocation: &NativeAuthorityInvocation,
         proposed_native_mutation: Option<&[u8]>,
-        checkpoint_mutation: bool,
+        native_kind: Option<&str>,
         apply: impl FnOnce(&Connection) -> Result<(), AuthorityError>,
     ) -> Result<Value, AuthorityError> {
         let request = match strict_json::parse(request_bytes) {
@@ -340,9 +345,17 @@ impl SqliteLocalAuthority {
         if request["arguments"]["mutation_digest"] != digest {
             return response(Some(&request), Some(&record), Some("invalid_host_request"));
         }
-        let declared_checkpoint = strict_json::parse(mutation)
-            .is_ok_and(|value| value["native_mutation"] == "checkpoint");
-        if declared_checkpoint != checkpoint_mutation {
+        let parsed_native = strict_json::parse(mutation).ok();
+        let declared_kind = parsed_native
+            .as_ref()
+            .and_then(|value| value["native_mutation"].as_str())
+            .filter(|kind| {
+                matches!(
+                    *kind,
+                    "checkpoint" | "checkpoint_effect_journal" | "effect_journal"
+                )
+            });
+        if declared_kind != native_kind {
             return response(Some(&request), Some(&record), Some("invalid_host_request"));
         }
         apply(&transaction)?;
@@ -356,8 +369,8 @@ impl SqliteLocalAuthority {
         let mut receipt = json!({
             "operation_id": request["operation_id"], "request_digest": request["request_digest"],
             "request": request, "result": result});
-        if checkpoint_mutation {
-            receipt["native_kind"] = json!("checkpoint");
+        if let Some(kind) = native_kind {
+            receipt["native_kind"] = json!(kind);
         }
         record["receipts"]
             .as_array_mut()
@@ -425,6 +438,7 @@ fn validate_schema(connection: &Connection, storage_binding: &str) -> Result<(),
     }
     for (name, expected) in [
         ("determa_scope_authority", RECORDS),
+        ("determa_authority_effect_journals", EFFECT_JOURNALS),
         ("determa_scope_allocations", ALLOCATIONS),
         ("determa_authority_mutations", MUTATIONS),
         ("determa_scope_allocations_forbid_delete", NO_DELETE),
@@ -464,7 +478,7 @@ fn validate_schema(connection: &Connection, storage_binding: &str) -> Result<(),
     let objects: u64 = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE sql IS NOT NULL AND (tbl_name IN ('determa_scope_authority','determa_scope_allocations','determa_authority_mutations','determa_authority_boundary') OR name LIKE 'determa_scope_%' OR name LIKE 'determa_authority_%')",
         [], |row| row.get(0)).map_err(failure)?;
-    if objects != 8 {
+    if objects != 9 {
         return Err(failure("unexpected authority schema object"));
     }
     let boundary: String = connection
@@ -596,8 +610,10 @@ fn validate_record(
     }
     let mut identifiers = BTreeSet::new();
     let mut latest_checkpoints = BTreeMap::new();
+    let mut latest_journals = BTreeMap::new();
     for (index, receipt) in receipts.iter().enumerate() {
-        let checkpoint_receipt = receipt["native_kind"] == "checkpoint";
+        let joint_receipt = receipt["native_kind"] == "checkpoint_effect_journal";
+        let checkpoint_receipt = receipt["native_kind"] == "checkpoint" || joint_receipt;
         if !(closed(
             receipt,
             &["operation_id", "request_digest", "request", "result"],
@@ -651,9 +667,17 @@ fn validate_record(
         {
             return Err(failure("retained native mutation digest mismatch"));
         }
-        let declared_checkpoint =
-            strict_json::parse(&bytes).is_ok_and(|value| value["native_mutation"] == "checkpoint");
-        if declared_checkpoint != checkpoint_receipt {
+        let parsed_native = strict_json::parse(&bytes).ok();
+        let declared_kind = parsed_native
+            .as_ref()
+            .and_then(|value| value["native_mutation"].as_str())
+            .filter(|kind| {
+                matches!(
+                    *kind,
+                    "checkpoint" | "checkpoint_effect_journal" | "effect_journal"
+                )
+            });
+        if declared_kind != receipt["native_kind"].as_str() {
             return Err(failure("native checkpoint receipt kind binding mismatch"));
         }
         if checkpoint_receipt {
@@ -661,15 +685,26 @@ fn validate_record(
             if canonical(&mutation)? != bytes
                 || !closed(
                     &mutation,
-                    &[
-                        "native_mutation",
-                        "root_instance_id",
-                        "expected_revision",
-                        "expected_checkpoint_digest",
-                        "checkpoint",
-                    ],
+                    if joint_receipt {
+                        &[
+                            "native_mutation",
+                            "root_instance_id",
+                            "expected_revision",
+                            "expected_checkpoint_digest",
+                            "checkpoint",
+                            "effect_document",
+                        ]
+                    } else {
+                        &[
+                            "native_mutation",
+                            "root_instance_id",
+                            "expected_revision",
+                            "expected_checkpoint_digest",
+                            "checkpoint",
+                        ]
+                    },
                 )
-                || mutation["native_mutation"] != "checkpoint"
+                || mutation["native_mutation"] != receipt["native_kind"]
             {
                 return Err(failure("retained checkpoint mutation malformed"));
             }
@@ -679,7 +714,46 @@ fn validate_record(
             if root.is_empty() || mutation["checkpoint"]["root_instance_id"] != root {
                 return Err(failure("checkpoint mutation root mismatch"));
             }
+            if joint_receipt {
+                if !mutation["expected_revision"].is_null()
+                    || !mutation["expected_checkpoint_digest"].is_null()
+                    || latest_checkpoints.contains_key(root)
+                    || latest_journals.contains_key(root)
+                {
+                    return Err(failure(
+                        "effect participant must originate in fresh native creation",
+                    ));
+                }
+                validate_native_effect_document(
+                    &mutation["effect_document"],
+                    &mutation["checkpoint"],
+                    scope,
+                )?;
+                latest_journals.insert(root.to_owned(), mutation["effect_document"].clone());
+            } else if latest_journals.contains_key(root) {
+                return Err(failure(
+                    "plain checkpoint mutation bypasses effect participant",
+                ));
+            }
             latest_checkpoints.insert(root.to_owned(), mutation["checkpoint"].clone());
+        }
+    }
+    let journal_count: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM determa_authority_effect_journals",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(failure)?;
+    if journal_count != latest_journals.len() as u64 {
+        return Err(failure("native effect journal inventory mismatch"));
+    }
+    for (root, document) in latest_journals {
+        let actual: Option<(String,Vec<u8>)> = connection.query_row("SELECT scope_identity,document FROM determa_authority_effect_journals WHERE root_instance_id=?",[&root],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(failure)?;
+        if actual != Some((scope.to_owned(), canonical(&document)?)) {
+            return Err(failure(
+                "native effect journal differs from committed evidence",
+            ));
         }
     }
     if checkpoint_count(connection)?.is_some_and(|count| count != latest_checkpoints.len() as u64) {
@@ -722,6 +796,76 @@ fn checkpoint_count(connection: &Connection) -> Result<Option<u64>, AuthorityErr
     }
 }
 
+// Fresh native creation is the only joint mutation at this implementation stage.
+// Later helper updates must add explicit immutable-history transition validation.
+fn validate_native_effect_document(
+    document: &Value,
+    checkpoint: &Value,
+    scope: &str,
+) -> Result<(), AuthorityError> {
+    if !closed(document, &["journal", "responses", "original_requests"]) {
+        return Err(failure("native effect document shape mismatch"));
+    }
+    let journal = &document["journal"];
+    let mut unsigned = journal.clone();
+    unsigned
+        .as_object_mut()
+        .ok_or_else(|| failure("native journal absent"))?
+        .remove("host_effect_journal_digest");
+    if journal["scope_identity"] != scope
+        || journal["root_instance_id"] != checkpoint["root_instance_id"]
+        || journal["checkpoint_revision"] != checkpoint["revision"]
+        || journal["checkpoint_digest"] != checkpoint["execution_checkpoint_digest"]
+        || journal["host_effect_journal_digest"]
+            != hash(&json!(["determa-host-effect-journal-digest-1", unsigned]))?
+    {
+        return Err(failure("native checkpoint/effect journal pair mismatch"));
+    }
+    let bodies = document["responses"]
+        .as_object()
+        .ok_or_else(|| failure("native responses absent"))?;
+    let requests = document["original_requests"]
+        .as_object()
+        .ok_or_else(|| failure("native original requests absent"))?;
+    let references = journal["operation_response_references"]
+        .as_array()
+        .ok_or_else(|| failure("native response references absent"))?;
+    if bodies.len() != 1 || requests.len() != 1 || references.len() != 1 {
+        return Err(failure("fresh creation response inventory mismatch"));
+    }
+    let receipt = &checkpoint["operation_receipts"][0];
+    let operation_id = receipt["creation_id"]
+        .as_str()
+        .ok_or_else(|| failure("actual creation identity absent"))?;
+    let body = bodies
+        .get(operation_id)
+        .ok_or_else(|| failure("actual creation response absent"))?;
+    let request = requests
+        .get(operation_id)
+        .ok_or_else(|| failure("actual creation request absent"))?;
+    if request != &json!({"operation_kind":"creation","request_digest":receipt["request_digest"]})
+        || !closed(
+            body,
+            &[
+                "checkpoint",
+                "creation_receipt",
+                "status",
+                "emissions",
+                "lifecycle_dispositions",
+                "fault",
+            ],
+        )
+        || body["checkpoint"] != *checkpoint
+        || body["creation_receipt"] != *receipt
+        || references[0]["operation_id"] != operation_id
+        || references[0]["response_digest"]
+            != hash(&json!(["determa-host-operation-response-1", body]))?
+    {
+        return Err(failure("native creation response/request binding mismatch"));
+    }
+    Ok(())
+}
+
 fn response(
     request: Option<&Value>,
     record: Option<&Value>,
@@ -758,6 +902,10 @@ fn apply_checkpoint(
     replacement: &StoreRecord,
     guard: Option<&MutationGuard>,
 ) -> Result<(), AuthorityError> {
+    let participant: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM determa_authority_effect_journals WHERE root_instance_id=?)",[&replacement.root_instance_id],|row|row.get(0)).map_err(failure)?;
+    if participant {
+        return Err(failure("effect journal requires a joint native commit"));
+    }
     crate::checkpoint::verify_sqlite_schema(transaction, mode).map_err(failure)?;
     let current = crate::checkpoint::load_sqlite_record(transaction, &replacement.root_instance_id)
         .map_err(failure)?;
