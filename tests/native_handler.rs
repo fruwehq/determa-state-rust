@@ -4540,7 +4540,334 @@ fn real_sigkill_dispatch_preserves_uncertain_starts_and_recorded_outcomes_withou
                 .admit_recorded_result("root", "result-1", effect_id, &effect_guard(&before.0))
                 .is_err());
             assert_eq!(native_snapshot(&path), before);
+            let recovery = host
+                .recover_expired_claim(
+                    "root",
+                    "recover-expired",
+                    effect_id,
+                    &effect_guard(&before.0),
+                )
+                .unwrap();
+            assert_eq!(recovery["body"]["claim"]["state"], "expired");
+            let recovered = native_snapshot(&path);
+            assert_eq!(recovered.0, before.0);
+            assert_eq!(
+                recovered.1["journal"]["effect_records"][0]["invocation_state"],
+                "ambiguous"
+            );
+            assert_eq!(
+                recovered.1["journal"]["effect_records"][0]["attempt_fence"],
+                "1"
+            );
+            assert_eq!(
+                host.recover_expired_claim(
+                    "root",
+                    "recover-expired",
+                    effect_id,
+                    &effect_guard(&before.0),
+                )
+                .unwrap(),
+                recovery
+            );
+            assert_eq!(native_snapshot(&path), recovered);
+            assert!(host
+                .dispatch_claimed("root", effect_id, b"private-native-credential", b"secret")
+                .is_err());
         }
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn owner_expiry_recovery_retains_fence_and_denies_worker_writes_without_retry_permission() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let authority = effect_worker_authority(&path);
+    let host = effect_host(&path, effect_resolver(&bundle), &fixture)
+        .with_worker_authority(authority.clone());
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let initial = native_snapshot(&path);
+    let effect_id = initial.1["journal"]["effect_records"][0]["effect_id"]
+        .as_str()
+        .unwrap();
+    host.claim(
+        "root",
+        "claim-1",
+        &determa_state::authority::NativeEffectClaimRequest {
+            effect_id: effect_id.into(),
+        },
+        b"private-native-credential",
+    )
+    .unwrap();
+    let leased = native_snapshot(&path);
+    assert!(host
+        .recover_expired_claim("root", "recover-1", effect_id, &effect_guard(&leased.0))
+        .is_err());
+    assert_eq!(native_snapshot(&path), leased);
+    authority.now.store(20, Ordering::SeqCst);
+    let mut stale_guard = effect_guard(&leased.0);
+    stale_guard.expected_revision = "999".into();
+    assert!(host
+        .recover_expired_claim("root", "recover-1", effect_id, &stale_guard)
+        .is_err());
+    assert_eq!(native_snapshot(&path), leased);
+    // Owner recovery does not use or revive the expired worker's credential.
+    authority.authorized.store(false, Ordering::SeqCst);
+    fixture.destination.healthy.store(false, Ordering::SeqCst);
+    let reply = host
+        .recover_expired_claim("root", "recover-1", effect_id, &effect_guard(&leased.0))
+        .unwrap();
+    assert_eq!(reply["body"]["claim"]["state"], "expired");
+    let recovered = native_snapshot(&path);
+    assert_eq!(recovered.0, leased.0);
+    let record = &recovered.1["journal"]["effect_records"][0];
+    assert_eq!(record["invocation_state"], "ambiguous");
+    assert_eq!(record["attempt_fence"], "1");
+    assert!(record["outcome"].is_null());
+    authority.authorized.store(true, Ordering::SeqCst);
+    authority.now.store(10, Ordering::SeqCst);
+    assert!(host
+        .dispatch_claimed("root", effect_id, b"private-native-credential", b"secret")
+        .is_err());
+    assert!(host
+        .claim(
+            "root",
+            "retry-1",
+            &determa_state::authority::NativeEffectClaimRequest {
+                effect_id: effect_id.into()
+            },
+            b"private-native-credential"
+        )
+        .is_err());
+    let report = json!({"effect_id":effect_id,"operation_token":record["operation_token"],"attempt_fence":"1","outcome_kind":"succeeded","payload":["map",[]]});
+    assert!(host
+        .record_result("root", "late-result", &report, b"private-native-credential")
+        .is_err());
+    assert_eq!(
+        host.recover_expired_claim("root", "recover-1", effect_id, &stale_guard)
+            .unwrap(),
+        reply
+    );
+    assert_eq!(native_snapshot(&path), recovered);
+    assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn expiry_recovery_final_clock_failure_or_regression_rolls_back_all_native_evidence() {
+    for fail_clock in [true, false] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let fixture = Fixture::new();
+        let bundle = effect_bundle();
+        let authority = effect_worker_authority(&path);
+        let host = effect_host(&path, effect_resolver(&bundle), &fixture)
+            .with_worker_authority(authority.clone());
+        host.setup_schema().unwrap();
+        host.allocate_scope().unwrap();
+        host.create(
+            &bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default(),
+        )
+        .unwrap();
+        let initial = native_snapshot(&path);
+        let effect_id = initial.1["journal"]["effect_records"][0]["effect_id"]
+            .as_str()
+            .unwrap();
+        host.claim(
+            "root",
+            "claim-1",
+            &determa_state::authority::NativeEffectClaimRequest {
+                effect_id: effect_id.into(),
+            },
+            b"private-native-credential",
+        )
+        .unwrap();
+        let before = native_snapshot(&path);
+        authority.now.store(20, Ordering::SeqCst);
+        let next = authority.clone();
+        *authority.time_probe.lock().unwrap() = Some(Arc::new(move || {
+            let final_authority = next.clone();
+            *next.time_probe.lock().unwrap() = Some(Arc::new(move || {
+                if fail_clock {
+                    final_authority.fail_clock.store(true, Ordering::SeqCst);
+                } else {
+                    final_authority.now.store(19, Ordering::SeqCst);
+                }
+            }));
+        }));
+        assert!(host
+            .recover_expired_claim("root", "recover-1", effect_id, &effect_guard(&before.0))
+            .is_err());
+        assert_eq!(native_snapshot(&path), before);
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(all(feature = "sqlite", unix))]
+#[test]
+fn native_expiry_recovery_crash_child() {
+    let Some(cut) = std::env::var_os("DETERMA_NATIVE_EXPIRY_TEST_CUT") else {
+        return;
+    };
+    let path =
+        std::path::PathBuf::from(std::env::var_os("DETERMA_NATIVE_EXPIRY_TEST_PATH").unwrap());
+    let marker =
+        std::path::PathBuf::from(std::env::var_os("DETERMA_NATIVE_EXPIRY_TEST_MARKER").unwrap());
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let authority = effect_worker_authority(&path);
+    let host = effect_host(&path, effect_resolver(&bundle), &fixture)
+        .with_worker_authority(authority.clone());
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let initial = native_snapshot(&path);
+    let effect_id = initial.1["journal"]["effect_records"][0]["effect_id"]
+        .as_str()
+        .unwrap();
+    host.claim(
+        "root",
+        "claim-1",
+        &determa_state::authority::NativeEffectClaimRequest {
+            effect_id: effect_id.into(),
+        },
+        b"private-native-credential",
+    )
+    .unwrap();
+    authority.now.store(20, Ordering::SeqCst);
+    if cut == "staged" {
+        let next = authority.clone();
+        let staged_marker = marker.clone();
+        *authority.time_probe.lock().unwrap() = Some(Arc::new(move || {
+            let marker = staged_marker.clone();
+            let path = next.path.clone();
+            *next.time_probe.lock().unwrap() = Some(Arc::new(move || {
+                // The final clock callback runs after all native SQL staging.
+                // Prove writer exclusion from another actual connection before
+                // publishing the cut that the parent will kill.
+                let connection = rusqlite::Connection::open(&path).unwrap();
+                connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+                assert!(matches!(
+                    connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK"),
+                    Err(rusqlite::Error::SqliteFailure(error, _))
+                        if matches!(error.code,
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ));
+                publish_admission_cut_marker(&marker, b"native expiry recovery staged");
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }));
+        }));
+    } else {
+        assert_eq!(cut, "committed");
+    }
+    let before = native_snapshot(&path);
+    let reply = host
+        .recover_expired_claim("root", "recover-1", effect_id, &effect_guard(&before.0))
+        .unwrap();
+    publish_admission_cut_marker(&marker, &serde_json::to_vec(&reply).unwrap());
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+#[cfg(all(feature = "sqlite", unix))]
+#[test]
+fn real_sigkill_expiry_recovery_preserves_fate_before_and_after_atomic_commit() {
+    use std::os::unix::process::ExitStatusExt;
+    for cut in ["staged", "committed"] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let marker = directory.path().join("expiry-cut.json");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_expiry_recovery_crash_child",
+                "--nocapture",
+            ])
+            .env("DETERMA_NATIVE_EXPIRY_TEST_CUT", cut)
+            .env("DETERMA_NATIVE_EXPIRY_TEST_PATH", &path)
+            .env("DETERMA_NATIVE_EXPIRY_TEST_MARKER", &marker)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let reached = marker.exists();
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        assert!(reached, "native expiry {cut} cut not reached");
+        assert_eq!(status.signal(), Some(9));
+        let before = native_snapshot(&path);
+        assert_eq!(before.0["revision"], "0");
+        assert_eq!(
+            before.2["scope_generation"],
+            if cut == "committed" { "3" } else { "2" }
+        );
+        let record = &before.1["journal"]["effect_records"][0];
+        assert_eq!(record["attempt_fence"], "1");
+        assert_eq!(
+            record["invocation_state"],
+            if cut == "committed" {
+                "ambiguous"
+            } else {
+                "leased"
+            }
+        );
+        assert_eq!(
+            record["attempt_records"].as_array().unwrap().len(),
+            usize::from(cut == "committed")
+        );
+        let fixture = Fixture::new();
+        let bundle = effect_bundle();
+        let authority = effect_worker_authority(&path);
+        authority.now.store(20, Ordering::SeqCst);
+        let host = effect_host(&path, effect_resolver(&bundle), &fixture)
+            .with_worker_authority(authority.clone());
+        let effect_id = record["effect_id"].as_str().unwrap();
+        let reply = host
+            .recover_expired_claim("root", "recover-1", effect_id, &effect_guard(&before.0))
+            .unwrap();
+        if cut == "committed" {
+            assert_eq!(
+                reply,
+                serde_json::from_slice::<Value>(&std::fs::read(&marker).unwrap()).unwrap()
+            );
+        }
+        let recovered = native_snapshot(&path);
+        authority.fail_clock.store(true, Ordering::SeqCst);
+        assert_eq!(
+            host.recover_expired_claim("root", "recover-1", effect_id, &effect_guard(&before.0))
+                .unwrap(),
+            reply
+        );
+        assert_eq!(native_snapshot(&path), recovered);
         assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
     }
 }

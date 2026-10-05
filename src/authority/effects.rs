@@ -1012,6 +1012,71 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         self.record_result(root, &report_id, &result, worker_credential)
     }
 
+    /// Owner-local retirement of an expired claim, preserving unknown provider fate.
+    /// This does not issue retry permission or invoke the native handler.
+    pub fn recover_expired_claim(
+        &self,
+        root: &str,
+        operation_id: &str,
+        effect_id: &str,
+        guard: &checkpoint::MutationGuard,
+    ) -> Result<Value, AuthorityError> {
+        if operation_id.is_empty() {
+            return Err(failure("native recovery identity absent"));
+        }
+        let original = json!({"operation_kind":"effect_expiry_recovery",
+            "root_instance_id":root,"effect_id":effect_id});
+        if let Some(saved) = self
+            .store
+            .native_effect_replay(root, operation_id, &original)
+            .map_err(failure)?
+        {
+            return Ok(saved);
+        }
+        let authority = self
+            .worker_authority
+            .as_ref()
+            .ok_or_else(|| failure("native trusted clock absent"))?;
+        let observed_now = authority.trusted_now().map_err(failure)?;
+        let (checkpoint, mut document) =
+            self.store.native_effect_snapshot(root).map_err(failure)?;
+        if checkpoint.revision() != guard.expected_revision
+            || checkpoint.digest() != guard.expected_checkpoint_digest
+        {
+            return Err(failure("checkpoint_revision_conflict"));
+        }
+        let prior = document.clone();
+        let record = document["journal"]["effect_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["effect_id"] == effect_id)
+            .ok_or_else(|| failure("effect_not_outstanding"))?;
+        let claim = current_native_effect_claim(&document, record)?.clone();
+        let expiry = canonical_native_time(&claim["expires_at"])?;
+        if observed_now < expiry {
+            return Err(failure("native claim has not expired"));
+        }
+        let response = expire_native_effect_claim(&mut document, effect_id, &claim, observed_now)?;
+        retain_native_effect_response(&mut document, operation_id, &original, &response)?;
+        self.store
+            .update_native_effect_checkpoint_with_final_guard(
+                &checkpoint,
+                &prior,
+                &checkpoint,
+                &document,
+                || Ok(()),
+                || {
+                    if authority.trusted_now().map_err(failure)? < observed_now {
+                        return Err(failure("native recovery clock regressed"));
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(failure)?;
+        Ok(response)
+    }
+
     /// Owner-authorized recovery of a retained terminal outcome. This operation
     /// never invokes a provider or requires the expired original worker claim.
     pub fn admit_recorded_result(
@@ -1232,6 +1297,40 @@ pub(super) fn current_native_effect_claim<'a>(
         return Err(failure("stale_attempt_fence"));
     }
     Ok(claim)
+}
+
+pub(super) fn expire_native_effect_claim(
+    document: &mut Value,
+    effect_id: &str,
+    claim: &Value,
+    observed_now: i64,
+) -> Result<Value, AuthorityError> {
+    let record = document["journal"]["effect_records"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|record| record["effect_id"] == effect_id)
+        .ok_or_else(|| failure("effect_not_outstanding"))?;
+    if record["invocation_state"] != "leased"
+        || claim["work_identity"] != effect_id
+        || claim["attempt_fence"] != record["attempt_fence"]
+        || claim["operation_token"] != record["operation_token"]
+        || observed_now < canonical_native_time(&claim["expires_at"])?
+    {
+        return Err(failure(
+            "native expiry recovery requires expired current claim",
+        ));
+    }
+    let report = json!({"effect_id":effect_id,"operation_token":record["operation_token"],
+        "attempt_fence":record["attempt_fence"],"outcome_kind":"ambiguous","payload":["map",[]]});
+    record_native_effect_report(record, &report)?;
+    let mut expired = claim.clone();
+    expired["state"] = json!("expired");
+    Ok(
+        json!({"kind":"effect_expiry_recovery","body":{"claim":expired,
+        "trusted_now":observed_now.to_string(),
+        "attempt_report":record["attempt_records"].as_array().unwrap().last().unwrap()}}),
+    )
 }
 
 pub(super) fn record_native_effect_report(

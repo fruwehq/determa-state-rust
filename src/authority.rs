@@ -1156,6 +1156,16 @@ fn validate_native_effect_transition(
     let request = requests
         .get(id)
         .ok_or_else(|| failure("new native request absent"))?;
+    if request["operation_kind"] == "effect_expiry_recovery" {
+        return validate_native_effect_expiry_transition(
+            prior,
+            prior_checkpoint,
+            document,
+            checkpoint,
+            request,
+            body,
+        );
+    }
     if request["operation_kind"] == "effect_invocation_start" {
         return validate_native_effect_start_transition(
             prior,
@@ -1763,6 +1773,51 @@ fn validate_native_effect_result_admission_transition(
         return Err(failure(
             "native result admission changed unrelated evidence",
         ));
+    }
+    Ok(())
+}
+
+fn validate_native_effect_expiry_transition(
+    prior: &Value,
+    prior_checkpoint: &Value,
+    document: &Value,
+    checkpoint: &Value,
+    request: &Value,
+    body: &Value,
+) -> Result<(), AuthorityError> {
+    if checkpoint != prior_checkpoint
+        || !closed(
+            request,
+            &["operation_kind", "root_instance_id", "effect_id"],
+        )
+        || request["root_instance_id"] != checkpoint["root_instance_id"]
+        || !closed(body, &["kind", "body"])
+        || body["kind"] != "effect_expiry_recovery"
+        || !closed(&body["body"], &["claim", "trusted_now", "attempt_report"])
+    {
+        return Err(failure("native expiry recovery identity mismatch"));
+    }
+    let record = prior["journal"]["effect_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["effect_id"] == request["effect_id"])
+        .ok_or_else(|| failure("effect_not_outstanding"))?;
+    let claim = effects::current_native_effect_claim(prior, record)?.clone();
+    let now = effects::canonical_native_time(&body["body"]["trusted_now"])?;
+    let mut expected = prior.clone();
+    let expected_body = effects::expire_native_effect_claim(
+        &mut expected,
+        request["effect_id"]
+            .as_str()
+            .ok_or_else(|| failure("native effect identity absent"))?,
+        &claim,
+        now,
+    )?;
+    if expected_body != *body
+        || expected["journal"]["effect_records"] != document["journal"]["effect_records"]
+    {
+        return Err(failure("native expiry recovery changed unrelated evidence"));
     }
     Ok(())
 }
