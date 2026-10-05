@@ -1,8 +1,8 @@
 //! Optional synchronous host for portable execution checkpoints.
 //!
 //! This module wraps the pure format-1 operations without changing their API or
-//! semantics. Stores are injected directly as trait objects or resolved through
-//! an explicitly populated public registry.
+//! semantics. Stores are injected directly for weak operations or configured
+//! through the public extension registry for verified durable operations.
 
 mod adapters;
 mod host;
@@ -11,7 +11,7 @@ mod types;
 mod v1;
 
 pub use adapters::{
-    register_bundled_adapters, FileExecutionStore, FileExecutionStoreFactory, MemoryExecutionStore,
+    FileExecutionStore, FileExecutionStoreFactory, MemoryExecutionStore,
     MemoryExecutionStoreFactory,
 };
 #[cfg(feature = "postgresql")]
@@ -19,9 +19,8 @@ pub use adapters::{PostgresqlExecutionStore, PostgresqlExecutionStoreFactory};
 #[cfg(feature = "sqlite")]
 pub use adapters::{SqliteExecutionStore, SqliteExecutionStoreFactory};
 pub use host::{
-    execute_adapter_registration, execute_adapter_resolution, CheckpointHost,
-    DurableCheckpointOperation, HostFailure, HostFailureCode, MaintenanceMigrationRequest,
-    MutationGuard,
+    CheckpointHost, DurableCheckpointOperation, HostFailure, HostFailureCode,
+    MaintenanceMigrationRequest, MutationGuard,
 };
 #[cfg(feature = "postgresql")]
 pub use host::{
@@ -29,7 +28,7 @@ pub use host::{
     PostgresqlTransactionOutcome,
 };
 pub use store::{
-    validate_store_host_profile, AdapterError, AdapterErrorCode, AdapterRegistry, DurableStoreMode,
+    hypothetical_host_profile_matches, AdapterError, AdapterErrorCode, DurableStoreMode,
     ExecutionStore, ExecutionStoreCapability, ExecutionStoreFactory, HealthStatus, HostFeature,
     HostProfile, OutboxRetentionMode, ReceiptRetentionMode, StoreError, StoreErrorCode,
     StoreRecord, StoreWriteResult,

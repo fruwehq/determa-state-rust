@@ -211,14 +211,11 @@ fn public_step_replays_terminal_and_tombstone_evidence_before_bundle_resolution(
                 .unwrap(),
             expected
         );
-        let response = host.execute_checkpoint_operation(
-            DurableCheckpointOperation::Step {
-                root_instance_id: checkpoint.root_instance_id(),
-                request: &processing,
-                guard: &stale,
-            },
-            false,
-        );
+        let response = host.execute_checkpoint_operation(DurableCheckpointOperation::Step {
+            root_instance_id: checkpoint.root_instance_id(),
+            request: &processing,
+            guard: &stale,
+        });
         assert_eq!(
             response.caller_response.unwrap(),
             json!({"kind":"retained_receipt","body":expected})

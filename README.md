@@ -101,6 +101,39 @@ Input and internal envelopes are caller-owned. `admit` retains accepted work in 
 aggregate and `step` processes one ready event. External emissions are deterministic
 output intents for the host to persist and deliver.
 
+## Public extensions
+
+`extensions::ExtensionRegistry` implements the version-1 public boundary for all eleven
+extension categories. It starts empty. A host registers an exact descriptor and factory
+with `register` or directly supplies a provider with `inject`; both paths validate the
+same closed reference, category, interface version, and capability vocabulary. Host-owned
+configuration is validated before an instance opens. `capabilities`, `health`, `report`,
+`negotiate`, and `evaluate_profile` operate on that exact configured instance. Unknown
+references, changed versions or digests, unhealthy instances, and missing guarantees
+fail before the host invokes a core or checkpoint operation. URI schemes are only hints.
+
+The host installs a `HostVerifier` to bind a factory and provider to its trusted loaded
+source and dependency closure. Its operational proof checks the configured native
+instance and current topology. A verified source with no operational proof remains
+usable with an empty effective claim set. The registry combines guarantees across all
+participants and treats unresolved external I/O as a hazard that requires explicit
+weak-profile opt-in. Provider reports and configuration flags cannot supply proof.
+The common boundary does not execute guards/actions or infer authority from a store.
+
+`extensions::bundled_store_registry()` registers memory, file, and enabled SQLite and
+PostgreSQL stores through this same public path. Their executable closure digest is
+derived from compiled crate source and the lockfile, and the bundled verifier binds
+the exact private factory/provider and native store instance before reporting current
+store capabilities and health. `bundled_store_registry_with_verifier` delegates other
+installed providers to a host verifier in the same registry. A host obtains a
+`VerifiedExecutionStore` through `configure_execution_store`, initializes SQL schemas
+explicitly, and passes that binding to `CheckpointHost::from_verified` before a
+durable profile or native durable process. Third-party Rust providers implement
+`ExtensionProvider` and `ExtensionFactory`; the host supplies its trusted
+`HostVerifier` for their source and operational proofs. The generic
+registry cannot attest arbitrary installed Rust binaries by inspecting trait-object
+types or self-reported health.
+
 ## Execution-checkpoint host
 
 The host accepts an `Arc<dyn ExecutionStore>` directly. No registry, URI, or discovery
@@ -119,10 +152,13 @@ let host = CheckpointHost::new(store, resolver);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-URI resolution is opt-in and generic. A new `AdapterRegistry` is empty;
-`register_bundled_adapters` registers compiled built-ins through its public `register`
-method. Generic resolution extracts only the lowercase URI scheme. Each factory owns
-configuration validation and capability evaluation.
+The public `ExtensionRegistry` binds a provider reference, registered factory,
+configuration, native instance, current health, and host-verified capabilities.
+`bundled_store_registry` registers compiled stores through this same path. A
+directly injected `ExecutionStore` remains useful for weak operations;
+`CheckpointHost::from_verified` is required before validating a durable host
+profile or running a durable process. Hosts install their own trusted verifier
+for third-party source and operational evidence.
 
 Storage setup is explicit:
 
@@ -151,7 +187,10 @@ For shared application and checkpoint atomicity, use
 transaction for application SQL and accepts exactly one root-bound checkpoint mutation
 through `CheckpointHost::stage_postgresql_mutation`. The host uses `SERIALIZABLE`,
 rejects cross-store/cross-root handles, rolls both parts back on failure, and returns
-the committed host result only after commit succeeds. Native schema-v1 creation,
+the committed host result only after commit succeeds. An ingress acknowledgement
+result requires a source-verified transport adapter that actually acknowledges the
+committed operation and passes the host's operational proof; a Boolean argument
+cannot assert it. Native schema-v1 creation,
 admission, step, maintenance migration, pruning, outbox lifecycle, and root
 tombstone mutations use this same shared transaction API. The store's lower-level
 native transaction callback does not run host operations.

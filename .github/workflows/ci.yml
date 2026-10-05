@@ -8,8 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: 1
-  SPECIFICATION_COMMIT: 6bd25e3fcdf068af861aa289903a8489bd8f0139
-  CONFORMANCE_COMMIT: 710d5e9bcf517e8a8cc8d7087123bda37a362d6b
+  SPECIFICATION_COMMIT: 6207362e879ccca70f709e1eb4cc90448d910c0b
+  CONFORMANCE_COMMIT: e499a99c3ced88f29008049ea9dddcc17a0d9f51
 
 jobs:
   msrv:
@@ -98,6 +98,10 @@ jobs:
           cmp schema/migration-descriptor-v1.schema.json authoritative-spec/schema/migration-descriptor-v1.schema.json
           cmp schema/core-step-result-v1.schema.json authoritative-spec/schema/core-step-result-v1.schema.json
           cmp schema/execution-checkpoint-v1.schema.json authoritative-spec/schema/execution-checkpoint-v1.schema.json
+          cmp schema/provider-reference-v1.schema.json authoritative-spec/schema/provider-reference-v1.schema.json
+          cmp schema/extension-descriptor-v1.schema.json authoritative-spec/schema/extension-descriptor-v1.schema.json
+          cmp schema/extension-capability-report-v1.schema.json authoritative-spec/schema/extension-capability-report-v1.schema.json
+          cmp schema/extension-capability-requirement-v1.schema.json authoritative-spec/schema/extension-capability-requirement-v1.schema.json
           cmp schema/durable-host-call-log-v1.schema.json conformance-suite/scripts/schemas/durable-host-call-log-v1.schema.json
           cmp schema/durable-host-inputs-v1.schema.json conformance-suite/scripts/schemas/durable-host-inputs-v1.schema.json
           cmp schema/durable-host-results-v1.schema.json conformance-suite/scripts/schemas/durable-host-results-v1.schema.json
@@ -122,6 +126,12 @@ jobs:
       - name: Unit and public API tests
         run: cargo test --locked --lib --bins --test public_api --test closed_code_registry --test checkpoint_adapters
 
+      - name: Public extension negotiation vectors
+        run: |
+          cargo test --locked --test extension_conformance
+          cargo build --locked --example extension_profile_adapter
+          python3 conformance-suite/scripts/run_extension_negotiation_profile.py --spec-root authoritative-spec --adapter target/debug/examples/extension_profile_adapter
+
       - name: All 75 authoritative mailbox-neutral RTC scenarios
         env:
           RUSTFLAGS: --cfg determa_repository_conformance
@@ -133,7 +143,7 @@ jobs:
       - name: All 162 native artifact/checkpoint schema-v1 vectors
         run: cargo test --locked --test native_v1_conformance -- --nocapture
 
-      - name: All 403 declared artifact documents
+      - name: All 420 declared artifact documents
         run: cargo test --locked --test artifact_manifest -- --nocapture
 
       - name: All 142 durable-host vectors

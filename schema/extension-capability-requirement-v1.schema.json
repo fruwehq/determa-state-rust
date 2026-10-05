@@ -1,0 +1,310 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/extension-capability-requirement-v1.schema.json",
+  "title": "Exact extension capability requirement version 1",
+  "type": "object",
+  "required": [
+    "category",
+    "provider_reference",
+    "instance_id",
+    "capability"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "category": {
+      "type": "string",
+      "enum": [
+        "execution_store",
+        "projection",
+        "transport",
+        "timer",
+        "http",
+        "native_handler",
+        "compiler",
+        "runtime_provider",
+        "resolver",
+        "authority",
+        "archive_participant"
+      ]
+    },
+    "provider_reference": {
+      "type": "object",
+      "required": [
+        "identifier",
+        "version",
+        "content_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "identifier": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9.-]*$"
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+        },
+        "content_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "instance_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9.-]*$"
+    },
+    "capability": {
+      "type": "string"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "category": {
+            "const": "execution_store"
+          }
+        },
+        "required": [
+          "category"
+        ]
+      },
+      "then": {
+        "properties": {
+          "capability": {
+            "enum": [
+              "ephemeral",
+              "restart_persistent",
+              "durable_single_writer",
+              "durable_concurrent",
+              "shared_application_transaction",
+              "permanent_receipt_retention",
+              "root_identity_retention",
+              "permanent_outbox_terminal_retention",
+              "compact_effect_identity_retention"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "category": {
+            "const": "projection"
+          }
+        },
+        "required": [
+          "category"
+        ]
+      },
+      "then": {
+        "properties": {
+          "capability": {
+            "enum": [
+              "lossless_projection"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "category": {
+            "const": "transport"
+          }
+        },
+        "required": [
+          "category"
+        ]
+      },
+      "then": {
+        "properties": {
+          "capability": {
+            "enum": [
+              "durable_ingress_dead_letter",
+              "source_ordered"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "category": {
+            "const": "timer"
+          }
+        },
+        "required": [
+          "category"
+        ]
+      },
+      "then": {
+        "properties": {
+          "capability": {
+            "enum": [
+              "ephemeral_timer_helper",
+              "durable_timer_helper",
+              "independent_timer_delivery",
+              "coordinated_timer_admission"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "category": {
+            "const": "http"
+          }
+        },
+        "required": [
+          "category"
+        ]
+      },
+      "then": {
+        "properties": {
+          "capability": {
+            "enum": []
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "category": {
+            "const": "native_handler"
+          }
+        },
+        "required": [
+          "category"
+        ]
+      },
+      "then": {
+        "properties": {
+          "capability": {
+            "enum": [
+              "durable_effect_results"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "category": {
+            "const": "compiler"
+          }
+        },
+        "required": [
+          "category"
+        ]
+      },
+      "then": {
+        "properties": {
+          "capability": {
+            "enum": []
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "category": {
+            "const": "runtime_provider"
+          }
+        },
+        "required": [
+          "category"
+        ]
+      },
+      "then": {
+        "properties": {
+          "capability": {
+            "enum": [
+              "deterministic",
+              "pure",
+              "portable",
+              "semantically_introspectable",
+              "process_contained",
+              "external_io_capable"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "category": {
+            "const": "resolver"
+          }
+        },
+        "required": [
+          "category"
+        ]
+      },
+      "then": {
+        "properties": {
+          "capability": {
+            "enum": []
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "category": {
+            "const": "authority"
+          }
+        },
+        "required": [
+          "category"
+        ]
+      },
+      "then": {
+        "properties": {
+          "capability": {
+            "enum": [
+              "authoritative_scope_fencing",
+              "consistent_scope_inventory",
+              "safe_relocation"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "category": {
+            "const": "archive_participant"
+          }
+        },
+        "required": [
+          "category"
+        ]
+      },
+      "then": {
+        "properties": {
+          "capability": {
+            "enum": [
+              "portable_export",
+              "portable_import",
+              "exact_reconstruction",
+              "consistent_archive_capture"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

@@ -9,6 +9,7 @@
 
 pub mod checkpoint;
 pub mod cli;
+pub mod extensions;
 pub mod format1;
 pub mod value;
 

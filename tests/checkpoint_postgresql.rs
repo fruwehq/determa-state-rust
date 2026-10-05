@@ -6,6 +6,7 @@ use determa_state::checkpoint::{
     PostgresqlHostMutationResult, ProcessingRequest, PruneRequest, StoreError,
     TerminalOutboxOutcome, TransactionalProcessRequest,
 };
+use determa_state::extensions::bundled_store_registry;
 use determa_state::{
     load_bundle, Bindings, InMemoryDefinitionResolver, MigrationRequest, ResourceLimits,
 };
@@ -72,7 +73,18 @@ machines:
     resolver.insert(outbox_bundle.clone(), true);
     resolver.insert(terminal_bundle.clone(), true);
     let store: Arc<dyn ExecutionStore> = concrete.clone();
-    let host = CheckpointHost::new(store.clone(), Arc::new(resolver));
+    let registry = Arc::new(bundled_store_registry().unwrap());
+    let descriptor = registry
+        .descriptors()
+        .unwrap()
+        .into_iter()
+        .find(|item| item["provider_reference"]["identifier"] == "determa.postgresql")
+        .unwrap();
+    let configuration = json!({"instance_id":"native-v1", "uri":format!("{url}#receipt_retention=bounded&outbox_retention=bounded&tls=no_tls")});
+    let verified = registry
+        .configure_execution_store(&descriptor, &configuration)
+        .unwrap();
+    let host = CheckpointHost::from_verified(verified, Arc::new(resolver));
     let bindings = Bindings::default();
     let retention = retention();
 

@@ -2,6 +2,7 @@
 name = "determa-state"
 version = "0.3.0"
 edition = "2021"
+build = "build.rs"
 rust-version = "1.86"
 authors = ["fruwehq"]
 license = "MIT"
@@ -17,6 +18,8 @@ exclude = [
     "tests/native_v1_conformance.rs",
     "tests/closed_code_registry.rs",
     "tests/checkpoint_postgresql.rs",
+    "tests/extension_conformance.rs",
+    "examples/extension_profile_adapter.rs",
     "src/format1/runtime_conformance.rs",
     ".github/",
 ]
