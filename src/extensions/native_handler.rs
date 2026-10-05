@@ -5,10 +5,13 @@
 use super::{ConfiguredExtension, ExtensionError, ExtensionErrorCode, ExtensionRegistry};
 use crate::format1::TypedValue;
 use serde_json::Value;
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 /// Host-owned metadata borrowed unchanged for one invocation. Credentials stay
-/// native and cannot enter typed payloads, checkpoint bytes or journal digests.
+/// outside typed payloads, checkpoint bytes and journal digests. Credential bytes
+/// cannot carry a downcastable host transaction; construct SDK objects internally.
+/// Trusted installation must also exclude captured host mutation capabilities;
+/// an in-process native handler is not isolated by this interface alone.
 pub struct NativeHandlerMetadata<'a> {
     pub scope_identity: &'a str,
     pub effect_id: &'a str,
@@ -16,7 +19,7 @@ pub struct NativeHandlerMetadata<'a> {
     pub destination_binding_digest: &'a str,
     pub route_configuration_generation: &'a str,
     pub handler_reference: &'a Value,
-    pub credential: &'a (dyn Any + Send + Sync),
+    pub credential: &'a [u8],
 }
 
 pub struct NativeHandlerAttempt<'a> {

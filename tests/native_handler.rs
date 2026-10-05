@@ -41,10 +41,10 @@ impl NativeHandler for Destination {
         metadata: &NativeHandlerMetadata<'_>,
         attempt: &NativeHandlerAttempt<'_>,
     ) -> Result<NativeHandlerReport, ExtensionError> {
-        assert_eq!(
-            metadata.credential.downcast_ref::<String>().unwrap(),
-            "secret"
-        );
+        struct SdkCredential(String);
+        let sdk_credential =
+            SdkCredential(String::from_utf8(metadata.credential.to_vec()).unwrap());
+        assert_eq!(sdk_credential.0, "secret");
         self.calls.fetch_add(1, Ordering::SeqCst);
         // Native SDK state is kept inside this method. Only typed portable output
         // and independent retained destination receipts leave the native boundary.
@@ -219,7 +219,7 @@ impl Fixture {
                 destination_binding_digest: &hash('b'),
                 route_configuration_generation: "7",
                 handler_reference: &descriptor()["provider_reference"],
-                credential: &"secret".to_owned(),
+                credential: b"secret",
             },
             &NativeHandlerAttempt { attempt_fence: "1" },
         )
