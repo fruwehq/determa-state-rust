@@ -230,3 +230,114 @@ fn bundled_uri_selection_uses_the_same_public_registry_and_native_memory_claim()
         AdapterErrorCode::AdapterCapabilityMismatch
     );
 }
+
+#[derive(Default)]
+struct ObservedRoots {
+    inner: MemoryExecutionStore,
+    accesses: AtomicUsize,
+}
+impl ExecutionStore for ObservedRoots {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn capabilities(&self) -> BTreeSet<ExecutionStoreCapability> {
+        self.inner.capabilities()
+    }
+    fn initialize_schema(&self) -> Result<(), determa_state::checkpoint::StoreError> {
+        self.inner.initialize_schema()
+    }
+    fn health(
+        &self,
+    ) -> Result<determa_state::checkpoint::HealthStatus, determa_state::checkpoint::StoreError>
+    {
+        self.inner.health()
+    }
+    fn load(
+        &self,
+        root: &str,
+    ) -> Result<Option<determa_state::checkpoint::StoreRecord>, determa_state::checkpoint::StoreError>
+    {
+        self.accesses.fetch_add(1, Ordering::SeqCst);
+        self.inner.load(root)
+    }
+    fn insert_if_absent(
+        &self,
+        record: determa_state::checkpoint::StoreRecord,
+    ) -> Result<determa_state::checkpoint::StoreWriteResult, determa_state::checkpoint::StoreError>
+    {
+        self.accesses.fetch_add(1, Ordering::SeqCst);
+        self.inner.insert_if_absent(record)
+    }
+    fn compare_and_swap(
+        &self,
+        root: &str,
+        revision: &str,
+        digest: &str,
+        record: determa_state::checkpoint::StoreRecord,
+    ) -> Result<determa_state::checkpoint::StoreWriteResult, determa_state::checkpoint::StoreError>
+    {
+        self.accesses.fetch_add(1, Ordering::SeqCst);
+        self.inner.compare_and_swap(root, revision, digest, record)
+    }
+}
+
+#[test]
+fn substituted_factory_and_copied_claims_fail_before_observed_root_access() {
+    use determa_state::checkpoint::{CheckpointHost, HostProfile};
+    let descriptor = json!({"category":"execution_store","provider_reference":{"identifier":"test.observed-memory","version":"1.0.0","content_digest":format!("sha256:{}", "a".repeat(64))},"interface_version":1,"supported_capabilities":["ephemeral","durable_concurrent"]});
+    let observed = Arc::new(ObservedRoots::default());
+    observed.load("observer-self-check").unwrap();
+    assert_eq!(observed.accesses.swap(0, Ordering::SeqCst), 1);
+    let store: Arc<dyn ExecutionStore> = observed.clone();
+    let provider: Arc<dyn ExtensionProvider> = Arc::new(Provider {
+        descriptor: descriptor.clone(),
+        store: store.clone(),
+        healthy: Arc::new(AtomicBool::new(true)),
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factory: Arc<dyn ExtensionFactory> = Arc::new(Factory(provider.clone(), calls.clone()));
+    let verifier = Arc::new(Verifier {
+        factory: factory.clone(),
+        provider: provider.clone(),
+        store,
+    });
+    let wrong_factory: Arc<dyn ExtensionFactory> = Arc::new(Factory(provider, calls.clone()));
+    let untrusted = Arc::new(ExtensionRegistry::with_verifier(verifier.clone()));
+    untrusted
+        .register(descriptor.clone(), wrong_factory)
+        .unwrap();
+    // Identical descriptor and digest do not identify the trusted compiled factory.
+    assert!(untrusted
+        .configure_execution_store(&descriptor, &json!({"instance_id":"native-memory"}))
+        .is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(observed.accesses.load(Ordering::SeqCst), 0);
+
+    let registry = Arc::new(ExtensionRegistry::with_verifier(verifier));
+    registry.register(descriptor.clone(), factory).unwrap();
+    let binding = registry
+        .configure_execution_store(&descriptor, &json!({"instance_id":"native-memory"}))
+        .unwrap();
+    let host = CheckpointHost::from_verified(
+        binding,
+        Arc::new(determa_state::InMemoryDefinitionResolver::default()),
+    );
+    for caller_claims in [
+        vec!["durable_concurrent".into()],
+        vec!["verified".into(), "trusted".into()],
+    ] {
+        let returned = host.validate_capabilities_contract(
+            "observed-memory",
+            HostProfile::ExactlyOnceCommittedProcessing,
+            &BTreeSet::new(),
+            &caller_claims,
+            &[],
+            true,
+        );
+        assert_eq!(
+            returned.result.code.as_deref(),
+            Some("adapter_capability_mismatch")
+        );
+        assert_eq!(observed.accesses.load(Ordering::SeqCst), 0);
+    }
+}
