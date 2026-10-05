@@ -3,8 +3,8 @@
 mod provider;
 use determa_state::format1::providers::{ProviderResult, RuntimeProviderRegistry, SourceClosure};
 use determa_state::{
-    admit, create, load_bundle_with_providers, restore_aggregate, step, AdmissionDelivery,
-    ArtifactError, Bindings, InMemoryDefinitionResolver,
+    admit, create, inspect_candidate, load_bundle_with_providers, restore_aggregate, step,
+    AdmissionDelivery, ArtifactError, Bindings, InMemoryDefinitionResolver, InspectionCapabilities,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -192,6 +192,33 @@ fn state(aggregate: &Value) -> Value {
         "deferred_mailbox_length":root["deferred_mailbox"].as_array().unwrap().len(),
         "output_count":aggregate["next_output_sequence"].as_str().unwrap().parse::<u64>().unwrap()})
 }
+fn component_states(aggregate: &Value) -> Value {
+    let mut result = json!({});
+    for runtime in aggregate["runtimes"].as_array().unwrap() {
+        if let Some(id) = runtime["target_identity"]["component"]["component_id"].as_str() {
+            let mut child = aggregate.clone();
+            child["root_runtime_id"] = runtime["runtime_id"].clone();
+            let mut observed = state(&child);
+            observed.as_object_mut().unwrap().remove("active_leaf");
+            observed.as_object_mut().unwrap().remove("output_count");
+            result[id] = observed;
+        }
+    }
+    result
+}
+fn component<'a>(aggregate: &'a Value, id: &str) -> &'a Value {
+    aggregate["runtimes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|runtime| runtime["target_identity"]["component"]["component_id"] == id)
+        .unwrap()
+}
+fn child_variables(aggregate: &Value, child: &Value) -> Value {
+    let mut projected = aggregate.clone();
+    projected["root_runtime_id"] = child["runtime_id"].clone();
+    state(&projected)["variables"].clone()
+}
 pub fn observe_runtime_profile(payload: &Value) -> Value {
     let request = &payload["request"];
     let root = Path::new(payload["profile_root"].as_str().unwrap());
@@ -207,7 +234,14 @@ pub fn observe_runtime_profile(payload: &Value) -> Value {
     let mut observation = empty();
     let mut loaded = json!({});
     let result = (|| -> ProviderResult<()> {
-        stage(&mut observation, "resolve_closure");
+        stage(
+            &mut observation,
+            if request["operation"] == "restore" {
+                "resolve_runtime_closure"
+            } else {
+                "resolve_closure"
+            },
+        );
         let source = std::fs::read_to_string(root.join(request["bundle"].as_str().unwrap()))
             .map_err(|_| unavailable())?;
         let document: Value = serde_yaml::from_str(&source).map_err(|_| unavailable())?;
@@ -252,7 +286,30 @@ pub fn observe_runtime_profile(payload: &Value) -> Value {
             observation["result"] = json!("accepted");
             return Ok(());
         }
-        if request["operation"] != "step" {
+        if request["operation"] == "restore" {
+            if bundle.fingerprint
+                != request["arguments"]["definition_fingerprint"]
+                    .as_str()
+                    .unwrap()
+            {
+                return Err(unavailable());
+            }
+            let aggregate = create(
+                &bundle,
+                document["machines"][0]["machine_id"].as_str().unwrap(),
+                "restore-root",
+                "restore-create",
+                &Bindings::default(),
+            )?;
+            let mut resolver = InMemoryDefinitionResolver::default();
+            resolver.insert(bundle.clone(), true);
+            restore_aggregate(&aggregate.canonical_bytes()?, &resolver)?;
+            stage(&mut observation, "restore");
+            observation["result"] = json!("accepted");
+            counts(&mut observation, &providers);
+            return Ok(());
+        }
+        if request["operation"] != "step" && request["operation"] != "inspect" {
             return Err(ArtifactError::new(
                 "runtime_adapter_operation_unfinished",
                 "remaining draft driver operation",
@@ -268,6 +325,65 @@ pub fn observe_runtime_profile(payload: &Value) -> Value {
             &Bindings::default(),
         )?;
         stage(&mut observation, "create");
+        if request["operation"] == "inspect" {
+            observation["state_before"] = state(aggregate.value());
+            observation["state_after"] = state(aggregate.value());
+            let arguments = &request["arguments"];
+            let mode = arguments["mode"].as_str().unwrap();
+            let root_runtime = aggregate.value()["runtimes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|runtime| runtime["runtime_id"] == aggregate.value()["root_runtime_id"])
+                .unwrap();
+            let mut envelope = setup["envelope"].clone();
+            if let Some(approved) = arguments.get("approved") {
+                envelope["payload"] = json!(["map", [["approved", ["boolean", approved]]]]);
+            }
+            let inspection = json!({"mode":mode,"aggregate_state_digest":aggregate.value()["aggregate_state_digest"],
+                "runtime_id":root_runtime["runtime_id"],"runtime_incarnation":root_runtime["identity_origin"],"envelope":envelope,
+                "limits":if mode == "structural" { Value::Null } else { json!({"maximum_guard_evaluations":arguments["maximum_guard_evaluations"].as_u64().unwrap().to_string(),
+                "maximum_evaluation_steps":arguments["maximum_evaluation_steps"].as_u64().unwrap().to_string()}) }});
+            let mut resolver = InMemoryDefinitionResolver::default();
+            resolver.insert(bundle.clone(), true);
+            stage(
+                &mut observation,
+                if mode == "semantic" {
+                    "preflight_inspection"
+                } else {
+                    "structural_inspection"
+                },
+            );
+            let outcome = inspect_candidate(
+                &aggregate,
+                &inspection,
+                &resolver,
+                InspectionCapabilities::default(),
+            )?;
+            let invocations: usize = providers
+                .iter()
+                .map(|provider| {
+                    provider
+                        .inspections
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                })
+                .sum();
+            observation["calls"]["inspect_guard"] = json!(invocations);
+            if invocations > 0 {
+                stage(&mut observation, "invoke_inspect_guard");
+            }
+            if let Some(code) = outcome.get("code") {
+                observation["code"] = code.clone();
+            } else {
+                observation["result"] = json!("accepted");
+                observation["value"] = json!({"classification":outcome["classification"]});
+                if mode == "semantic" {
+                    observation["value"]["disposition"] = outcome["disposition"].clone();
+                    observation["value"]["fuel"] = arguments["maximum_evaluation_steps"].clone();
+                }
+            }
+            return Ok(());
+        }
         let envelope: determa_state::QueueEnvelope =
             serde_json::from_value(setup["envelope"].clone()).unwrap();
         let delivery = AdmissionDelivery {
@@ -312,8 +428,19 @@ pub fn observe_runtime_profile(payload: &Value) -> Value {
             observation["result"] = json!("faulted");
             observation["code"] = processed["fault"]["code"].clone();
             observation["state_after"] = observation["state_before"].clone();
-            if request["arguments"]["invalid_output"] == true {
+            if request["arguments"].get("environment_send").is_some() {
+                observation["value"] = json!({"source_locator":processed["fault"]["source_locator"],
+                    "component_states_before":component_states(aggregate.value()),
+                    "component_states_after":component_states(&processed["state"])});
+            }
+            if request["arguments"]["invalid_output"] == true
+                || request["arguments"]["destroyed_write"] == true
+            {
                 observation["value"] = json!({"boundary_code":"runtime_provider_output_invalid"});
+                if request["arguments"]["destroyed_write"] == true {
+                    observation["value"]["source_locator"] =
+                        processed["fault"]["source_locator"].clone();
+                }
             }
         } else {
             stage(&mut observation, "commit");
@@ -324,8 +451,66 @@ pub fn observe_runtime_profile(payload: &Value) -> Value {
                 processed["disposition"].clone()
             };
             observation["state_after"] = state(&processed["state"]);
-            observation["value"] = json!({"emissions":processed["emissions"].as_array().unwrap().len(),
-                "accepted":observation["state_after"]["variables"]["accepted"]});
+            observation["value"] =
+                json!({"emissions":processed["emissions"].as_array().unwrap().len()});
+            if let Some(accepted) = observation["state_after"]["variables"]
+                .get("accepted")
+                .cloned()
+            {
+                observation["value"]["accepted"] = accepted;
+            }
+            if observation["state_after"]["status"] == "completed" {
+                observation["value"]["status"] = json!("completed");
+                observation["value"]["exit_correlation"] =
+                    processed["emissions"].as_array().unwrap().last().unwrap()["correlation_id"]
+                        .clone();
+            }
+            if request["arguments"].get("environment_send").is_some() {
+                let before = component(aggregate.value(), "replica");
+                let after = component(&processed["state"], "replica");
+                let internal = processed["emissions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["kind"] == "internal_mailbox")
+                    .unwrap();
+                let envelope = &after["ready_mailbox"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["envelope"]["event_id"] == internal["event_id"])
+                    .unwrap()["envelope"];
+                observation["value"]["forwarded_event"] = json!({"event":envelope["event"],"payload":envelope["payload"],"component_id":"replica"});
+                observation["value"]["component_variables_before"] =
+                    child_variables(aggregate.value(), before);
+                observation["value"]["component_ready_before_delivery"] =
+                    json!(after["ready_mailbox"].as_array().unwrap().len());
+                let owner_result = restore_aggregate(
+                    &serde_json_canonicalizer::to_vec(&processed["state"]).unwrap(),
+                    &resolver,
+                )?;
+                let delivered = step(
+                    &bundle,
+                    &owner_result,
+                    after["runtime_id"].as_str().unwrap(),
+                )?;
+                stage(&mut observation, "deliver_env");
+                let refreshed = component(&delivered["state"], "replica");
+                observation["value"]["component_variables_after"] =
+                    child_variables(&delivered["state"], refreshed);
+                observation["value"]["component_ready_after_delivery"] =
+                    json!(refreshed["ready_mailbox"].as_array().unwrap().len());
+            }
+            if request["arguments"]["capture_snapshot"] == true {
+                for provider in &providers {
+                    let captured = provider.observation();
+                    for key in ["guard_snapshot", "action_snapshot"] {
+                        if !captured[key].is_null() {
+                            observation["value"][key] = captured[key].clone();
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     })();
@@ -350,7 +535,7 @@ fn delivery_digest(root: &str, envelope: &determa_state::QueueEnvelope) -> Strin
 }
 
 #[test]
-fn production_driver_load_and_basic_step_vectors() {
+fn production_driver_runtime_operation_vectors() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("conformance-suite/conformance/profiles/runtime-provider/provider-01-exact-source");
     let manifest: Value =
@@ -360,18 +545,13 @@ fn production_driver_load_and_basic_step_vectors() {
     for vector in manifest["vectors"].as_array().unwrap() {
         let request = &vector["request"];
         let args = &request["arguments"];
-        let selected = request["operation"] == "load"
+        let selected = ["load", "inspect", "restore"]
+            .iter()
+            .any(|operation| request["operation"] == *operation)
             || request["operation"] == "step"
-                && request["bundle"] == "machine.yaml"
-                && [
-                    "repeat_send",
-                    "mixed_send",
-                    "destroyed_write",
-                    "capture_snapshot",
-                    "environment_send",
-                ]
-                .iter()
-                .all(|key| args.get(key).is_none());
+                && ["repeat_send", "mixed_send"]
+                    .iter()
+                    .all(|key| args.get(key).is_none());
         if !selected {
             continue;
         }
@@ -384,5 +564,5 @@ fn production_driver_load_and_basic_step_vectors() {
         );
         tested += 1;
     }
-    assert_eq!(tested, 13);
+    assert_eq!(tested, 36);
 }
