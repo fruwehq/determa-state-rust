@@ -32,6 +32,7 @@ jobs:
         run: |
           python3 scripts/verify_msrv.py --expected 1.86
           python3 scripts/test_release_metadata.py
+          python3 -m unittest discover -s scripts -p test_native_gate_report.py
           cargo metadata --locked --all-features --format-version 1 > /dev/null
 
       - name: Build default features
@@ -196,4 +197,4 @@ jobs:
       - name: PostgreSQL transaction and CAS contract
         env:
           DETERMA_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/determa
-        run: cargo test --locked --features postgresql --test checkpoint_postgresql -- --nocapture
+        run: python3 scripts/native_gate_report.py --require-postgresql --report target/native-gates/postgresql.xml --test checkpoint_postgresql

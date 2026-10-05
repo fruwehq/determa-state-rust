@@ -616,3 +616,115 @@ fn isolated_schema_url(base_url: &str, label: &str) -> String {
 fn pg_error(error: postgres::Error) -> StoreError {
     StoreError::new(error.to_string())
 }
+
+#[test]
+fn independent_postgresql_sessions_commit_exactly_one_cas_winner() {
+    use determa_state::checkpoint::{StoreRecord, StoreWriteResult};
+    use std::sync::Barrier;
+
+    let Some(base_url) = postgresql_url() else {
+        return;
+    };
+    let url = isolated_schema_url(&base_url, "concurrent_cas");
+    let initial = StoreRecord {
+        root_instance_id: "competing-root".into(),
+        revision: "0".into(),
+        execution_checkpoint_digest: format!("sha256:{}", "a".repeat(64)),
+        bytes: b"original committed bytes".to_vec(),
+    };
+    let first =
+        PostgresqlExecutionStore::connect_no_tls(&url, DurableStoreMode::bounded()).unwrap();
+    first.initialize_schema().unwrap();
+    assert_eq!(
+        first.insert_if_absent(initial.clone()).unwrap(),
+        StoreWriteResult::Committed
+    );
+    let second =
+        PostgresqlExecutionStore::connect_no_tls(&url, DurableStoreMode::bounded()).unwrap();
+    // These are separate physical sessions, not two references to one mutex.
+    let first_pid = first
+        .with_native_transaction(|tx| {
+            Ok(tx
+                .query_one("SELECT pg_backend_pid()", &[])
+                .map_err(pg_error)?
+                .get::<_, i32>(0))
+        })
+        .unwrap();
+    let second_pid = second
+        .with_native_transaction(|tx| {
+            Ok(tx
+                .query_one("SELECT pg_backend_pid()", &[])
+                .map_err(pg_error)?
+                .get::<_, i32>(0))
+        })
+        .unwrap();
+    assert_ne!(first_pid, second_pid);
+    let barrier = Arc::new(Barrier::new(2));
+    let threads: Vec<_> = [first, second]
+        .into_iter()
+        .enumerate()
+        .map(|(index, store)| {
+            let initial = initial.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let candidate = StoreRecord {
+                    revision: "1".into(),
+                    execution_checkpoint_digest: format!(
+                        "sha256:{}",
+                        if index == 0 { "b" } else { "c" }.repeat(64)
+                    ),
+                    bytes: format!("winner candidate {index}").into_bytes(),
+                    ..initial.clone()
+                };
+                barrier.wait();
+                let result = store
+                    .compare_and_swap(
+                        &initial.root_instance_id,
+                        &initial.revision,
+                        &initial.execution_checkpoint_digest,
+                        candidate.clone(),
+                    )
+                    .unwrap();
+                (result, candidate)
+            })
+        })
+        .collect();
+    let results: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(result, _)| *result == StoreWriteResult::Committed)
+            .count(),
+        1
+    );
+    let winner = &results
+        .iter()
+        .find(|(result, _)| *result == StoreWriteResult::Committed)
+        .unwrap()
+        .1;
+    let loser = results
+        .iter()
+        .find(|(result, _)| *result != StoreWriteResult::Committed)
+        .unwrap();
+    assert_eq!(loser.0, StoreWriteResult::Conflict(Some(winner.clone())));
+    // A fresh session observes only the winner; the losing transaction changed no bytes.
+    let reopened =
+        PostgresqlExecutionStore::connect_no_tls(&url, DurableStoreMode::bounded()).unwrap();
+    assert_eq!(
+        reopened.load(&initial.root_instance_id).unwrap(),
+        Some(winner.clone())
+    );
+    let failed: Result<(), StoreError> = reopened.with_native_transaction(|tx| {
+        tx.execute("UPDATE determa_execution_checkpoints SET checkpoint_bytes = $1 WHERE root_instance_id = $2",
+            &[&b"must roll back".to_vec(), &initial.root_instance_id]).map_err(pg_error)?;
+        Err(StoreError::new("abort native application transaction"))
+    });
+    assert!(failed.is_err());
+    assert_eq!(
+        reopened.load(&initial.root_instance_id).unwrap(),
+        Some(winner.clone())
+    );
+}
