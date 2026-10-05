@@ -126,7 +126,7 @@ pub fn adapter_registration_policy(
         || !identifier(&proposed["adapter_identifier"])
         || !identifier(&proposed["uri_scheme"])
         || !matches!(proposed["source"].as_str(), Some("bundled" | "third_party"))
-        || !fields.contains_key("configuration_schema")
+        || !proposed["configuration_schema"].is_object()
         || !fields.contains_key("capabilities")
     {
         return Err(invalid("invalid registration metadata"));

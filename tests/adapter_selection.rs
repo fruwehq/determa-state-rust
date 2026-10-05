@@ -106,6 +106,16 @@ fn generic_vendor_selection_uses_native_proof_and_preserves_first_registration()
         provider,
         store: store.clone(),
     })));
+    let mut invalid_registration = registration.clone();
+    invalid_registration["configuration_schema"] = json!(true);
+    assert_eq!(
+        registry
+            .register_store_adapter(invalid_registration, descriptor.clone(), factory.clone())
+            .unwrap_err()
+            .code,
+        AdapterErrorCode::InvalidAdapterConfiguration
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
     registry
         .register_store_adapter(registration.clone(), descriptor.clone(), factory.clone())
         .unwrap();
