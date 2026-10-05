@@ -2,9 +2,9 @@
 use super::*;
 use crate::checkpoint::{self, ExecutionStore, SqliteExecutionStore};
 use crate::{load_bundle, Bindings, InMemoryDefinitionResolver};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::process::ExitStatusExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -150,6 +150,8 @@ fn sigkill_after_staging_and_after_commit_preserves_atomic_fate_and_retained_rep
                 "authority::crash_tests::native_crash_child",
                 "--nocapture",
             ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .env("DETERMA_AUTHORITY_TEST_DATABASE", &path)
             .env("DETERMA_AUTHORITY_TEST_MARKER", &marker)
             .env("DETERMA_AUTHORITY_TEST_CUT", cut)
@@ -158,7 +160,14 @@ fn sigkill_after_staging_and_after_commit_preserves_atomic_fate_and_retained_rep
         let deadline = Instant::now() + Duration::from_secs(30);
         while !marker.exists() {
             if let Some(status) = child.try_wait().unwrap() {
-                panic!("child exited before native cut: {status}");
+                let mut diagnostics = String::new();
+                child
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut diagnostics)
+                    .unwrap();
+                panic!("child exited before native cut: {status}: {diagnostics}");
             }
             if Instant::now() >= deadline {
                 child.kill().unwrap();
