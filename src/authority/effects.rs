@@ -43,6 +43,37 @@ pub struct NativeEffectClaimRequest {
     pub effect_id: String,
 }
 
+// Adapter acceptance is separate from the still-outstanding business invocation.
+pub(super) fn native_invocable_intent<'a>(
+    checkpoint: &'a Value,
+    effect_id: &str,
+) -> Result<&'a Value, AuthorityError> {
+    for (field, state_field, accepted) in [
+        (
+            "pending_outbox_intents",
+            "delivery_state",
+            json!({"status":"not_attempted"}),
+        ),
+        (
+            "terminal_outbox_records",
+            "outcome",
+            json!({"status":"confirmed"}),
+        ),
+    ] {
+        if let Some(record) = checkpoint[field].as_array().and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["intent"]["effect_id"] == effect_id)
+        }) {
+            if record[state_field] != accepted {
+                return Err(failure("effect_not_outstanding"));
+            }
+            return Ok(&record["intent"]);
+        }
+    }
+    Err(failure("committed dispatch intent absent"))
+}
+
 pub(super) fn canonical_native_time(value: &Value) -> Result<i64, AuthorityError> {
     let text = value
         .as_str()
@@ -595,6 +626,98 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             .map_err(failure)?;
         Ok(response)
     }
+    /// Confirm durable adapter acceptance into this owned native journal only.
+    /// The business invocation, claim fence and any outcome remain unchanged.
+    pub fn confirm_registered_intent(
+        &self,
+        root: &str,
+        operation_id: &str,
+        effect_id: &str,
+        guard: &checkpoint::MutationGuard,
+    ) -> Result<Value, AuthorityError> {
+        if operation_id.is_empty() {
+            return Err(failure("native confirmation identity absent"));
+        }
+        let original = json!({"operation_kind":"effect_adapter_confirmation",
+            "root_instance_id":root,"effect_id":effect_id});
+        if let Some(saved) = self
+            .store
+            .native_effect_replay(root, operation_id, &original)
+            .map_err(failure)?
+        {
+            return Ok(saved);
+        }
+        let (checkpoint, mut document) =
+            self.store.native_effect_snapshot(root).map_err(failure)?;
+        if checkpoint.revision() != guard.expected_revision
+            || checkpoint.digest() != guard.expected_checkpoint_digest
+        {
+            return Err(failure("checkpoint_revision_conflict"));
+        }
+        let prior = document.clone();
+        let record = document["journal"]["effect_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["effect_id"] == effect_id)
+            .ok_or_else(|| failure("effect_not_outstanding"))?
+            .clone();
+        native_invocable_intent(checkpoint.value(), effect_id)?;
+        let fingerprint = record["target"]["runtime_incarnation"]["definition"]
+            ["validated_bundle_fingerprint"]
+            .as_str()
+            .ok_or_else(|| failure("native confirmation source absent"))?;
+        let resolved = self
+            .resolver
+            .resolve_definition(fingerprint)
+            .ok_or_else(|| failure("native confirmation source unavailable"))?;
+        if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
+            return Err(failure("native confirmation source not trusted"));
+        }
+        let value = checkpoint::terminalize_outbox(
+            &checkpoint,
+            effect_id,
+            checkpoint::TerminalOutboxOutcome::Confirmed,
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )
+        .map_err(failure)?;
+        let candidate =
+            checkpoint::restore(&canonical(&value)?, self.resolver.as_ref()).map_err(failure)?;
+        let terminal = value["terminal_outbox_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["intent"]["effect_id"] == effect_id)
+            .ok_or_else(|| failure("native confirmed intent absent"))?;
+        document["journal"]["checkpoint_revision"] = json!(candidate.revision());
+        document["journal"]["checkpoint_digest"] = json!(candidate.digest());
+        let response = json!({"kind":"effect_adapter_confirmation","body":{"checkpoint":value,"terminal_record":terminal}});
+        retain_native_effect_response(&mut document, operation_id, &original, &response)?;
+        self.store
+            .update_native_effect_checkpoint(&checkpoint, &prior, &candidate, &document, || {
+                let current = self
+                    .resolver
+                    .resolve_definition(fingerprint)
+                    .ok_or_else(|| failure("native confirmation source lost at commit"))?;
+                if !current.trusted
+                    || current.bundle.fingerprint != fingerprint
+                    || current.bundle.normalized != resolved.bundle.normalized
+                {
+                    return Err(failure("native confirmation source changed at commit"));
+                }
+                crate::format1::providers::check_bundle(&current.bundle).map_err(failure)?;
+                self.handler
+                    .verify(
+                        &record["handler_reference"],
+                        record["destination_binding_digest"].as_str().unwrap(),
+                    )
+                    .map_err(failure)
+            })
+            .map_err(failure)?;
+        Ok(response)
+    }
+
     /// First claim only: retries, expiry recovery and reconciliation are separate
     /// operations and cannot be inferred from an absent result or provider claim.
     /// A retained active-shaped reply is historical evidence, never renewed rights.
@@ -942,13 +1065,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
             return Err(failure("native definition not trusted"));
         }
-        let intent = checkpoint.value()["pending_outbox_intents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|intent| intent["intent"]["effect_id"] == effect_id)
-            .ok_or_else(|| failure("committed dispatch intent absent"))?["intent"]
-            .clone();
+        let intent = native_invocable_intent(checkpoint.value(), effect_id)?.clone();
         let payload: crate::format1::TypedValue =
             serde_json::from_value(intent["payload"].clone()).map_err(failure)?;
         let destination = record["destination_binding_digest"].as_str().unwrap();
@@ -1003,7 +1120,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         let report = self.store.with_native_effect_call(root, |latest_checkpoint, latest_document| {
             if latest_document["journal"]["effect_records"].as_array().unwrap().iter().find(|item| item["effect_id"] == effect_id) != Some(&record)
                 || latest_document["invocation_starts"].get(&start_id) != Some(&start)
-                || !latest_checkpoint["pending_outbox_intents"].as_array().unwrap().iter().any(|item| item["intent"] == intent && item["delivery_state"] == json!({"status":"not_attempted"})) {
+                || !native_invocable_intent(latest_checkpoint,effect_id).is_ok_and(|current| current == &intent) {
                 return Err(failure("native invocation changed before call"));
             }
             check_source()?;

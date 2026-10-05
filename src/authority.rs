@@ -1183,6 +1183,16 @@ fn validate_native_effect_transition(
     let request = requests
         .get(id)
         .ok_or_else(|| failure("new native request absent"))?;
+    if request["operation_kind"] == "effect_adapter_confirmation" {
+        return validate_native_effect_confirmation_transition(
+            prior,
+            prior_checkpoint,
+            document,
+            checkpoint,
+            request,
+            body,
+        );
+    }
     if request["operation_kind"] == "effect_expiry_recovery" {
         return validate_native_effect_expiry_transition(
             prior,
@@ -1639,14 +1649,8 @@ fn validate_native_effect_claim_transition(
         || !record["outcome"].is_null()
         || !record["cancellation"].is_null()
         || claim["operation_token"] != record["operation_token"]
-        || !checkpoint["pending_outbox_intents"]
-            .as_array()
-            .is_some_and(|intents| {
-                intents.iter().any(|intent| {
-                    intent["intent"]["effect_id"] == request["effect_id"]
-                        && intent["delivery_state"] == json!({"status":"not_attempted"})
-                })
-            })
+        || effects::native_invocable_intent(checkpoint, request["effect_id"].as_str().unwrap_or(""))
+            .is_err()
     {
         return Err(failure("effect_not_outstanding"));
     }
@@ -1839,6 +1843,93 @@ fn validate_native_effect_expiry_transition(
     Ok(())
 }
 
+fn validate_native_effect_confirmation_transition(
+    prior: &Value,
+    prior_checkpoint: &Value,
+    document: &Value,
+    checkpoint: &Value,
+    request: &Value,
+    body: &Value,
+) -> Result<(), AuthorityError> {
+    if !closed(
+        request,
+        &["operation_kind", "root_instance_id", "effect_id"],
+    ) || request["root_instance_id"] != prior_checkpoint["root_instance_id"]
+        || !closed(body, &["kind", "body"])
+        || body["kind"] != "effect_adapter_confirmation"
+        || !closed(&body["body"], &["checkpoint", "terminal_record"])
+        || prior["journal"]["effect_records"] != document["journal"]["effect_records"]
+        || !prior["journal"]["effect_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["effect_id"] == request["effect_id"])
+    {
+        return Err(failure(
+            "native adapter confirmation shape/participant mismatch",
+        ));
+    }
+    let effect_id = request["effect_id"]
+        .as_str()
+        .ok_or_else(|| failure("native effect identity absent"))?;
+    effects::native_invocable_intent(prior_checkpoint, effect_id)?;
+    let mut expected = prior_checkpoint.clone();
+    let terminal = if let Some(record) = prior_checkpoint["terminal_outbox_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["intent"]["effect_id"] == effect_id)
+    {
+        record.clone()
+    } else {
+        let pending = expected["pending_outbox_intents"].as_array_mut().unwrap();
+        let index = pending
+            .iter()
+            .position(|item| item["intent"]["effect_id"] == effect_id)
+            .ok_or_else(|| failure("native pending intent absent"))?;
+        let intent = pending.remove(index)["intent"].clone();
+        let revision = (prior_checkpoint["revision"]
+            .as_str()
+            .unwrap()
+            .parse::<BigUint>()
+            .map_err(failure)?
+            + BigUint::from(1u8))
+        .to_string();
+        let sequence = prior_checkpoint["next_outbox_terminal_sequence"].clone();
+        expected["revision"] = json!(revision);
+        expected["next_outbox_terminal_sequence"] = json!((sequence
+            .as_str()
+            .unwrap()
+            .parse::<BigUint>()
+            .map_err(failure)?
+            + BigUint::from(1u8))
+        .to_string());
+        let record = json!({"terminal_sequence":sequence,"intent":intent,"committed_revision":revision,"outcome":{"status":"confirmed"}});
+        expected["terminal_outbox_records"]
+            .as_array_mut()
+            .unwrap()
+            .push(record.clone());
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_checkpoint_digest");
+        expected["execution_checkpoint_digest"] = json!(hash(&json!([
+            "determa-execution-checkpoint-digest-1",
+            expected
+        ]))?);
+        record
+    };
+    if checkpoint != &expected
+        || body["body"]["checkpoint"] != expected
+        || body["body"]["terminal_record"] != terminal
+    {
+        return Err(failure(
+            "native adapter confirmation changed business/checkpoint evidence",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_native_effect_start_transition(
     prior: &Value,
     prior_checkpoint: &Value,
@@ -1888,15 +1979,8 @@ fn validate_native_effect_start_transition(
         || start["record"] != *record
         || start["claim"] != *claim
         || id != &expected_id
-        || !checkpoint["pending_outbox_intents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|intent| {
-                intent["intent"] == start["intent"]
-                    && intent["intent"]["effect_id"] == record["effect_id"]
-                    && intent["delivery_state"] == json!({"status":"not_attempted"})
-            })
+        || !effects::native_invocable_intent(checkpoint, record["effect_id"].as_str().unwrap())
+            .is_ok_and(|intent| intent == &start["intent"])
     {
         return Err(failure(
             "native invocation start claim/intent/identity mismatch",
