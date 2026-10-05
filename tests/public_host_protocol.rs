@@ -242,6 +242,90 @@ fn local_sqlite_host_executes_exact_delivery_goldens() {
                 admitted["value"]["result"]
             );
         }
+        if name == "process_unhandled_event" {
+            use determa_state::checkpoint::{self, PruneRequest};
+            use serde_json::json;
+            use sha2::{Digest, Sha256};
+            let mut resolver = InMemoryDefinitionResolver::default();
+            resolver.insert(bundle.clone(), true);
+            let completed = &case["response"]["value"]["result"]["checkpoint"];
+            let native = checkpoint::restore(
+                &serde_json_canonicalizer::to_vec(completed).unwrap(),
+                &resolver,
+            )
+            .unwrap();
+            let pruned = checkpoint::prune(
+                &native,
+                &PruneRequest {
+                    cutoff_receipt_sequence: "2".into(),
+                    target_mode: "bounded".into(),
+                    policy_identifier: Some("test-retention".into()),
+                    dependency_receipt_sequences: vec![],
+                    dependency_effect_ids: vec![],
+                },
+                Some(native.revision()),
+                Some(native.digest()),
+            )
+            .unwrap();
+            let encoded = serde_json_canonicalizer::to_vec(&pruned).unwrap();
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute(
+                "UPDATE determa_public_host_checkpoints SET checkpoint=?",
+                [&encoded],
+            )
+            .unwrap();
+            let original = goldens["cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == "admit_declared_event")
+                .unwrap()["request"]
+                .clone();
+            for mixed in [false, true] {
+                let mut request = original.clone();
+                request["operation_id"] = json!(format!("pruned-replay-{mixed}"));
+                request["precondition"] = json!({"revision":pruned["revision"],"checkpoint_digest":pruned["execution_checkpoint_digest"]});
+                if mixed {
+                    let mut fresh = request["arguments"]["ordered_deliveries"][0].clone();
+                    fresh["envelope"]["event_id"] = json!("fresh-after-prune");
+                    fresh["envelope"]["cause_id"] = json!("fresh-after-prune");
+                    let operand = json!([
+                        "determa-inbox-envelope-digest-1",
+                        "1",
+                        "server-1",
+                        "input",
+                        fresh["envelope"]
+                    ]);
+                    fresh["envelope_digest"] = json!(format!(
+                        "sha256:{:x}",
+                        Sha256::digest(serde_json_canonicalizer::to_vec(&operand).unwrap())
+                    ));
+                    request["arguments"]["ordered_deliveries"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(fresh);
+                }
+                let response = host.handle(&request, "alice").unwrap();
+                assert_eq!(response["error"]["code"], "replay_evidence_expired");
+                let retained: Vec<u8> = db
+                    .query_row(
+                        "SELECT checkpoint FROM determa_public_host_checkpoints",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(retained, encoded);
+                let count: i64 = db
+                    .query_row(
+                        "SELECT COUNT(*) FROM determa_public_host_responses",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 1);
+            }
+            drop(db);
+        }
         drop(host);
         fs::remove_dir_all(directory).unwrap();
     }
