@@ -341,3 +341,106 @@ fn substituted_factory_and_copied_claims_fail_before_observed_root_access() {
         assert_eq!(observed.accesses.load(Ordering::SeqCst), 0);
     }
 }
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_native_schema_changes_invalidate_a_previously_verified_host() {
+    use determa_state::checkpoint::{CheckpointHost, HostProfile};
+    let registry = Arc::new(bundled_store_registry().unwrap());
+    let path = std::env::temp_dir().join(format!(
+        "determa-native-health-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let uri = format!(
+        "sqlite:{}#receipt_retention=bounded&outbox_retention=bounded",
+        path.display()
+    );
+    let config = json!({"instance_id":"sqlite-native","uri":uri});
+    let descriptor = registry
+        .descriptors()
+        .unwrap()
+        .into_iter()
+        .find(|descriptor| descriptor["provider_reference"]["identifier"] == "determa.sqlite")
+        .unwrap();
+    let configured = registry
+        .validate_configuration(&descriptor, &config)
+        .unwrap();
+    registry
+        .bundled_execution_store(&configured)
+        .unwrap()
+        .initialize_schema()
+        .unwrap();
+    let binding = registry
+        .resolve_execution_store(&uri, Some("sqlite"), &config, &json!([]))
+        .unwrap();
+    assert!(binding
+        .current_capabilities()
+        .unwrap()
+        .contains(&ExecutionStoreCapability::DurableSingleWriter));
+    let host = CheckpointHost::from_verified(
+        binding,
+        Arc::new(determa_state::InMemoryDefinitionResolver::default()),
+    );
+    let bounded = host.validate_capabilities_contract(
+        "not-created",
+        HostProfile::ExactlyOnceCommittedProcessing,
+        &BTreeSet::new(),
+        &[],
+        &[],
+        false,
+    );
+    assert_eq!(
+        bounded.result.code.as_deref(),
+        Some("adapter_capability_mismatch")
+    );
+    let native = rusqlite::Connection::open(&path).unwrap();
+    let journal: String = native
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal, "wal");
+    native
+        .execute(
+            "ALTER TABLE determa_execution_checkpoints ADD COLUMN unexpected TEXT",
+            [],
+        )
+        .unwrap();
+    let returned = host.validate_capabilities_contract(
+        "not-created",
+        HostProfile::DurableEmbeddedProcessing,
+        &BTreeSet::new(),
+        &[],
+        &[],
+        false,
+    );
+    assert_eq!(
+        returned.result.code.as_deref(),
+        Some("adapter_capability_mismatch")
+    );
+    let roots: i64 = native
+        .query_row(
+            "SELECT COUNT(*) FROM determa_execution_checkpoints",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(roots, 0);
+    for invalid in [
+        "sqlite::memory:",
+        "sqlite:relative.sqlite",
+        "sqlite:/tmp/not-created.sqlite#synchronous=off",
+    ] {
+        let config = json!({"instance_id":"bad","uri":invalid});
+        assert!(registry
+            .resolve_execution_store(
+                invalid,
+                Some("sqlite"),
+                &config,
+                &json!(["durable_single_writer"])
+            )
+            .is_err());
+    }
+}
