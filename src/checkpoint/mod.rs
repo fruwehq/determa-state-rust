@@ -4,11 +4,16 @@
 //! semantics. Stores are injected directly for weak operations or configured
 //! through the public extension registry for verified durable operations.
 
+mod adapter_policy;
 mod adapters;
 mod host;
 mod store;
 mod types;
 mod v1;
+
+pub use adapter_policy::{
+    adapter_registration_policy, adapter_resolution_policy, conditional_adapter_policy,
+};
 
 pub use adapters::{
     FileExecutionStore, FileExecutionStoreFactory, MemoryExecutionStore,

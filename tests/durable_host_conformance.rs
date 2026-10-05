@@ -1,5 +1,5 @@
 use determa_state::checkpoint::{
-    hypothetical_host_profile_matches, AdmissionSource, CheckpointHost, DurableCheckpointOperation,
+    conditional_adapter_policy, AdmissionSource, CheckpointHost, DurableCheckpointOperation,
     DurableContractExecution, DurableFailurePolicy, DurableHostResult, DurableProcessRequest,
     DurableQuarantineReleaseRequest, DurableStoreMode, ExecutionStore, ExecutionStoreCapability,
     HealthStatus, HostFeature, HostProfile, MemoryExecutionStore, MutationGuard,
@@ -669,72 +669,20 @@ fn invoke_contract(directory: &Path, vector: &Value, request: &Value) -> Durable
             );
             host.injected_store_contract()
         }
-        "checkpoint_register_adapter_v1" => {
-            let existing = request["existing_registrations"].as_array().unwrap();
-            let descriptor = &request["registration"];
-            if existing
-                .iter()
-                .any(|item| item["uri_scheme"] == descriptor["uri_scheme"])
-            {
-                hypothetical_contract_failure("duplicate_adapter_registration")
+        "checkpoint_register_adapter_v1"
+        | "checkpoint_resolve_adapter_v1"
+        | "checkpoint_validate_capabilities_v1" => {
+            let caller_response = conditional_adapter_policy(request);
+            let result = if caller_response["kind"] == "typed_failure" {
+                DurableHostResult::validation_rejected(
+                    caller_response["body"]["code"].as_str().unwrap(),
+                )
             } else {
-                hypothetical_contract_success("registration", descriptor.clone())
-            }
-        }
-        "checkpoint_resolve_adapter_v1" => {
-            let scheme = request["uri"].as_str().unwrap().split_once(':').unwrap().0;
-            let Some(registration) = request["registrations"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|item| item["uri_scheme"] == scheme)
-            else {
-                return hypothetical_contract_failure("unknown_adapter");
+                DurableHostResult::validated()
             };
-            let schema = &registration["configuration_schema"];
-            if !jsonschema::validator_for(schema)
-                .is_ok_and(|v| v.is_valid(&request["configuration"]))
-            {
-                return hypothetical_contract_failure("invalid_adapter_configuration");
-            }
-            let requested = capabilities(&request["requested_capabilities"]);
-            if !requested.is_subset(&capabilities(&registration["capabilities"])) {
-                return hypothetical_contract_failure("adapter_capability_mismatch");
-            }
-            hypothetical_contract_success(
-                "resolution",
-                json!({
-                    "registration":registration,
-                    "configuration":request["configuration"],
-                    "requested_capabilities":request["requested_capabilities"]
-                }),
-            )
-        }
-        "checkpoint_validate_capabilities_v1" => {
-            let store_capabilities = capabilities(&request["store_capabilities"]);
-            let host_guarantees = features(&request["host_guarantees"]);
-            if hypothetical_host_profile_matches(
-                &store_capabilities,
-                &host_guarantees,
-                profile(request["host_profile"].as_str().unwrap()),
-                request["retention_mode"] == "permanent",
-            ) {
-                DurableContractExecution {
-                    result: DurableHostResult::validated(),
-                    caller_response: json!({"kind":"capability_report","body":{
-                        "adapter_identifier":request["adapter_identifier"],
-                        "host_profile":request["host_profile"],
-                        "host_guarantees":request["host_guarantees"],
-                        "retention_mode":request["retention_mode"],
-                        "store_capabilities":request["store_capabilities"],
-                        "validated":true
-                    }}),
-                }
-            } else {
-                DurableContractExecution {
-                    result: DurableHostResult::validation_rejected("adapter_capability_mismatch"),
-                    caller_response: json!({"kind":"typed_failure","body":{"code":"adapter_capability_mismatch"}}),
-                }
+            DurableContractExecution {
+                result,
+                caller_response,
             }
         }
         "checkpoint_scope_operation_v1" => {
@@ -1222,18 +1170,6 @@ fn collect_machine_documents(directory: &Path, resolver: &mut InMemoryDefinition
 
 // The B0 decision vectors supply hypothetical registration premises. This
 // interpreter exists only in the conformance driver; it is not a host registry.
-fn hypothetical_contract_success(kind: &str, body: Value) -> DurableContractExecution {
-    DurableContractExecution {
-        result: DurableHostResult::validated(),
-        caller_response: json!({"kind":kind,"body":body}),
-    }
-}
-fn hypothetical_contract_failure(code: &str) -> DurableContractExecution {
-    DurableContractExecution {
-        result: DurableHostResult::validation_rejected(code),
-        caller_response: json!({"kind":"typed_failure","body":{"code":code}}),
-    }
-}
 struct StaticStore {
     capabilities: BTreeSet<ExecutionStoreCapability>,
 }

@@ -131,11 +131,16 @@ jobs:
       - name: Unit and public API tests
         run: cargo test --locked --lib --bins --test public_api --test closed_code_registry --test checkpoint_adapters
 
+      - name: Install pinned conformance runner dependencies
+        run: python3 -m pip install -r conformance-suite/scripts/validation-requirements.txt
+
       - name: Public extension negotiation vectors
         run: |
           cargo test --locked --test extension_conformance
           cargo build --locked --example extension_profile_adapter
           python3 conformance-suite/scripts/run_extension_negotiation_profile.py --spec-root authoritative-spec --adapter target/debug/examples/extension_profile_adapter
+          cargo build --locked --example adapter_policy_probe
+          python3 conformance-suite/scripts/run_adapter_policy_profile.py --adapter target/debug/examples/adapter_policy_probe
 
       - name: All 75 authoritative mailbox-neutral RTC scenarios
         env:

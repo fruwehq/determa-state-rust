@@ -21,6 +21,7 @@ exclude = [
     "tests/checkpoint_postgresql.rs",
     "tests/extension_conformance.rs",
     "examples/extension_profile_adapter.rs",
+    "examples/adapter_policy_probe.rs",
     "src/format1/runtime_conformance.rs",
     ".github/",
 ]

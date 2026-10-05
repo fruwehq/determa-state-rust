@@ -252,6 +252,7 @@ pub struct ProfileRequest<'a> {
 #[derive(Default)]
 pub struct ExtensionRegistry {
     entries: RwLock<BTreeMap<(String, String, String), Entry>>,
+    store_adapters: RwLock<BTreeMap<String, (Value, Value)>>,
     token: Arc<()>,
     verifier: Option<Arc<dyn HostVerifier>>,
 }
@@ -280,6 +281,83 @@ impl ExtensionRegistry {
         factory: Arc<dyn ExtensionFactory>,
     ) -> Result<(), ExtensionError> {
         self.register_entry(descriptor, factory, None)
+    }
+    /// Associate an ordinary URI lookup key with an exact public store provider.
+    /// Metadata is selection policy only; effective claims come from the native instance.
+    pub fn register_store_adapter(
+        &self,
+        registration: Value,
+        descriptor: Value,
+        factory: Arc<dyn ExtensionFactory>,
+    ) -> Result<Value, crate::checkpoint::AdapterError> {
+        use crate::checkpoint::{adapter_registration_policy, AdapterError, AdapterErrorCode};
+        if descriptor["category"] != "execution_store" {
+            return Err(AdapterError::new(
+                AdapterErrorCode::InvalidAdapterConfiguration,
+                "not an execution-store provider",
+            ));
+        }
+        let mut entries = self
+            .store_adapters
+            .write()
+            .map_err(|_| adapter_error(lock_error()))?;
+        let existing: Vec<_> = entries.values().map(|entry| entry.0.clone()).collect();
+        let checked = adapter_registration_policy(&existing, &registration)?;
+        self.register(descriptor.clone(), factory)
+            .map_err(adapter_error)?;
+        entries.insert(
+            checked["uri_scheme"].as_str().unwrap().to_owned(),
+            (checked.clone(), descriptor),
+        );
+        Ok(checked)
+    }
+
+    /// Select a provider generically, configure it through the public verified
+    /// path, and evaluate requested capabilities against current native proof.
+    pub fn resolve_execution_store(
+        self: &Arc<Self>,
+        uri: &str,
+        adapter_identifier: Option<&str>,
+        configuration: &Value,
+        requested_capabilities: &Value,
+    ) -> Result<VerifiedExecutionStore, crate::checkpoint::AdapterError> {
+        use crate::checkpoint::adapter_resolution_policy;
+        let (registration, descriptor) = {
+            let entries = self
+                .store_adapters
+                .read()
+                .map_err(|_| adapter_error(lock_error()))?;
+            let registrations: Vec<_> = entries.values().map(|entry| entry.0.clone()).collect();
+            let decision = adapter_resolution_policy(
+                &registrations,
+                uri,
+                adapter_identifier,
+                configuration,
+                &json!([]),
+            )?;
+            let entry = entries
+                .get(decision["registration"]["uri_scheme"].as_str().unwrap())
+                .unwrap();
+            entry.clone()
+        };
+        let verified = self
+            .configure_execution_store(&descriptor, configuration)
+            .map_err(adapter_error)?;
+        let mut proved = registration;
+        proved["capabilities"] = json!(verified
+            .current_capabilities()
+            .map_err(adapter_error)?
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>());
+        adapter_resolution_policy(
+            &[proved],
+            uri,
+            adapter_identifier,
+            configuration,
+            requested_capabilities,
+        )?;
+        Ok(verified)
     }
     fn register_entry(
         &self,
@@ -774,6 +852,25 @@ impl ExtensionFactory for InjectedFactory {
         Ok(self.0.clone())
     }
 }
+fn adapter_error(error: ExtensionError) -> crate::checkpoint::AdapterError {
+    use crate::checkpoint::{AdapterError, AdapterErrorCode};
+    let code = match error.code {
+        ExtensionErrorCode::DuplicateExtensionRegistration => {
+            AdapterErrorCode::DuplicateAdapterRegistration
+        }
+        ExtensionErrorCode::UnknownExtension => AdapterErrorCode::UnknownAdapter,
+        ExtensionErrorCode::InvalidExtensionDescriptor
+        | ExtensionErrorCode::InvalidExtensionConfiguration => {
+            AdapterErrorCode::InvalidAdapterConfiguration
+        }
+        ExtensionErrorCode::ExtensionIdentityMismatch
+        | ExtensionErrorCode::ExtensionCapabilityMismatch => {
+            AdapterErrorCode::AdapterCapabilityMismatch
+        }
+    };
+    AdapterError::new(code, error.to_string())
+}
+
 fn lock_error() -> ExtensionError {
     ExtensionError::new(
         ExtensionErrorCode::InvalidExtensionConfiguration,
@@ -891,7 +988,11 @@ fn create_bundled_store_registry(
         let factory: Arc<dyn ExtensionFactory> = Arc::new(InjectedFactory(provider.clone()));
         let descriptor = bundled_store_descriptor(name);
         verifier.bind(name, factory.clone(), provider)?;
-        registry.register(descriptor, factory)?;
+        registry.register_store_adapter(json!({
+            "adapter_identifier":name,"uri_scheme":name,"source":"bundled",
+            "configuration_schema":{"type":"object","properties":{"instance_id":{"type":"string"},"uri":{"type":"string"}},"required":["instance_id","uri"],"additionalProperties":false},
+            "capabilities":descriptor["supported_capabilities"]
+        }), descriptor, factory).map_err(|error| ExtensionError::new(ExtensionErrorCode::InvalidExtensionDescriptor, error.to_string()))?;
     }
     Ok(registry)
 }
