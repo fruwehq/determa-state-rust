@@ -235,7 +235,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             self.resolver.as_ref(),
         )
         .map_err(failure)?;
-        let document = json!({"journal":validated.value(),"responses":responses,"original_requests":{creation_id:original_request}});
+        let document = json!({"journal":validated.value(),"responses":responses,"original_requests":{creation_id:original_request},"invocation_starts":{}});
         self.store
             .insert_native_effect_checkpoint(&checkpoint, &document, || {
                 let current = self
@@ -902,7 +902,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             effect_id,
             record["attempt_fence"]
         ]))?;
-        if document["responses"].get(&start_id).is_some() {
+        if document["invocation_starts"].get(&start_id).is_some() {
             return Err(failure(
                 "native invocation already started; reconciliation required",
             ));
@@ -943,10 +943,8 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
                 .verify(&record["handler_reference"], destination)
                 .map_err(failure)
         };
-        let original = json!({"operation_kind":"effect_invocation_start","root_instance_id":root,
-            "effect_id":effect_id,"attempt_fence":record["attempt_fence"],"worker_principal":caller.authenticated_principal});
-        let response = json!({"kind":"effect_invocation_start","body":{"claim":claim}});
-        retain_native_effect_response(&mut document, &start_id, &original, &response)?;
+        let start = json!({"claim":claim,"intent":intent,"record":record});
+        document["invocation_starts"][&start_id] = start.clone();
         let fresh = self
             .store
             .update_native_effect_checkpoint_with_final_guard(
@@ -979,7 +977,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         };
         let report = self.store.with_native_effect_call(root, |latest_checkpoint, latest_document| {
             if latest_document["journal"]["effect_records"].as_array().unwrap().iter().find(|item| item["effect_id"] == effect_id) != Some(&record)
-                || latest_document["original_requests"].get(&start_id) != Some(&original)
+                || latest_document["invocation_starts"].get(&start_id) != Some(&start)
                 || !latest_checkpoint["pending_outbox_intents"].as_array().unwrap().iter().any(|item| item["intent"] == intent && item["delivery_state"] == json!({"status":"not_attempted"})) {
                 return Err(failure("native invocation changed before call"));
             }

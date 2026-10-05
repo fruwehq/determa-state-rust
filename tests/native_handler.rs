@@ -2543,11 +2543,10 @@ impl determa_state::authority::NativeEffectWorkerAuthority for EffectWorkerAutho
                 )
                 .ok();
             let started = bytes.is_some_and(|bytes| {
-                serde_json::from_slice::<Value>(&bytes).unwrap()["original_requests"]
+                !serde_json::from_slice::<Value>(&bytes).unwrap()["invocation_starts"]
                     .as_object()
                     .unwrap()
-                    .values()
-                    .any(|request| request["operation_kind"] == "effect_invocation_start")
+                    .is_empty()
             });
             if !started || !probe() {
                 *self.after_start_auth.lock().unwrap() = Some(probe);
@@ -2563,11 +2562,10 @@ impl determa_state::authority::NativeEffectWorkerAuthority for EffectWorkerAutho
                 )
                 .ok();
             if bytes.is_some_and(|bytes| {
-                serde_json::from_slice::<Value>(&bytes).unwrap()["original_requests"]
+                !serde_json::from_slice::<Value>(&bytes).unwrap()["invocation_starts"]
                     .as_object()
                     .unwrap()
-                    .values()
-                    .any(|request| request["operation_kind"] == "effect_invocation_start")
+                    .is_empty()
             }) {
                 match self.fail_after_start.load(Ordering::SeqCst) {
                     1 => self.now.store(20, Ordering::SeqCst),
@@ -4077,6 +4075,10 @@ fn native_dispatch_calls_only_committed_claim_once_and_owner_admits_its_actual_r
         .admit_recorded_result("root", "result-1", effect_id, &effect_guard(&after.0))
         .unwrap();
     assert_eq!(admitted["body"]["result_response"]["status"], "committed");
+    assert_eq!(
+        native_snapshot(&path).1["invocation_starts"],
+        after.1["invocation_starts"]
+    );
     assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 1);
 }
 #[cfg(feature = "sqlite")]
@@ -4133,6 +4135,10 @@ fn native_dispatch_failures_after_start_never_authorize_a_restart_call() {
             .is_err());
         let after = native_snapshot(&path);
         assert_eq!(after.0, before.0);
+        // A private call start is not a public host-operation response.
+        assert_eq!(after.1["journal"], before.1["journal"]);
+        assert_eq!(after.1["responses"], before.1["responses"]);
+        assert_eq!(after.1["original_requests"], before.1["original_requests"]);
         assert_eq!(
             after.1["journal"]["effect_records"],
             before.1["journal"]["effect_records"]
@@ -4142,15 +4148,7 @@ fn native_dispatch_failures_after_start_never_authorize_a_restart_call() {
             fixture.destination.calls.load(Ordering::SeqCst),
             usize::from(mode >= 4)
         );
-        assert_eq!(
-            after.1["original_requests"]
-                .as_object()
-                .unwrap()
-                .values()
-                .filter(|request| request["operation_kind"] == "effect_invocation_start")
-                .count(),
-            1
-        );
+        assert_eq!(after.1["invocation_starts"].as_object().unwrap().len(), 1);
         authority.fail_after_start.store(0, Ordering::SeqCst);
         authority.now.store(10, Ordering::SeqCst);
         authority.fail_clock.store(false, Ordering::SeqCst);
@@ -4378,12 +4376,10 @@ fn native_dispatch_identical_contenders_cannot_call_twice_before_first_report() 
     );
     assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
-        native_snapshot(&path).1["original_requests"]
+        native_snapshot(&path).1["invocation_starts"]
             .as_object()
             .unwrap()
-            .values()
-            .filter(|request| request["operation_kind"] == "effect_invocation_start")
-            .count(),
+            .len(),
         1
     );
 }
@@ -4497,15 +4493,7 @@ fn real_sigkill_dispatch_preserves_uncertain_starts_and_recorded_outcomes_withou
             record["attempt_records"].as_array().unwrap().len(),
             usize::from(cut == "outcome")
         );
-        assert_eq!(
-            before.1["original_requests"]
-                .as_object()
-                .unwrap()
-                .values()
-                .filter(|request| request["operation_kind"] == "effect_invocation_start")
-                .count(),
-            1
-        );
+        assert_eq!(before.1["invocation_starts"].as_object().unwrap().len(), 1);
         if cut == "acceptance" {
             let receipt: Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
             assert_eq!(receipt["scope_identity"], "scope-one");

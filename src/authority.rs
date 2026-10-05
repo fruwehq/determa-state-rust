@@ -846,8 +846,19 @@ fn validate_native_effect_document(
     checkpoint: &Value,
     scope: &str,
 ) -> Result<(), AuthorityError> {
-    if !closed(document, &["journal", "responses", "original_requests"]) {
+    if !closed(
+        document,
+        &[
+            "journal",
+            "responses",
+            "original_requests",
+            "invocation_starts",
+        ],
+    ) {
         return Err(failure("native effect document shape mismatch"));
+    }
+    if document["invocation_starts"] != json!({}) {
+        return Err(failure("fresh native creation contains invocation starts"));
     }
     let journal = &document["journal"];
     if !closed(
@@ -1054,8 +1065,24 @@ fn validate_native_effect_transition(
     checkpoint: &Value,
     scope: &str,
 ) -> Result<(), AuthorityError> {
-    if !closed(document, &["journal", "responses", "original_requests"]) {
+    if !closed(
+        document,
+        &[
+            "journal",
+            "responses",
+            "original_requests",
+            "invocation_starts",
+        ],
+    ) {
         return Err(failure("native effect document shape mismatch"));
+    }
+    if document["invocation_starts"] != prior["invocation_starts"] {
+        return validate_native_effect_start_transition(
+            prior,
+            prior_checkpoint,
+            document,
+            checkpoint,
+        );
     }
     let journal = &document["journal"];
     let old_journal = &prior["journal"];
@@ -1158,16 +1185,6 @@ fn validate_native_effect_transition(
         .ok_or_else(|| failure("new native request absent"))?;
     if request["operation_kind"] == "effect_expiry_recovery" {
         return validate_native_effect_expiry_transition(
-            prior,
-            prior_checkpoint,
-            document,
-            checkpoint,
-            request,
-            body,
-        );
-    }
-    if request["operation_kind"] == "effect_invocation_start" {
-        return validate_native_effect_start_transition(
             prior,
             prior_checkpoint,
             document,
@@ -1827,73 +1844,62 @@ fn validate_native_effect_start_transition(
     prior_checkpoint: &Value,
     document: &Value,
     checkpoint: &Value,
-    request: &Value,
-    body: &Value,
 ) -> Result<(), AuthorityError> {
+    let old = prior["invocation_starts"]
+        .as_object()
+        .ok_or_else(|| failure("prior native start inventory absent"))?;
+    let starts = document["invocation_starts"]
+        .as_object()
+        .ok_or_else(|| failure("native start inventory absent"))?;
+    let mut expected = prior.clone();
+    expected["invocation_starts"] = document["invocation_starts"].clone();
     if checkpoint != prior_checkpoint
-        || document["journal"]["effect_records"] != prior["journal"]["effect_records"]
-        || !closed(
-            request,
-            &[
-                "operation_kind",
-                "root_instance_id",
-                "effect_id",
-                "attempt_fence",
-                "worker_principal",
-            ],
-        )
-        || request["root_instance_id"] != checkpoint["root_instance_id"]
-        || !closed(body, &["kind", "body"])
-        || body["kind"] != "effect_invocation_start"
-        || !closed(&body["body"], &["claim"])
+        || document != &expected
+        || starts.len() != old.len() + 1
+        || old.iter().any(|(id, value)| starts.get(id) != Some(value))
     {
+        return Err(failure(
+            "native start changed portable or retained private evidence",
+        ));
+    }
+    let (id, start) = starts
+        .iter()
+        .find(|(id, _)| !old.contains_key(*id))
+        .ok_or_else(|| failure("new native invocation start absent"))?;
+    if !closed(start, &["claim", "intent", "record"]) {
         return Err(failure("native invocation start shape mismatch"));
     }
     let record = prior["journal"]["effect_records"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|record| record["effect_id"] == request["effect_id"])
+        .find(|record| record["effect_id"] == start["record"]["effect_id"])
         .ok_or_else(|| failure("effect_not_outstanding"))?;
     let claim = effects::current_native_effect_claim(prior, record)?;
+    let expected_id = hash(&json!([
+        "determa-native-invocation-start-1",
+        prior["journal"]["scope_identity"],
+        prior_checkpoint["root_instance_id"],
+        record["effect_id"],
+        record["attempt_fence"]
+    ]))?;
     if record["invocation_state"] != "leased"
         || !record["cancellation"].is_null()
-        || request["attempt_fence"] != record["attempt_fence"]
-        || request["worker_principal"] != claim["worker_principal"]
-        || body["body"]["claim"] != *claim
-        || prior["original_requests"]
-            .as_object()
-            .unwrap()
-            .values()
-            .any(|old| {
-                old["operation_kind"] == "effect_invocation_start"
-                    && old["effect_id"] == request["effect_id"]
-                    && old["attempt_fence"] == request["attempt_fence"]
-            })
-    {
-        return Err(failure(
-            "native invocation already started or not outstanding",
-        ));
-    }
-    let start_id = hash(&json!([
-        "determa-native-invocation-start-1",
-        document["journal"]["scope_identity"],
-        request["root_instance_id"],
-        request["effect_id"],
-        request["attempt_fence"]
-    ]))?;
-    if document["original_requests"].get(&start_id) != Some(request)
+        || start["record"] != *record
+        || start["claim"] != *claim
+        || id != &expected_id
         || !checkpoint["pending_outbox_intents"]
             .as_array()
             .unwrap()
             .iter()
             .any(|intent| {
-                intent["intent"]["effect_id"] == request["effect_id"]
+                intent["intent"] == start["intent"]
+                    && intent["intent"]["effect_id"] == record["effect_id"]
                     && intent["delivery_state"] == json!({"status":"not_attempted"})
             })
     {
         return Err(failure(
-            "native invocation start identity/committed intent mismatch",
+            "native invocation start claim/intent/identity mismatch",
         ));
     }
     Ok(())
