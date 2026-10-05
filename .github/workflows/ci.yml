@@ -194,7 +194,10 @@ jobs:
       - name: Build with PostgreSQL
         run: cargo build --release --locked --features postgresql
 
-      - name: PostgreSQL transaction and CAS contract
+      - name: Install native gate runner dependencies
+        run: python3 -m pip install -r conformance-suite/scripts/validation-requirements.txt
+
+      - name: All required native execution-store gates with live PostgreSQL
         env:
           DETERMA_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/determa
-        run: python3 scripts/native_gate_report.py --require-postgresql --report target/native-gates/postgresql.xml --test checkpoint_postgresql
+        run: python3 conformance-suite/scripts/run_execution_store_gates.py --implementation-root . --mapping scripts/native-gates.json

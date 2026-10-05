@@ -1,0 +1,112 @@
+{
+  "gates": {
+    "public_registration": [
+      "extension_conformance::bundled_and_third_party_providers_share_one_public_registry",
+      "extension_conformance::bundled_stores_are_bound_to_public_registration_and_current_native_health"
+    ],
+    "public_selection": [
+      "adapter_selection::generic_vendor_selection_uses_native_proof_and_preserves_first_registration",
+      "adapter_selection::bundled_uri_selection_uses_the_same_public_registry_and_native_memory_claim"
+    ],
+    "executing_source": [
+      "extension_conformance::source_verification_precedes_factory_execution_and_injected_provider_calls",
+      "adapter_selection::substituted_factory_and_copied_claims_fail_before_observed_root_access"
+    ],
+    "configured_instance": [
+      "extension_conformance::source_and_native_instance_mutations_invalidate_bound_handles",
+      "adapter_selection::substituted_factory_and_copied_claims_fail_before_observed_root_access"
+    ],
+    "current_health": [
+      "adapter_selection::sqlite_native_schema_changes_invalidate_a_previously_verified_host",
+      "adapter_selection::generic_vendor_selection_uses_native_proof_and_preserves_first_registration"
+    ],
+    "forged_evidence": [
+      "adapter_selection::substituted_factory_and_copied_claims_fail_before_observed_root_access"
+    ],
+    "memory_and_file": [
+      "adapter_selection::bundled_uri_selection_uses_the_same_public_registry_and_native_memory_claim",
+      "extension_conformance::file_store_claim_requires_initialized_native_schema",
+      "checkpoint_adapters::file_store_runs_the_native_v1_host_contract_and_survives_restart"
+    ],
+    "sqlite_transactions": [
+      "durable_host_conformance::persistence_acknowledges_only_after_commit",
+      "checkpoint_adapters::sqlite_store_runs_the_native_v1_host_contract_and_survives_restart"
+    ],
+    "sqlite_configuration": [
+      "determa_state::checkpoint::adapters::sqlite::native_configuration_tests::changed_native_connection_settings_remove_sqlite_health",
+      "adapter_selection::sqlite_native_schema_changes_invalidate_a_previously_verified_host",
+      "extension_conformance::sqlite_claims_follow_the_configured_native_schema_and_health"
+    ],
+    "postgresql_transactions": [
+      "checkpoint_postgresql::postgresql_shared_application_transaction_runs_every_native_v1_variant"
+    ],
+    "postgresql_concurrency": [
+      "checkpoint_postgresql::independent_postgresql_sessions_commit_exactly_one_cas_winner"
+    ],
+    "postgresql_configuration": [
+      "checkpoint_postgresql::postgresql_rechecks_native_configuration_and_rolls_back_weakened_commit",
+      "checkpoint_postgresql::independent_postgresql_sessions_commit_exactly_one_cas_winner",
+      "adapter_selection::incompatible_live_postgresql_health_refuses_public_host_before_root_access"
+    ],
+    "durable_processing": [
+      "durable_host_conformance::native_lifecycle_acknowledgement_is_observed_after_commit_or_replay",
+      "durable_host_conformance::persistence_acknowledges_only_after_commit",
+      "checkpoint_adapters::public_process_replays_the_original_terminal_receipt_before_cas_or_migration"
+    ],
+    "permanent_retention": [
+      "checkpoint_adapters::permanent_sqlite_retains_internal_event_through_deferral_recall_and_terminalization",
+      "durable_host_conformance::permanent_quarantine_obeys_retained_replay_and_conflict_precedence",
+      "adapter_selection::sqlite_native_schema_changes_invalidate_a_previously_verified_host",
+      "native_worker_composition::actual_worker_preserves_strict_terminal_and_compact_dependency_evidence"
+    ],
+    "broker_composition": [
+      "native_worker_composition::durable_ingress_redelivers_after_commit_before_ack_and_runs_actual_outbox_worker",
+      "durable_host_conformance::native_lifecycle_acknowledgement_is_observed_after_commit_or_replay",
+      "extension_conformance::strong_host_profile_requires_bound_source_instance_health_and_host_proof"
+    ],
+    "strict_outbox_composition": [
+      "native_worker_composition::actual_worker_preserves_strict_terminal_and_compact_dependency_evidence"
+    ],
+    "compact_outbox_composition": [
+      "native_worker_composition::actual_worker_preserves_strict_terminal_and_compact_dependency_evidence"
+    ],
+    "shared_transaction_composition": [
+      "checkpoint_postgresql::postgresql_shared_application_transaction_runs_every_native_v1_variant",
+      "durable_host_conformance::persistence_acknowledges_only_after_commit",
+      "extension_conformance::strong_host_profile_requires_bound_source_instance_health_and_host_proof"
+    ],
+    "return_integrity": [
+      "durable_host_conformance::every_production_checkpoint_response_rejects_an_extra_member",
+      "durable_host_conformance::every_production_contract_response_rejects_an_extra_member",
+      "durable_host_conformance::every_returned_persistence_response_rejects_an_extra_member"
+    ]
+  },
+  "runs": [
+    {
+      "command": [
+        "python3",
+        "scripts/native_gate_report.py",
+        "--require-postgresql",
+        "--lib",
+        "--report",
+        "{report}",
+        "--test",
+        "adapter_selection",
+        "--test",
+        "extension_conformance",
+        "--test",
+        "checkpoint_adapters",
+        "--test",
+        "checkpoint_postgresql",
+        "--test",
+        "durable_host_conformance",
+        "--test",
+        "native_worker_composition"
+      ],
+      "report": "native-gates.xml",
+      "required_environment": [
+        "DETERMA_TEST_POSTGRES_URL"
+      ]
+    }
+  ]
+}

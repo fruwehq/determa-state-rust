@@ -29,10 +29,17 @@ impl ExtensionProvider for Provider {
     }
     fn capabilities(&self, _: &ExtensionInstance) -> Result<Vec<String>, ExtensionError> {
         // Deliberately overstate a candidate: the verifier must not promote it.
-        Ok(vec!["ephemeral".into(), "durable_concurrent".into()])
+        Ok(self.descriptor["supported_capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect())
     }
     fn health(&self, _: &ExtensionInstance) -> Result<String, ExtensionError> {
-        Ok(if self.healthy.load(Ordering::SeqCst) {
+        Ok(if self.healthy.load(Ordering::SeqCst)
+            && self.store.health().is_ok_and(|health| health.healthy)
+        {
             "healthy"
         } else {
             "unavailable"
@@ -53,6 +60,28 @@ struct Verifier {
     store: Arc<dyn ExecutionStore>,
 }
 impl HostVerifier for Verifier {
+    fn prove_host_features(
+        &self,
+        descriptor: &Value,
+        configuration: &Value,
+        instance: &ExtensionInstance,
+        context: &str,
+    ) -> BTreeSet<String> {
+        // This observer is installed around the real native PostgreSQL store
+        // and the production CheckpointHost already exercised by native gates.
+        if descriptor["provider_reference"]["identifier"] == "test.observed-postgresql"
+            && context == "general"
+            && configuration == &json!({"instance_id":"native-memory"})
+            && instance
+                .downcast_ref::<Arc<dyn ExecutionStore>>()
+                .is_some_and(|store| Arc::ptr_eq(store, &self.store))
+            && self.store.health().is_ok_and(|health| health.healthy)
+        {
+            BTreeSet::from(["atomic_accept_process".into()])
+        } else {
+            BTreeSet::new()
+        }
+    }
     fn verify_factory(&self, _: &Value, factory: &Arc<dyn ExtensionFactory>) -> bool {
         Arc::ptr_eq(factory, &self.factory)
     }
@@ -232,11 +261,11 @@ fn bundled_uri_selection_uses_the_same_public_registry_and_native_memory_claim()
 }
 
 #[derive(Default)]
-struct ObservedRoots {
-    inner: MemoryExecutionStore,
+struct ObservedRoots<T = MemoryExecutionStore> {
+    inner: T,
     accesses: AtomicUsize,
 }
-impl ExecutionStore for ObservedRoots {
+impl<T: ExecutionStore + 'static> ExecutionStore for ObservedRoots<T> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -285,7 +314,7 @@ impl ExecutionStore for ObservedRoots {
 fn substituted_factory_and_copied_claims_fail_before_observed_root_access() {
     use determa_state::checkpoint::{CheckpointHost, HostProfile};
     let descriptor = json!({"category":"execution_store","provider_reference":{"identifier":"test.observed-memory","version":"1.0.0","content_digest":format!("sha256:{}", "a".repeat(64))},"interface_version":1,"supported_capabilities":["ephemeral","durable_concurrent"]});
-    let observed = Arc::new(ObservedRoots::default());
+    let observed: Arc<ObservedRoots> = Arc::new(ObservedRoots::default());
     observed.load("observer-self-check").unwrap();
     assert_eq!(observed.accesses.swap(0, Ordering::SeqCst), 1);
     let store: Arc<dyn ExecutionStore> = observed.clone();
@@ -434,4 +463,78 @@ fn sqlite_native_schema_changes_invalidate_a_previously_verified_host() {
             )
             .is_err());
     }
+}
+
+#[cfg(feature = "postgresql")]
+#[test]
+fn incompatible_live_postgresql_health_refuses_public_host_before_root_access() {
+    use determa_state::checkpoint::{
+        CheckpointHost, DurableStoreMode, HostProfile, PostgresqlExecutionStore,
+    };
+    let Ok(base_url) = std::env::var("DETERMA_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let schema = format!(
+        "determa_observed_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let mut native = postgres::Client::connect(&base_url, postgres::NoTls).unwrap();
+    native
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .unwrap();
+    let separator = if base_url.contains('?') { '&' } else { '?' };
+    let url = format!("{base_url}{separator}options=-c%20search_path%3D{schema}");
+    let concrete =
+        PostgresqlExecutionStore::connect_no_tls(&url, DurableStoreMode::bounded()).unwrap();
+    concrete.initialize_schema().unwrap();
+    let observed = Arc::new(ObservedRoots {
+        inner: concrete,
+        accesses: AtomicUsize::new(0),
+    });
+    observed.load("observer-self-check").unwrap();
+    assert_eq!(observed.accesses.swap(0, Ordering::SeqCst), 1);
+    let store: Arc<dyn ExecutionStore> = observed.clone();
+    let descriptor = json!({"category":"execution_store","provider_reference":{"identifier":"test.observed-postgresql","version":"1.0.0","content_digest":format!("sha256:{}", "b".repeat(64))},"interface_version":1,"supported_capabilities":["ephemeral","durable_concurrent","root_identity_retention"]});
+    // The trusted test verifier binds this compiled provider to this precise
+    // observed native store. Its health comes from the real PostgreSQL session.
+    let provider: Arc<dyn ExtensionProvider> = Arc::new(Provider {
+        descriptor: descriptor.clone(),
+        store: store.clone(),
+        healthy: Arc::new(AtomicBool::new(true)),
+    });
+    let factory: Arc<dyn ExtensionFactory> =
+        Arc::new(Factory(provider.clone(), Arc::new(AtomicUsize::new(0))));
+    let registry = Arc::new(ExtensionRegistry::with_verifier(Arc::new(Verifier {
+        factory: factory.clone(),
+        provider,
+        store,
+    })));
+    registry.register(descriptor.clone(), factory).unwrap();
+    let binding = registry
+        .configure_execution_store(&descriptor, &json!({"instance_id":"native-memory"}))
+        .unwrap();
+    let host = CheckpointHost::from_verified(
+        binding,
+        Arc::new(determa_state::InMemoryDefinitionResolver::default()),
+    );
+    assert!(host
+        .validate_profile(HostProfile::DurableEmbeddedProcessing, false)
+        .is_ok());
+    assert_eq!(observed.accesses.load(Ordering::SeqCst), 0);
+    native
+        .batch_execute(&format!(
+            "ALTER TABLE {schema}.determa_execution_checkpoints ADD COLUMN unexpected TEXT"
+        ))
+        .unwrap();
+    assert_eq!(
+        host.validate_profile(HostProfile::DurableEmbeddedProcessing, false)
+            .unwrap_err()
+            .code,
+        AdapterErrorCode::AdapterCapabilityMismatch
+    );
+    assert_eq!(observed.accesses.load(Ordering::SeqCst), 0);
 }
