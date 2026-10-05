@@ -225,46 +225,13 @@ impl SqliteLocalAuthority {
         let mutation = checkpoint_mutation_bytes(replacement, guard)?;
         let native_record = StoreRecord::from_checkpoint(replacement).map_err(failure)?;
         let replacement = &native_record;
-        self.perform_native(request_bytes, invocation, Some(&mutation), true, |transaction| {
-            crate::checkpoint::verify_sqlite_schema(transaction, mode)
-                .map_err(failure)?;
-            let current = crate::checkpoint::load_sqlite_record(
-                transaction, &replacement.root_instance_id,
-            ).map_err(failure)?;
-            match guard {
-                None => {
-                    if current.is_some() {
-                        return Err(failure("checkpoint_revision_conflict"));
-                    }
-                    crate::checkpoint::validate_policy_insert(mode, replacement)
-                        .map_err(failure)?;
-                    transaction.execute(
-                        "INSERT INTO determa_execution_checkpoints VALUES (?,?,?,?)",
-                        params![replacement.root_instance_id, replacement.revision,
-                            replacement.execution_checkpoint_digest, replacement.bytes],
-                    ).map_err(failure)?;
-                }
-                Some(guard) => {
-                    let current = current.ok_or_else(|| failure("checkpoint_revision_conflict"))?;
-                    if current.revision != guard.expected_revision
-                        || current.execution_checkpoint_digest != guard.expected_checkpoint_digest {
-                        return Err(failure("checkpoint_revision_conflict"));
-                    }
-                    crate::checkpoint::validate_policy_replacement(mode, &current, replacement)
-                        .map_err(failure)?;
-                    let changed = transaction.execute(
-                        "UPDATE determa_execution_checkpoints SET revision=?,checkpoint_digest=?,checkpoint_bytes=? WHERE root_instance_id=? AND revision=? AND checkpoint_digest=?",
-                        params![replacement.revision, replacement.execution_checkpoint_digest,
-                            replacement.bytes, replacement.root_instance_id,
-                            guard.expected_revision, guard.expected_checkpoint_digest],
-                    ).map_err(failure)?;
-                    if changed != 1 {
-                        return Err(failure("checkpoint_revision_conflict"));
-                    }
-                }
-            }
-            Ok(())
-        })
+        self.perform_native(
+            request_bytes,
+            invocation,
+            Some(&mutation),
+            true,
+            |transaction| apply_checkpoint(transaction, mode, replacement, guard),
+        )
     }
 
     fn perform_native(
@@ -784,3 +751,56 @@ fn response(
     }
     Ok(result)
 }
+
+fn apply_checkpoint(
+    transaction: &Connection,
+    mode: DurableStoreMode,
+    replacement: &StoreRecord,
+    guard: Option<&MutationGuard>,
+) -> Result<(), AuthorityError> {
+    crate::checkpoint::verify_sqlite_schema(transaction, mode).map_err(failure)?;
+    let current = crate::checkpoint::load_sqlite_record(transaction, &replacement.root_instance_id)
+        .map_err(failure)?;
+    match guard {
+        None => {
+            if current.is_some() {
+                return Err(failure("checkpoint_revision_conflict"));
+            }
+            crate::checkpoint::validate_policy_insert(mode, replacement).map_err(failure)?;
+            transaction
+                .execute(
+                    "INSERT INTO determa_execution_checkpoints VALUES (?,?,?,?)",
+                    params![
+                        replacement.root_instance_id,
+                        replacement.revision,
+                        replacement.execution_checkpoint_digest,
+                        replacement.bytes
+                    ],
+                )
+                .map_err(failure)?;
+        }
+        Some(guard) => {
+            let current = current.ok_or_else(|| failure("checkpoint_revision_conflict"))?;
+            if current.revision != guard.expected_revision
+                || current.execution_checkpoint_digest != guard.expected_checkpoint_digest
+            {
+                return Err(failure("checkpoint_revision_conflict"));
+            }
+            crate::checkpoint::validate_policy_replacement(mode, &current, replacement)
+                .map_err(failure)?;
+            let changed = transaction.execute(
+            "UPDATE determa_execution_checkpoints SET revision=?,checkpoint_digest=?,checkpoint_bytes=? WHERE root_instance_id=? AND revision=? AND checkpoint_digest=?",
+            params![replacement.revision, replacement.execution_checkpoint_digest,
+                replacement.bytes, replacement.root_instance_id,
+                guard.expected_revision, guard.expected_checkpoint_digest],
+        ).map_err(failure)?;
+            if changed != 1 {
+                return Err(failure("checkpoint_revision_conflict"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod crash_tests;
