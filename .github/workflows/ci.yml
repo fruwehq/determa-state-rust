@@ -103,6 +103,10 @@ jobs:
           cmp schema/extension-capability-report-v1.schema.json authoritative-spec/schema/extension-capability-report-v1.schema.json
           cmp schema/extension-capability-requirement-v1.schema.json authoritative-spec/schema/extension-capability-requirement-v1.schema.json
           cmp schema/inspection-v1.schema.json authoritative-spec/schema/inspection-v1.schema.json
+          cmp schema/delivery-v1.schema.json authoritative-spec/schema/delivery-v1.schema.json
+          cmp schema/host-effect-journal-v1.schema.json authoritative-spec/schema/host-effect-journal-v1.schema.json
+          cmp schema/application-projection-v1.schema.json conformance-suite/scripts/schemas/application-projection-v1.schema.json
+          cmp schema/lossless-delivery-v1.schema.json conformance-suite/scripts/schemas/lossless-delivery-v1.schema.json
           cmp schema/durable-host-call-log-v1.schema.json conformance-suite/scripts/schemas/durable-host-call-log-v1.schema.json
           cmp schema/durable-host-inputs-v1.schema.json conformance-suite/scripts/schemas/durable-host-inputs-v1.schema.json
           cmp schema/durable-host-results-v1.schema.json conformance-suite/scripts/schemas/durable-host-results-v1.schema.json

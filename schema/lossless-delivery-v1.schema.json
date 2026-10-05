@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/schemas/conformance/lossless-delivery-v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["lossless_delivery_format", "lossless_delivery_schema_version", "configured_transport_claims", "vectors", "invalid_vectors", "core_observability_vectors", "integration", "normative_examples"],
+  "properties": {
+    "lossless_delivery_format": {"const": "determa.conformance.lossless_delivery"},
+    "lossless_delivery_schema_version": {"const": 1},
+    "configured_transport_claims": {"const": []},
+    "vectors": {"type": "array", "minItems": 22, "items": {"$ref": "#/$defs/vector"}},
+    "invalid_vectors": {"type": "array", "minItems": 27, "items": {"$ref": "#/$defs/invalid_vector"}},
+    "core_observability_vectors": {"type": "array", "minItems": 6, "maxItems": 6,
+      "items": {"$ref": "#/$defs/core_observability_vector"}},
+    "integration": {
+      "type": "object", "additionalProperties": false,
+      "required": ["authority_scenario", "required_authority_guarantees", "effect_profile_format", "integration_vectors"],
+      "properties": {
+        "authority_scenario": {"const": "worker_sqlite"},
+        "required_authority_guarantees": {"const": ["guarded_local_writes", "worker_fencing"]},
+        "effect_profile_format": {"const": "determa.committed_native_effects.vectors"},
+        "integration_vectors": {"type": "array", "minItems": 5, "maxItems": 5,
+          "items": {"$ref": "#/$defs/integration_vector"}}
+      }
+    },
+    "normative_examples": {"type": "object", "minProperties": 5}
+  },
+  "$defs": {
+    "store": {
+      "type": "object", "additionalProperties": false,
+      "required": ["checkpoint", "bindings", "dead_letters", "source_acknowledgements", "provider_dispatches"],
+      "properties": {
+        "checkpoint": {"type": "string", "pattern": "^[a-z0-9-]+-checkpoint-v1\\.json$"},
+        "bindings": {"type": "array", "items": {"$ref": "https://determa.dev/state/schema/delivery-v1.schema.json#/$defs/admission_binding"}},
+        "dead_letters": {"type": "array", "items": {"$ref": "https://determa.dev/state/schema/delivery-v1.schema.json#/$defs/dead_letter_record"}},
+        "source_acknowledgements": {"type": "array", "items": {"type": "object", "additionalProperties": false,
+          "required": ["source_scope", "source_delivery_id"],
+          "properties": {"source_scope": {"type": "string"}, "source_delivery_id": {"type": "string"}}}},
+        "provider_dispatches": {"type": "integer", "minimum": 0},
+        "destination_receipts": {"type": "array", "items": {"$ref": "https://determa.dev/state/schema/delivery-v1.schema.json#/$defs/outbound_destination_receipt"}}
+      }
+    },
+    "vector": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "operation", "request", "before", "after", "fault_injection", "replay_of", "expected_response"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+        "operation": {"enum": ["ingest", "ingest_batch", "process", "dead_letter", "defer", "recall", "deliver_outbound"]},
+        "request": {"oneOf": [{"type": "object", "minProperties": 1}, {"type": "array", "minItems": 2}]},
+        "before": {"$ref": "#/$defs/store"},
+        "after": {"$ref": "#/$defs/store"},
+        "fault_injection": {"enum": [null, "atomic_commit_failure", "crash_before_commit", "crash_after_commit_before_ack", "backpressure", "target_removed", "earlier_source_item_unresolved"]},
+        "ordering_context": {"type": "object", "additionalProperties": false,
+          "required": ["mode", "source_scope", "unresolved_source_delivery_id"],
+          "properties": {"mode": {"const": "source_ordered"},
+            "source_scope": {"type": "string"},
+            "unresolved_source_delivery_id": {"type": "string"}}},
+        "premise_kind": {"const": "hypothetical_common_rule"},
+        "authority_context": {"type": "object", "additionalProperties": false,
+          "required": ["scope_identity", "claimed_epoch", "current_epoch", "guarantee"],
+          "properties": {"scope_identity": {"type": "string"},
+            "claimed_epoch": {"type": "string", "pattern": "^[0-9]+$"},
+            "current_epoch": {"type": "string", "pattern": "^[0-9]+$"},
+            "guarantee": {"const": "authoritative_scope_fencing"}}},
+        "replay_of": {"type": ["string", "null"]},
+        "expected_response": {"oneOf": [
+          {"$ref": "https://determa.dev/state/schema/delivery-v1.schema.json#/$defs/source_owned"},
+          {"$ref": "https://determa.dev/state/schema/delivery-v1.schema.json#/$defs/admitted"},
+          {"$ref": "https://determa.dev/state/schema/delivery-v1.schema.json#/$defs/dead_lettered"},
+          {"$ref": "https://determa.dev/state/schema/delivery-v1.schema.json#/$defs/machine_disposition"},
+          {"$ref": "https://determa.dev/state/schema/delivery-v1.schema.json#/$defs/mailbox_placement"},
+          {"$ref": "https://determa.dev/state/schema/delivery-v1.schema.json#/$defs/outbound_decision"},
+          {"type": "array", "minItems": 2,
+            "items": {"$ref": "https://determa.dev/state/schema/delivery-v1.schema.json#/$defs/source_owned"}},
+          {"type": "object", "additionalProperties": false,
+            "required": ["kind", "code", "acknowledge_source"],
+            "properties": {"kind": {"const": "typed_failure"},
+              "code": {"const": "stale_scope_authority"},
+              "acknowledge_source": {"const": false}}},
+          {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "no_response"}}}
+        ]}
+      }
+    },
+    "invalid_vector": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "operation", "candidate", "before", "after", "expected_failure", "acknowledge_source"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+        "operation": {"enum": ["parse_delivery", "parse_delivery_bytes", "validate_evidence"]},
+        "candidate": {"oneOf": [{"type": "object"}, {"type": "string"}]},
+        "before": {"$ref": "#/$defs/store"},
+        "after": {"$ref": "#/$defs/store"},
+        "expected_failure": {"enum": ["malformed_delivery", "invalid_delivery", "invalid_delivery_evidence"]},
+        "acknowledge_source": {"const": false}
+      }
+    },
+    "integration_vector": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "effect_vector", "request", "expected", "source_item", "source_acknowledgements", "checkpoint_before", "checkpoint_after", "journal_before", "journal_after"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+        "effect_vector": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+        "request": {"type": "object"},
+        "expected": {"type": "object"},
+        "source_item": {"type": "null"},
+        "source_acknowledgements": {"const": []},
+        "checkpoint_before": {"$ref": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json"},
+        "checkpoint_after": {"$ref": "https://determa.dev/state/schema/execution-checkpoint-v1.schema.json"},
+        "journal_before": {"$ref": "https://determa.dev/state/schema/host-effect-journal-v1.schema.json"},
+        "journal_after": {"$ref": "https://determa.dev/state/schema/host-effect-journal-v1.schema.json"}
+      }
+    },
+    "core_observability_vector": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "core_case", "request_pointer", "operation", "request", "machine_source", "before_state", "expected_result", "descriptor", "target_machine_source", "source_acknowledgements"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+        "core_case": {"enum": ["117-version1-mailboxes", "118-version1-persistence"]},
+        "request_pointer": {"type": "string"},
+        "operation": {"enum": ["step_v1", "migrate_aggregate_v1"]},
+        "request": {"type": "object"},
+        "machine_source": {"type": "string", "minLength": 1},
+        "before_state": {"$ref": "https://determa.dev/state/schema/aggregate-state-v1.schema.json"},
+        "expected_result": {"type": "object"},
+        "descriptor": {"oneOf": [{"type": "null"}, {"$ref": "https://determa.dev/state/schema/migration-descriptor-v1.schema.json"}]},
+        "target_machine_source": {"type": ["string", "null"]},
+        "source_acknowledgements": {"const": []}
+      }
+    }
+  }
+}

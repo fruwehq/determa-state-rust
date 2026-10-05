@@ -1,0 +1,986 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/delivery-v1.schema.json",
+  "title": "Determa State lossless delivery version 1",
+  "description": "Closed ingress ownership decisions, durable ingress dead-letter evidence, and hosted machine/outbound decision projections. Semantic digest and transaction checks are in SPEC section 21.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/source_owned"
+    },
+    {
+      "$ref": "#/$defs/admitted"
+    },
+    {
+      "$ref": "#/$defs/dead_letter_record"
+    },
+    {
+      "$ref": "#/$defs/dead_lettered"
+    },
+    {
+      "$ref": "#/$defs/machine_disposition"
+    },
+    {
+      "$ref": "#/$defs/outbound_decision"
+    },
+    {
+      "$ref": "#/$defs/mailbox_placement"
+    },
+    {
+      "$ref": "#/$defs/admission_binding"
+    },
+    {
+      "$ref": "#/$defs/outbound_destination_receipt"
+    }
+  ],
+  "$defs": {
+    "string": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "content": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "content_kind",
+            "content_value"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "content_kind": {
+              "const": "original_bytes_base64"
+            },
+            "content_value": {
+              "type": "string",
+              "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/][AQgw]==|[A-Za-z0-9+/]{2}[AEIMQUYcgkosw048]=)?(?![\\s\\S])"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "content_kind",
+            "content_value"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "content_kind": {
+              "const": "canonical_transport_value"
+            },
+            "content_value": {
+              "$ref": "aggregate-state-v1.schema.json#/$defs/typedValue"
+            }
+          }
+        }
+      ]
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "source_scope",
+        "source_delivery_id",
+        "source_content_digest",
+        "content"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_scope": {
+          "$ref": "#/$defs/string"
+        },
+        "source_delivery_id": {
+          "$ref": "#/$defs/string"
+        },
+        "source_content_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "content": {
+          "$ref": "#/$defs/content"
+        }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "required": [
+        "kind",
+        "identifier"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "source_policy",
+            "operator",
+            "host_profile",
+            "machine_core",
+            "destination"
+          ]
+        },
+        "identifier": {
+          "$ref": "#/$defs/string"
+        }
+      }
+    },
+    "retention": {
+      "type": "object",
+      "required": [
+        "profile",
+        "minimum_replay_until"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "enum": [
+            "permanent",
+            "bounded"
+          ]
+        },
+        "minimum_replay_until": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/string"
+            }
+          ]
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "required": [
+        "delivery_message_kind",
+        "source",
+        "envelope",
+        "delivery_mode"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "delivery_message_kind": {
+          "const": "ingress_request"
+        },
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "envelope": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "aggregate-state-v1.schema.json#/$defs/envelope"
+            }
+          ]
+        },
+        "delivery_mode": {
+          "enum": [
+            "input",
+            "internal"
+          ]
+        }
+      }
+    },
+    "source_owned": {
+      "type": "object",
+      "required": [
+        "delivery_message_kind",
+        "source_scope",
+        "source_delivery_id",
+        "source_content_digest",
+        "event_id",
+        "reason",
+        "decision_authority",
+        "acknowledge_source"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "delivery_message_kind": {
+          "const": "source_owned"
+        },
+        "source_scope": {
+          "$ref": "#/$defs/string"
+        },
+        "source_delivery_id": {
+          "$ref": "#/$defs/string"
+        },
+        "source_content_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "event_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/string"
+            }
+          ]
+        },
+        "reason": {
+          "enum": [
+            "backpressure",
+            "capacity_unavailable",
+            "malformed_delivery",
+            "invalid_delivery",
+            "target_unavailable",
+            "precommit_failure",
+            "authority_unavailable",
+            "source_delivery_id_conflict",
+            "event_id_conflict"
+          ]
+        },
+        "decision_authority": {
+          "$ref": "#/$defs/authority"
+        },
+        "acknowledge_source": {
+          "const": false
+        }
+      }
+    },
+    "admitted": {
+      "type": "object",
+      "required": [
+        "delivery_message_kind",
+        "source_scope",
+        "source_delivery_id",
+        "source_content_digest",
+        "event_id",
+        "evidence",
+        "retention",
+        "decision_authority",
+        "acknowledge_source",
+        "admission_binding_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "delivery_message_kind": {
+          "const": "admitted"
+        },
+        "source_scope": {
+          "$ref": "#/$defs/string"
+        },
+        "source_delivery_id": {
+          "$ref": "#/$defs/string"
+        },
+        "source_content_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "event_id": {
+          "$ref": "#/$defs/string"
+        },
+        "evidence": {
+          "$ref": "#/$defs/acceptance_evidence"
+        },
+        "retention": {
+          "$ref": "#/$defs/retention"
+        },
+        "decision_authority": {
+          "$ref": "#/$defs/authority"
+        },
+        "acknowledge_source": {
+          "const": true
+        },
+        "admission_binding_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "dead_letter_record": {
+      "type": "object",
+      "required": [
+        "delivery_message_kind",
+        "source",
+        "event_id",
+        "envelope_digest",
+        "reason_code",
+        "decision_authority",
+        "retention",
+        "terminal_receipt_id",
+        "ingress_dead_letter_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "delivery_message_kind": {
+          "const": "ingress_dead_letter_record"
+        },
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "event_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/string"
+            }
+          ]
+        },
+        "envelope_digest": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/digest"
+            }
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/string"
+        },
+        "decision_authority": {
+          "$ref": "#/$defs/authority"
+        },
+        "retention": {
+          "$ref": "#/$defs/retention"
+        },
+        "terminal_receipt_id": {
+          "$ref": "#/$defs/string"
+        },
+        "ingress_dead_letter_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "dead_lettered": {
+      "type": "object",
+      "required": [
+        "delivery_message_kind",
+        "record",
+        "acknowledge_source"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "delivery_message_kind": {
+          "const": "ingress_dead_lettered"
+        },
+        "record": {
+          "$ref": "#/$defs/dead_letter_record"
+        },
+        "acknowledge_source": {
+          "const": true
+        }
+      }
+    },
+    "machine_disposition": {
+      "type": "object",
+      "required": [
+        "delivery_message_kind",
+        "event_id",
+        "disposition",
+        "decision_authority",
+        "evidence",
+        "retention",
+        "outcome"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "delivery_message_kind": {
+          "const": "machine_disposition"
+        },
+        "event_id": {
+          "$ref": "#/$defs/string"
+        },
+        "disposition": {
+          "enum": [
+            "handled",
+            "unhandled",
+            "faulted",
+            "disposed",
+            "migration_disposed"
+          ]
+        },
+        "decision_authority": {
+          "$ref": "#/$defs/authority"
+        },
+        "evidence": {
+          "$ref": "#/$defs/terminal_event_evidence"
+        },
+        "retention": {
+          "$ref": "#/$defs/retention"
+        },
+        "outcome": {
+          "$ref": "execution-checkpoint-v1.schema.json#/$defs/terminalEventOutcome"
+        }
+      }
+    },
+    "outbound_decision": {
+      "type": "object",
+      "required": [
+        "delivery_message_kind",
+        "effect_id",
+        "outcome",
+        "reason_code",
+        "decision_authority",
+        "evidence",
+        "destination_receipt_id",
+        "retention"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "delivery_message_kind": {
+          "const": "outbound_decision"
+        },
+        "effect_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "outcome": {
+          "enum": [
+            "not_attempted",
+            "retryable_failure",
+            "ambiguous",
+            "confirmed",
+            "permanently_rejected",
+            "operator_cancelled",
+            "discarded",
+            "dead_lettered"
+          ]
+        },
+        "reason_code": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/string"
+            }
+          ]
+        },
+        "decision_authority": {
+          "$ref": "#/$defs/authority"
+        },
+        "evidence": {
+          "$ref": "#/$defs/outbound_evidence"
+        },
+        "destination_receipt_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/string"
+            }
+          ]
+        },
+        "retention": {
+          "$ref": "#/$defs/retention"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "retryable_failure",
+                  "ambiguous",
+                  "permanently_rejected",
+                  "operator_cancelled",
+                  "discarded",
+                  "dead_lettered"
+                ]
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason_code": {
+                "$ref": "#/$defs/string"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "reason_code": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "confirmed",
+                  "dead_lettered"
+                ]
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "destination_receipt_id": {
+                "$ref": "#/$defs/string"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "destination_receipt_id": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "not_attempted",
+                  "retryable_failure",
+                  "ambiguous"
+                ]
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "type": "object",
+                "required": [
+                  "checkpoint",
+                  "outbox_location"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "checkpoint": {
+                    "$ref": "#/$defs/checkpoint_state_evidence"
+                  },
+                  "outbox_location": {
+                    "type": "object",
+                    "required": [
+                      "kind",
+                      "state_revision"
+                    ],
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "pending"
+                      },
+                      "state_revision": {
+                        "$ref": "#/$defs/decimal"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "evidence": {
+                "type": "object",
+                "required": [
+                  "checkpoint",
+                  "outbox_location"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "checkpoint": {
+                    "$ref": "#/$defs/checkpoint_state_evidence"
+                  },
+                  "outbox_location": {
+                    "type": "object",
+                    "required": [
+                      "kind",
+                      "terminal_sequence",
+                      "committed_revision"
+                    ],
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "terminal"
+                      },
+                      "terminal_sequence": {
+                        "$ref": "#/$defs/decimal"
+                      },
+                      "committed_revision": {
+                        "$ref": "#/$defs/decimal"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "mailbox_placement": {
+      "type": "object",
+      "required": [
+        "delivery_message_kind",
+        "event_id",
+        "placement",
+        "acceptance_sequence",
+        "queue_sequence",
+        "decision_authority",
+        "evidence",
+        "retention",
+        "origin",
+        "envelope_digest",
+        "target_runtime_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "delivery_message_kind": {
+          "const": "mailbox_placement"
+        },
+        "event_id": {
+          "$ref": "#/$defs/string"
+        },
+        "placement": {
+          "enum": [
+            "ready",
+            "deferred"
+          ]
+        },
+        "acceptance_sequence": {
+          "$ref": "#/$defs/decimal"
+        },
+        "queue_sequence": {
+          "$ref": "#/$defs/decimal"
+        },
+        "decision_authority": {
+          "$ref": "#/$defs/authority"
+        },
+        "evidence": {
+          "$ref": "#/$defs/checkpoint_state_evidence"
+        },
+        "retention": {
+          "$ref": "#/$defs/retention"
+        },
+        "origin": {
+          "$ref": "#/$defs/mailbox_origin"
+        },
+        "envelope_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "target_runtime_id": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "admission_binding": {
+      "type": "object",
+      "required": [
+        "delivery_message_kind",
+        "source_scope",
+        "source_delivery_id",
+        "source_content_digest",
+        "event_id",
+        "envelope_digest",
+        "evidence",
+        "admission_binding_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "delivery_message_kind": {
+          "const": "admission_binding"
+        },
+        "source_scope": {
+          "$ref": "#/$defs/string"
+        },
+        "source_delivery_id": {
+          "$ref": "#/$defs/string"
+        },
+        "source_content_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "event_id": {
+          "$ref": "#/$defs/string"
+        },
+        "envelope_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "evidence": {
+          "$ref": "#/$defs/acceptance_evidence"
+        },
+        "admission_binding_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "checkpoint_state_evidence": {
+      "type": "object",
+      "required": [
+        "root_instance_id",
+        "checkpoint_revision",
+        "execution_checkpoint_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "root_instance_id": {
+          "$ref": "#/$defs/string"
+        },
+        "checkpoint_revision": {
+          "$ref": "#/$defs/decimal"
+        },
+        "execution_checkpoint_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "acceptance_evidence": {
+      "type": "object",
+      "required": [
+        "operation_kind",
+        "checkpoint",
+        "receipt_sequence",
+        "acceptance_sequence",
+        "envelope_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation_kind": {
+          "const": "acceptance"
+        },
+        "checkpoint": {
+          "$ref": "#/$defs/checkpoint_state_evidence"
+        },
+        "receipt_sequence": {
+          "$ref": "#/$defs/decimal"
+        },
+        "acceptance_sequence": {
+          "$ref": "#/$defs/decimal"
+        },
+        "envelope_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "terminal_event_evidence": {
+      "type": "object",
+      "required": [
+        "operation_kind",
+        "checkpoint",
+        "receipt_sequence",
+        "acceptance_sequence",
+        "final_queue_sequence",
+        "request_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operation_kind": {
+          "const": "event_terminal"
+        },
+        "checkpoint": {
+          "$ref": "#/$defs/checkpoint_state_evidence"
+        },
+        "receipt_sequence": {
+          "$ref": "#/$defs/decimal"
+        },
+        "acceptance_sequence": {
+          "$ref": "#/$defs/decimal"
+        },
+        "final_queue_sequence": {
+          "$ref": "#/$defs/decimal"
+        },
+        "request_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "mailbox_origin": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "origin_kind",
+            "acceptance_receipt_sequence"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "origin_kind": {
+              "const": "host_acceptance"
+            },
+            "acceptance_receipt_sequence": {
+              "$ref": "#/$defs/decimal"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "origin_kind",
+            "producer_operation_receipt_sequence"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "origin_kind": {
+              "const": "internal_emission"
+            },
+            "producer_operation_receipt_sequence": {
+              "$ref": "#/$defs/decimal"
+            }
+          }
+        }
+      ]
+    },
+    "outbox_location": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "state_revision"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "pending"
+            },
+            "state_revision": {
+              "$ref": "#/$defs/decimal"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "terminal_sequence",
+            "committed_revision"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "terminal"
+            },
+            "terminal_sequence": {
+              "$ref": "#/$defs/decimal"
+            },
+            "committed_revision": {
+              "$ref": "#/$defs/decimal"
+            }
+          }
+        }
+      ]
+    },
+    "outbound_evidence": {
+      "type": "object",
+      "required": [
+        "checkpoint",
+        "outbox_location"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "checkpoint": {
+          "$ref": "#/$defs/checkpoint_state_evidence"
+        },
+        "outbox_location": {
+          "$ref": "#/$defs/outbox_location"
+        }
+      }
+    },
+    "outbound_destination_receipt": {
+      "type": "object",
+      "required": [
+        "delivery_message_kind",
+        "root_instance_id",
+        "effect_id",
+        "terminal_sequence",
+        "outcome",
+        "reason_code",
+        "destination_receipt_id",
+        "destination_authority",
+        "execution_checkpoint_digest",
+        "outbound_destination_receipt_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "delivery_message_kind": {
+          "const": "outbound_destination_receipt"
+        },
+        "root_instance_id": {
+          "$ref": "#/$defs/string"
+        },
+        "effect_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "terminal_sequence": {
+          "$ref": "#/$defs/decimal"
+        },
+        "outcome": {
+          "enum": [
+            "confirmed",
+            "dead_lettered"
+          ]
+        },
+        "reason_code": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/string"
+            }
+          ]
+        },
+        "destination_receipt_id": {
+          "$ref": "#/$defs/string"
+        },
+        "destination_authority": {
+          "$ref": "#/$defs/authority"
+        },
+        "execution_checkpoint_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "outbound_destination_receipt_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "dead_lettered"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason_code": {
+                "$ref": "#/$defs/string"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "reason_code": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

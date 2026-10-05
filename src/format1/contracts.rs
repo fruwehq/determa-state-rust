@@ -171,6 +171,12 @@ fn validate_embedded_artifacts(
 
 fn contract_schema(kind: &str) -> Option<&'static str> {
     match kind {
+        "application_projection_v1" => Some(include_str!(
+            "../../schema/application-projection-v1.schema.json"
+        )),
+        "lossless_delivery_v1" => Some(include_str!(
+            "../../schema/lossless-delivery-v1.schema.json"
+        )),
         "core_step_result_v1" => Some(include_str!("../../schema/core-step-result-v1.schema.json")),
         "inspection_v1" => Some(include_str!("../../schema/inspection-v1.schema.json")),
         "durable_host_call_log_v1" => Some(include_str!(
@@ -201,8 +207,12 @@ fn contract_schema(kind: &str) -> Option<&'static str> {
     }
 }
 
-fn schema_resources() -> [&'static str; 15] {
+fn schema_resources() -> [&'static str; 20] {
     [
+        include_str!("../../schema/application-projection-v1.schema.json"),
+        include_str!("../../schema/lossless-delivery-v1.schema.json"),
+        include_str!("../../schema/delivery-v1.schema.json"),
+        include_str!("../../schema/host-effect-journal-v1.schema.json"),
         include_str!("../../schema/aggregate-state-v1.schema.json"),
         include_str!("../../schema/aggregate-state-package-v1.schema.json"),
         include_str!("../../schema/core-step-result-v1.schema.json"),
@@ -218,6 +228,7 @@ fn schema_resources() -> [&'static str; 15] {
         include_str!("../../schema/version1-operation-result.schema.json"),
         include_str!("../../schema/version1-operation-failures.schema.json"),
         include_str!("../../schema/machine.schema.json"),
+        include_str!("../../schema/provider-reference-v1.schema.json"),
     ]
 }
 
