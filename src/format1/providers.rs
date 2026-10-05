@@ -564,7 +564,7 @@ pub(crate) fn guard(
             .ok_or_else(unavailable)?
             .invoke_guard(
                 provider,
-                &super::runtime::provider_snapshot(runtime, scope, envelope, provider),
+                &super::runtime::provider_snapshot(runtime, scope, envelope, provider, None),
             ),
     }
 }

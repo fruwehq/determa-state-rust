@@ -2606,22 +2606,14 @@ fn execute_transition(
     if runtime.status == RuntimeStatus::Completed {
         return Ok(());
     }
-    for (runtime_id, declaration_path, locator) in &context.provider_writes[writes_start..] {
-        if runtime_id == &runtime.runtime_id
-            && !super::compile::scope_survives(
-                &runtime.definition,
-                &runtime.definition.states[source_path],
-                &CompiledTarget::State(target.clone()),
-                declaration_path,
-            )
-        {
-            return Err(StepFault {
-                code: EngineFaultCode::ActionFault,
-                source_locator: locator.clone(),
-            });
-        }
-    }
-    context.provider_writes.truncate(writes_start);
+    validate_provider_writes(
+        runtime,
+        source_path,
+        &target,
+        transition.local,
+        writes_start,
+        context,
+    )?;
     perform_transition(
         runtime,
         source_path,
@@ -2686,15 +2678,13 @@ fn choice_enabled(
     })
 }
 
-fn perform_transition(
-    runtime: &mut RuntimeState,
+fn transition_boundary(
+    runtime: &RuntimeState,
     source_path: &str,
     target_path: &str,
-    history: bool,
     local: bool,
-    context: &mut StepContext<'_>,
-) -> Result<(), StepFault> {
-    let boundary = if source_path == target_path {
+) -> String {
+    if source_path == target_path {
         runtime.definition.states[source_path]
             .parent
             .clone()
@@ -2712,7 +2702,43 @@ fn perform_transition(
         target_path.to_string()
     } else {
         lowest_common_ancestor(&runtime.definition, source_path, target_path)
-    };
+    }
+}
+
+fn validate_provider_writes(
+    runtime: &RuntimeState,
+    source_path: &str,
+    target_path: &str,
+    local: bool,
+    writes_start: usize,
+    context: &mut StepContext<'_>,
+) -> Result<(), StepFault> {
+    let boundary = transition_boundary(runtime, source_path, target_path, local);
+    for (runtime_id, declaration_path, locator) in &context.provider_writes[writes_start..] {
+        if runtime_id == &runtime.runtime_id
+            && declaration_path != "root"
+            && declaration_path != &boundary
+            && is_descendant(declaration_path, &boundary)
+        {
+            return Err(StepFault {
+                code: EngineFaultCode::ActionFault,
+                source_locator: locator.clone(),
+            });
+        }
+    }
+    context.provider_writes.truncate(writes_start);
+    Ok(())
+}
+
+fn perform_transition(
+    runtime: &mut RuntimeState,
+    source_path: &str,
+    target_path: &str,
+    history: bool,
+    local: bool,
+    context: &mut StepContext<'_>,
+) -> Result<(), StepFault> {
+    let boundary = transition_boundary(runtime, source_path, target_path, local);
     let mut exits = runtime
         .active
         .iter()
@@ -2866,11 +2892,13 @@ fn descend_initial(
             return Ok(());
         }
         let initial = state.initial.expect("validated composite initial");
+        let writes_start = context.provider_writes.len();
         run_actions(runtime, &current, &initial.action, None, context)?;
         if runtime.status == RuntimeStatus::Completed {
             return Ok(());
         }
         let target = initial.target;
+        validate_provider_writes(runtime, &current, &target, false, writes_start, context)?;
         let mut chain = ancestors_to_root(&runtime.definition, &target);
         chain.reverse();
         for path in chain {
@@ -3115,7 +3143,7 @@ fn execute_provider_actions(
 ) -> Result<(), StepFault> {
     let fault = || StepFault {
         code: EngineFaultCode::ActionFault,
-        source_locator: format!("{}/provider_actions", action.pointer),
+        source_locator: action.pointer.clone(),
     };
     let registry = runtime
         .definition
@@ -3126,9 +3154,10 @@ fn execute_provider_actions(
     let proposals = registry
         .invoke_actions(
             binding,
-            &provider_snapshot(runtime, scope, envelope, binding),
+            &provider_snapshot(runtime, scope, envelope, binding, None),
         )
         .map_err(|_| fault())?;
+    let mut ordinals = NativeSendOrdinals::default();
     for proposal in proposals {
         if let Some(assign) = proposal.get("assign") {
             let name = assign["variable"].as_str().ok_or_else(fault)?;
@@ -3260,6 +3289,7 @@ fn execute_provider_actions(
                 payload,
                 correlation,
                 dynamic,
+                Some(&mut ordinals),
                 context,
             )
             .map_err(|_| fault())?;
@@ -3273,6 +3303,7 @@ pub(crate) fn provider_snapshot(
     scope: &str,
     envelope: Option<&Envelope>,
     binding: &JsonValue,
+    candidate_envelope: Option<&JsonValue>,
 ) -> JsonValue {
     let inputs = &binding["input_types"];
     let values = visible_variables(runtime, scope);
@@ -3298,6 +3329,15 @@ pub(crate) fn provider_snapshot(
                 "payload":super::native::TypedValue::from_value(&Value::Map(envelope.payload.clone()))});
             if let Some(correlation) = &envelope.correlation_id {
                 event["correlation_id"] = serde_json::json!(correlation);
+            }
+            if let Some(queue) = candidate_envelope.or_else(|| {
+                runtime.ready_mailbox.iter().find_map(|entry| {
+                    let queue = &entry["envelope"];
+                    (queue["event_id"].as_str() == Some(envelope.event_id.as_str()))
+                        .then_some(queue)
+                })
+            }) {
+                event = queue.clone();
             }
             snapshot.insert("event".into(), event);
         }
@@ -3378,8 +3418,15 @@ fn execute_send(
         payload,
         correlation_id,
         dynamic_values,
+        None,
         context,
     )
+}
+
+#[derive(Default)]
+struct NativeSendOrdinals {
+    internal: usize,
+    external: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3391,6 +3438,7 @@ fn execute_send_values(
     mut payload: BTreeMap<String, Value>,
     correlation_id: Option<String>,
     dynamic_values: Vec<Option<Value>>,
+    mut native_ordinals: Option<&mut NativeSendOrdinals>,
     context: &mut StepContext<'_>,
 ) -> Result<(), StepFault> {
     let declaration = if event == "env" {
@@ -3420,7 +3468,21 @@ fn execute_send_values(
             index,
         )?);
     }
-    for (ordinal, target) in resolved.into_iter().enumerate() {
+    let locator = if native_ordinals.is_some() {
+        action.pointer.clone()
+    } else {
+        format!("{}/send", action.pointer)
+    };
+    for (mut ordinal, target) in resolved.into_iter().enumerate() {
+        if let Some(ordinals) = native_ordinals.as_deref_mut() {
+            let counter = if matches!(target, Target::External) {
+                &mut ordinals.external
+            } else {
+                &mut ordinals.internal
+            };
+            ordinal = *counter;
+            *counter += 1;
+        }
         if matches!(target, Target::External) {
             let sequence = context.next_output_sequence.allocate();
             context.emissions.push(Emission {
@@ -3437,7 +3499,7 @@ fn execute_send_values(
                     context.root_instance_id,
                     &context.cause_id,
                     &context.step_sequence,
-                    &format!("{}/send", action.pointer),
+                    &locator,
                     ordinal,
                 )),
                 sequence: Some(sequence),
@@ -3457,7 +3519,7 @@ fn execute_send_values(
                     &target_runtime_id,
                     &context.cause_id,
                     &context.step_sequence,
-                    &format!("{}/send", action.pointer),
+                    &locator,
                     ordinal,
                 )),
                 target,

@@ -488,6 +488,7 @@ pub fn inspect_candidate(
                             &state.path,
                             Some(&core_envelope),
                             provider,
+                            Some(&request["envelope"]),
                         );
                         match registry.inspect(provider, &snapshot, guard_limit + 1, step_limit) {
                             Ok((value, spent)) => {
