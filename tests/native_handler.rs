@@ -1125,3 +1125,564 @@ fn health_loss_during_actual_call_does_not_erase_acceptance_or_allow_hidden_retr
     assert!(fixture.invoke(&handler, &TypedValue::Null).is_err());
     assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 1);
 }
+#[cfg(feature = "sqlite")]
+fn external_effect_delivery(checkpoint: &Value, event_id: &str) -> Value {
+    let runtime = &checkpoint["root_record"]["aggregate_state"]["runtimes"][0];
+    let envelope = json!({"event":"native_cancelled","event_id":event_id,"cause_id":event_id,
+        "source":{"host":true},"target":runtime["target_identity"],"payload":["map",[]]});
+    let digest = {
+        use sha2::{Digest, Sha256};
+        format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                serde_json_canonicalizer::to_vec(&json!([
+                    "determa-inbox-envelope-digest-1",
+                    "1",
+                    checkpoint["root_instance_id"],
+                    "input",
+                    envelope
+                ]))
+                .unwrap()
+            )
+        )
+    };
+    json!({"delivery_mode":"input","envelope":envelope,"envelope_digest":digest})
+}
+
+#[cfg(feature = "sqlite")]
+fn effect_guard(checkpoint: &Value) -> determa_state::checkpoint::MutationGuard {
+    determa_state::checkpoint::MutationGuard {
+        expected_revision: checkpoint["revision"].as_str().unwrap().into(),
+        expected_checkpoint_digest: checkpoint["execution_checkpoint_digest"]
+            .as_str()
+            .unwrap()
+            .into(),
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn actual_external_admission_commits_joint_history_and_preserves_original_creation_replay() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let resolver = effect_resolver(&bundle);
+    let host = effect_host(&path, resolver.clone(), &fixture);
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    let creation = host
+        .create(
+            &bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default(),
+        )
+        .unwrap();
+    let (prior, prior_document, _) = native_snapshot(&path);
+    let delivery = external_effect_delivery(&prior, "external-event-1");
+    fixture.destination.healthy.store(false, Ordering::SeqCst);
+    fixture
+        .destination
+        .binding_checks
+        .store(0, Ordering::SeqCst);
+    let first = host
+        .admit("root", "admit-1", &delivery, &effect_guard(&prior))
+        .unwrap();
+    let (current, document, ledger) = native_snapshot(&path);
+    assert_eq!(current["revision"], "1");
+    assert_eq!(document["journal"]["journal_revision"], "1");
+    assert_eq!(
+        document["journal"]["checkpoint_digest"],
+        current["execution_checkpoint_digest"]
+    );
+    assert_eq!(
+        document["journal"]["effect_records"],
+        prior_document["journal"]["effect_records"]
+    );
+    assert_eq!(document["responses"]["create-root"], creation);
+    assert_eq!(document["responses"]["admit-1"], first);
+    assert_eq!(ledger["scope_generation"], "2");
+    assert_eq!(ledger["receipts"].as_array().unwrap().len(), 2);
+    assert_eq!(fixture.destination.binding_checks.load(Ordering::SeqCst), 0);
+    // Exact named replay ignores current CAS, performs no native invocation and
+    // retains the original response rather than returning a newer checkpoint.
+    assert_eq!(
+        host.admit("root", "admit-1", &delivery, &effect_guard(&prior))
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        host.create(
+            &bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default()
+        )
+        .unwrap(),
+        creation
+    );
+    assert_eq!(
+        native_snapshot(&path),
+        (current.clone(), document.clone(), ledger.clone())
+    );
+    fixture.destination.healthy.store(true, Ordering::SeqCst);
+    drop(host);
+    let reopened = effect_host(&path, resolver, &fixture);
+    assert_eq!(
+        reopened
+            .admit("root", "admit-1", &delivery, &effect_guard(&prior))
+            .unwrap(),
+        first
+    );
+    assert_eq!(native_snapshot(&path), (current, document, ledger));
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn duplicate_external_delivery_has_unchanged_checkpoint_and_a_new_exact_native_response() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let host = effect_host(&path, effect_resolver(&bundle), &fixture);
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let (prior, _, _) = native_snapshot(&path);
+    let delivery = external_effect_delivery(&prior, "external-event-1");
+    host.admit("root", "admit-1", &delivery, &effect_guard(&prior))
+        .unwrap();
+    let (current, _, _) = native_snapshot(&path);
+    let duplicate = host
+        .admit("root", "admit-2", &delivery, &effect_guard(&current))
+        .unwrap();
+    let (unchanged, document, ledger) = native_snapshot(&path);
+    assert_eq!(unchanged, current);
+    assert_eq!(document["journal"]["journal_revision"], "2");
+    assert_eq!(ledger["scope_generation"], "3");
+    assert_eq!(
+        duplicate["body"]["admission_result"]["operation_kind"],
+        "acceptance"
+    );
+    let snapshot = native_snapshot(&path);
+    assert_eq!(
+        host.admit("root", "admit-2", &delivery, &effect_guard(&prior))
+            .unwrap(),
+        duplicate
+    );
+    assert_eq!(native_snapshot(&path), snapshot);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn changed_original_or_new_stale_guard_refuses_without_tearing_native_pair() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let host = effect_host(&path, effect_resolver(&bundle), &fixture);
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let (prior, _, _) = native_snapshot(&path);
+    let delivery = external_effect_delivery(&prior, "external-event-1");
+    host.admit("root", "admit-1", &delivery, &effect_guard(&prior))
+        .unwrap();
+    let snapshot = native_snapshot(&path);
+    let changed = external_effect_delivery(&prior, "external-event-2");
+    assert!(host
+        .admit("root", "admit-1", &changed, &effect_guard(&prior))
+        .is_err());
+    assert!(host
+        .admit("root", "admit-new", &changed, &effect_guard(&prior))
+        .is_err());
+    assert!(host
+        .admit(
+            "root",
+            "admit-duplicate-stale",
+            &delivery,
+            &effect_guard(&prior)
+        )
+        .is_err());
+    assert!(host
+        .admit("root", "create-root", &delivery, &effect_guard(&prior))
+        .is_err());
+    assert_eq!(native_snapshot(&path), snapshot);
+}
+#[cfg(feature = "sqlite")]
+fn publish_admission_cut_marker(path: &std::path::Path, bytes: &[u8]) {
+    let pending = path.with_extension("pending");
+    std::fs::write(&pending, bytes).unwrap();
+    std::fs::File::open(&pending).unwrap().sync_all().unwrap();
+    std::fs::rename(pending, path).unwrap();
+}
+
+#[cfg(feature = "sqlite")]
+struct AdmissionStageResolver {
+    bundle: determa_state::format1::Bundle,
+    path: std::path::PathBuf,
+    armed: std::sync::atomic::AtomicBool,
+    stage_checks: std::sync::atomic::AtomicUsize,
+    marker: Option<std::path::PathBuf>,
+}
+#[cfg(feature = "sqlite")]
+impl determa_state::DefinitionResolver for AdmissionStageResolver {
+    fn resolve_definition(
+        &self,
+        fingerprint: &str,
+    ) -> Option<determa_state::format1::ResolvedDefinition> {
+        if fingerprint != self.bundle.fingerprint {
+            return None;
+        }
+        if self.armed.load(Ordering::SeqCst) {
+            // A separate actual native connection detects the host's writer lock.
+            // It never changes rows. Deferred read snapshots permit this probe;
+            // BEGIN IMMEDIATE held by the actual staged update makes it busy.
+            let connection = rusqlite::Connection::open(&self.path).unwrap();
+            connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+            match connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK") {
+                Ok(()) => {}
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if matches!(
+                        error.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) =>
+                {
+                    self.stage_checks.fetch_add(1, Ordering::SeqCst);
+                    if let Some(marker) = &self.marker {
+                        publish_admission_cut_marker(marker,b"actual native admission holds writer transaction before source recheck");
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                    }
+                    return None;
+                }
+                Err(error) => panic!("unexpected native admission stage probe: {error}"),
+            }
+        }
+        Some(determa_state::format1::ResolvedDefinition {
+            bundle: self.bundle.clone(),
+            trusted: true,
+        })
+    }
+}
+#[cfg(feature = "sqlite")]
+fn admission_stage_host(
+    path: &std::path::Path,
+    resolver: Arc<AdmissionStageResolver>,
+    fixture: &Fixture,
+) -> determa_state::authority::SqliteNativeEffectHost<AdmissionStageResolver> {
+    determa_state::authority::SqliteNativeEffectHost::open(
+        path,
+        "scope-one".into(),
+        "owner".into(),
+        "host-one".into(),
+        resolver,
+        effect_route(),
+        fixture.handler(),
+    )
+    .unwrap()
+}
+#[cfg(feature = "sqlite")]
+#[test]
+fn actual_source_loss_after_admission_sql_staging_rolls_back_checkpoint_journal_and_receipt() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let resolver = Arc::new(AdmissionStageResolver {
+        bundle: bundle.clone(),
+        path: path.clone(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        stage_checks: std::sync::atomic::AtomicUsize::new(0),
+        marker: None,
+    });
+    let host = admission_stage_host(&path, resolver.clone(), &fixture);
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let snapshot = native_snapshot(&path);
+    let delivery = external_effect_delivery(&snapshot.0, "external-event-1");
+    resolver.armed.store(true, Ordering::SeqCst);
+    assert!(host
+        .admit("root", "admit-1", &delivery, &effect_guard(&snapshot.0))
+        .is_err());
+    assert_eq!(resolver.stage_checks.load(Ordering::SeqCst), 1);
+    assert_eq!(native_snapshot(&path), snapshot);
+    resolver.armed.store(false, Ordering::SeqCst);
+    host.admit("root", "admit-1", &delivery, &effect_guard(&snapshot.0))
+        .unwrap();
+    assert_eq!(native_snapshot(&path).2["scope_generation"], "2");
+}
+
+#[cfg(all(feature = "sqlite", unix))]
+#[test]
+fn native_admission_crash_child() {
+    let Some(cut) = std::env::var_os("DETERMA_NATIVE_ADMISSION_TEST_CUT") else {
+        return;
+    };
+    let path =
+        std::path::PathBuf::from(std::env::var_os("DETERMA_NATIVE_ADMISSION_TEST_PATH").unwrap());
+    let marker =
+        std::path::PathBuf::from(std::env::var_os("DETERMA_NATIVE_ADMISSION_TEST_MARKER").unwrap());
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let resolver = Arc::new(AdmissionStageResolver {
+        bundle: bundle.clone(),
+        path: path.clone(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        stage_checks: std::sync::atomic::AtomicUsize::new(0),
+        marker: if cut == "staged" {
+            Some(marker.clone())
+        } else {
+            None
+        },
+    });
+    let host = admission_stage_host(&path, resolver.clone(), &fixture);
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let snapshot = native_snapshot(&path);
+    let delivery = external_effect_delivery(&snapshot.0, "external-event-1");
+    if cut == "staged" {
+        resolver.armed.store(true, Ordering::SeqCst);
+    } else {
+        assert_eq!(cut, "committed");
+    }
+    let response = host
+        .admit("root", "admit-1", &delivery, &effect_guard(&snapshot.0))
+        .unwrap();
+    publish_admission_cut_marker(&marker, &serde_json::to_vec(&response).unwrap());
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+#[cfg(all(feature = "sqlite", unix))]
+#[test]
+fn real_sigkill_admission_before_and_after_commit_reopens_exact_native_pair() {
+    for cut in ["staged", "committed"] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let marker = directory.path().join("cut-marker");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "native_admission_crash_child", "--nocapture"])
+            .env("DETERMA_NATIVE_ADMISSION_TEST_CUT", cut)
+            .env("DETERMA_NATIVE_ADMISSION_TEST_PATH", &path)
+            .env("DETERMA_NATIVE_ADMISSION_TEST_MARKER", &marker)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let reached = marker.exists();
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        assert!(reached, "actual admission {cut} cut not reached");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(9));
+        let (checkpoint, document, ledger) = native_snapshot(&path);
+        assert_eq!(
+            checkpoint["revision"],
+            if cut == "committed" { "1" } else { "0" }
+        );
+        assert_eq!(
+            document["journal"]["journal_revision"],
+            checkpoint["revision"]
+        );
+        assert_eq!(
+            ledger["scope_generation"],
+            if cut == "committed" { "2" } else { "1" }
+        );
+        assert_eq!(
+            document["responses"].get("admit-1").is_some(),
+            cut == "committed"
+        );
+        let fixture = Fixture::new();
+        let bundle = effect_bundle();
+        let host = effect_host(&path, effect_resolver(&bundle), &fixture);
+        let creation = host
+            .create(
+                &bundle,
+                "workflow",
+                "root",
+                "create-root",
+                &determa_state::Bindings::default(),
+            )
+            .unwrap();
+        let delivery = external_effect_delivery(&creation["checkpoint"], "external-event-1");
+        let response = host
+            .admit(
+                "root",
+                "admit-1",
+                &delivery,
+                &effect_guard(&creation["checkpoint"]),
+            )
+            .unwrap();
+        if cut == "committed" {
+            assert_eq!(
+                response,
+                serde_json::from_slice::<Value>(&std::fs::read(&marker).unwrap()).unwrap()
+            );
+        }
+        let snapshot = native_snapshot(&path);
+        assert_eq!(snapshot.2["scope_generation"], "2");
+        assert_eq!(
+            host.admit(
+                "root",
+                "admit-1",
+                &delivery,
+                &effect_guard(&creation["checkpoint"])
+            )
+            .unwrap(),
+            response
+        );
+        assert_eq!(native_snapshot(&path), snapshot);
+    }
+}
+#[cfg(feature = "sqlite")]
+struct PausedAdmissionResolver {
+    bundle: determa_state::format1::Bundle,
+    signal: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    released: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+#[cfg(feature = "sqlite")]
+impl determa_state::DefinitionResolver for PausedAdmissionResolver {
+    fn resolve_definition(
+        &self,
+        fingerprint: &str,
+    ) -> Option<determa_state::format1::ResolvedDefinition> {
+        if fingerprint != self.bundle.fingerprint {
+            return None;
+        }
+        if let Some(signal) = self.signal.lock().unwrap().take() {
+            signal.send(()).unwrap();
+            let released = self.released.lock().unwrap();
+            let (released, timeout) = self
+                .wake
+                .wait_timeout_while(released, std::time::Duration::from_secs(20), |released| {
+                    !*released
+                })
+                .unwrap();
+            assert!(
+                *released && !timeout.timed_out(),
+                "native snapshot release not received"
+            );
+        }
+        Some(determa_state::format1::ResolvedDefinition {
+            bundle: self.bundle.clone(),
+            trusted: true,
+        })
+    }
+}
+#[cfg(feature = "sqlite")]
+#[test]
+fn genuine_journal_only_race_refuses_stale_helper_while_checkpoint_guard_still_matches() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let host = effect_host(&path, effect_resolver(&bundle), &fixture);
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let (prior, _, _) = native_snapshot(&path);
+    let delivery = external_effect_delivery(&prior, "external-event-1");
+    host.admit("root", "admit-1", &delivery, &effect_guard(&prior))
+        .unwrap();
+    let (current, _, _) = native_snapshot(&path);
+    let (signal, receiver) = std::sync::mpsc::channel();
+    let resolver = Arc::new(PausedAdmissionResolver {
+        bundle: bundle.clone(),
+        signal: std::sync::Mutex::new(Some(signal)),
+        released: std::sync::Mutex::new(false),
+        wake: std::sync::Condvar::new(),
+    });
+    let loser = determa_state::authority::SqliteNativeEffectHost::open(
+        &path,
+        "scope-one".into(),
+        "owner".into(),
+        "host-one".into(),
+        resolver.clone(),
+        effect_route(),
+        fixture.handler(),
+    )
+    .unwrap();
+    let loser_delivery = delivery.clone();
+    let loser_guard = effect_guard(&current);
+    let thread = std::thread::spawn(move || {
+        loser.admit("root", "loser-duplicate", &loser_delivery, &loser_guard)
+    });
+    // The losing operation has read its exact document and checkpoint bytes into
+    // one Deferred snapshot before its first resolver-backed restoration call.
+    let pinned = receiver.recv_timeout(std::time::Duration::from_secs(20));
+    if pinned.is_err() {
+        *resolver.released.lock().unwrap() = true;
+        resolver.wake.notify_all();
+        let _ = thread.join();
+        panic!("loser did not pin its old native snapshot");
+    }
+    let winner = host.admit(
+        "root",
+        "winner-duplicate",
+        &delivery,
+        &effect_guard(&current),
+    );
+    *resolver.released.lock().unwrap() = true;
+    resolver.wake.notify_all();
+    let lost = thread.join().unwrap();
+    winner.unwrap();
+    let error = lost.expect_err("old helper update overwrote first response inventory");
+    assert!(
+        error
+            .to_string()
+            .contains("effect_journal_revision_conflict"),
+        "{error}"
+    );
+    let (unchanged, document, ledger) = native_snapshot(&path);
+    assert_eq!(unchanged, current);
+    assert_eq!(ledger["scope_generation"], "3");
+    assert_eq!(document["journal"]["journal_revision"], "2");
+    assert!(document["responses"].get("winner-duplicate").is_some());
+    assert!(document["responses"].get("loser-duplicate").is_none());
+}

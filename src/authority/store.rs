@@ -210,6 +210,117 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
         Ok(())
     }
 
+    // Receiver-owned snapshot, not portable participant activation.
+    pub(super) fn native_effect_snapshot(
+        &self,
+        root: &str,
+    ) -> Result<(checkpoint::ExecutionCheckpoint, Value), StoreError> {
+        self.with_authority_snapshot(|connection, _| {
+            let bytes: Vec<u8> = connection.query_row(
+                "SELECT document FROM determa_authority_effect_journals WHERE root_instance_id=? AND scope_identity=?",
+                rusqlite::params![root, self.scope], |row| row.get(0),
+            ).map_err(error)?;
+            let document = strict_json::parse(&bytes).map_err(error)?;
+            let record = checkpoint::load_sqlite_record(connection, root)?
+                .ok_or_else(|| error("native effect checkpoint absent"))?;
+            let restored = checkpoint::restore(&record.bytes, self.resolver.as_ref()).map_err(error)?;
+            let responses = serde_json::from_value(document["responses"].clone()).map_err(error)?;
+            crate::format1::effect_journal::ValidatedEffectJournal::restore(
+                &canonical(&document["journal"]).map_err(error)?, &restored, &self.scope,
+                &responses, self.resolver.as_ref(),
+            ).map_err(error)?;
+            Ok((restored, document))
+        })
+    }
+
+    pub(super) fn update_native_effect_admission(
+        &self,
+        original_checkpoint: &checkpoint::ExecutionCheckpoint,
+        original_document: &Value,
+        candidate: &checkpoint::ExecutionCheckpoint,
+        document: &Value,
+        precommit: impl FnOnce() -> Result<(), super::AuthorityError>,
+    ) -> Result<(), StoreError> {
+        super::validate_native_effect_admission_transition(
+            original_document,
+            original_checkpoint.value(),
+            document,
+            candidate.value(),
+            &self.scope,
+        )
+        .map_err(error)?;
+        let responses = serde_json::from_value(document["responses"].clone()).map_err(error)?;
+        crate::format1::effect_journal::ValidatedEffectJournal::restore(
+            &canonical(&document["journal"]).map_err(error)?,
+            candidate,
+            &self.scope,
+            &responses,
+            self.resolver.as_ref(),
+        )
+        .map_err(error)?;
+        let authority = self.authority_snapshot()?;
+        let record = StoreRecord::from_checkpoint(candidate)?;
+        let mutation = json!({"native_mutation":"checkpoint_effect_journal",
+            "root_instance_id":record.root_instance_id,
+            "expected_revision":original_checkpoint.revision(),
+            "expected_checkpoint_digest":original_checkpoint.digest(),
+            "checkpoint":candidate.value(),"effect_document":document});
+        let mutation = canonical(&mutation).map_err(error)?;
+        let operation_id = hash(&json!([
+            "determa-authority-effect-admission-1",
+            self.scope,
+            authority["authority_epoch"],
+            authority["scope_generation"],
+            strict_json::parse(&mutation).map_err(error)?
+        ]))
+        .map_err(error)?;
+        let mut request = json!({"interface":"determa.host_authority","interface_version":1,
+            "operation":"guarded_commit","operation_id":operation_id,"scope_identity":self.scope,
+            "expected_authority_epoch":"0","expected_scope_generation":authority["scope_generation"],
+            "arguments":{"mutation_digest":format!("sha256:{:x}",<sha2::Sha256 as sha2::Digest>::digest(&mutation))}});
+        request["request_digest"] =
+            json!(hash(&json!(["determa-host-authority-request-1", request])).map_err(error)?);
+        let result = self.authority.perform_native(
+            &canonical(&request).map_err(error)?, &self.caller(), Some(&mutation),
+            Some("checkpoint_effect_journal"), |transaction| {
+                checkpoint::verify_sqlite_schema(transaction,self.mode).map_err(super::failure)?;
+                let current = checkpoint::load_sqlite_record(transaction,&record.root_instance_id)
+                    .map_err(super::failure)?.ok_or_else(||super::failure("native checkpoint absent"))?;
+                if current.bytes != original_checkpoint.canonical_bytes().map_err(super::failure)? {
+                    return Err(super::failure("checkpoint_revision_conflict"));
+                }
+                let old = canonical(original_document)?;
+                let actual: Vec<u8> = transaction.query_row(
+                    "SELECT document FROM determa_authority_effect_journals WHERE root_instance_id=? AND scope_identity=?",
+                    rusqlite::params![record.root_instance_id,self.scope],|row|row.get(0),
+                ).map_err(super::failure)?;
+                if actual != old { return Err(super::failure("effect_journal_revision_conflict")); }
+                if current.bytes != record.bytes {
+                    checkpoint::validate_policy_replacement(self.mode,&current,&record).map_err(super::failure)?;
+                    let changed = transaction.execute(
+                        "UPDATE determa_execution_checkpoints SET revision=?,checkpoint_digest=?,checkpoint_bytes=? WHERE root_instance_id=? AND revision=? AND checkpoint_digest=?",
+                        rusqlite::params![record.revision,record.execution_checkpoint_digest,record.bytes,
+                            record.root_instance_id,current.revision,current.execution_checkpoint_digest],
+                    ).map_err(super::failure)?;
+                    if changed != 1 { return Err(super::failure("checkpoint_revision_conflict")); }
+                }
+                let changed = transaction.execute(
+                    "UPDATE determa_authority_effect_journals SET document=? WHERE root_instance_id=? AND scope_identity=? AND document=?",
+                    rusqlite::params![canonical(document)?,record.root_instance_id,self.scope,old],
+                ).map_err(super::failure)?;
+                if changed != 1 { return Err(super::failure("effect_journal_revision_conflict")); }
+                precommit()
+            },
+        ).map_err(error)?;
+        if result["status"] != "accepted" {
+            return Err(error(format!(
+                "native admission refused: {}",
+                result["error_code"]
+            )));
+        }
+        Ok(())
+    }
+
     fn commit(
         &self,
         record: StoreRecord,

@@ -609,8 +609,8 @@ fn validate_record(
         return Err(failure("native authority mutation inventory mismatch"));
     }
     let mut identifiers = BTreeSet::new();
-    let mut latest_checkpoints = BTreeMap::new();
-    let mut latest_journals = BTreeMap::new();
+    let mut latest_checkpoints: BTreeMap<String, Value> = BTreeMap::new();
+    let mut latest_journals: BTreeMap<String, Value> = BTreeMap::new();
     for (index, receipt) in receipts.iter().enumerate() {
         let joint_receipt = receipt["native_kind"] == "checkpoint_effect_journal";
         let checkpoint_receipt = receipt["native_kind"] == "checkpoint" || joint_receipt;
@@ -715,20 +715,38 @@ fn validate_record(
                 return Err(failure("checkpoint mutation root mismatch"));
             }
             if joint_receipt {
-                if !mutation["expected_revision"].is_null()
-                    || !mutation["expected_checkpoint_digest"].is_null()
-                    || latest_checkpoints.contains_key(root)
-                    || latest_journals.contains_key(root)
-                {
-                    return Err(failure(
-                        "effect participant must originate in fresh native creation",
-                    ));
+                if let Some(prior_document) = latest_journals.get(root) {
+                    let prior_checkpoint = latest_checkpoints
+                        .get(root)
+                        .ok_or_else(|| failure("prior native checkpoint absent"))?;
+                    if mutation["expected_revision"] != prior_checkpoint["revision"]
+                        || mutation["expected_checkpoint_digest"]
+                            != prior_checkpoint["execution_checkpoint_digest"]
+                    {
+                        return Err(failure("native joint history guard mismatch"));
+                    }
+                    validate_native_effect_admission_transition(
+                        prior_document,
+                        prior_checkpoint,
+                        &mutation["effect_document"],
+                        &mutation["checkpoint"],
+                        scope,
+                    )?;
+                } else {
+                    if !mutation["expected_revision"].is_null()
+                        || !mutation["expected_checkpoint_digest"].is_null()
+                        || latest_checkpoints.contains_key(root)
+                    {
+                        return Err(failure(
+                            "effect participant must originate in fresh native creation",
+                        ));
+                    }
+                    validate_native_effect_document(
+                        &mutation["effect_document"],
+                        &mutation["checkpoint"],
+                        scope,
+                    )?;
                 }
-                validate_native_effect_document(
-                    &mutation["effect_document"],
-                    &mutation["checkpoint"],
-                    scope,
-                )?;
                 latest_journals.insert(root.to_owned(), mutation["effect_document"].clone());
             } else if latest_journals.contains_key(root) {
                 return Err(failure(
@@ -796,8 +814,8 @@ fn checkpoint_count(connection: &Connection) -> Result<Option<u64>, AuthorityErr
     }
 }
 
-// Fresh native creation is the only joint mutation at this implementation stage.
-// Later helper updates must add explicit immutable-history transition validation.
+// Native genesis remains fresh creation. Subsequent joint mutations are limited
+// to complete admission-only transitions with immutable prior helper history.
 fn validate_native_effect_document(
     document: &Value,
     checkpoint: &Value,
@@ -807,6 +825,27 @@ fn validate_native_effect_document(
         return Err(failure("native effect document shape mismatch"));
     }
     let journal = &document["journal"];
+    if !closed(
+        journal,
+        &[
+            "host_effect_journal_format",
+            "host_effect_journal_schema_version",
+            "scope_identity",
+            "root_instance_id",
+            "checkpoint_revision",
+            "checkpoint_digest",
+            "journal_revision",
+            "effect_records",
+            "operation_response_references",
+            "host_effect_journal_digest",
+        ],
+    ) || journal["host_effect_journal_format"] != "determa.host_effect_journal"
+        || journal["host_effect_journal_schema_version"] != 1
+        || journal["journal_revision"] != "0"
+    {
+        return Err(failure("fresh native journal shape/version mismatch"));
+    }
+
     let mut unsigned = journal.clone();
     unsigned
         .as_object_mut()
@@ -863,6 +902,281 @@ fn validate_native_effect_document(
     {
         return Err(failure("native creation response/request binding mismatch"));
     }
+    Ok(())
+}
+
+// Complete admission-only field invariant, without executing a core operation
+// during retained-response replay. All other checkpoint/runtime fields are fixed.
+fn validate_native_admission_checkpoint_transition(
+    prior: &Value,
+    candidate: &Value,
+    delivery: &Value,
+    result: &Value,
+) -> Result<(), AuthorityError> {
+    if !closed(delivery, &["delivery_mode", "envelope", "envelope_digest"])
+        || delivery["delivery_mode"] != "input"
+    {
+        return Err(failure(
+            "native external admission requires exact input delivery",
+        ));
+    }
+    let prior_receipts = prior["operation_receipts"]
+        .as_array()
+        .ok_or_else(|| failure("prior operation receipts absent"))?;
+    if let Some(receipt) = prior_receipts.iter().find(|receipt| {
+        receipt["operation_kind"] == "acceptance"
+            && receipt["event_id"] == delivery["envelope"]["event_id"]
+    }) {
+        if candidate != prior
+            || result != receipt
+            || receipt["request_digest"] != delivery["envelope_digest"]
+            || receipt["delivery_mode"] != "input"
+        {
+            return Err(failure(
+                "duplicate native admission changed checkpoint/evidence",
+            ));
+        }
+        return Ok(());
+    }
+    let mut expected = prior.clone();
+    let aggregate = &mut expected["root_record"]["aggregate_state"];
+    let acceptance = aggregate["next_acceptance_sequence"].clone();
+    let queue = aggregate["next_queue_sequence"].clone();
+    let entry = json!({"acceptance_sequence":acceptance,"queue_sequence":queue,
+        "delivery_mode":"input","envelope":delivery["envelope"],
+        "envelope_digest":delivery["envelope_digest"],"deferral_count":"0"});
+    let runtimes = aggregate["runtimes"]
+        .as_array_mut()
+        .ok_or_else(|| failure("prior runtimes absent"))?;
+    let proposed = candidate["root_record"]["aggregate_state"]["runtimes"]
+        .as_array()
+        .ok_or_else(|| failure("candidate runtimes absent"))?;
+    if runtimes.len() != proposed.len() {
+        return Err(failure("admission changed runtime inventory"));
+    }
+    let index = runtimes
+        .iter()
+        .zip(proposed)
+        .position(|(old, new)| old["ready_mailbox"] != new["ready_mailbox"])
+        .ok_or_else(|| failure("actual admission queue insertion absent"))?;
+    runtimes[index]["ready_mailbox"]
+        .as_array_mut()
+        .ok_or_else(|| failure("prior ready mailbox absent"))?
+        .push(entry);
+    for field in ["next_acceptance_sequence", "next_queue_sequence"] {
+        aggregate[field] = json!((aggregate[field]
+            .as_str()
+            .ok_or_else(|| failure("prior queue counter absent"))?
+            .parse::<BigUint>()
+            .map_err(failure)?
+            + BigUint::from(1u8))
+        .to_string());
+    }
+    aggregate
+        .as_object_mut()
+        .unwrap()
+        .remove("aggregate_state_digest");
+    aggregate["aggregate_state_digest"] = json!(hash(&json!([
+        "determa-aggregate-state-digest-1",
+        aggregate
+    ]))?);
+    expected["revision"] = json!((prior["revision"]
+        .as_str()
+        .ok_or_else(|| failure("prior revision absent"))?
+        .parse::<BigUint>()
+        .map_err(failure)?
+        + BigUint::from(1u8))
+    .to_string());
+    expected["next_operation_receipt_sequence"] = json!((prior["next_operation_receipt_sequence"]
+        .as_str()
+        .ok_or_else(|| failure("prior receipt counter absent"))?
+        .parse::<BigUint>()
+        .map_err(failure)?
+        + BigUint::from(1u8))
+    .to_string());
+    let receipt = json!({"operation_kind":"acceptance",
+        "receipt_sequence":prior["next_operation_receipt_sequence"],
+        "event_id":delivery["envelope"]["event_id"],"request_digest":delivery["envelope_digest"],
+        "acceptance_sequence":acceptance,"accepted_revision":expected["revision"],"delivery_mode":"input"});
+    expected["operation_receipts"]
+        .as_array_mut()
+        .unwrap()
+        .push(receipt);
+    expected
+        .as_object_mut()
+        .unwrap()
+        .remove("execution_checkpoint_digest");
+    expected["execution_checkpoint_digest"] = json!(hash(&json!([
+        "determa-execution-checkpoint-digest-1",
+        expected
+    ]))?);
+    if candidate != &expected || result != candidate {
+        return Err(failure(
+            "native admission changed unrelated checkpoint state",
+        ));
+    }
+    Ok(())
+}
+
+// Admission-only transition: no worker, route, attempt, outcome or result state
+// may change. Every previously committed response and caller request is immutable.
+// Admission-only transition: no worker, route, attempt, outcome or result state
+// may change. Every previously committed response and caller request is immutable.
+fn validate_native_effect_admission_transition(
+    prior: &Value,
+    prior_checkpoint: &Value,
+    document: &Value,
+    checkpoint: &Value,
+    scope: &str,
+) -> Result<(), AuthorityError> {
+    if !closed(document, &["journal", "responses", "original_requests"]) {
+        return Err(failure("native effect document shape mismatch"));
+    }
+    let journal = &document["journal"];
+    let old_journal = &prior["journal"];
+    let mut unsigned = journal.clone();
+    unsigned
+        .as_object_mut()
+        .ok_or_else(|| failure("native journal absent"))?
+        .remove("host_effect_journal_digest");
+    let revision = old_journal["journal_revision"]
+        .as_str()
+        .ok_or_else(|| failure("prior journal revision absent"))?
+        .parse::<BigUint>()
+        .map_err(failure)?;
+    if journal["scope_identity"] != scope
+        || journal["root_instance_id"] != checkpoint["root_instance_id"]
+        || checkpoint["root_instance_id"] != prior_checkpoint["root_instance_id"]
+        || journal["checkpoint_revision"] != checkpoint["revision"]
+        || journal["checkpoint_digest"] != checkpoint["execution_checkpoint_digest"]
+        || journal["journal_revision"] != (revision + BigUint::from(1u8)).to_string()
+        || journal["effect_records"] != old_journal["effect_records"]
+        || journal["host_effect_journal_digest"]
+            != hash(&json!(["determa-host-effect-journal-digest-1", unsigned]))?
+    {
+        return Err(failure("native admission journal transition mismatch"));
+    }
+    let bodies = document["responses"]
+        .as_object()
+        .ok_or_else(|| failure("native bodies absent"))?;
+    let requests = document["original_requests"]
+        .as_object()
+        .ok_or_else(|| failure("native requests absent"))?;
+    let old_bodies = prior["responses"]
+        .as_object()
+        .ok_or_else(|| failure("prior native bodies absent"))?;
+    let old_requests = prior["original_requests"]
+        .as_object()
+        .ok_or_else(|| failure("prior native requests absent"))?;
+    if bodies.len() != old_bodies.len() + 1
+        || requests.len() != bodies.len()
+        || old_bodies
+            .iter()
+            .any(|(id, body)| bodies.get(id) != Some(body))
+        || old_requests
+            .iter()
+            .any(|(id, request)| requests.get(id) != Some(request))
+        || requests.keys().any(|id| !bodies.contains_key(id))
+    {
+        return Err(failure(
+            "native response/request immutable inventory mismatch",
+        ));
+    }
+    let references = journal["operation_response_references"]
+        .as_array()
+        .ok_or_else(|| failure("native response references absent"))?;
+    let mut prior_id: Option<&str> = None;
+    if references.len() != bodies.len() {
+        return Err(failure("native response inventory mismatch"));
+    }
+    for reference in references {
+        let id = reference["operation_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| failure("native operation identity absent"))?;
+        if !closed(reference, &["operation_id", "response_digest"])
+            || prior_id.is_some_and(|old| old.as_bytes() >= id.as_bytes())
+            || reference["response_digest"]
+                != hash(&json!([
+                    "determa-host-operation-response-1",
+                    bodies
+                        .get(id)
+                        .ok_or_else(|| failure("native retained response absent"))?
+                ]))?
+        {
+            return Err(failure("native response reference mismatch"));
+        }
+        prior_id = Some(id);
+    }
+    let mut expected_journal = old_journal.clone();
+    expected_journal["checkpoint_revision"] = checkpoint["revision"].clone();
+    expected_journal["checkpoint_digest"] = checkpoint["execution_checkpoint_digest"].clone();
+    expected_journal["journal_revision"] = journal["journal_revision"].clone();
+    expected_journal["operation_response_references"] = json!(references);
+    expected_journal
+        .as_object_mut()
+        .unwrap()
+        .remove("host_effect_journal_digest");
+    expected_journal["host_effect_journal_digest"] = json!(hash(&json!([
+        "determa-host-effect-journal-digest-1",
+        expected_journal
+    ]))?);
+    if journal != &expected_journal {
+        return Err(failure("admission changed immutable journal fields"));
+    }
+    let (id, body) = bodies
+        .iter()
+        .find(|(id, _)| !old_bodies.contains_key(*id))
+        .ok_or_else(|| failure("new native response absent"))?;
+    let request = requests
+        .get(id)
+        .ok_or_else(|| failure("new native request absent"))?;
+    if !closed(request, &["operation_kind", "root_instance_id", "delivery"])
+        || request["operation_kind"] != "admission"
+        || request["root_instance_id"] != checkpoint["root_instance_id"]
+        || !closed(body, &["kind", "body"])
+        || body["kind"] != "admission"
+        || !closed(&body["body"], &["checkpoint", "admission_result"])
+        || body["body"]["checkpoint"] != *checkpoint
+    {
+        return Err(failure("native admission response/request kind mismatch"));
+    }
+    let delivery = &request["delivery"];
+    let digest = hash(&json!([
+        "determa-inbox-envelope-digest-1",
+        "1",
+        checkpoint["root_instance_id"],
+        delivery["delivery_mode"],
+        delivery["envelope"]
+    ]))?;
+    if delivery["envelope_digest"] != digest {
+        return Err(failure(
+            "native admission original envelope digest mismatch",
+        ));
+    }
+    let receipt = checkpoint["operation_receipts"]
+        .as_array()
+        .and_then(|receipts| {
+            receipts.iter().find(|receipt| {
+                receipt["operation_kind"] == "acceptance"
+                    && receipt["event_id"] == delivery["envelope"]["event_id"]
+                    && receipt["request_digest"] == digest
+                    && receipt["delivery_mode"] == delivery["delivery_mode"]
+            })
+        })
+        .ok_or_else(|| failure("native admission actual receipt absent"))?;
+    let result = &body["body"]["admission_result"];
+    if result != checkpoint && result != receipt {
+        return Err(failure(
+            "native admission result differs from actual checkpoint/receipt",
+        ));
+    }
+    validate_native_admission_checkpoint_transition(
+        prior_checkpoint,
+        checkpoint,
+        delivery,
+        result,
+    )?;
     Ok(())
 }
 
@@ -952,3 +1266,187 @@ fn apply_checkpoint(
 
 #[cfg(all(test, unix))]
 mod crash_tests;
+#[cfg(test)]
+mod admission_transition_tests {
+    use super::*;
+
+    fn fixture() -> (
+        Value,
+        Value,
+        Value,
+        crate::format1::InMemoryDefinitionResolver,
+    ) {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "conformance-suite/conformance/profiles/committed-native-effects/effect-01-result",
+        );
+        let bundle =
+            crate::load_bundle(&std::fs::read_to_string(directory.join("machine.yaml")).unwrap())
+                .unwrap();
+        let mut resolver = crate::format1::InMemoryDefinitionResolver::default();
+        resolver.insert(bundle.clone(), true);
+        let prior = crate::checkpoint::restore(
+            &std::fs::read(directory.join("pending-checkpoint.json")).unwrap(),
+            &resolver,
+        )
+        .unwrap();
+        let runtime = &prior.value()["root_record"]["aggregate_state"]["runtimes"][0];
+        let envelope = json!({"event":"native_cancelled","event_id":"admission-invariant-event",
+            "cause_id":"admission-invariant-event","source":{"host":true},"target":runtime["target_identity"],"payload":["map",[]]});
+        let digest = hash(&json!([
+            "determa-inbox-envelope-digest-1",
+            "1",
+            prior.root_instance_id(),
+            "input",
+            envelope
+        ]))
+        .unwrap();
+        let delivery =
+            json!({"delivery_mode":"input","envelope":envelope,"envelope_digest":digest});
+        let candidate = crate::checkpoint::admit(
+            &bundle,
+            &prior,
+            std::slice::from_ref(&delivery),
+            Some(prior.revision()),
+            Some(prior.digest()),
+        )
+        .unwrap();
+        (prior.value().clone(), candidate, delivery, resolver)
+    }
+    fn reseal(checkpoint: &mut Value) {
+        let aggregate = &mut checkpoint["root_record"]["aggregate_state"];
+        aggregate
+            .as_object_mut()
+            .unwrap()
+            .remove("aggregate_state_digest");
+        aggregate["aggregate_state_digest"] =
+            json!(hash(&json!(["determa-aggregate-state-digest-1", aggregate])).unwrap());
+        checkpoint
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_checkpoint_digest");
+        checkpoint["execution_checkpoint_digest"] = json!(hash(&json!([
+            "determa-execution-checkpoint-digest-1",
+            checkpoint
+        ]))
+        .unwrap());
+    }
+
+    #[test]
+    fn actual_core_admission_matches_complete_field_invariant_without_reexecution() {
+        let (prior, candidate, delivery, resolver) = fixture();
+        crate::checkpoint::restore(&canonical(&candidate).unwrap(), &resolver).unwrap();
+        validate_native_admission_checkpoint_transition(&prior, &candidate, &delivery, &candidate)
+            .unwrap();
+        let acceptance = candidate["operation_receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|receipt| {
+                receipt["operation_kind"] == "acceptance"
+                    && receipt["event_id"] == delivery["envelope"]["event_id"]
+            })
+            .unwrap();
+        validate_native_admission_checkpoint_transition(
+            &candidate, &candidate, &delivery, acceptance,
+        )
+        .unwrap();
+        assert!(validate_native_admission_checkpoint_transition(
+            &candidate, &candidate, &delivery, &candidate
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn matching_receipt_does_not_allow_resealed_unrelated_checkpoint_changes() {
+        let (prior, candidate, delivery, resolver) = fixture();
+        for mutation in [
+            "runtime_counter",
+            "deferred_queue",
+            "outbox",
+            "receipt",
+            "queue_counter",
+            "root",
+            "extra_runtime",
+        ] {
+            let mut corrupt = candidate.clone();
+            match mutation {
+                "runtime_counter" => {
+                    corrupt["root_record"]["aggregate_state"]["runtimes"][0]
+                        ["next_spawn_sequence"] = json!("99")
+                }
+                "deferred_queue" => {
+                    let mut entry = corrupt["root_record"]["aggregate_state"]["runtimes"][0]
+                        ["ready_mailbox"][0]
+                        .clone();
+                    entry["deferral_count"] = json!("1");
+                    corrupt["root_record"]["aggregate_state"]["runtimes"][0]["deferred_mailbox"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(entry);
+                }
+                "outbox" => {
+                    corrupt["pending_outbox_intents"][0]["intent"]["correlation_id"] =
+                        json!("substituted-token")
+                }
+                "receipt" => {
+                    corrupt["operation_receipts"][0]["creation_id"] = json!("substituted-creation")
+                }
+                "queue_counter" => {
+                    corrupt["root_record"]["aggregate_state"]["next_queue_sequence"] = json!("99")
+                }
+                "root" => corrupt["root_record"]["status"] = json!("tombstone"),
+                "extra_runtime" => {
+                    let extra = corrupt["root_record"]["aggregate_state"]["runtimes"][0].clone();
+                    corrupt["root_record"]["aggregate_state"]["runtimes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(extra);
+                }
+                _ => unreachable!(),
+            }
+            reseal(&mut corrupt);
+            if mutation == "runtime_counter" {
+                // This is still a valid portable checkpoint. Admission authority
+                // must reject the unrelated change even when content restores.
+                crate::checkpoint::restore(&canonical(&corrupt).unwrap(), &resolver).unwrap();
+            }
+            // The actual new acceptance receipt remains present, and the caller's
+            // returned body echoes the corrupt checkpoint. Both are insufficient.
+            assert!(
+                validate_native_admission_checkpoint_transition(
+                    &prior, &corrupt, &delivery, &corrupt
+                )
+                .is_err(),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_cannot_mutate_runtime_and_extra_delivery_fields_refuse() {
+        let (_, candidate, delivery, _) = fixture();
+        let acceptance = candidate["operation_receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|receipt| {
+                receipt["operation_kind"] == "acceptance"
+                    && receipt["event_id"] == delivery["envelope"]["event_id"]
+            })
+            .unwrap();
+        let mut corrupt = candidate.clone();
+        corrupt["root_record"]["aggregate_state"]["runtimes"][0]["next_spawn_sequence"] =
+            json!("99");
+        reseal(&mut corrupt);
+        assert!(validate_native_admission_checkpoint_transition(
+            &candidate, &corrupt, &delivery, acceptance
+        )
+        .is_err());
+        let mut extra = delivery.clone();
+        extra["trusted_worker"] = json!(true);
+        assert!(validate_native_admission_checkpoint_transition(
+            &candidate, &candidate, &extra, acceptance
+        )
+        .is_err());
+    }
+}

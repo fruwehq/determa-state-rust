@@ -1,4 +1,4 @@
-//! Fresh native effect production over the authority's actual SQLite transaction.
+//! Native creation and external admission over the authority's SQLite transaction.
 //! No imported checkpoint/journal activation, worker, archive or recovery claim.
 
 use super::{canonical, failure, hash, AuthorityError, GuardedSqliteExecutionStore};
@@ -207,6 +207,128 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
                     )
                     .map_err(failure)
             })
+            .map_err(failure)?;
+        Ok(response)
+    }
+    /// Admit one exact external delivery while preserving the native effect
+    /// participant. This owner-local API is not a public protocol endpoint, worker
+    /// credential, effect result submission or imported journal activation.
+    pub fn admit(
+        &self,
+        root: &str,
+        operation_id: &str,
+        delivery: &Value,
+        guard: &checkpoint::MutationGuard,
+    ) -> Result<Value, AuthorityError> {
+        if delivery["delivery_mode"] != "input" {
+            return Err(failure("native external admission requires input mode"));
+        }
+        if operation_id.is_empty() {
+            return Err(failure("operation identity absent"));
+        }
+        let (original_checkpoint, mut document) =
+            self.store.native_effect_snapshot(root).map_err(failure)?;
+        let original_request =
+            json!({"operation_kind":"admission","root_instance_id":root,"delivery":delivery});
+        if let Some(saved) = document["responses"].get(operation_id) {
+            if document["original_requests"].get(operation_id) != Some(&original_request)
+                || saved["kind"] != "admission"
+            {
+                return Err(failure("operation_id_conflict"));
+            }
+            return Ok(saved.clone());
+        }
+        let fingerprint = original_checkpoint
+            .bundle_fingerprint()
+            .ok_or_else(|| failure("native admission definition absent"))?;
+        let resolved = self
+            .resolver
+            .resolve_definition(fingerprint)
+            .ok_or_else(|| failure("native admission definition unavailable"))?;
+        if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
+            return Err(failure("native admission definition not trusted"));
+        }
+        let result = checkpoint::admit(
+            &resolved.bundle,
+            &original_checkpoint,
+            std::slice::from_ref(delivery),
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )
+        .map_err(failure)?;
+        let candidate_value = if result.get("execution_checkpoint_format").is_some() {
+            result.clone()
+        } else if result.get("checkpoint").is_some() {
+            result["checkpoint"].clone()
+        } else {
+            original_checkpoint.value().clone()
+        };
+        let candidate = checkpoint::restore(&canonical(&candidate_value)?, self.resolver.as_ref())
+            .map_err(failure)?;
+        // Portable duplicate-event admission may return its existing receipt before
+        // CAS. A NEW named host operation still requires the current native guard.
+        if original_checkpoint.revision() != guard.expected_revision
+            || original_checkpoint.digest() != guard.expected_checkpoint_digest
+        {
+            return Err(failure("checkpoint_revision_conflict"));
+        }
+        let prior_document = document.clone();
+        let response = json!({"kind":"admission","body":{"checkpoint":candidate.value(),"admission_result":result}});
+        document["responses"][operation_id] = response.clone();
+        document["original_requests"][operation_id] = original_request;
+        let journal = &mut document["journal"];
+        let revision = journal["journal_revision"]
+            .as_str()
+            .ok_or_else(|| failure("native journal revision absent"))?
+            .parse::<num_bigint::BigUint>()
+            .map_err(failure)?;
+        journal["journal_revision"] =
+            json!((revision + num_bigint::BigUint::from(1u8)).to_string());
+        journal["checkpoint_revision"] = json!(candidate.revision());
+        journal["checkpoint_digest"] = json!(candidate.digest());
+        journal["operation_response_references"].as_array_mut().ok_or_else(||failure("native references absent"))?
+            .push(json!({"operation_id":operation_id,"response_digest":hash(&json!(["determa-host-operation-response-1",response]))?}));
+        journal["operation_response_references"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by(|left, right| {
+                left["operation_id"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+                    .cmp(right["operation_id"].as_str().unwrap().as_bytes())
+            });
+        journal
+            .as_object_mut()
+            .unwrap()
+            .remove("host_effect_journal_digest");
+        journal["host_effect_journal_digest"] = json!(hash(&json!([
+            "determa-host-effect-journal-digest-1",
+            journal
+        ]))?);
+        self.store
+            .update_native_effect_admission(
+                &original_checkpoint,
+                &prior_document,
+                &candidate,
+                &document,
+                || {
+                    // Recheck the source after actual SQL staging, before native commit.
+                    let current =
+                        self.resolver
+                            .resolve_definition(fingerprint)
+                            .ok_or_else(|| {
+                                failure("native admission definition unavailable at commit")
+                            })?;
+                    if !current.trusted
+                        || current.bundle.fingerprint != fingerprint
+                        || current.bundle.normalized != resolved.bundle.normalized
+                    {
+                        return Err(failure("native admission definition changed at commit"));
+                    }
+                    Ok(())
+                },
+            )
             .map_err(failure)?;
         Ok(response)
     }
