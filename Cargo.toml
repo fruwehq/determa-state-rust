@@ -20,6 +20,7 @@ exclude = [
     "tests/closed_code_registry.rs",
     "tests/checkpoint_postgresql.rs",
     "tests/extension_conformance.rs",
+    "tests/public_host_protocol.rs",
     "examples/extension_profile_adapter.rs",
     "examples/adapter_policy_probe.rs",
     "src/format1/runtime_conformance.rs",

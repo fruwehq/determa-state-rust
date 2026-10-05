@@ -28,6 +28,14 @@ jobs:
         with:
           shared-key: msrv-1.86
 
+      - name: Check out pinned public protocol fixtures
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: fruwehq/determa-state-spec
+          ref: ${{ env.SPECIFICATION_COMMIT }}
+          path: authoritative-spec
+          persist-credentials: false
+
       - name: Verify MSRV metadata and locked dependency graph
         run: |
           python3 scripts/verify_msrv.py --expected 1.86
@@ -116,6 +124,11 @@ jobs:
           cmp schema/version1-operation-inputs.schema.json conformance-suite/scripts/schemas/version1-operation-inputs.schema.json
           cmp schema/version1-operation-result.schema.json conformance-suite/scripts/schemas/version1-operation-result.schema.json
           cmp schema/version1-operation-failures.schema.json conformance-suite/scripts/schemas/version1-operation-failures.schema.json
+          for schema in schema/*.schema.json; do
+            if test -f "authoritative-spec/$schema"; then
+              cmp "$schema" "authoritative-spec/$schema"
+            fi
+          done
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-03
 
@@ -150,6 +163,9 @@ jobs:
 
       - name: Documentation tests
         run: cargo test --locked --doc
+
+      - name: Public client journals and exact local host protocol goldens
+        run: cargo test --locked --test public_host_protocol -- --nocapture
 
       - name: All 162 native artifact/checkpoint schema-v1 vectors
         run: cargo test --locked --test native_v1_conformance -- --nocapture

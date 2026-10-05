@@ -2,10 +2,20 @@ use determa_state::public_host::{request_digest, validate_message};
 use serde_json::Value;
 use std::{env, fs, path::PathBuf};
 
-fn fixture(name: &str) -> Value {
-    let root = env::var_os("DETERMA_SPEC_DIR")
+fn spec_root() -> PathBuf {
+    env::var_os("DETERMA_SPEC_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("authoritative-spec"));
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("authoritative-spec"))
+}
+
+fn conformance_root() -> PathBuf {
+    env::var_os("DETERMA_CONFORMANCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("conformance-suite"))
+}
+
+fn fixture(name: &str) -> Value {
+    let root = spec_root();
     serde_json::from_slice(&fs::read(root.join("examples/public-host").join(name)).unwrap())
         .unwrap()
 }
@@ -51,8 +61,8 @@ fn local_sqlite_host_executes_exact_public_core_goldens() {
     use determa_state::public_host::SqlitePublicExecutionHost;
     use determa_state::{load_bundle, InMemoryDefinitionResolver};
     use std::collections::BTreeSet;
-    let spec = PathBuf::from(env::var_os("DETERMA_SPEC_DIR").unwrap());
-    let conformance = PathBuf::from(env::var_os("DETERMA_CONFORMANCE_DIR").unwrap());
+    let spec = spec_root();
+    let conformance = conformance_root();
     let bundle = load_bundle(
         &fs::read_to_string(
             conformance
@@ -109,7 +119,7 @@ fn local_sqlite_host_executes_exact_delivery_goldens() {
     use determa_state::public_host::SqlitePublicExecutionHost;
     use determa_state::{load_bundle, InMemoryDefinitionResolver};
     use std::collections::BTreeSet;
-    let spec = PathBuf::from(env::var_os("DETERMA_SPEC_DIR").unwrap());
+    let spec = spec_root();
     let bundle = load_bundle(
         &fs::read_to_string(spec.join("examples/portable-event-deferral.yaml")).unwrap(),
     )
@@ -209,7 +219,7 @@ fn native_local_host_replay_precedes_resolver_and_authorization_precedes_existen
             self.inner.resolve_definition(fingerprint)
         }
     }
-    let conformance = PathBuf::from(env::var_os("DETERMA_CONFORMANCE_DIR").unwrap());
+    let conformance = conformance_root();
     let bundle = load_bundle(
         &fs::read_to_string(
             conformance
