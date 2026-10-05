@@ -843,7 +843,32 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
     /// Native writer exclusion spans the consuming check and entire provider call.
     /// Providers must bound I/O and must not reenter this SQLite authority.
     /// This is not the complete public dispatch protocol or an automatic retry.
+    /// Convenience composition: call once, then durably record the native report.
+    /// A failure between these stages retains the private start, never permission
+    /// to call again. Operational transports may instead submit the candidate.
     pub fn dispatch_claimed(
+        &self,
+        root: &str,
+        effect_id: &str,
+        worker_credential: &[u8],
+        handler_credential: &[u8],
+    ) -> Result<Value, AuthorityError> {
+        let result =
+            self.dispatch_candidate(root, effect_id, worker_credential, handler_credential)?;
+        let report_id = hash(&json!([
+            "determa-native-invocation-report-1",
+            self.scope,
+            root,
+            effect_id,
+            result["attempt_fence"]
+        ]))?;
+        self.record_result(root, &report_id, &result, worker_credential)
+    }
+
+    /// Invoke an exclusive committed claim and return a result candidate only.
+    /// This does not durably report or admit that candidate. Loss before explicit
+    /// submission leaves the retained private start and unknown native fate.
+    pub fn dispatch_candidate(
         &self,
         root: &str,
         effect_id: &str,
@@ -997,17 +1022,11 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             // A provider assertion cannot establish independent safe retry evidence.
             Kind::RetryableFailure | Kind::Ambiguous => "ambiguous",
         };
-        let result = json!({"effect_id":effect_id,"operation_token":record["operation_token"],
+        Ok(
+            json!({"effect_id":effect_id,"operation_token":record["operation_token"],
             "attempt_fence":record["attempt_fence"],"outcome_kind":kind,
-            "payload":serde_json::to_value(report.payload).map_err(failure)?});
-        let report_id = hash(&json!([
-            "determa-native-invocation-report-1",
-            self.scope,
-            root,
-            effect_id,
-            record["attempt_fence"]
-        ]))?;
-        self.record_result(root, &report_id, &result, worker_credential)
+            "payload":serde_json::to_value(report.payload).map_err(failure)?}),
+        )
     }
 
     /// Owner-local retirement of an expired claim, preserving unknown provider fate.

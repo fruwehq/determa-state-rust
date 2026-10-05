@@ -4383,6 +4383,87 @@ fn native_dispatch_identical_contenders_cannot_call_twice_before_first_report() 
         1
     );
 }
+#[cfg(feature = "sqlite")]
+#[test]
+fn native_dispatch_candidate_preserves_public_bytes_until_explicit_report() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    fixture.destination.map_result.store(true, Ordering::SeqCst);
+    let bundle = effect_bundle();
+    let resolver = effect_resolver(&bundle);
+    let authority = effect_worker_authority(&path);
+    let host =
+        effect_host(&path, resolver.clone(), &fixture).with_worker_authority(authority.clone());
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let initial = native_snapshot(&path);
+    let effect_id = initial.1["journal"]["effect_records"][0]["effect_id"]
+        .as_str()
+        .unwrap();
+    host.claim(
+        "root",
+        "claim-1",
+        &determa_state::authority::NativeEffectClaimRequest {
+            effect_id: effect_id.into(),
+        },
+        b"private-native-credential",
+    )
+    .unwrap();
+    let before = native_snapshot(&path);
+    let candidate = host
+        .dispatch_candidate("root", effect_id, b"private-native-credential", b"secret")
+        .unwrap();
+    let after = native_snapshot(&path);
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.1["journal"], before.1["journal"]);
+    assert_eq!(after.1["responses"], before.1["responses"]);
+    assert_eq!(after.1["original_requests"], before.1["original_requests"]);
+    assert_eq!(
+        after.1["journal"]["effect_records"][0]["invocation_state"],
+        "leased"
+    );
+    assert_eq!(after.2["scope_generation"], "3");
+    assert_eq!(candidate["attempt_fence"], "1");
+    assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 1);
+    drop(host);
+    let host = effect_host(&path, resolver, &fixture).with_worker_authority(authority);
+    assert!(host
+        .dispatch_candidate("root", effect_id, b"private-native-credential", b"secret")
+        .is_err());
+    assert_eq!(native_snapshot(&path), after);
+    host.record_result(
+        "root",
+        "submitted-candidate",
+        &candidate,
+        b"private-native-credential",
+    )
+    .unwrap();
+    let reported = native_snapshot(&path);
+    assert_eq!(
+        reported.1["invocation_starts"],
+        after.1["invocation_starts"]
+    );
+    let accepted = host
+        .admit_recorded_result(
+            "root",
+            "candidate-admission",
+            effect_id,
+            &effect_guard(&reported.0),
+        )
+        .unwrap();
+    assert_eq!(accepted["body"]["result_response"]["status"], "committed");
+    assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 1);
+}
+
 #[cfg(all(feature = "sqlite", unix))]
 #[test]
 fn native_dispatch_crash_child() {
@@ -4431,6 +4512,21 @@ fn native_dispatch_crash_child() {
         }));
     } else if cut == "acceptance" {
         *fixture.destination.accepted_marker.lock().unwrap() = Some(marker.clone());
+    } else if cut == "candidate" {
+        let before = native_snapshot(&path);
+        let candidate = host
+            .dispatch_candidate("root", effect_id, b"private-native-credential", b"secret")
+            .unwrap();
+        let after = native_snapshot(&path);
+        assert_eq!(after.0, before.0);
+        assert_eq!(after.1["journal"], before.1["journal"]);
+        std::fs::write(
+            &marker,
+            serde_json_canonicalizer::to_vec(&candidate).unwrap(),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        unreachable!("candidate cut must be killed");
     } else {
         assert_eq!(cut, "outcome");
     }
@@ -4446,7 +4542,7 @@ fn native_dispatch_crash_child() {
 #[test]
 fn real_sigkill_dispatch_preserves_uncertain_starts_and_recorded_outcomes_without_redispatch() {
     use std::os::unix::process::ExitStatusExt;
-    for cut in ["start", "acceptance", "outcome"] {
+    for cut in ["start", "acceptance", "candidate", "outcome"] {
         let directory = EffectTestDirectory::new();
         let path = directory.path().join("authority.sqlite");
         let marker = directory.path().join("cut.json");
