@@ -331,8 +331,9 @@ fn validate_record(
         .get(event)
         .or_else(|| bundle.events.get(event))
         .ok_or_else(|| failure("undeclared result event"))?;
-    super::runtime::normalize_payload(declaration, &logical)
+    let logical = super::runtime::normalize_payload(declaration, &logical)
         .map_err(|_| failure("invalid declared result payload"))?;
+    let payload = TypedValue::from_value(&crate::value::Value::Map(logical));
     let mut envelope = json!({"event":mapping["event"],"event_id":result_id,"cause_id":result_id,"source":{"host":true},"target":target,"payload":payload});
     if mapping["operation_token_location"]["kind"] == "correlation_id" {
         envelope["correlation_id"] = record["operation_token"].clone();
@@ -536,4 +537,129 @@ fn validate_result_mappings(
         }
     }
     Ok(())
+}
+
+/// Native retained source evidence keeps integer/float distinctions in canonical
+/// storage. It grants no executable provider, resolver trust or imported authority.
+#[cfg(feature = "sqlite")]
+pub(crate) fn native_definition_evidence(bundle: &super::Bundle) -> Value {
+    super::compile::typed_projection(&bundle.normalized)
+}
+
+/// Derive the complete normalized result envelope without resolving mutable
+/// routes. Native first-reply/history checks use retained typed source bytes;
+/// executable restoration and source/provider verification remain separate.
+#[cfg(feature = "sqlite")]
+pub(crate) fn native_result_delivery(
+    record: &Value,
+    root: &str,
+    evidence: &Value,
+) -> Result<Value, EffectJournalError> {
+    let origin = &record["target"]["runtime_incarnation"];
+    let identity = &origin["definition"]["machine"];
+    require(
+        origin["kind"] == "root"
+            && record["target"]["root_instance_id"] == root
+            && origin["root_instance_id"] == root,
+        "native result target must be the original root incarnation",
+    )?;
+    require(
+        super::compile::hash_json(json!(["determa-validated-bundle-fingerprint-1", evidence]))
+            == origin["definition"]["validated_bundle_fingerprint"],
+        "retained result source fingerprint mismatch",
+    )?;
+    let source: TypedValue = serde_json::from_value(evidence.clone()).map_err(failure)?;
+    let normalized =
+        serde_json::to_value(source.to_value(None).map_err(failure)?).map_err(failure)?;
+    require(
+        normalized["format"] == 1 && normalized["namespace"] == identity["namespace"],
+        "retained source identity mismatch",
+    )?;
+    let pointer = text(identity, "root_definition_pointer")?
+        .strip_suffix("/root")
+        .ok_or_else(|| failure("retained native machine root pointer invalid"))?;
+    let machine = normalized
+        .pointer(pointer)
+        .ok_or_else(|| failure("retained result machine absent"))?;
+    let version = machine
+        .get("version")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+        .to_string();
+    require(
+        machine["machine_id"] == identity["machine_id"] && identity["machine_version"] == version,
+        "retained result machine identity mismatch",
+    )?;
+    let outcome = &record["outcome"];
+    require(!outcome.is_null(), "native result outcome absent")?;
+    let mapping = array(record, "result_mapping")?
+        .iter()
+        .find(|mapping| mapping["outcome_kind"] == outcome["kind"])
+        .ok_or_else(|| failure("native result mapping absent"))?;
+    let event = text(mapping, "event")?;
+    let declaration = machine["events"]
+        .get(event)
+        .or_else(|| normalized["events"].get(event))
+        .ok_or_else(|| failure("retained result declaration absent"))?;
+    let declaration: super::model::EventDeclaration =
+        serde_json::from_value(declaration.clone()).map_err(failure)?;
+    require(
+        declaration.direction == super::model::EventDirection::Input,
+        "native result event is not input",
+    )?;
+    let mut payload: TypedValue =
+        serde_json::from_value(outcome["payload"].clone()).map_err(failure)?;
+    if mapping["operation_token_location"]["kind"] == "payload" {
+        let pointer = text(&mapping["operation_token_location"], "pointer")?;
+        let key = pointer
+            .strip_prefix('/')
+            .filter(|key| !key.contains('/'))
+            .ok_or_else(|| failure("native token pointer is not flat"))?
+            .replace("~1", "/")
+            .replace("~0", "~");
+        let TypedValue::Map(fields) = &mut payload else {
+            return Err(failure("native result payload is not a map"));
+        };
+        if let Some((_, supplied)) = fields.iter_mut().find(|(name, _)| *name == key) {
+            require(
+                matches!(supplied, TypedValue::String(_)),
+                "native result token is not a string",
+            )?;
+            *supplied = TypedValue::String(text(record, "operation_token")?.to_owned());
+        } else {
+            fields.push((
+                key,
+                TypedValue::String(text(record, "operation_token")?.to_owned()),
+            ));
+            fields.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        }
+    }
+    let crate::value::Value::Map(logical) = payload.to_value(None).map_err(failure)? else {
+        return Err(failure("native result payload is not a map"));
+    };
+    let logical = super::runtime::normalize_payload(&declaration, &logical)
+        .map_err(|_| failure("invalid declared native result payload"))?;
+    let payload = TypedValue::from_value(&crate::value::Value::Map(logical));
+    let event_id = hash(&json!([
+        "determa-effect-result-event-1",
+        record["effect_id"],
+        mapping["result_slot"]
+    ]))?;
+    require(
+        record["result_event_id"] == event_id,
+        "native result event identity mismatch",
+    )?;
+    let mut envelope = json!({"event":event,"event_id":event_id,"cause_id":event_id,"source":{"host":true},
+        "target":{"root":{"root_instance_id":root,"root_runtime_id":record["target"]["runtime_id"]}},"payload":payload});
+    if mapping["operation_token_location"]["kind"] == "correlation_id" {
+        envelope["correlation_id"] = record["operation_token"].clone();
+    }
+    let digest = hash(&json!([
+        "determa-inbox-envelope-digest-1",
+        "1",
+        root,
+        "input",
+        envelope
+    ]))?;
+    Ok(json!({"delivery_mode":"input","envelope":envelope,"envelope_digest":digest}))
 }

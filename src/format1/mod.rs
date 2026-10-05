@@ -57,3 +57,6 @@ pub(crate) use contracts::validate_native_core_step_result;
 
 #[cfg(feature = "sqlite")]
 pub(crate) use contracts::validate_native_effect_result_request;
+
+#[cfg(feature = "sqlite")]
+pub(crate) use contracts::validate_native_effect_result_response;

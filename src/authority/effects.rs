@@ -838,6 +838,160 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             .map_err(failure)?;
         Ok(response)
     }
+    /// Owner-authorized recovery of a retained terminal outcome. This operation
+    /// never invokes a provider or requires the expired original worker claim.
+    pub fn admit_recorded_result(
+        &self,
+        root: &str,
+        operation_id: &str,
+        effect_id: &str,
+        guard: &checkpoint::MutationGuard,
+    ) -> Result<Value, AuthorityError> {
+        if operation_id.is_empty() {
+            return Err(failure("native result admission identity absent"));
+        }
+        let original = json!({"operation_kind":"effect_result_admission","root_instance_id":root,"effect_id":effect_id});
+        if let Some(saved) = self
+            .store
+            .native_effect_replay(root, operation_id, &original)
+            .map_err(failure)?
+        {
+            return Ok(saved);
+        }
+        let (original_checkpoint, mut document) =
+            self.store.native_effect_snapshot(root).map_err(failure)?;
+        let prior = document.clone();
+        let record = document["journal"]["effect_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["effect_id"] == effect_id)
+            .ok_or_else(|| failure("effect_not_outstanding"))?;
+        if record["invocation_state"] != "outcome_recorded" || record["outcome"].is_null() {
+            return Err(failure("native result admission requires recorded outcome"));
+        }
+        let pinned_fingerprint = record["target"]["runtime_incarnation"]["definition"]
+            ["validated_bundle_fingerprint"]
+            .as_str()
+            .ok_or_else(|| failure("native result definition absent"))?
+            .to_owned();
+        let pinned = self
+            .resolver
+            .resolve_definition(&pinned_fingerprint)
+            .ok_or_else(|| failure("native result definition unavailable"))?;
+        if !pinned.trusted || pinned.bundle.fingerprint != pinned_fingerprint {
+            return Err(failure("native result definition not trusted"));
+        }
+        let evidence = crate::format1::effect_journal::native_definition_evidence(&pinned.bundle);
+        let delivery =
+            crate::format1::effect_journal::native_result_delivery(record, root, &evidence)
+                .map_err(failure)?;
+        let current_fingerprint = original_checkpoint
+            .bundle_fingerprint()
+            .ok_or_else(|| failure("native active definition absent"))?;
+        let current = self
+            .resolver
+            .resolve_definition(current_fingerprint)
+            .ok_or_else(|| failure("native active definition unavailable"))?;
+        if !current.trusted || current.bundle.fingerprint != current_fingerprint {
+            return Err(failure("native active definition not trusted"));
+        }
+        let result = checkpoint::admit(
+            &current.bundle,
+            &original_checkpoint,
+            std::slice::from_ref(&delivery),
+            Some(&guard.expected_revision),
+            Some(&guard.expected_checkpoint_digest),
+        )
+        .map_err(failure)?;
+        let candidate_value = if result.get("execution_checkpoint_format").is_some() {
+            result.clone()
+        } else {
+            original_checkpoint.value().clone()
+        };
+        let candidate = checkpoint::restore(&canonical(&candidate_value)?, self.resolver.as_ref())
+            .map_err(failure)?;
+        if original_checkpoint.revision() != guard.expected_revision
+            || original_checkpoint.digest() != guard.expected_checkpoint_digest
+        {
+            return Err(failure("checkpoint_revision_conflict"));
+        }
+        let receipt = candidate.value()["operation_receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|receipt| {
+                receipt["operation_kind"] == "acceptance"
+                    && receipt["event_id"] == record["result_event_id"]
+                    && receipt["request_digest"] == delivery["envelope_digest"]
+                    && receipt["delivery_mode"] == "input"
+            })
+            .ok_or_else(|| failure("native result acceptance absent"))?
+            .clone();
+        let record = document["journal"]["effect_records"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|record| record["effect_id"] == effect_id)
+            .unwrap();
+        record["admission_receipt"] = receipt;
+        record["invocation_state"] = json!("result_admitted");
+        let journal = &mut document["journal"];
+        journal["checkpoint_revision"] = json!(candidate.revision());
+        journal["checkpoint_digest"] = json!(candidate.digest());
+        // retain_native_effect_response advances exactly one journal revision.
+        let next_revision: num_bigint::BigUint = journal["journal_revision"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .map_err(failure)?;
+        let mut response_journal = journal.clone();
+        response_journal["journal_revision"] =
+            json!((next_revision + num_bigint::BigUint::from(1u8)).to_string());
+        let updated = response_journal["effect_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["effect_id"] == effect_id)
+            .unwrap();
+        let response = json!({"kind":"effect_result_admission","body":{"checkpoint":candidate.value(),
+            "admission_result":result,"delivery":delivery,"definition_evidence":evidence,
+            "result_response":native_committed_result_response(updated, &response_journal, candidate.value())}});
+        crate::format1::validate_native_effect_result_response(
+            &response["body"]["result_response"],
+        )
+        .map_err(failure)?;
+        retain_native_effect_response(&mut document, operation_id, &original, &response)?;
+        self.store
+            .update_native_effect_checkpoint(
+                &original_checkpoint,
+                &prior,
+                &candidate,
+                &document,
+                || {
+                    for (fingerprint, expected) in [
+                        (pinned_fingerprint.as_str(), &pinned.bundle),
+                        (current_fingerprint, &current.bundle),
+                    ] {
+                        let resolved = self
+                            .resolver
+                            .resolve_definition(fingerprint)
+                            .ok_or_else(|| failure("native result source unavailable at commit"))?;
+                        if !resolved.trusted
+                            || resolved.bundle.fingerprint != fingerprint
+                            || resolved.bundle.normalized != expected.normalized
+                        {
+                            return Err(failure("native result source changed at commit"));
+                        }
+                        crate::format1::providers::check_bundle(&resolved.bundle)
+                            .map_err(failure)?;
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(failure)?;
+        Ok(response)
+    }
 }
 
 fn retain_native_effect_response(
@@ -967,4 +1121,15 @@ pub(super) fn record_native_effect_report(
         record["invocation_state"] = json!("outcome_recorded");
     }
     Ok(())
+}
+
+pub(super) fn native_committed_result_response(
+    record: &Value,
+    journal: &Value,
+    checkpoint: &Value,
+) -> Value {
+    json!({"status":"committed","effect_id":record["effect_id"],"attempt_fence":record["attempt_fence"],
+        "attempt_report":null,"outcome":record["outcome"],"result_event_id":record["result_event_id"],
+        "admission_receipt":record["admission_receipt"],"checkpoint_revision":checkpoint["revision"],
+        "journal_revision":journal["journal_revision"],"error_code":null})
 }

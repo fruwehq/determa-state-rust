@@ -1156,6 +1156,16 @@ fn validate_native_effect_transition(
     let request = requests
         .get(id)
         .ok_or_else(|| failure("new native request absent"))?;
+    if request["operation_kind"] == "effect_result_admission" {
+        return validate_native_effect_result_admission_transition(
+            prior,
+            prior_checkpoint,
+            document,
+            checkpoint,
+            request,
+            body,
+        );
+    }
     if request["operation_kind"] == "effect_report" {
         return validate_native_effect_report_transition(
             prior,
@@ -1655,6 +1665,94 @@ fn validate_native_effect_report_transition(
         "outcome":record["outcome"],"result_event_id":record["result_event_id"]}});
     if document["journal"]["effect_records"] != expected || body != &expected_body {
         return Err(failure("native report changed unrelated evidence"));
+    }
+    Ok(())
+}
+
+fn validate_native_effect_result_admission_transition(
+    prior: &Value,
+    prior_checkpoint: &Value,
+    document: &Value,
+    checkpoint: &Value,
+    request: &Value,
+    body: &Value,
+) -> Result<(), AuthorityError> {
+    if !closed(
+        request,
+        &["operation_kind", "root_instance_id", "effect_id"],
+    ) || request["root_instance_id"] != checkpoint["root_instance_id"]
+        || !closed(body, &["kind", "body"])
+        || body["kind"] != "effect_result_admission"
+        || !closed(
+            &body["body"],
+            &[
+                "checkpoint",
+                "admission_result",
+                "delivery",
+                "definition_evidence",
+                "result_response",
+            ],
+        )
+        || body["body"]["checkpoint"] != *checkpoint
+    {
+        return Err(failure("native result admission shape mismatch"));
+    }
+    let mut expected = prior["journal"]["effect_records"].clone();
+    let record = expected
+        .as_array_mut()
+        .ok_or_else(|| failure("prior effects absent"))?
+        .iter_mut()
+        .find(|record| record["effect_id"] == request["effect_id"])
+        .ok_or_else(|| failure("effect_not_outstanding"))?;
+    if record["invocation_state"] != "outcome_recorded"
+        || record["outcome"].is_null()
+        || !record["admission_receipt"].is_null()
+    {
+        return Err(failure("native result admission requires recorded outcome"));
+    }
+    let root = checkpoint["root_instance_id"]
+        .as_str()
+        .ok_or_else(|| failure("native root absent"))?;
+    let delivery = crate::format1::effect_journal::native_result_delivery(
+        record,
+        root,
+        &body["body"]["definition_evidence"],
+    )
+    .map_err(failure)?;
+    if body["body"]["delivery"] != delivery {
+        return Err(failure(
+            "native result envelope differs from immutable pins",
+        ));
+    }
+    validate_native_admission_checkpoint_transition(
+        prior_checkpoint,
+        checkpoint,
+        &delivery,
+        &body["body"]["admission_result"],
+    )?;
+    let receipt = checkpoint["operation_receipts"]
+        .as_array()
+        .ok_or_else(|| failure("native receipts absent"))?
+        .iter()
+        .find(|receipt| {
+            receipt["operation_kind"] == "acceptance"
+                && receipt["event_id"] == record["result_event_id"]
+                && receipt["request_digest"] == delivery["envelope_digest"]
+                && receipt["delivery_mode"] == "input"
+        })
+        .ok_or_else(|| failure("native result acceptance receipt absent"))?
+        .clone();
+    record["admission_receipt"] = receipt;
+    record["invocation_state"] = json!("result_admitted");
+    let response =
+        effects::native_committed_result_response(record, &document["journal"], checkpoint);
+    crate::format1::validate_native_effect_result_response(&response).map_err(failure)?;
+    if body["body"]["result_response"] != response
+        || document["journal"]["effect_records"] != expected
+    {
+        return Err(failure(
+            "native result admission changed unrelated evidence",
+        ));
     }
     Ok(())
 }

@@ -209,6 +209,17 @@ pub(crate) fn validate_native_effect_result_request(
     Ok(())
 }
 
+#[cfg(feature = "sqlite")]
+pub(crate) fn validate_native_effect_result_response(
+    value: &Value,
+) -> Result<(), super::ArtifactError> {
+    validate_schema(
+        "effect_result_response_v1",
+        value,
+        include_str!("../../schema/effect-result-response-v1.schema.json"),
+    )
+}
+
 fn contract_schema(kind: &str) -> Option<&'static str> {
     match kind {
         "host_effect_journal_v1" => Some(include_str!(
