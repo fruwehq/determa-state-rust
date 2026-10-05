@@ -42,6 +42,9 @@ Never invent a release tag or weaken an exact revision check.
 - `tests/inspection_conformance.rs`: all 49 mandatory exact-target inspection vectors
   through the production operation. Seven native provider vectors execute through separately verified provider
   capabilities.
+- `tests/runtime_provider_conformance.rs`: all 52 exact-source runtime-provider vectors
+  through production operations, with repository observations enabled by
+  `RUSTFLAGS="--cfg determa_repository_conformance"`.
 - `tests/durable_host_conformance.rs`: production-host driver for all 142 optional
   durable-host vectors, including SQLite shared transactions.
 - `tests/checkpoint_adapters.rs`: shared memory/file/SQLite setup, restart, and CAS

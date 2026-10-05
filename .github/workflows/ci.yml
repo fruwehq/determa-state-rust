@@ -156,6 +156,15 @@ jobs:
           cargo build --locked --example adapter_policy_probe
           python3 conformance-suite/scripts/run_adapter_policy_profile.py --adapter target/debug/examples/adapter_policy_probe
 
+      - name: All 52 verified runtime-provider vectors
+        env:
+          RUSTFLAGS: --cfg determa_repository_conformance
+        run: |
+          cargo test --locked --test runtime_provider_conformance
+          cargo test --locked --test source_compilation
+          cargo build --locked --example runtime_provider_adapter
+          python3 conformance-suite/scripts/run_runtime_provider_profile.py --spec-root authoritative-spec --adapter target/debug/examples/runtime_provider_adapter
+
       - name: All 75 authoritative mailbox-neutral RTC scenarios
         env:
           RUSTFLAGS: --cfg determa_repository_conformance

@@ -1,4 +1,5 @@
-//! Repository-only production provider adapter; unfinished operations fail explicitly.
+//! Repository-only production provider adapter. Enable determa_repository_conformance
+//! for compilation-stage and emission-index observations required by the full profile.
 #[path = "../tests/runtime_provider_conformance.rs"]
 mod driver;
 use std::io::{Read, Write};

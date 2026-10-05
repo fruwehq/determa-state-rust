@@ -133,8 +133,13 @@ receipts, counters, or the supplied aggregate.
 
 All seven native provider inspection vectors run through a separately verified
 `inspect_guard` entrypoint. Their portable aggregates restore through the actual
-provider-backed definition resolver. Complete runtime-provider profile coverage
-remains unfinished and is required before the final release claim.
+provider-backed definition resolver. All 52 exact-source runtime-provider vectors
+also run through production loading, creation, step, inspection, source compilation,
+restoration and durable checkpoint commit/replay operations. The repository-only
+adapter records compiler stages and emission indexes with
+`RUSTFLAGS="--cfg determa_repository_conformance"`; these observations do not add
+members to portable results or artifacts. Full release gates and independent review
+remain required before the final release claim.
 
 `compile_language_source` compiles only executable grammar slots through explicitly
 installed exact-source compilers, then strictly loads the generated format-1 bundle.

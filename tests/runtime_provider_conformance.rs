@@ -1,4 +1,6 @@
 //! Actual production operations for the optional exact-source runtime profile.
+#[path = "support/runtime_provider_host.rs"]
+mod host;
 #[path = "support/runtime_provider.rs"]
 mod provider;
 use determa_state::format1::providers::{ProviderResult, RuntimeProviderRegistry, SourceClosure};
@@ -147,9 +149,10 @@ fn installed(
         )?;
         providers.push(provider);
     }
-    if !providers.is_empty() {
+    if !references.is_empty() {
         let bytes =
             std::fs::read(root.join("provider/test_provider.rs")).map_err(|_| unavailable())?;
+        if bytes != include_bytes!("../conformance-suite/conformance/profiles/runtime-provider/provider-01-exact-source/provider/test_provider.rs") { return Err(unavailable()); }
         loaded["provider/test_provider.rs"] = json!(format!("sha256:{:x}", Sha256::digest(bytes)));
     }
     Ok((registry, providers))
@@ -289,6 +292,9 @@ pub fn observe_runtime_profile(payload: &Value) -> Value {
             stage(&mut observation, "load");
             observation["result"] = json!("accepted");
             return Ok(());
+        }
+        if request["operation"] == "host_commit" {
+            return host::run(&bundle, &providers, request, &mut observation);
         }
         if request["operation"] == "restore" {
             if bundle.fingerprint
@@ -803,7 +809,7 @@ fn production_driver_runtime_operation_vectors() {
                     .all(|key| args.get(key).is_none());
         #[cfg(determa_repository_conformance)]
         let selected = selected
-            || ["step", "compile", "create"]
+            || ["step", "compile", "create", "host_commit"]
                 .iter()
                 .any(|operation| request["operation"] == *operation);
         if !selected {
@@ -821,5 +827,5 @@ fn production_driver_runtime_operation_vectors() {
     #[cfg(not(determa_repository_conformance))]
     assert_eq!(tested, 36);
     #[cfg(determa_repository_conformance)]
-    assert_eq!(tested, 50);
+    assert_eq!(tested, 52);
 }

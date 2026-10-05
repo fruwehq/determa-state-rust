@@ -19,6 +19,7 @@ exclude = [
     "tests/source_compilation.rs",
     "tests/runtime_provider_conformance.rs",
     "tests/support/runtime_provider.rs",
+    "tests/support/runtime_provider_host.rs",
     "tests/support/inspection_provider.rs",
     "tests/native_v1_conformance.rs",
     "tests/closed_code_registry.rs",
