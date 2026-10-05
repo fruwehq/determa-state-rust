@@ -23,7 +23,7 @@ pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "affe3fe3bcc4d13fa7c5374471568e94a
 #[cfg(determa_repository_conformance)]
 pub use format1::observed_inspection_guards;
 pub use format1::{
-    admit, create, inspect_candidate, load_bundle, load_bundle_from_json, migrate_aggregate,
+    admit, create, inspect_candidate, load_bundle, load_bundle_with_providers, load_bundle_from_json, migrate_aggregate,
     migrate_aggregate_route, restore_aggregate, restore_package, step, validate_artifact,
     validate_contract_artifact, validate_migration_descriptor, AdmissionDelivery, Aggregate,
     ArtifactError, Bindings, Bundle, Counter, CreationRejectionCode, DefinitionResolver,

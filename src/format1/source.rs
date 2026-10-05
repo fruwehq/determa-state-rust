@@ -24,6 +24,7 @@ pub enum LoadErrorCode {
     DestroyedReferenceBinding,
     RootReentry,
     RootLocalTransition,
+    RuntimeProviderUnavailable,
 }
 
 impl LoadErrorCode {
@@ -71,6 +72,7 @@ impl LoadErrorCode {
             Self::DestroyedReferenceBinding => "destroyed_reference_binding",
             Self::RootReentry => "root_reentry",
             Self::RootLocalTransition => "root_local_transition",
+            Self::RuntimeProviderUnavailable => "runtime_provider_unavailable",
         }
     }
 }
@@ -106,6 +108,9 @@ pub fn load_bundle_from_json(value: serde_json::Value) -> Result<Bundle, LoadErr
     validate_numeric_domain(&value, "")?;
     validate_format(&value)?;
     validate_schema(&value)?;
+    if super::providers::requires_providers(&value) {
+        return Err(LoadError { code: LoadErrorCode::RuntimeProviderUnavailable, path: "/".into(), message: "native providers must be installed explicitly".into() });
+    }
     compile_bundle(value).map_err(|error| LoadError {
         code: error.code,
         path: error.path,
@@ -544,4 +549,35 @@ mod tests {
         .unwrap();
         assert_ne!(integer.fingerprint, floating.fingerprint);
     }
+}
+
+
+pub fn load_bundle_with_providers(source: &str, registry: super::providers::RuntimeProviderRegistry,
+    required_capabilities: &std::collections::BTreeSet<String>) -> Result<Bundle, super::ArtifactError> {
+    let value = parse_document(source).map_err(|e|super::ArtifactError::new(e.code.as_str(),e.message))?;
+    for checked in [validate_unicode(&value),validate_numeric_domain(&value,""),validate_format(&value),validate_schema(&value)] {
+        checked.map_err(|e|super::ArtifactError::new(e.code.as_str(),e.message))?;
+    }
+    let mut bundle=compile_bundle(value).map_err(|e|super::ArtifactError::new(e.code.as_str(),e.message))?;
+    super::providers::activate(&mut bundle,registry,required_capabilities)?;
+    Ok(bundle)
+}
+fn validate_runtime_schema(value:&serde_json::Value,schema:&str,code:&str)->Result<(),super::ArtifactError> {
+    let mut options=jsonschema::options();
+    for text in [include_str!("../../schema/machine.schema.json"),include_str!("../../schema/provider-reference-v1.schema.json")] {
+        let resource:serde_json::Value=serde_json::from_str(text).unwrap();
+        options=options.with_resource(resource["$id"].as_str().unwrap().into(),jsonschema::Resource::from_contents(resource).unwrap());
+    }
+    let parsed:serde_json::Value=serde_json::from_str(schema).unwrap();
+    let validator=options.build(&parsed).map_err(|e|super::ArtifactError::new(code,e.to_string()))?;
+    validator.validate(value).map_err(|e|super::ArtifactError::new(code,e.to_string()))
+}
+pub(crate) fn validate_provider_reference(value:&serde_json::Value)->Result<(),super::ArtifactError> {
+    validate_runtime_schema(value,include_str!("../../schema/provider-reference-v1.schema.json"),"invalid_extension_descriptor")
+}
+pub(crate) fn validate_runtime_descriptor(value:&serde_json::Value)->Result<(),super::ArtifactError> {
+    validate_runtime_schema(value,include_str!("../../schema/runtime-provider-descriptor-v1.schema.json"),"invalid_extension_descriptor")
+}
+pub(crate) fn validate_runtime_output(value:&serde_json::Value)->Result<(),super::ArtifactError> {
+    validate_runtime_schema(value,include_str!("../../schema/runtime-action-output-v1.schema.json"),"runtime_provider_output_invalid")
 }

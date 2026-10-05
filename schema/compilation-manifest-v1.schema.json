@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/compilation-manifest-v1.schema.json",
+  "title": "Determa compilation manifest version 1",
+  "type": "object",
+  "required": ["artifact_format", "artifact_schema_version", "content", "artifact_digest"],
+  "additionalProperties": false,
+  "properties": {
+    "artifact_format": {"const": "determa.compilation_manifest"},
+    "artifact_schema_version": {"const": 1},
+    "content": {
+      "type": "object",
+      "required": ["source_artifact_digest", "compiler_providers", "generated_validated_bundle_fingerprint", "source_capabilities"],
+      "additionalProperties": false,
+      "properties": {
+        "source_artifact_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "compiler_providers": {"type": "array", "minItems": 1, "items": {"$ref": "provider-reference-v1.schema.json"}},
+        "generated_validated_bundle_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "source_capabilities": {"$ref": "machine.schema.json#/$defs/providerCapabilities"}
+      }
+    },
+    "artifact_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/runtime-action-output-v1.schema.json",
+  "title": "Runtime provider action output version 1",
+  "type": "object",
+  "required": ["actions"],
+  "additionalProperties": false,
+  "properties": {
+    "actions": {"type": "array", "items": {"oneOf": [{"$ref": "#/$defs/assign"}, {"$ref": "#/$defs/send"}]}}
+  },
+  "$defs": {
+    "value": {
+      "oneOf": [
+        {"type": "array", "prefixItems": [{"const": "null"}], "minItems": 1, "maxItems": 1},
+        {"type": "array", "prefixItems": [{"const": "boolean"}, {"type": "boolean"}], "minItems": 2, "maxItems": 2},
+        {"type": "array", "prefixItems": [{"const": "string"}, {"type": "string"}], "minItems": 2, "maxItems": 2},
+        {"type": "array", "prefixItems": [{"const": "integer"}, {"type": "string", "pattern": "^(0|-?[1-9][0-9]*)$"}], "minItems": 2, "maxItems": 2},
+        {"type": "array", "prefixItems": [{"const": "float"}, {"type": "string", "pattern": "^[0-9a-f]{16}$"}], "minItems": 2, "maxItems": 2},
+        {"type": "array", "prefixItems": [{"const": "list"}, {"type": "array", "items": {"$ref": "#/$defs/value"}}], "minItems": 2, "maxItems": 2},
+        {"type": "array", "prefixItems": [{"const": "map"}, {"type": "array", "items": {"type": "array", "prefixItems": [{"type": "string"}, {"$ref": "#/$defs/value"}], "minItems": 2, "maxItems": 2}}], "minItems": 2, "maxItems": 2}
+      ]
+    },
+    "assign": {
+      "type": "object", "required": ["assign"], "additionalProperties": false,
+      "properties": {"assign": {"type": "object", "required": ["variable", "value"], "additionalProperties": false, "properties": {"variable": {"$ref": "machine.schema.json#/$defs/celVisibleIdentifier"}, "value": {"$ref": "#/$defs/value"}}}}
+    },
+    "target": {
+      "oneOf": [
+        {"type": "object", "required": ["self"], "additionalProperties": false, "properties": {"self": {"const": true}}},
+        {"type": "object", "required": ["owner"], "additionalProperties": false, "properties": {"owner": {"const": true}}},
+        {"type": "object", "required": ["component"], "additionalProperties": false, "properties": {"component": {"$ref": "machine.schema.json#/$defs/identifier"}}},
+        {"type": "object", "required": ["external"], "additionalProperties": false, "properties": {"external": {"const": true}}},
+        {"type": "object", "required": ["instance"], "additionalProperties": false, "properties": {"instance": {"$ref": "#/$defs/value"}}}
+      ]
+    },
+    "send": {
+      "type": "object", "required": ["send"], "additionalProperties": false,
+      "properties": {"send": {
+        "type": "object", "required": ["event", "payload"], "additionalProperties": false,
+        "properties": {
+          "event": {"$ref": "machine.schema.json#/$defs/identifier"},
+          "to": {"$ref": "#/$defs/target"},
+          "targets": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/target"}},
+          "payload": {"$ref": "#/$defs/value"},
+          "correlation_id": {"$ref": "#/$defs/value"}
+        },
+        "not": {"required": ["to", "targets"]}
+      }}
+    }
+  }
+}

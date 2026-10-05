@@ -1694,6 +1694,7 @@ fn action_fault_locator(action: &CompiledAction, locator: &str) -> bool {
             locator == format!("{}/cancel/instance", action.pointer)
         }
         CompiledActionKind::Stop => false,
+        CompiledActionKind::ProviderActions(_) => false,
     }
 }
 
@@ -2511,10 +2512,9 @@ fn select_handler(
             }
             let state = &runtime.definition.states[&path];
             if let Some(transitions) = state.handlers.get(&envelope.event) {
-                let environment = action_environment(runtime, &path, Some(envelope));
                 for transition in transitions {
                     if let Some(guard) = &transition.guard {
-                        match cel::evaluate_boolean(guard, &environment) {
+                        match super::providers::guard(runtime, &path, guard, Some(envelope)) {
                             Ok(true) => {
                                 return Ok(HandlerSelection::Handled(path, transition.clone()))
                             }
@@ -2657,7 +2657,7 @@ fn choice_enabled(
     let Some(guard) = &branch.guard else {
         return Ok(true);
     };
-    cel::evaluate_boolean(guard, &action_environment(runtime, scope, Some(envelope))).map_err(
+    super::providers::guard(runtime, scope, guard, None).map_err(
         |_| StepFault {
             code: EngineFaultCode::GuardFault,
             source_locator: branch.guard_pointer.clone().expect("guard pointer"),
@@ -3071,6 +3071,9 @@ fn run_actions(
                 if let Value::InstanceReference(reference) = value {
                     let _ = cancel_owned(runtime, &reference, context)?;
                 }
+            }
+            CompiledActionKind::ProviderActions(binding) => {
+                execute_provider_actions(runtime, scope, action, binding, envelope, context)?;
             }
             CompiledActionKind::Stop => {
                 complete_runtime(runtime, context)?;
