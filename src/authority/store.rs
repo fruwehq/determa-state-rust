@@ -78,9 +78,17 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
         &self,
         read: impl FnOnce(&rusqlite::Connection, &Value) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
+        self.with_authority_snapshot_behavior(rusqlite::TransactionBehavior::Deferred, read)
+    }
+
+    fn with_authority_snapshot_behavior<T>(
+        &self,
+        behavior: rusqlite::TransactionBehavior,
+        read: impl FnOnce(&rusqlite::Connection, &Value) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
         let mut connection = self.authority.connection.lock().map_err(error)?;
         let transaction = connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .transaction_with_behavior(behavior)
             .map_err(error)?;
         super::validate_schema(&transaction, &self.authority.storage_binding).map_err(error)?;
         checkpoint::verify_sqlite_schema(&transaction, self.mode)?;
@@ -242,6 +250,27 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
         })
     }
 
+    // A consuming call holds the native writer exclusion, not only a read
+    // snapshot. Reports, cancellation and all other owner mutations cannot commit
+    // between the checked start/claim and external call. The already committed
+    // start survives a crash while this read-only transaction rolls back.
+    pub(super) fn with_native_effect_call<T>(
+        &self,
+        root: &str,
+        call: impl FnOnce(&Value, &Value) -> Result<T, super::AuthorityError>,
+    ) -> Result<T, StoreError> {
+        self.with_authority_snapshot_behavior(rusqlite::TransactionBehavior::Immediate, |connection, _| {
+            let checkpoint = checkpoint::load_sqlite_record(connection, root)?
+                .ok_or_else(|| error("native checkpoint absent"))?;
+            let bytes: Vec<u8> = connection.query_row(
+                "SELECT document FROM determa_authority_effect_journals WHERE root_instance_id=? AND scope_identity=?",
+                rusqlite::params![root,self.scope],|row|row.get(0),
+            ).map_err(error)?;
+            let document = strict_json::parse(&bytes).map_err(error)?;
+            call(&strict_json::parse(&checkpoint.bytes).map_err(error)?, &document).map_err(error)
+        })
+    }
+
     pub(super) fn update_native_effect_checkpoint(
         &self,
         original_checkpoint: &checkpoint::ExecutionCheckpoint,
@@ -258,6 +287,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
             precommit,
             || Ok(()),
         )
+        .map(|_| ())
     }
 
     pub(super) fn update_native_effect_checkpoint_with_final_guard(
@@ -268,7 +298,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
         document: &Value,
         precommit: impl FnOnce() -> Result<(), super::AuthorityError>,
         final_guard: impl FnOnce() -> Result<(), super::AuthorityError>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         super::validate_native_effect_transition(
             original_document,
             original_checkpoint.value(),
@@ -308,6 +338,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
             "arguments":{"mutation_digest":format!("sha256:{:x}",<sha2::Sha256 as sha2::Digest>::digest(&mutation))}});
         request["request_digest"] =
             json!(hash(&json!(["determa-host-authority-request-1", request])).map_err(error)?);
+        let freshly_committed = std::cell::Cell::new(false);
         let result = self.authority.perform_native_with_final_guard(
             &canonical(&request).map_err(error)?, &self.caller(), Some(&mutation),
             Some("checkpoint_effect_journal"), |transaction| {
@@ -339,7 +370,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
                 if changed != 1 { return Err(super::failure("effect_journal_revision_conflict")); }
                 precommit()
             },
-            final_guard,
+            || {final_guard()?;freshly_committed.set(true);Ok(())},
         ).map_err(error)?;
         if result["status"] != "accepted" {
             return Err(error(format!(
@@ -347,7 +378,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
                 result["error_code"]
             )));
         }
-        Ok(())
+        Ok(freshly_committed.get())
     }
 
     fn commit(

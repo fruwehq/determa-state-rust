@@ -838,6 +838,180 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             .map_err(failure)?;
         Ok(response)
     }
+    /// Host-local dispatch of one issued claim. A durable start marker is committed
+    /// before external I/O; historical starts never authorize a second call.
+    /// Native writer exclusion spans the consuming check and entire provider call.
+    /// Providers must bound I/O and must not reenter this SQLite authority.
+    /// This is not the complete public dispatch protocol or an automatic retry.
+    pub fn dispatch_claimed(
+        &self,
+        root: &str,
+        effect_id: &str,
+        worker_credential: &[u8],
+        handler_credential: &[u8],
+    ) -> Result<Value, AuthorityError> {
+        let authority = self
+            .worker_authority
+            .as_ref()
+            .ok_or_else(|| failure("native worker authority absent"))?;
+        let caller = authority.authenticate(worker_credential).map_err(failure)?;
+        let authorize = || -> Result<(), AuthorityError> {
+            let current = authority.authenticate(worker_credential).map_err(failure)?;
+            if current.authenticated_principal != caller.authenticated_principal
+                || current.authenticated_principal.is_empty()
+                || !current.authorized_scopes.contains(&self.scope)
+                || !current.operation_rights.contains("dispatch_effect")
+                || !current.operation_rights.contains("submit_effect_result")
+            {
+                return Err(failure("unauthorized_scope"));
+            }
+            Ok(())
+        };
+        authorize()?;
+        let (checkpoint, mut document) =
+            self.store.native_effect_snapshot(root).map_err(failure)?;
+        let prior = document.clone();
+        let record = document["journal"]["effect_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["effect_id"] == effect_id)
+            .ok_or_else(|| failure("effect_not_outstanding"))?
+            .clone();
+        let claim = current_native_effect_claim(&document, &record)?.clone();
+        if record["invocation_state"] != "leased"
+            || !record["cancellation"].is_null()
+            || claim["worker_principal"] != caller.authenticated_principal
+            || claim["scope_identity"] != self.scope
+        {
+            return Err(failure("effect_not_outstanding"));
+        }
+        let expiry = canonical_native_time(&claim["expires_at"])?;
+        let guard = || -> Result<(), AuthorityError> {
+            authorize()?;
+            if authority.trusted_now().map_err(failure)? >= expiry {
+                return Err(failure("stale_attempt_fence"));
+            }
+            Ok(())
+        };
+        guard()?;
+        let start_id = hash(&json!([
+            "determa-native-invocation-start-1",
+            self.scope,
+            root,
+            effect_id,
+            record["attempt_fence"]
+        ]))?;
+        if document["responses"].get(&start_id).is_some() {
+            return Err(failure(
+                "native invocation already started; reconciliation required",
+            ));
+        }
+        let fingerprint = checkpoint
+            .bundle_fingerprint()
+            .ok_or_else(|| failure("native definition absent"))?;
+        let resolved = self
+            .resolver
+            .resolve_definition(fingerprint)
+            .ok_or_else(|| failure("native definition unavailable"))?;
+        if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
+            return Err(failure("native definition not trusted"));
+        }
+        let intent = checkpoint.value()["pending_outbox_intents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|intent| intent["intent"]["effect_id"] == effect_id)
+            .ok_or_else(|| failure("committed dispatch intent absent"))?["intent"]
+            .clone();
+        let payload: crate::format1::TypedValue =
+            serde_json::from_value(intent["payload"].clone()).map_err(failure)?;
+        let destination = record["destination_binding_digest"].as_str().unwrap();
+        let check_source = || -> Result<(), AuthorityError> {
+            let current = self
+                .resolver
+                .resolve_definition(fingerprint)
+                .ok_or_else(|| failure("native dispatch source unavailable"))?;
+            if !current.trusted
+                || current.bundle.fingerprint != fingerprint
+                || current.bundle.normalized != resolved.bundle.normalized
+            {
+                return Err(failure("native dispatch source changed"));
+            }
+            crate::format1::providers::check_bundle(&current.bundle).map_err(failure)?;
+            self.handler
+                .verify(&record["handler_reference"], destination)
+                .map_err(failure)
+        };
+        let original = json!({"operation_kind":"effect_invocation_start","root_instance_id":root,
+            "effect_id":effect_id,"attempt_fence":record["attempt_fence"],"worker_principal":caller.authenticated_principal});
+        let response = json!({"kind":"effect_invocation_start","body":{"claim":claim}});
+        retain_native_effect_response(&mut document, &start_id, &original, &response)?;
+        let fresh = self
+            .store
+            .update_native_effect_checkpoint_with_final_guard(
+                &checkpoint,
+                &prior,
+                &checkpoint,
+                &document,
+                check_source,
+                guard,
+            )
+            .map_err(failure)?;
+        if !fresh {
+            return Err(failure(
+                "native invocation start was replayed; no call permission",
+            ));
+        }
+        // A subsequent call, restart or competing worker sees the retained start and
+        // cannot reach this point. Errors here retain uncertainty, never safe retry.
+        check_source()?;
+        let metadata = crate::extensions::NativeHandlerMetadata {
+            scope_identity: &self.scope,
+            effect_id,
+            operation_token: record["operation_token"].as_str().unwrap(),
+            destination_binding_digest: destination,
+            route_configuration_generation: record["route_configuration_generation"]
+                .as_str()
+                .unwrap(),
+            handler_reference: &record["handler_reference"],
+            credential: handler_credential,
+        };
+        let report = self.store.with_native_effect_call(root, |latest_checkpoint, latest_document| {
+            if latest_document["journal"]["effect_records"].as_array().unwrap().iter().find(|item| item["effect_id"] == effect_id) != Some(&record)
+                || latest_document["original_requests"].get(&start_id) != Some(&original)
+                || !latest_checkpoint["pending_outbox_intents"].as_array().unwrap().iter().any(|item| item["intent"] == intent && item["delivery_state"] == json!({"status":"not_attempted"})) {
+                return Err(failure("native invocation changed before call"));
+            }
+            check_source()?;
+            self.handler.invoke_with_guard(&payload, &metadata,
+                &crate::extensions::NativeHandlerAttempt {attempt_fence:record["attempt_fence"].as_str().unwrap()},
+                || guard().map_err(|error| crate::extensions::ExtensionError {
+                    code:crate::extensions::ExtensionErrorCode::ExtensionIdentityMismatch,message:error.to_string(),
+                })).map_err(failure)
+        }).map_err(failure)?;
+        use crate::extensions::NativeHandlerReportKind as Kind;
+        let kind = match report.kind {
+            Kind::Succeeded => "succeeded",
+            Kind::DomainRejected => "domain_rejected",
+            Kind::TerminalFailure => "terminal_failure",
+            Kind::Cancelled => "cancelled",
+            // A provider assertion cannot establish independent safe retry evidence.
+            Kind::RetryableFailure | Kind::Ambiguous => "ambiguous",
+        };
+        let result = json!({"effect_id":effect_id,"operation_token":record["operation_token"],
+            "attempt_fence":record["attempt_fence"],"outcome_kind":kind,
+            "payload":serde_json::to_value(report.payload).map_err(failure)?});
+        let report_id = hash(&json!([
+            "determa-native-invocation-report-1",
+            self.scope,
+            root,
+            effect_id,
+            record["attempt_fence"]
+        ]))?;
+        self.record_result(root, &report_id, &result, worker_credential)
+    }
+
     /// Owner-authorized recovery of a retained terminal outcome. This operation
     /// never invokes a provider or requires the expired original worker claim.
     pub fn admit_recorded_result(

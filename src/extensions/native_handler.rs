@@ -170,6 +170,18 @@ impl VerifiedNativeHandler {
         metadata: &NativeHandlerMetadata<'_>,
         attempt: &NativeHandlerAttempt<'_>,
     ) -> Result<NativeHandlerReport, ExtensionError> {
+        self.invoke_with_guard(payload, metadata, attempt, || Ok(()))
+    }
+
+    /// The host rechecks live rights after all pre-call provider verification.
+    /// This callback adds no rights to the verified handler handle.
+    pub(crate) fn invoke_with_guard(
+        &self,
+        payload: &TypedValue,
+        metadata: &NativeHandlerMetadata<'_>,
+        attempt: &NativeHandlerAttempt<'_>,
+        guard: impl FnOnce() -> Result<(), ExtensionError>,
+    ) -> Result<NativeHandlerReport, ExtensionError> {
         if metadata.scope_identity.is_empty()
             || metadata.operation_token.is_empty()
             || !digest(metadata.effect_id)
@@ -184,6 +196,7 @@ impl VerifiedNativeHandler {
             metadata.handler_reference,
             metadata.destination_binding_digest,
         )?;
+        guard()?;
         let report = self.adapter.invoke(payload, metadata, attempt)?;
         // Source/health changes during an external call cannot turn its candidate
         // result into an authorized host outcome or erase possible acceptance.

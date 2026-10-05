@@ -1156,6 +1156,16 @@ fn validate_native_effect_transition(
     let request = requests
         .get(id)
         .ok_or_else(|| failure("new native request absent"))?;
+    if request["operation_kind"] == "effect_invocation_start" {
+        return validate_native_effect_start_transition(
+            prior,
+            prior_checkpoint,
+            document,
+            checkpoint,
+            request,
+            body,
+        );
+    }
     if request["operation_kind"] == "effect_result_admission" {
         return validate_native_effect_result_admission_transition(
             prior,
@@ -1752,6 +1762,83 @@ fn validate_native_effect_result_admission_transition(
     {
         return Err(failure(
             "native result admission changed unrelated evidence",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_native_effect_start_transition(
+    prior: &Value,
+    prior_checkpoint: &Value,
+    document: &Value,
+    checkpoint: &Value,
+    request: &Value,
+    body: &Value,
+) -> Result<(), AuthorityError> {
+    if checkpoint != prior_checkpoint
+        || document["journal"]["effect_records"] != prior["journal"]["effect_records"]
+        || !closed(
+            request,
+            &[
+                "operation_kind",
+                "root_instance_id",
+                "effect_id",
+                "attempt_fence",
+                "worker_principal",
+            ],
+        )
+        || request["root_instance_id"] != checkpoint["root_instance_id"]
+        || !closed(body, &["kind", "body"])
+        || body["kind"] != "effect_invocation_start"
+        || !closed(&body["body"], &["claim"])
+    {
+        return Err(failure("native invocation start shape mismatch"));
+    }
+    let record = prior["journal"]["effect_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["effect_id"] == request["effect_id"])
+        .ok_or_else(|| failure("effect_not_outstanding"))?;
+    let claim = effects::current_native_effect_claim(prior, record)?;
+    if record["invocation_state"] != "leased"
+        || !record["cancellation"].is_null()
+        || request["attempt_fence"] != record["attempt_fence"]
+        || request["worker_principal"] != claim["worker_principal"]
+        || body["body"]["claim"] != *claim
+        || prior["original_requests"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|old| {
+                old["operation_kind"] == "effect_invocation_start"
+                    && old["effect_id"] == request["effect_id"]
+                    && old["attempt_fence"] == request["attempt_fence"]
+            })
+    {
+        return Err(failure(
+            "native invocation already started or not outstanding",
+        ));
+    }
+    let start_id = hash(&json!([
+        "determa-native-invocation-start-1",
+        document["journal"]["scope_identity"],
+        request["root_instance_id"],
+        request["effect_id"],
+        request["attempt_fence"]
+    ]))?;
+    if document["original_requests"].get(&start_id) != Some(request)
+        || !checkpoint["pending_outbox_intents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|intent| {
+                intent["intent"]["effect_id"] == request["effect_id"]
+                    && intent["delivery_state"] == json!({"status":"not_attempted"})
+            })
+    {
+        return Err(failure(
+            "native invocation start identity/committed intent mismatch",
         ));
     }
     Ok(())
