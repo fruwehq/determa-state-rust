@@ -171,6 +171,9 @@ fn validate_embedded_artifacts(
 
 fn contract_schema(kind: &str) -> Option<&'static str> {
     match kind {
+        "host_effect_journal_v1" => Some(include_str!(
+            "../../schema/host-effect-journal-v1.schema.json"
+        )),
         "application_projection_v1" => Some(include_str!(
             "../../schema/application-projection-v1.schema.json"
         )),

@@ -2,6 +2,7 @@ mod cel;
 mod compile;
 mod contracts;
 mod counter;
+pub mod effect_journal;
 mod inspection;
 mod inspection_cel;
 pub(crate) mod migration;
