@@ -3200,7 +3200,7 @@ fn execute_provider_actions(
                     serde_json::from_value(value.clone()).map_err(|_| fault())?;
                 typed.to_value(declaration).map_err(|_| fault())
             };
-            let Value::Map(payload) = decode(&send["payload"], None)? else {
+            let Value::Map(mut payload) = decode(&send["payload"], None)? else {
                 return Err(fault());
             };
             let correlation = send
@@ -3256,7 +3256,8 @@ fn execute_provider_actions(
                 return Err(fault());
             }
             if event == "env" {
-                if targets.len() != 1
+                if send.get("targets").is_some()
+                    || targets.len() != 1
                     || !matches!(targets[0], CompiledSendTarget::Component(_))
                     || correlation.is_some()
                     || payload.len() != 1
@@ -3264,6 +3265,29 @@ fn execute_provider_actions(
                 {
                     return Err(fault());
                 }
+                let CompiledSendTarget::Component(component_id) = &targets[0] else {
+                    return Err(fault());
+                };
+                let component = runtime
+                    .components
+                    .iter()
+                    .find(|component| component.component_id == *component_id)
+                    .ok_or_else(fault)?;
+                let external = root_external_variables(&component.runtime.definition);
+                let Some(Value::Map(changed)) = payload.get("changed") else {
+                    return Err(fault());
+                };
+                let mut normalized = BTreeMap::new();
+                for (name, value) in changed {
+                    let declaration = external.get(name).ok_or_else(fault)?;
+                    normalized.insert(
+                        name.clone(),
+                        value
+                            .normalize_for_type(&declaration.value_type)
+                            .ok_or_else(fault)?,
+                    );
+                }
+                payload.insert("changed".into(), Value::Map(normalized));
             } else {
                 let declaration = runtime
                     .definition

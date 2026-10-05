@@ -16,6 +16,8 @@ exclude = [
     "tests/checkpoint_adapters.rs",
     "tests/durable_host_conformance.rs",
     "tests/inspection_conformance.rs",
+    "tests/source_compilation.rs",
+    "tests/support/inspection_provider.rs",
     "tests/native_v1_conformance.rs",
     "tests/closed_code_registry.rs",
     "tests/checkpoint_postgresql.rs",
