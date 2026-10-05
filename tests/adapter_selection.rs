@@ -385,17 +385,14 @@ fn sqlite_native_schema_changes_invalidate_a_previously_verified_host() {
         binding,
         Arc::new(determa_state::InMemoryDefinitionResolver::default()),
     );
-    let bounded = host.validate_capabilities_contract(
-        "not-created",
-        HostProfile::ExactlyOnceCommittedProcessing,
-        &BTreeSet::new(),
-        &[],
-        &[],
-        false,
-    );
+    assert!(host
+        .validate_profile(HostProfile::DurableEmbeddedProcessing, false)
+        .is_ok());
     assert_eq!(
-        bounded.result.code.as_deref(),
-        Some("adapter_capability_mismatch")
+        host.validate_profile(HostProfile::ExactlyOnceCommittedProcessing, true)
+            .unwrap_err()
+            .code,
+        AdapterErrorCode::AdapterCapabilityMismatch
     );
     let native = rusqlite::Connection::open(&path).unwrap();
     let journal: String = native
@@ -408,17 +405,11 @@ fn sqlite_native_schema_changes_invalidate_a_previously_verified_host() {
             [],
         )
         .unwrap();
-    let returned = host.validate_capabilities_contract(
-        "not-created",
-        HostProfile::DurableEmbeddedProcessing,
-        &BTreeSet::new(),
-        &[],
-        &[],
-        false,
-    );
     assert_eq!(
-        returned.result.code.as_deref(),
-        Some("adapter_capability_mismatch")
+        host.validate_profile(HostProfile::DurableEmbeddedProcessing, false)
+            .unwrap_err()
+            .code,
+        AdapterErrorCode::AdapterCapabilityMismatch
     );
     let roots: i64 = native
         .query_row(
@@ -429,9 +420,9 @@ fn sqlite_native_schema_changes_invalidate_a_previously_verified_host() {
         .unwrap();
     assert_eq!(roots, 0);
     for invalid in [
-        "sqlite::memory:",
-        "sqlite:relative.sqlite",
-        "sqlite:/tmp/not-created.sqlite#synchronous=off",
+        "sqlite::memory:#receipt_retention=bounded&outbox_retention=bounded",
+        "sqlite:relative.sqlite#receipt_retention=bounded&outbox_retention=bounded",
+        "sqlite:/tmp/not-created.sqlite#receipt_retention=bounded&outbox_retention=bounded&synchronous=off",
     ] {
         let config = json!({"instance_id":"bad","uri":invalid});
         assert!(registry
