@@ -8,16 +8,17 @@ This version adds portable runtime-local event deferral, the sole current schema
 aggregate artifacts, and durable checkpoint coverage. The implementation is validated against
 these exact normative inputs:
 
-- specification commit `86bb88dd21cb1f799eefe5020b6e49dabf6e7225`;
-- conformance commit `affe3fe3bcc4d13fa7c5374471568e94af36f0d1`.
+- specification commit `77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0`;
+- conformance commit `cf7e673b26ebb162dfdc54d9d235300cd3350438`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 75 mailbox-neutral runtime traces through the shared private RTC kernel,
 all 162 applicable native artifact/checkpoint schema-v1 core vectors, and all 142
 durable-host vectors, all 49 exact candidate inspection vectors, plus semantic validation
-of all 484 declared artifact documents, 47 extension negotiation vectors and
-30 runtime-provider vectors. Native guard-provider inspection remains conditional
-on the configured provider.
+of all 487 declared artifact documents, 47 extension negotiation vectors and
+all seven configured native guard-provider inspection vectors. The pinned suite
+also defines 41 runtime-provider vectors; complete production adapter coverage is
+unfinished in this draft implementation checkpoint.
 Durable host profiles remain optional host contracts; memory, file, SQLite, and
 PostgreSQL tests exercise the implemented transactional host surface.
 

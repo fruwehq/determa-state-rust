@@ -151,14 +151,22 @@ pub(super) fn configure(
     closure: SourceClosure,
     policy: Arc<dyn RuntimeProviderVerifier>,
 ) -> ProviderResult<(Arc<ExtensionRegistry>, ConfiguredExtension)> {
-    let capabilities: Vec<_> = descriptor["binding"]["capabilities"]
+    let mut capabilities: Vec<_> = descriptor["binding"]["capabilities"]
         .as_object()
         .unwrap()
         .iter()
         .filter(|(_, value)| value == &&Value::Bool(true))
         .map(|(name, _)| name.clone())
         .collect();
-    let common_descriptor = json!({"category":"runtime_provider","provider_reference":descriptor["binding"]["provider_reference"],"interface_version":1,"supported_capabilities":capabilities});
+    let category = if descriptor["kind"] == "compiler" {
+        // Compiler operational guarantees are independently verified source claims;
+        // the common compiler category currently advertises no capabilities.
+        capabilities.clear();
+        "compiler"
+    } else {
+        "runtime_provider"
+    };
+    let common_descriptor = json!({"category":category,"provider_reference":descriptor["binding"]["provider_reference"],"interface_version":1,"supported_capabilities":capabilities});
     let provider: Arc<dyn ExtensionProvider> = Arc::new(Provider {
         descriptor: common_descriptor.clone(),
         native: native.clone(),

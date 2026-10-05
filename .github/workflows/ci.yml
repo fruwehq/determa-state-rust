@@ -8,8 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: 1
-  SPECIFICATION_COMMIT: 86bb88dd21cb1f799eefe5020b6e49dabf6e7225
-  CONFORMANCE_COMMIT: affe3fe3bcc4d13fa7c5374471568e94af36f0d1
+  SPECIFICATION_COMMIT: 77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0
+  CONFORMANCE_COMMIT: cf7e673b26ebb162dfdc54d9d235300cd3350438
 
 jobs:
   msrv:
@@ -175,7 +175,7 @@ jobs:
           RUSTFLAGS: --cfg determa_repository_conformance
         run: cargo test --locked --test inspection_conformance -- --nocapture
 
-      - name: All 484 declared artifact documents
+      - name: All 487 declared artifact documents
         run: cargo test --locked --test artifact_manifest -- --nocapture
 
       - name: All 142 durable-host vectors

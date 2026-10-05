@@ -34,6 +34,7 @@ pub use persistence::{
     DefinitionResolver, InMemoryDefinitionResolver, MigrationArtifactResolver, ResolvedDefinition,
     ResolvedMigrationDescriptor,
 };
+pub use providers::compile_language_source;
 pub use runtime::{
     CreationRejectionCode, DispatchRejectionCode, Disposition, EngineFaultCode,
     NativeAggregate as Aggregate,

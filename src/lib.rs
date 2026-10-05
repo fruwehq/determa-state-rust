@@ -15,15 +15,15 @@ pub mod public_host;
 pub mod value;
 
 /// Exact normative specification revision implemented by this crate.
-pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "86bb88dd21cb1f799eefe5020b6e49dabf6e7225";
+pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0";
 
 /// Exact core conformance revision exercised by this crate.
-pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "affe3fe3bcc4d13fa7c5374471568e94af36f0d1";
+pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "cf7e673b26ebb162dfdc54d9d235300cd3350438";
 
 #[cfg(determa_repository_conformance)]
 pub use format1::observed_inspection_guards;
 pub use format1::{
-    admit, create, inspect_candidate, load_bundle, load_bundle_from_json,
+    admit, compile_language_source, create, inspect_candidate, load_bundle, load_bundle_from_json,
     load_bundle_with_providers, migrate_aggregate, migrate_aggregate_route, restore_aggregate,
     restore_package, step, validate_artifact, validate_contract_artifact,
     validate_migration_descriptor, AdmissionDelivery, Aggregate, ArtifactError, Bindings, Bundle,

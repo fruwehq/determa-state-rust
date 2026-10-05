@@ -575,7 +575,7 @@ pub fn load_bundle_with_providers(
     super::providers::activate(&mut bundle, registry, required_capabilities)?;
     Ok(bundle)
 }
-fn validate_runtime_schema(
+pub(crate) fn validate_runtime_schema(
     value: &serde_json::Value,
     schema: &str,
     code: &str,

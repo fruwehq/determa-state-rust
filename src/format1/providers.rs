@@ -10,6 +10,8 @@ use std::path::{Component, PathBuf};
 use std::sync::Arc;
 
 mod common;
+mod compilation;
+pub use compilation::compile_language_source;
 
 pub type ProviderResult<T> = Result<T, Version1Error>;
 
@@ -32,6 +34,9 @@ pub trait NativeRuntimeProvider: Any + Send + Sync {
         Err(unavailable())
     }
     fn evaluate_actions(&self, _snapshot: &Value) -> ProviderResult<Value> {
+        Err(unavailable())
+    }
+    fn compile_region(&self, _source: &str) -> ProviderResult<Value> {
         Err(unavailable())
     }
     fn inspect_guard(
@@ -188,6 +193,12 @@ impl RuntimeProviderRegistry {
         closure: SourceClosure,
     ) -> ProviderResult<()> {
         let key = reference_key(&reference)?;
+        if self.0.dependencies.contains_key(&key) {
+            return Err(Version1Error::new(
+                "duplicate_extension_registration",
+                "dependency already installed",
+            ));
+        }
         closure.verify()?;
         if closure.digest()? != reference["content_digest"] {
             return Err(unavailable());
@@ -292,6 +303,13 @@ impl RuntimeProviderRegistry {
             if report["health"] != "healthy" {
                 return Err(unavailable());
             }
+            if entry.descriptor["kind"] == "compiler" {
+                return self.0.verifier.verify(
+                    entry.provider.as_ref(),
+                    &entry.descriptor,
+                    &entry.closure,
+                );
+            }
             Ok(report["claims"]
                 .as_array()
                 .unwrap()
@@ -305,7 +323,15 @@ impl RuntimeProviderRegistry {
         let entry = self
             .0
             .entries
-            .get(&("runtime_provider".into(), key))
+            .get(&(
+                (if kind == "compiler" {
+                    "compiler"
+                } else {
+                    "runtime_provider"
+                })
+                .into(),
+                key,
+            ))
             .ok_or_else(unavailable)?;
         if entry.descriptor != json!({"kind":kind,"binding":binding}) {
             return Err(unavailable());
