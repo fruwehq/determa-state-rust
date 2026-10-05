@@ -1,5 +1,6 @@
 //! Native creation, external admission and production over the authority's SQLite transaction.
-//! No imported checkpoint/journal activation, worker, archive or recovery claim.
+//! First authenticated claims only; no imported participant activation, complete
+//! worker/effects profile, archive or recovery claim.
 
 use super::{canonical, failure, hash, AuthorityError, GuardedSqliteExecutionStore};
 use crate::checkpoint::{self, DurableStoreMode, ExecutionStore};
@@ -29,12 +30,37 @@ pub struct NativeEffectProductionRequest {
     pub guard: checkpoint::MutationGuard,
 }
 
+/// Trusted host-installed transport authentication and signed-nanosecond clock.
+/// Portable principal fields and handler objects cannot construct worker rights.
+pub trait NativeEffectWorkerAuthority: Send + Sync {
+    fn authenticate(&self, credential: &[u8]) -> Result<super::NativeAuthorityInvocation, String>;
+    fn trusted_now(&self) -> Result<i64, String>;
+    /// Positive bounded host lease duration in nanoseconds; never worker input.
+    fn lease_duration_ns(&self) -> Result<i64, String>;
+}
+
+pub struct NativeEffectClaimRequest {
+    pub effect_id: String,
+}
+
+pub(super) fn canonical_native_time(value: &Value) -> Result<i64, AuthorityError> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| failure("native time absent"))?;
+    let parsed: i64 = text.parse().map_err(failure)?;
+    if parsed.to_string() != text {
+        return Err(failure("noncanonical native time"));
+    }
+    Ok(parsed)
+}
+
 pub struct SqliteNativeEffectHost<R> {
     store: GuardedSqliteExecutionStore<R>,
     resolver: Arc<R>,
     scope: String,
     route: NativeEffectRoute,
     handler: VerifiedNativeHandler,
+    worker_authority: Option<Arc<dyn NativeEffectWorkerAuthority>>,
 }
 
 impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
@@ -80,7 +106,17 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             scope,
             route,
             handler,
+            worker_authority: None,
         })
+    }
+
+    /// Configure an actual trusted native authority, never a portable credential.
+    pub fn with_worker_authority(
+        mut self,
+        authority: Arc<dyn NativeEffectWorkerAuthority>,
+    ) -> Self {
+        self.worker_authority = Some(authority);
+        self
     }
 
     /// Explicit setup never repairs an already allocated participant's evidence.
@@ -559,4 +595,167 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             .map_err(failure)?;
         Ok(response)
     }
+    /// First claim only: retries, expiry recovery and reconciliation are separate
+    /// operations and cannot be inferred from an absent result or provider claim.
+    /// A retained active-shaped reply is historical evidence, never renewed rights.
+    pub fn claim(
+        &self,
+        root: &str,
+        operation_id: &str,
+        request: &NativeEffectClaimRequest,
+        credential: &[u8],
+    ) -> Result<Value, AuthorityError> {
+        if operation_id.is_empty() {
+            return Err(failure("native claim identity absent"));
+        }
+        let authority = self
+            .worker_authority
+            .as_ref()
+            .ok_or_else(|| failure("native worker authority absent"))?;
+        let caller = authority.authenticate(credential).map_err(failure)?;
+        if caller.authenticated_principal.is_empty()
+            || !caller.authorized_scopes.contains(&self.scope)
+            || !caller.operation_rights.contains("claim_effect")
+        {
+            return Err(failure("unauthorized_scope"));
+        }
+        let original = json!({"operation_kind":"effect_claim","root_instance_id":root,
+            "effect_id":request.effect_id,"worker_principal":caller.authenticated_principal,
+            "scope_authority_epoch":"0"});
+        if let Some(saved) = self
+            .store
+            .native_effect_replay(root, operation_id, &original)
+            .map_err(failure)?
+        {
+            return Ok(saved);
+        }
+        let duration = authority.lease_duration_ns().map_err(failure)?;
+        if duration <= 0 {
+            return Err(failure("invalid native lease policy"));
+        }
+        let expiry = authority
+            .trusted_now()
+            .map_err(failure)?
+            .checked_add(duration)
+            .ok_or_else(|| failure("native lease time overflow"))?;
+        let (checkpoint, mut document) =
+            self.store.native_effect_snapshot(root).map_err(failure)?;
+        let fingerprint = checkpoint
+            .bundle_fingerprint()
+            .ok_or_else(|| failure("native definition absent"))?;
+        let resolved = self
+            .resolver
+            .resolve_definition(fingerprint)
+            .ok_or_else(|| failure("native definition unavailable"))?;
+        if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
+            return Err(failure("native definition not trusted"));
+        }
+        let prior = document.clone();
+        let record = document["journal"]["effect_records"]
+            .as_array_mut()
+            .ok_or_else(|| failure("native effects absent"))?
+            .iter_mut()
+            .find(|record| record["effect_id"] == request.effect_id)
+            .ok_or_else(|| failure("effect_not_outstanding"))?;
+        if record["invocation_state"] != "unclaimed" || record["attempt_fence"] != "0" {
+            return Err(failure("effect_not_outstanding"));
+        }
+        if record["handler_reference"] != self.route.handler_reference
+            || record["destination_binding_digest"] != self.route.destination_binding_digest
+            || record["route_configuration_generation"] != self.route.generation
+            || record["result_mapping"] != self.route.result_mapping
+        {
+            return Err(failure("scope_generation_conflict"));
+        }
+        let claim = json!({"scope_identity":self.scope,"root_instance_id":root,"work_kind":"effect",
+            "work_identity":request.effect_id,"operation_token":record["operation_token"],
+            "scope_authority_epoch":"0","attempt_fence":"1","worker_principal":caller.authenticated_principal,
+            "expires_at":expiry.to_string(),"state":"active"});
+        record["attempt_fence"] = json!("1");
+        record["invocation_state"] = json!("leased");
+        let response = json!({"kind":"effect_claim","body":{"claim":claim}});
+        retain_native_effect_response(&mut document, operation_id, &original, &response)?;
+        self.store
+            .update_native_effect_checkpoint_with_final_guard(
+                &checkpoint,
+                &prior,
+                &checkpoint,
+                &document,
+                || {
+                    let fingerprint = checkpoint
+                        .bundle_fingerprint()
+                        .ok_or_else(|| failure("native definition absent"))?;
+                    let current_bundle = self
+                        .resolver
+                        .resolve_definition(fingerprint)
+                        .ok_or_else(|| failure("native definition unavailable"))?;
+                    if !current_bundle.trusted
+                        || current_bundle.bundle.fingerprint != fingerprint
+                        || current_bundle.bundle.normalized != resolved.bundle.normalized
+                    {
+                        return Err(failure("native definition changed at commit"));
+                    }
+                    crate::format1::providers::check_bundle(&current_bundle.bundle)
+                        .map_err(failure)?;
+                    self.handler
+                        .verify(
+                            &self.route.handler_reference,
+                            &self.route.destination_binding_digest,
+                        )
+                        .map_err(failure)
+                },
+                || {
+                    let current = authority.authenticate(credential).map_err(failure)?;
+                    if current.authenticated_principal != caller.authenticated_principal
+                        || !current.authorized_scopes.contains(&self.scope)
+                        || !current.operation_rights.contains("claim_effect")
+                    {
+                        return Err(failure("unauthorized_scope"));
+                    }
+                    if authority.trusted_now().map_err(failure)? >= expiry {
+                        return Err(failure("stale_attempt_fence"));
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(failure)?;
+        Ok(response)
+    }
+}
+
+fn retain_native_effect_response(
+    document: &mut Value,
+    operation_id: &str,
+    request: &Value,
+    response: &Value,
+) -> Result<(), AuthorityError> {
+    document["responses"][operation_id] = response.clone();
+    document["original_requests"][operation_id] = request.clone();
+    let journal = &mut document["journal"];
+    let revision: num_bigint::BigUint = journal["journal_revision"]
+        .as_str()
+        .ok_or_else(|| failure("native journal revision absent"))?
+        .parse()
+        .map_err(failure)?;
+    journal["journal_revision"] = json!((revision + num_bigint::BigUint::from(1u8)).to_string());
+    let references = journal["operation_response_references"]
+        .as_array_mut()
+        .ok_or_else(|| failure("native references absent"))?;
+    references.push(json!({"operation_id":operation_id,"response_digest":hash(&json!(["determa-host-operation-response-1",response]))?}));
+    references.sort_by(|left, right| {
+        left["operation_id"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .cmp(right["operation_id"].as_str().unwrap().as_bytes())
+    });
+    journal
+        .as_object_mut()
+        .unwrap()
+        .remove("host_effect_journal_digest");
+    journal["host_effect_journal_digest"] = json!(hash(&json!([
+        "determa-host-effect-journal-digest-1",
+        journal
+    ]))?);
+    Ok(())
 }

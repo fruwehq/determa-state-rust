@@ -250,6 +250,25 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
         document: &Value,
         precommit: impl FnOnce() -> Result<(), super::AuthorityError>,
     ) -> Result<(), StoreError> {
+        self.update_native_effect_checkpoint_with_final_guard(
+            original_checkpoint,
+            original_document,
+            candidate,
+            document,
+            precommit,
+            || Ok(()),
+        )
+    }
+
+    pub(super) fn update_native_effect_checkpoint_with_final_guard(
+        &self,
+        original_checkpoint: &checkpoint::ExecutionCheckpoint,
+        original_document: &Value,
+        candidate: &checkpoint::ExecutionCheckpoint,
+        document: &Value,
+        precommit: impl FnOnce() -> Result<(), super::AuthorityError>,
+        final_guard: impl FnOnce() -> Result<(), super::AuthorityError>,
+    ) -> Result<(), StoreError> {
         super::validate_native_effect_transition(
             original_document,
             original_checkpoint.value(),
@@ -289,7 +308,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
             "arguments":{"mutation_digest":format!("sha256:{:x}",<sha2::Sha256 as sha2::Digest>::digest(&mutation))}});
         request["request_digest"] =
             json!(hash(&json!(["determa-host-authority-request-1", request])).map_err(error)?);
-        let result = self.authority.perform_native(
+        let result = self.authority.perform_native_with_final_guard(
             &canonical(&request).map_err(error)?, &self.caller(), Some(&mutation),
             Some("checkpoint_effect_journal"), |transaction| {
                 checkpoint::verify_sqlite_schema(transaction,self.mode).map_err(super::failure)?;
@@ -320,6 +339,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
                 if changed != 1 { return Err(super::failure("effect_journal_revision_conflict")); }
                 precommit()
             },
+            final_guard,
         ).map_err(error)?;
         if result["status"] != "accepted" {
             return Err(error(format!(

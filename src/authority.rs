@@ -7,7 +7,10 @@
 
 mod effects;
 mod store;
-pub use effects::{NativeEffectProductionRequest, NativeEffectRoute, SqliteNativeEffectHost};
+pub use effects::{
+    NativeEffectClaimRequest, NativeEffectProductionRequest, NativeEffectRoute,
+    NativeEffectWorkerAuthority, SqliteNativeEffectHost,
+};
 pub use store::GuardedSqliteExecutionStore;
 
 use crate::checkpoint::{DurableStoreMode, ExecutionCheckpoint, MutationGuard, StoreRecord};
@@ -247,6 +250,25 @@ impl SqliteLocalAuthority {
         native_kind: Option<&str>,
         apply: impl FnOnce(&Connection) -> Result<(), AuthorityError>,
     ) -> Result<Value, AuthorityError> {
+        self.perform_native_with_final_guard(
+            request_bytes,
+            invocation,
+            proposed_native_mutation,
+            native_kind,
+            apply,
+            || Ok(()),
+        )
+    }
+
+    fn perform_native_with_final_guard(
+        &self,
+        request_bytes: &[u8],
+        invocation: &NativeAuthorityInvocation,
+        proposed_native_mutation: Option<&[u8]>,
+        native_kind: Option<&str>,
+        apply: impl FnOnce(&Connection) -> Result<(), AuthorityError>,
+        final_guard: impl FnOnce() -> Result<(), AuthorityError>,
+    ) -> Result<Value, AuthorityError> {
         let request = match strict_json::parse(request_bytes) {
             Ok(value) => value,
             Err(_) => return response(None, None, Some("invalid_host_request")),
@@ -395,6 +417,9 @@ impl SqliteLocalAuthority {
                 params![canonical(&record)?, scope],
             )
             .map_err(failure)?;
+        // No resolver, provider, transport callback or additional staged write
+        // may run after this last consuming authorization/clock proof.
+        final_guard()?;
         transaction.commit().map_err(failure)?;
         Ok(result)
     }
@@ -1131,6 +1156,16 @@ fn validate_native_effect_transition(
     let request = requests
         .get(id)
         .ok_or_else(|| failure("new native request absent"))?;
+    if request["operation_kind"] == "effect_claim" {
+        return validate_native_effect_claim_transition(
+            prior,
+            prior_checkpoint,
+            document,
+            checkpoint,
+            request,
+            body,
+        );
+    }
     if request["operation_kind"] == "produce" {
         return validate_native_effect_production_transition(
             prior,
@@ -1478,6 +1513,94 @@ fn apply_checkpoint(
 
 #[cfg(all(test, unix))]
 mod crash_tests;
+fn validate_native_effect_claim_transition(
+    prior: &Value,
+    prior_checkpoint: &Value,
+    document: &Value,
+    checkpoint: &Value,
+    request: &Value,
+    body: &Value,
+) -> Result<(), AuthorityError> {
+    if checkpoint != prior_checkpoint
+        || !closed(
+            request,
+            &[
+                "operation_kind",
+                "root_instance_id",
+                "effect_id",
+                "worker_principal",
+                "scope_authority_epoch",
+            ],
+        )
+        || request["root_instance_id"] != checkpoint["root_instance_id"]
+        || request["scope_authority_epoch"] != "0"
+        || !closed(body, &["kind", "body"])
+        || body["kind"] != "effect_claim"
+        || !closed(&body["body"], &["claim"])
+    {
+        return Err(failure("native effect claim transition malformed"));
+    }
+    let claim = &body["body"]["claim"];
+    if !closed(
+        claim,
+        &[
+            "scope_identity",
+            "root_instance_id",
+            "work_kind",
+            "work_identity",
+            "operation_token",
+            "scope_authority_epoch",
+            "attempt_fence",
+            "worker_principal",
+            "expires_at",
+            "state",
+        ],
+    ) || claim["scope_identity"] != document["journal"]["scope_identity"]
+        || claim["root_instance_id"] != request["root_instance_id"]
+        || claim["work_kind"] != "effect"
+        || claim["work_identity"] != request["effect_id"]
+        || claim["scope_authority_epoch"] != "0"
+        || claim["worker_principal"] != request["worker_principal"]
+        || claim["worker_principal"].as_str().is_none_or(str::is_empty)
+        || claim["state"] != "active"
+    {
+        return Err(failure("native effect claim identity mismatch"));
+    }
+    effects::canonical_native_time(&claim["expires_at"])?;
+    let mut expected = prior["journal"]["effect_records"].clone();
+    let record = expected
+        .as_array_mut()
+        .ok_or_else(|| failure("prior effects absent"))?
+        .iter_mut()
+        .find(|record| record["effect_id"] == request["effect_id"])
+        .ok_or_else(|| failure("effect_not_outstanding"))?;
+    if record["invocation_state"] != "unclaimed"
+        || record["attempt_fence"] != "0"
+        || !record["attempt_records"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        || !record["outcome"].is_null()
+        || !record["cancellation"].is_null()
+        || claim["operation_token"] != record["operation_token"]
+        || !checkpoint["pending_outbox_intents"]
+            .as_array()
+            .is_some_and(|intents| {
+                intents.iter().any(|intent| {
+                    intent["intent"]["effect_id"] == request["effect_id"]
+                        && intent["delivery_state"] == json!({"status":"not_attempted"})
+                })
+            })
+    {
+        return Err(failure("effect_not_outstanding"));
+    }
+    record["attempt_fence"] = json!("1");
+    record["invocation_state"] = json!("leased");
+    if claim["attempt_fence"] != "1" || document["journal"]["effect_records"] != expected {
+        return Err(failure("native effect claim changed unrelated evidence"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod admission_transition_tests {
     use super::*;
