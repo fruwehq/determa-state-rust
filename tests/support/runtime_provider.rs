@@ -150,6 +150,16 @@ impl RuntimeProviderVerifier for Verifier {
         }
         let identifier = descriptor["binding"]["provider_reference"]["identifier"].as_str();
         let claims = if provider.as_any().is::<RuntimeFixture>() {
+            let configured = provider.as_any().downcast_ref::<RuntimeFixture>().unwrap();
+            if matches!(
+                identifier,
+                Some("example.native-safe" | "example.native-safe-actions")
+            ) && (configured.flag("guard_external_io")
+                || configured.flag("action_external_io")
+                || configured.options["guard_override"].as_bool().is_some())
+            {
+                return Err(error("runtime_provider_unavailable"));
+            }
             match identifier {
                 Some("example.native-safe" | "example.native-safe-actions") => vec![
                     "deterministic",
@@ -184,5 +194,69 @@ impl RuntimeProviderVerifier for Verifier {
             .downcast_ref::<RuntimeFixture>()
             .map(RuntimeFixture::state_bytes)
             .ok_or_else(|| error("runtime_provider_unavailable"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use determa_state::format1::providers::RuntimeProviderRegistry;
+    #[test]
+    fn safe_proof_rejects_io_and_inspection_divergence_before_invocation() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "conformance-suite/conformance/profiles/runtime-provider/provider-01-exact-source",
+        );
+        let document: Value =
+            serde_yaml::from_str(&std::fs::read_to_string(root.join("machine-safe.yaml")).unwrap())
+                .unwrap();
+        let handler = &document["machines"][0]["root"]["states"]["pending"]["on_events"]["submit"];
+        let closure = SourceClosure {
+            root,
+            paths: vec![
+                "provider/test_provider.py".into(),
+                "provider/test_provider.rs".into(),
+            ],
+            manifest: "provider-closure.json".into(),
+            domain: b"determa-test-runtime-provider-closure-1\0".to_vec(),
+        };
+        for options in [
+            json!({"guard_external_io":true}),
+            json!({"action_external_io":true}),
+            json!({"guard_override":true}),
+            json!({"guard_override":false}),
+        ] {
+            for (kind, binding) in [
+                ("guard", &handler["guard"]["provider"]),
+                ("actions", &handler["action"][0]["provider_actions"]),
+            ] {
+                let fixture = std::sync::Arc::new(RuntimeFixture::new(options.clone()));
+                let mut registry = RuntimeProviderRegistry::new(std::sync::Arc::new(Verifier {
+                    trusted: true,
+                    weak_compiler: false,
+                }));
+                for dependency in binding["dependencies"].as_array().unwrap() {
+                    registry
+                        .register_dependency(dependency.clone(), closure.clone())
+                        .unwrap();
+                }
+                let descriptor = json!({"kind":kind,"binding":binding});
+                let proof = Verifier {
+                    trusted: true,
+                    weak_compiler: false,
+                }
+                .verify(fixture.as_ref(), &descriptor, &closure)
+                .unwrap_err();
+                assert_eq!(proof.code, "runtime_provider_unavailable");
+                let error = registry
+                    .register(descriptor, fixture.clone(), closure.clone())
+                    .unwrap_err();
+                assert_eq!(error.code, "extension_identity_mismatch");
+                let observed = fixture.observation();
+                for counter in ["guard", "actions", "external", "irreversible_side_effects"] {
+                    assert_eq!(observed[counter], 0);
+                }
+                assert_eq!(fixture.inspections.load(Ordering::SeqCst), 0);
+            }
+        }
     }
 }
