@@ -1,17 +1,192 @@
 #![cfg(feature = "sqlite")]
 
 use determa_state::authority::{
-    checkpoint_mutation_bytes, NativeAuthorityInvocation, SqliteLocalAuthority,
+    checkpoint_mutation_bytes, GuardedSqliteExecutionStore, NativeAuthorityInvocation,
+    SqliteLocalAuthority,
 };
 use determa_state::checkpoint::{
-    self, DurableStoreMode, ExecutionStore, MutationGuard, OutboxRetentionMode,
-    ReceiptRetentionMode, SqliteExecutionStore, StoreRecord,
+    self, CheckpointHost, DurableStoreMode, ExecutionStore, ExecutionStoreCapability,
+    MutationGuard, OutboxRetentionMode, ReceiptRetentionMode, SqliteExecutionStore, StoreRecord,
 };
 use determa_state::{load_bundle, Bindings, InMemoryDefinitionResolver};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+#[test]
+fn production_checkpoint_host_uses_guarded_store_and_survives_restart() {
+    let file = path();
+    let bundle = load_bundle(
+        &json!({"format":1,"namespace":"authority.host.tests",
+        "events":{"received":{"direction":"input"}},"machines":[{"machine_id":"counter",
+        "root":{"type":"composite","initial":{"transition_to":"waiting"},
+            "states":{"waiting":{"on_events":{"received":{}}}}}}]})
+        .to_string(),
+    )
+    .unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle.clone(), true);
+    let resolver = Arc::new(resolver);
+    let mode = DurableStoreMode::bounded();
+    let store = Arc::new(
+        GuardedSqliteExecutionStore::open(
+            &file,
+            mode,
+            "scope".to_owned(),
+            "owner".to_owned(),
+            "local-host".to_owned(),
+            resolver.clone(),
+        )
+        .unwrap(),
+    );
+    store.initialize_schema().unwrap();
+    assert!(store.allocate_scope().unwrap());
+    assert!(!store
+        .capabilities()
+        .contains(&ExecutionStoreCapability::SharedApplicationTransaction));
+    let host = CheckpointHost::new(store.clone(), resolver.clone());
+    host.create_checkpoint(&bundle, "counter", "root", "create", &Bindings::default(), None,
+        json!({"mode":"bounded","permanent_replay_eligible":false,"pruned_through_receipt_sequence":null,"policy_identifier":"test-bounded"})).unwrap();
+    let created = host.load_checkpoint("root").unwrap().unwrap();
+    let envelope = json!({"event":"received","event_id":"event-A","cause_id":"event-A",
+        "source":{"host":true},"target":{"root":{"root_instance_id":"root",
+            "root_runtime_id":created.value()["root_record"]["aggregate_state"]["root_runtime_id"]}},
+        "payload":["map",[]]});
+    let digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(
+            serde_json_canonicalizer::to_vec(&json!([
+                "determa-inbox-envelope-digest-1",
+                "1",
+                "root",
+                "input",
+                envelope
+            ]))
+            .unwrap()
+        )
+    );
+    let delivery = json!({"delivery_mode":"input","envelope":envelope,"envelope_digest":digest});
+    let admitted = host
+        .admit_checkpoint(
+            "root",
+            &[delivery],
+            &MutationGuard::new(created.revision(), created.digest()),
+        )
+        .unwrap();
+    drop(host);
+    drop(store);
+    let restarted = Arc::new(
+        GuardedSqliteExecutionStore::open(
+            &file,
+            mode,
+            "scope".to_owned(),
+            "owner".to_owned(),
+            "local-host".to_owned(),
+            resolver.clone(),
+        )
+        .unwrap(),
+    );
+    restarted.initialize_schema().unwrap();
+    assert!(!restarted.allocate_scope().unwrap());
+    let host = CheckpointHost::new(restarted.clone(), resolver.clone());
+    assert_eq!(
+        host.load_checkpoint("root").unwrap().unwrap().value(),
+        &admitted
+    );
+    let connection = rusqlite::Connection::open(&file).unwrap();
+    let bytes: Vec<u8> = connection
+        .query_row("SELECT ledger FROM determa_scope_authority", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let ledger: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(ledger["scope_generation"], "2");
+    assert_eq!(ledger["receipts"].as_array().unwrap().len(), 2);
+    let invalid = StoreRecord {
+        root_instance_id: "invalid-root".to_owned(),
+        revision: "0".to_owned(),
+        execution_checkpoint_digest: format!("sha256:{}", "0".repeat(64)),
+        bytes: serde_json_canonicalizer::to_vec(
+            &json!({"root_instance_id":"invalid-root", "revision":"0",
+            "execution_checkpoint_digest":format!("sha256:{}", "0".repeat(64))}),
+        )
+        .unwrap(),
+    };
+    assert!(restarted.insert_if_absent(invalid).is_err());
+    let after: Vec<u8> = connection
+        .query_row("SELECT ledger FROM determa_scope_authority", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(bytes, after);
+    let wrong_owner = GuardedSqliteExecutionStore::open(
+        &file,
+        mode,
+        "scope".to_owned(),
+        "owner".to_owned(),
+        "other-host".to_owned(),
+        resolver.clone(),
+    )
+    .unwrap();
+    assert!(wrong_owner.load("root").is_err());
+    let untracked = checkpoint::create(
+        &bundle,
+        "counter",
+        "untracked-root",
+        "untracked-create",
+        &Bindings::default(),
+        None,
+        created.value()["replay_retention"].clone(),
+    )
+    .unwrap();
+    let untracked_record = StoreRecord::from_checkpoint(&untracked).unwrap();
+    let raw = SqliteExecutionStore::open(&file, mode).unwrap();
+    assert_eq!(
+        raw.insert_if_absent(untracked_record.clone()).unwrap(),
+        checkpoint::StoreWriteResult::Committed
+    );
+    assert!(restarted.load("root").is_err());
+    drop(raw);
+
+    let fresh_file = path();
+    let fresh = GuardedSqliteExecutionStore::open(
+        &fresh_file,
+        mode,
+        "fresh".to_owned(),
+        "owner".to_owned(),
+        "local-host".to_owned(),
+        resolver,
+    )
+    .unwrap();
+    fresh.initialize_schema().unwrap();
+    let imported = SqliteExecutionStore::open(&fresh_file, mode).unwrap();
+    imported.insert_if_absent(untracked_record.clone()).unwrap();
+    assert!(fresh.allocate_scope().is_err());
+    assert_eq!(
+        imported.load("untracked-root").unwrap(),
+        Some(untracked_record)
+    );
+    let bootstrap = rusqlite::Connection::open(&fresh_file).unwrap();
+    let allocations: u64 = bootstrap
+        .query_row(
+            "SELECT COUNT(*) FROM determa_scope_allocations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(allocations, 0);
+    drop(bootstrap);
+    drop(imported);
+    drop(fresh);
+    std::fs::remove_file(fresh_file).unwrap();
+    drop(wrong_owner);
+    drop(connection);
+    drop(host);
+    drop(restarted);
+    std::fs::remove_file(file).unwrap();
+}
 
 fn path() -> std::path::PathBuf {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);

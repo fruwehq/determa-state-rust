@@ -5,6 +5,9 @@
 //! inventories, worker fences, relocation and verified registration remain unfinished.
 //! No completed authority profile or capability claim is advertised.
 
+mod store;
+pub use store::GuardedSqliteExecutionStore;
+
 use crate::checkpoint::{DurableStoreMode, ExecutionCheckpoint, MutationGuard, StoreRecord};
 use crate::format1::strict_json;
 use num_bigint::BigUint;
@@ -154,6 +157,11 @@ impl SqliteLocalAuthority {
             .map_err(failure)?;
         if count != 0 {
             return Ok(false);
+        }
+        if checkpoint_count(&transaction)?.is_some_and(|count| count != 0) {
+            return Err(failure(
+                "existing checkpoints cannot acquire fresh authority implicitly",
+            ));
         }
         let owner = json!({"owner_principal": owner_principal, "host_binding": host_binding});
         let record = json!({"scope_identity": scope, "ownership_binding_digest": hash(&owner)?,
@@ -697,6 +705,11 @@ fn validate_record(
             latest_checkpoints.insert(root.to_owned(), mutation["checkpoint"].clone());
         }
     }
+    if checkpoint_count(connection)?.is_some_and(|count| count != latest_checkpoints.len() as u64) {
+        return Err(failure(
+            "checkpoint inventory differs from native guarded history",
+        ));
+    }
     for (root, checkpoint) in latest_checkpoints {
         let actual = crate::checkpoint::load_sqlite_record(connection, &root)
             .map_err(failure)?
@@ -711,6 +724,25 @@ fn validate_record(
         }
     }
     Ok(())
+}
+
+fn checkpoint_count(connection: &Connection) -> Result<Option<u64>, AuthorityError> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='determa_execution_checkpoints')",
+        [], |row| row.get(0),
+    ).map_err(failure)?;
+    if exists {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM determa_execution_checkpoints",
+                [],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .map_err(failure)
+    } else {
+        Ok(None)
+    }
 }
 
 fn response(
