@@ -557,10 +557,17 @@ fn durable_snapshot(connection: &Connection, root_instance_id: &str) -> Result<V
     }))
 }
 
-fn verify_schema_contract(
+pub(crate) fn verify_schema_contract(
     connection: &Connection,
     mode: DurableStoreMode,
 ) -> Result<(), StoreError> {
+    let triggers: u64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name IN ('determa_execution_store_metadata','determa_execution_checkpoints','determa_durable_inbox','determa_durable_application_rows','determa_durable_quarantine')",
+        [], |row| row.get(0),
+    ).map_err(sql_error)?;
+    if triggers != 1 {
+        return Err(StoreError::new("unexpected SQLite execution-store trigger"));
+    }
     let metadata = connection
         .query_row(
             "

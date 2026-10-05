@@ -5,12 +5,13 @@
 //! inventories, worker fences, relocation and verified registration remain unfinished.
 //! No completed authority profile or capability claim is advertised.
 
+use crate::checkpoint::{DurableStoreMode, MutationGuard, StoreRecord};
 use crate::format1::strict_json;
 use num_bigint::BigUint;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
@@ -74,7 +75,7 @@ impl SqliteLocalAuthority {
             .to_owned();
         connection
             .execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;",
+                "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;",
             )
             .map_err(failure)?;
         Ok(Self {
@@ -179,6 +180,77 @@ impl SqliteLocalAuthority {
         invocation: &NativeAuthorityInvocation,
         proposed_native_mutation: Option<&[u8]>,
     ) -> Result<Value, AuthorityError> {
+        self.perform_native(
+            request_bytes,
+            invocation,
+            proposed_native_mutation,
+            false,
+            |_| Ok(()),
+        )
+    }
+
+    /// Bind an actual root checkpoint insert or CAS to the authority commit.
+    /// The request digest covers `checkpoint_mutation_bytes`; no SQL or native
+    /// transaction is supplied through the portable request.
+    pub fn commit_checkpoint(
+        &self,
+        request_bytes: &[u8],
+        invocation: &NativeAuthorityInvocation,
+        mode: DurableStoreMode,
+        replacement: &StoreRecord,
+        guard: Option<&MutationGuard>,
+    ) -> Result<Value, AuthorityError> {
+        let mutation = checkpoint_mutation_bytes(replacement, guard)?;
+        self.perform_native(request_bytes, invocation, Some(&mutation), true, |transaction| {
+            crate::checkpoint::verify_sqlite_schema(transaction, mode)
+                .map_err(failure)?;
+            let current = crate::checkpoint::load_sqlite_record(
+                transaction, &replacement.root_instance_id,
+            ).map_err(failure)?;
+            match guard {
+                None => {
+                    if current.is_some() {
+                        return Err(failure("checkpoint_revision_conflict"));
+                    }
+                    crate::checkpoint::validate_policy_insert(mode, replacement)
+                        .map_err(failure)?;
+                    transaction.execute(
+                        "INSERT INTO determa_execution_checkpoints VALUES (?,?,?,?)",
+                        params![replacement.root_instance_id, replacement.revision,
+                            replacement.execution_checkpoint_digest, replacement.bytes],
+                    ).map_err(failure)?;
+                }
+                Some(guard) => {
+                    let current = current.ok_or_else(|| failure("checkpoint_revision_conflict"))?;
+                    if current.revision != guard.expected_revision
+                        || current.execution_checkpoint_digest != guard.expected_checkpoint_digest {
+                        return Err(failure("checkpoint_revision_conflict"));
+                    }
+                    crate::checkpoint::validate_policy_replacement(mode, &current, replacement)
+                        .map_err(failure)?;
+                    let changed = transaction.execute(
+                        "UPDATE determa_execution_checkpoints SET revision=?,checkpoint_digest=?,checkpoint_bytes=? WHERE root_instance_id=? AND revision=? AND checkpoint_digest=?",
+                        params![replacement.revision, replacement.execution_checkpoint_digest,
+                            replacement.bytes, replacement.root_instance_id,
+                            guard.expected_revision, guard.expected_checkpoint_digest],
+                    ).map_err(failure)?;
+                    if changed != 1 {
+                        return Err(failure("checkpoint_revision_conflict"));
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn perform_native(
+        &self,
+        request_bytes: &[u8],
+        invocation: &NativeAuthorityInvocation,
+        proposed_native_mutation: Option<&[u8]>,
+        checkpoint_mutation: bool,
+        apply: impl FnOnce(&Connection) -> Result<(), AuthorityError>,
+    ) -> Result<Value, AuthorityError> {
         let request = match strict_json::parse(request_bytes) {
             Ok(value) => value,
             Err(_) => return response(None, None, Some("invalid_host_request")),
@@ -277,6 +349,12 @@ impl SqliteLocalAuthority {
         if request["arguments"]["mutation_digest"] != digest {
             return response(Some(&request), Some(&record), Some("invalid_host_request"));
         }
+        let declared_checkpoint = strict_json::parse(mutation)
+            .is_ok_and(|value| value["native_mutation"] == "checkpoint");
+        if declared_checkpoint != checkpoint_mutation {
+            return response(Some(&request), Some(&record), Some("invalid_host_request"));
+        }
+        apply(&transaction)?;
         let generation = record["scope_generation"]
             .as_str()
             .ok_or_else(|| failure("generation absent"))?
@@ -284,12 +362,16 @@ impl SqliteLocalAuthority {
             .map_err(failure)?;
         record["scope_generation"] = json!((generation + BigUint::from(1u8)).to_string());
         let result = response(Some(&request), Some(&record), None)?;
+        let mut receipt = json!({
+            "operation_id": request["operation_id"], "request_digest": request["request_digest"],
+            "request": request, "result": result});
+        if checkpoint_mutation {
+            receipt["native_kind"] = json!("checkpoint");
+        }
         record["receipts"]
             .as_array_mut()
             .ok_or_else(|| failure("receipts absent"))?
-            .push(json!({
-            "operation_id": request["operation_id"], "request_digest": request["request_digest"],
-            "request": request, "result": result}));
+            .push(receipt);
         transaction
             .execute(
                 "INSERT INTO determa_authority_mutations VALUES (?,?,?,?)",
@@ -312,6 +394,28 @@ impl SqliteLocalAuthority {
         transaction.commit().map_err(failure)?;
         Ok(result)
     }
+}
+
+/// Exact native checkpoint mutation identity, including root and CAS preconditions.
+/// This host envelope is not added to the portable checkpoint or machine grammar.
+pub fn checkpoint_mutation_bytes(
+    record: &StoreRecord,
+    guard: Option<&MutationGuard>,
+) -> Result<Vec<u8>, AuthorityError> {
+    let checkpoint = strict_json::parse(&record.bytes).map_err(failure)?;
+    if canonical(&checkpoint)? != record.bytes
+        || checkpoint["root_instance_id"] != record.root_instance_id
+        || checkpoint["revision"] != record.revision
+        || checkpoint["execution_checkpoint_digest"] != record.execution_checkpoint_digest
+    {
+        return Err(failure("checkpoint native metadata mismatch"));
+    }
+    canonical(
+        &json!({"native_mutation": "checkpoint", "root_instance_id": record.root_instance_id,
+        "expected_revision": guard.map(|g| &g.expected_revision),
+        "expected_checkpoint_digest": guard.map(|g| &g.expected_checkpoint_digest),
+        "checkpoint": checkpoint}),
+    )
 }
 
 fn validate_schema(connection: &Connection, storage_binding: &str) -> Result<(), AuthorityError> {
@@ -492,11 +596,24 @@ fn validate_record(
         return Err(failure("native authority mutation inventory mismatch"));
     }
     let mut identifiers = BTreeSet::new();
+    let mut latest_checkpoints = BTreeMap::new();
     for (index, receipt) in receipts.iter().enumerate() {
-        if !closed(
+        let checkpoint_receipt = receipt["native_kind"] == "checkpoint";
+        if !(closed(
             receipt,
             &["operation_id", "request_digest", "request", "result"],
-        ) {
+        ) || checkpoint_receipt
+            && closed(
+                receipt,
+                &[
+                    "operation_id",
+                    "request_digest",
+                    "request",
+                    "result",
+                    "native_kind",
+                ],
+            ))
+        {
             return Err(failure("authority receipt shape mismatch"));
         }
         let request = &receipt["request"];
@@ -531,9 +648,52 @@ fn validate_record(
             return Err(failure("retained native mutation absent"));
         };
         if request["arguments"]["mutation_digest"] != digest
-            || digest != format!("sha256:{:x}", Sha256::digest(bytes))
+            || digest != format!("sha256:{:x}", Sha256::digest(&bytes))
         {
             return Err(failure("retained native mutation digest mismatch"));
+        }
+        let declared_checkpoint =
+            strict_json::parse(&bytes).is_ok_and(|value| value["native_mutation"] == "checkpoint");
+        if declared_checkpoint != checkpoint_receipt {
+            return Err(failure("native checkpoint receipt kind binding mismatch"));
+        }
+        if checkpoint_receipt {
+            let mutation = strict_json::parse(&bytes).map_err(failure)?;
+            if canonical(&mutation)? != bytes
+                || !closed(
+                    &mutation,
+                    &[
+                        "native_mutation",
+                        "root_instance_id",
+                        "expected_revision",
+                        "expected_checkpoint_digest",
+                        "checkpoint",
+                    ],
+                )
+                || mutation["native_mutation"] != "checkpoint"
+            {
+                return Err(failure("retained checkpoint mutation malformed"));
+            }
+            let root = mutation["root_instance_id"]
+                .as_str()
+                .ok_or_else(|| failure("checkpoint root absent"))?;
+            if root.is_empty() || mutation["checkpoint"]["root_instance_id"] != root {
+                return Err(failure("checkpoint mutation root mismatch"));
+            }
+            latest_checkpoints.insert(root.to_owned(), mutation["checkpoint"].clone());
+        }
+    }
+    for (root, checkpoint) in latest_checkpoints {
+        let actual = crate::checkpoint::load_sqlite_record(connection, &root)
+            .map_err(failure)?
+            .ok_or_else(|| failure("guarded checkpoint absent"))?;
+        if actual.bytes != canonical(&checkpoint)?
+            || checkpoint["revision"] != actual.revision
+            || checkpoint["execution_checkpoint_digest"] != actual.execution_checkpoint_digest
+        {
+            return Err(failure(
+                "guarded checkpoint no longer matches committed evidence",
+            ));
         }
     }
     Ok(())

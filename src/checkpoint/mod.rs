@@ -12,6 +12,13 @@ mod types;
 mod v1;
 
 #[cfg(feature = "sqlite")]
+pub(crate) use adapters::sqlite::{
+    load_record as load_sqlite_record, verify_schema_contract as verify_sqlite_schema,
+};
+#[cfg(feature = "sqlite")]
+pub(crate) use store::{validate_policy_insert, validate_policy_replacement};
+
+#[cfg(feature = "sqlite")]
 pub(crate) use v1::{checkpoint_step_v1_with_core, create_with_response};
 
 pub use adapter_policy::{

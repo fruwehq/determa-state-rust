@@ -1,6 +1,13 @@
 #![cfg(feature = "sqlite")]
 
-use determa_state::authority::{NativeAuthorityInvocation, SqliteLocalAuthority};
+use determa_state::authority::{
+    checkpoint_mutation_bytes, NativeAuthorityInvocation, SqliteLocalAuthority,
+};
+use determa_state::checkpoint::{
+    self, DurableStoreMode, ExecutionStore, MutationGuard, OutboxRetentionMode,
+    ReceiptRetentionMode, SqliteExecutionStore, StoreRecord,
+};
+use determa_state::{load_bundle, Bindings, InMemoryDefinitionResolver};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -40,6 +47,226 @@ fn request(operation: &str, identifier: &str, mutation: &[u8]) -> Value {
         "expected_scope_generation": if operation == "read_authority" { Value::Null } else { json!("0") },
         "arguments": if operation == "read_authority" { json!({}) } else { json!({"mutation_digest": format!("sha256:{:x}", Sha256::digest(mutation))}) }}),
     )
+}
+
+#[test]
+fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
+    let file = path();
+    let authority = SqliteLocalAuthority::open(&file).unwrap();
+    authority.setup_schema().unwrap();
+    authority.allocate("scope", "owner", "local-host").unwrap();
+    let mode = DurableStoreMode::new(
+        ReceiptRetentionMode::Permanent,
+        OutboxRetentionMode::Bounded,
+    );
+    let store = SqliteExecutionStore::open(&file, mode).unwrap();
+    store.initialize_schema().unwrap();
+    let bundle = load_bundle(
+        &json!({"format":1,"namespace":"authority.checkpoint.tests",
+        "events":{"received":{"direction":"input"}},"machines":[{"machine_id":"counter",
+        "root":{"type":"composite","initial":{"transition_to":"waiting"},
+            "states":{"waiting":{"on_events":{"received":{}}}}}}]})
+        .to_string(),
+    )
+    .unwrap();
+    let created = checkpoint::create(&bundle,"counter","root","create", &Bindings::default(), None,
+        json!({"mode":"permanent","permanent_replay_eligible":true,"pruned_through_receipt_sequence":null,"policy_identifier":null})).unwrap();
+    let native = StoreRecord::from_checkpoint(&created).unwrap();
+    let mutation = checkpoint_mutation_bytes(&native, None).unwrap();
+    let insert = request("guarded_commit", "insert", &mutation);
+    let accepted = authority
+        .commit_checkpoint(
+            &serde_json_canonicalizer::to_vec(&insert).unwrap(),
+            &invocation("owner"),
+            mode,
+            &native,
+            None,
+        )
+        .unwrap();
+    assert_eq!(accepted["status"], "accepted");
+    assert_eq!(store.load("root").unwrap(), Some(native.clone()));
+    assert_eq!(
+        authority
+            .commit_checkpoint(
+                &serde_json_canonicalizer::to_vec(&insert).unwrap(),
+                &invocation("owner"),
+                mode,
+                &native,
+                None
+            )
+            .unwrap(),
+        accepted
+    );
+
+    let runtime = created.value()["root_record"]["aggregate_state"]["root_runtime_id"].clone();
+    let envelope = json!({"event":"received","event_id":"event-A","cause_id":"event-A",
+        "source":{"host":true},"target":{"root":{"root_instance_id":"root","root_runtime_id":runtime}},
+        "payload":["map",[]]});
+    let digest_bytes = serde_json_canonicalizer::to_vec(&json!([
+        "determa-inbox-envelope-digest-1",
+        "1",
+        "root",
+        "input",
+        envelope
+    ]))
+    .unwrap();
+    let delivery = json!({"delivery_mode":"input","envelope":envelope,
+        "envelope_digest":format!("sha256:{:x}",Sha256::digest(digest_bytes))});
+    let admitted = checkpoint::admit(
+        &bundle,
+        &created,
+        &[delivery],
+        Some(created.revision()),
+        Some(created.digest()),
+    )
+    .unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let restored = checkpoint::restore(
+        &serde_json_canonicalizer::to_vec(&admitted).unwrap(),
+        &resolver,
+    )
+    .unwrap();
+    let replacement = StoreRecord::from_checkpoint(&restored).unwrap();
+    let guard = MutationGuard::new(created.revision(), created.digest());
+    let mutation = checkpoint_mutation_bytes(&replacement, Some(&guard)).unwrap();
+    let mut replace = request("guarded_commit", "replace", &mutation);
+    replace["expected_scope_generation"] = json!("1");
+    replace = sealed(replace);
+
+    // Unexpected authority schema refuses before either native write.
+    let connection = rusqlite::Connection::open(&file).unwrap();
+    connection.execute_batch("CREATE TRIGGER injected_native_failure BEFORE INSERT ON determa_authority_mutations BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+    assert_eq!(
+        authority
+            .commit_checkpoint(
+                &serde_json_canonicalizer::to_vec(&replace).unwrap(),
+                &invocation("owner"),
+                mode,
+                &replacement,
+                Some(&guard)
+            )
+            .unwrap()["error_code"],
+        "host_capability_mismatch"
+    );
+    assert_eq!(store.load("root").unwrap(), Some(native.clone()));
+    connection
+        .execute_batch("DROP TRIGGER injected_native_failure;")
+        .unwrap();
+    connection.execute_batch("CREATE TRIGGER unexpected_checkpoint_writer AFTER UPDATE ON determa_execution_checkpoints BEGIN SELECT RAISE(ABORT, 'unexpected writer'); END;").unwrap();
+    assert!(authority
+        .commit_checkpoint(
+            &serde_json_canonicalizer::to_vec(&replace).unwrap(),
+            &invocation("owner"),
+            mode,
+            &replacement,
+            Some(&guard)
+        )
+        .is_err());
+    assert_eq!(store.load("root").unwrap(), Some(native.clone()));
+    connection
+        .execute_batch("DROP TRIGGER unexpected_checkpoint_writer;")
+        .unwrap();
+    let wrong_guard = MutationGuard::new("999", created.digest());
+    let wrong_mutation = checkpoint_mutation_bytes(&replacement, Some(&wrong_guard)).unwrap();
+    let mut wrong_cas = request("guarded_commit", "wrong-cas", &wrong_mutation);
+    wrong_cas["expected_scope_generation"] = json!("1");
+    wrong_cas = sealed(wrong_cas);
+    assert!(authority
+        .commit_checkpoint(
+            &serde_json_canonicalizer::to_vec(&wrong_cas).unwrap(),
+            &invocation("owner"),
+            mode,
+            &replacement,
+            Some(&wrong_guard)
+        )
+        .is_err());
+    assert_eq!(store.load("root").unwrap(), Some(native.clone()));
+    assert_eq!(
+        perform(
+            &authority,
+            &request("read_authority", "before-replace", b""),
+            "owner",
+            None
+        )["scope_generation"],
+        "1"
+    );
+    let updated = authority
+        .commit_checkpoint(
+            &serde_json_canonicalizer::to_vec(&replace).unwrap(),
+            &invocation("owner"),
+            mode,
+            &replacement,
+            Some(&guard),
+        )
+        .unwrap();
+    assert_eq!(updated["scope_generation"], "2");
+    assert_eq!(store.load("root").unwrap(), Some(replacement.clone()));
+    assert_eq!(
+        perform(
+            &authority,
+            &request("read_authority", "read", b""),
+            "owner",
+            None
+        )["scope_generation"],
+        "2"
+    );
+    let saved: Vec<u8> = connection
+        .query_row("SELECT ledger FROM determa_scope_authority", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut altered: Value = serde_json::from_slice(&saved).unwrap();
+    altered["receipts"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("native_kind");
+    connection
+        .execute(
+            "UPDATE determa_scope_authority SET ledger=?",
+            [serde_json_canonicalizer::to_vec(&altered).unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        perform(
+            &authority,
+            &request("read_authority", "erased-binding", b""),
+            "owner",
+            None
+        )["error_code"],
+        "host_capability_mismatch"
+    );
+    connection
+        .execute("UPDATE determa_scope_authority SET ledger=?", [saved])
+        .unwrap();
+    // Even canonical old checkpoint bytes cannot stand for the latest native commit.
+    connection.execute("UPDATE determa_execution_checkpoints SET revision=?,checkpoint_digest=?,checkpoint_bytes=? WHERE root_instance_id='root'",
+        rusqlite::params![native.revision, native.execution_checkpoint_digest, native.bytes]).unwrap();
+    assert_eq!(
+        perform(
+            &authority,
+            &request("read_authority", "tampered-read", b""),
+            "owner",
+            None
+        )["error_code"],
+        "host_capability_mismatch"
+    );
+    assert_eq!(
+        authority
+            .commit_checkpoint(
+                &serde_json_canonicalizer::to_vec(&replace).unwrap(),
+                &invocation("owner"),
+                mode,
+                &replacement,
+                Some(&guard)
+            )
+            .unwrap()["error_code"],
+        "host_capability_mismatch"
+    );
+    drop(connection);
+    drop(store);
+    drop(authority);
+    std::fs::remove_file(file).unwrap();
 }
 
 #[test]
