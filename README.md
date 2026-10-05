@@ -8,14 +8,16 @@ This version adds portable runtime-local event deferral, the sole current schema
 aggregate artifacts, and durable checkpoint coverage. The implementation is validated against
 these exact normative inputs:
 
-- specification commit `6bd25e3fcdf068af861aa289903a8489bd8f0139`;
-- conformance commit `c0e101c86bd71068669df3cd2250d4fec24ff74d`.
+- specification commit `86bb88dd21cb1f799eefe5020b6e49dabf6e7225`;
+- conformance commit `affe3fe3bcc4d13fa7c5374471568e94af36f0d1`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 75 mailbox-neutral runtime traces through the shared private RTC kernel,
 all 162 applicable native artifact/checkpoint schema-v1 core vectors, and all 142
 durable-host vectors, all 49 exact candidate inspection vectors, plus semantic validation
-of all 420 declared artifact documents.
+of all 484 declared artifact documents, 47 extension negotiation vectors and
+30 runtime-provider vectors. Native guard-provider inspection remains conditional
+on the configured provider.
 Durable host profiles remain optional host contracts; memory, file, SQLite, and
 PostgreSQL tests exercise the implemented transactional host surface.
 
@@ -60,6 +62,21 @@ import, or background scheduler. The optional host
 persists SPEC section 17 state around those unchanged operations. Broker adapters,
 workers, transport integration, and application response data remain application
 concerns. The command-line binary still provides bundle validation only.
+
+With the `sqlite` feature, `public_host::PublicHostClient` retains complete version-1
+mutation requests and their original endpoint in an explicitly initialized SQLite
+journal. Named `EndpointBinding` values supply deployment endpoints and scope aliases;
+the injected transport authenticates requests outside their JSON. Discovery pins an
+immutable scope identity before new work. `retry` and `receipt` use the saved endpoint
+after restart or alias changes. A transport failure leaves the outcome unknown.
+
+`public_host::SqlitePublicExecutionHost` implements capabilities, create, admit,
+process, read, structural inspect and receipt for one local authenticated scope.
+Call `setup_schema` explicitly. Native schema and retention guards are verified;
+checkpoint and complete first public response commit in one SQLite transaction.
+Authorization precedes root/receipt lookup, and equal mutations replay before
+definition resolution or core execution. This profile advertises no authority,
+native effects, timer, archive or recovery provider.
 
 ## Build and test
 

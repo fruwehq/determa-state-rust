@@ -47,6 +47,246 @@ fn public_schema_rejects_negative_response_shapes() {
 
 #[cfg(feature = "sqlite")]
 #[test]
+fn local_sqlite_host_executes_exact_public_core_goldens() {
+    use determa_state::public_host::SqlitePublicExecutionHost;
+    use determa_state::{load_bundle, InMemoryDefinitionResolver};
+    use std::collections::BTreeSet;
+    let spec = PathBuf::from(env::var_os("DETERMA_SPEC_DIR").unwrap());
+    let conformance = PathBuf::from(env::var_os("DETERMA_CONFORMANCE_DIR").unwrap());
+    let bundle = load_bundle(
+        &fs::read_to_string(
+            conformance
+                .join("conformance/core/119-native-v1-aggregate-integrity/root-machine.yaml"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let directory =
+        env::temp_dir().join(format!("determa-public-host-core-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let host = SqlitePublicExecutionHost::new(
+        directory.join("host.db"),
+        "scope".into(),
+        "binding-local-1".into(),
+        BTreeSet::from(["alice".into()]),
+        resolver,
+    )
+    .unwrap();
+    host.setup_schema().unwrap();
+    let goldens: Value = serde_json::from_slice(
+        &fs::read(spec.join("examples/public-host/positive-v1.json")).unwrap(),
+    )
+    .unwrap();
+    let names = [
+        "create_committed",
+        "read_existing_checkpoint",
+        "inspect_absent_target_in_checkpoint",
+        "process_empty_mailbox",
+        "retained_operation_receipt",
+    ];
+    let mut observed = 0;
+    for case in goldens["cases"].as_array().unwrap() {
+        if names.contains(&case["name"].as_str().unwrap()) {
+            assert_eq!(
+                host.handle(&case["request"], "alice").unwrap(),
+                case["response"],
+                "{}",
+                case["name"]
+            );
+            observed += 1;
+        }
+    }
+    assert_eq!(observed, names.len());
+    drop(host);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn local_sqlite_host_executes_exact_delivery_goldens() {
+    use determa_state::public_host::SqlitePublicExecutionHost;
+    use determa_state::{load_bundle, InMemoryDefinitionResolver};
+    use std::collections::BTreeSet;
+    let spec = PathBuf::from(env::var_os("DETERMA_SPEC_DIR").unwrap());
+    let bundle = load_bundle(
+        &fs::read_to_string(spec.join("examples/portable-event-deferral.yaml")).unwrap(),
+    )
+    .unwrap();
+    let goldens = fixture("positive-v1.json");
+    for (name, source, initial) in [
+        (
+            "admit_declared_event",
+            "execution-checkpoint-transfer-v1.json",
+            "before_admission",
+        ),
+        (
+            "process_unhandled_event",
+            "execution-checkpoint-transfer-v1.json",
+            "after_admission",
+        ),
+        (
+            "process_deferred_event",
+            "queue-placement-checkpoints-v1.json",
+            "after_second_admission",
+        ),
+        (
+            "process_recall_event",
+            "queue-placement-checkpoints-v1.json",
+            "after_received_admission",
+        ),
+    ] {
+        let mut resolver = InMemoryDefinitionResolver::default();
+        resolver.insert(bundle.clone(), true);
+        let snapshots: Value =
+            serde_json::from_slice(&fs::read(spec.join("examples/delivery").join(source)).unwrap())
+                .unwrap();
+        let checkpoint = &snapshots[initial];
+        let bytes = serde_json_canonicalizer::to_vec(checkpoint).unwrap();
+        determa_state::checkpoint::restore(&bytes, &resolver).unwrap();
+        let directory =
+            env::temp_dir().join(format!("determa-public-host-{name}-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("host.db");
+        let host = SqlitePublicExecutionHost::new(
+            &path,
+            "scope".into(),
+            "binding-local-1".into(),
+            BTreeSet::from(["alice".into()]),
+            resolver,
+        )
+        .unwrap();
+        host.setup_schema().unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute(
+            "INSERT INTO determa_public_host_checkpoints VALUES (?,?)",
+            rusqlite::params![checkpoint["root_instance_id"].as_str().unwrap(), bytes],
+        )
+        .unwrap();
+        drop(db);
+        let case = goldens["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap();
+        assert_eq!(
+            host.handle(&case["request"], "alice").unwrap(),
+            case["response"],
+            "{name}"
+        );
+        assert_eq!(
+            host.handle(&case["request"], "alice").unwrap(),
+            case["response"],
+            "{name}: exact replay"
+        );
+        drop(host);
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn native_local_host_replay_precedes_resolver_and_authorization_precedes_existence() {
+    use determa_state::format1::ResolvedDefinition;
+    use determa_state::public_host::SqlitePublicExecutionHost;
+    use determa_state::{load_bundle, DefinitionResolver, InMemoryDefinitionResolver};
+    use std::{
+        collections::BTreeSet,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+    struct CountingResolver {
+        inner: InMemoryDefinitionResolver,
+        calls: Arc<AtomicUsize>,
+    }
+    impl DefinitionResolver for CountingResolver {
+        fn resolve_definition(&self, fingerprint: &str) -> Option<ResolvedDefinition> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.resolve_definition(fingerprint)
+        }
+    }
+    let conformance = PathBuf::from(env::var_os("DETERMA_CONFORMANCE_DIR").unwrap());
+    let bundle = load_bundle(
+        &fs::read_to_string(
+            conformance
+                .join("conformance/core/119-native-v1-aggregate-integrity/root-machine.yaml"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let directory =
+        env::temp_dir().join(format!("determa-public-host-replay-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("host.db");
+    let host = SqlitePublicExecutionHost::new(
+        &path,
+        "scope".into(),
+        "binding-local-1".into(),
+        BTreeSet::from(["alice".into()]),
+        CountingResolver {
+            inner: resolver,
+            calls: calls.clone(),
+        },
+    )
+    .unwrap();
+    host.setup_schema().unwrap();
+    let goldens = fixture("positive-v1.json");
+    let cases = goldens["cases"].as_array().unwrap();
+    let create = &cases
+        .iter()
+        .find(|c| c["name"] == "create_committed")
+        .unwrap()["request"];
+    let first = host.handle(create, "alice").unwrap();
+    let first_calls = calls.load(Ordering::SeqCst);
+    assert!(first_calls > 0);
+    assert_eq!(host.handle(create, "alice").unwrap(), first);
+    assert_eq!(calls.load(Ordering::SeqCst), first_calls);
+    let mut conflict = create.clone();
+    conflict["arguments"]["creation_id"] = serde_json::json!("conflicting");
+    assert_eq!(
+        host.handle(&conflict, "alice").unwrap()["error"]["code"],
+        "operation_id_conflict"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), first_calls);
+    let read = &cases
+        .iter()
+        .find(|c| c["name"] == "read_existing_checkpoint")
+        .unwrap()["request"];
+    let denied = host.handle(read, "outsider").unwrap();
+    let mut absent = read.clone();
+    absent["target"]["root_instance_id"] = serde_json::json!("absent");
+    assert_eq!(host.handle(&absent, "outsider").unwrap(), denied);
+    assert_eq!(calls.load(Ordering::SeqCst), first_calls);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    for sql in [
+        "DELETE FROM determa_public_host_responses",
+        "UPDATE determa_public_host_responses SET response=X'00'",
+        "DELETE FROM determa_public_host_checkpoints",
+        "UPDATE determa_public_host_binding SET scope_binding_identity='other'",
+    ] {
+        assert!(db.execute(sql, []).is_err(), "{sql}");
+    }
+    db.execute_batch("DROP TRIGGER determa_public_host_responses_forbid_delete")
+        .unwrap();
+    assert_eq!(
+        host.handle(create, "alice").unwrap()["error"]["code"],
+        "host_capability_mismatch"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), first_calls);
+    drop(db);
+    drop(host);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
 fn durable_client_reconciles_lost_response_at_original_binding_after_restart() {
     use determa_state::public_host::{ClientError, EndpointBinding, PublicHostClient};
     use serde_json::json;
@@ -155,6 +395,23 @@ fn durable_client_reconciles_lost_response_at_original_binding_after_restart() {
         )),
         Err(ClientError::OperationConflict)
     ));
+    let db = rusqlite::Connection::open(&path).unwrap();
+    for mutation in [
+        "DELETE FROM determa_public_client_requests",
+        "UPDATE determa_public_client_requests SET endpoint='replacement'",
+        "UPDATE determa_public_client_requests SET request=X'00'",
+        "UPDATE determa_public_client_requests SET response=NULL",
+    ] {
+        assert!(db.execute(mutation, []).is_err(), "{mutation}");
+    }
+    db.execute_batch("DROP TRIGGER determa_public_client_guard_update")
+        .unwrap();
+    assert!(restarted
+        .retry(operation_id, &mut |_, _| panic!(
+            "changed native schema must refuse before transport"
+        ))
+        .is_err());
+    drop(db);
     drop(restarted);
     fs::remove_dir_all(directory).unwrap();
 }

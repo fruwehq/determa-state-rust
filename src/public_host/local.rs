@@ -34,7 +34,7 @@ fn parse(bytes: &[u8]) -> Result<Value, ClientError> {
 fn refusal(code: &str) -> ClientError {
     crate::ArtifactError::new(code, code).into()
 }
-fn sql_tokens(sql: &str) -> Vec<String> {
+pub(super) fn sql_tokens(sql: &str) -> Vec<String> {
     static TOKENS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     TOKENS
         .get_or_init(|| {
@@ -457,7 +457,7 @@ impl<R: DefinitionResolver> SqlitePublicExecutionHost<R> {
                 root,
                 args["creation_id"].as_str().unwrap(),
                 &decoded,
-                None,
+                (None, Some(&args["bindings"])),
                 json!({"mode":"permanent","permanent_replay_eligible":true,"pruned_through_receipt_sequence":null,"policy_identifier":null}),
             )?;
             return Ok((result, Some(checkpoint.value().clone()), true));

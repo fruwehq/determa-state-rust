@@ -290,6 +290,12 @@ mod client {
         path::{Path, PathBuf},
     };
 
+    const TABLE: &str = "CREATE TABLE determa_public_client_requests (operation_id TEXT PRIMARY KEY, binding_name TEXT NOT NULL, endpoint TEXT NOT NULL, request BLOB NOT NULL, request_digest TEXT NOT NULL, response BLOB)";
+    const TRIGGERS: &[(&str, &str)] = &[
+        ("determa_public_client_forbid_delete", "CREATE TRIGGER determa_public_client_forbid_delete BEFORE DELETE ON determa_public_client_requests BEGIN SELECT RAISE(ABORT,'public_client_immutable'); END"),
+        ("determa_public_client_guard_update", "CREATE TRIGGER determa_public_client_guard_update BEFORE UPDATE ON determa_public_client_requests WHEN OLD.operation_id IS NOT NEW.operation_id OR OLD.binding_name IS NOT NEW.binding_name OR OLD.endpoint IS NOT NEW.endpoint OR OLD.request IS NOT NEW.request OR OLD.request_digest IS NOT NEW.request_digest OR OLD.response IS NOT NULL OR NEW.response IS NULL BEGIN SELECT RAISE(ABORT,'public_client_immutable'); END"),
+    ];
+
     /// Durable exact-request retry uses only its saved endpoint and scope binding.
     pub struct PublicHostClient {
         path: PathBuf,
@@ -315,19 +321,64 @@ mod client {
             })
         }
 
-        fn connect(&self) -> Result<rusqlite::Connection, ClientError> {
+        fn open(&self) -> Result<rusqlite::Connection, ClientError> {
             let connection = rusqlite::Connection::open(&self.path)?;
             connection.pragma_update(None, "journal_mode", "WAL")?;
             connection.pragma_update(None, "synchronous", "FULL")?;
+            let mode: String = connection.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+            let sync: i64 = connection.pragma_query_value(None, "synchronous", |r| r.get(0))?;
+            if mode != "wal" || sync != 2 {
+                return Err(error("host_capability_mismatch").into());
+            }
+            Ok(connection)
+        }
+
+        fn check_schema(connection: &rusqlite::Connection) -> Result<(), ClientError> {
+            let actual: Option<String> = connection.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='determa_public_client_requests'",[],|r|r.get(0)).optional()?;
+            let mut statement = connection.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='determa_public_client_requests'")?;
+            let triggers = statement
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            if actual.as_deref().map(super::local::sql_tokens)
+                != Some(super::local::sql_tokens(TABLE))
+                || triggers.len() != TRIGGERS.len()
+                || TRIGGERS.iter().any(|(name, sql)| {
+                    triggers.get(*name).map(|v| super::local::sql_tokens(v))
+                        != Some(super::local::sql_tokens(sql))
+                })
+            {
+                return Err(error("host_capability_mismatch").into());
+            }
+            Ok(())
+        }
+
+        fn connect(&self) -> Result<rusqlite::Connection, ClientError> {
+            let connection = self.open()?;
+            Self::check_schema(&connection)?;
             Ok(connection)
         }
 
         pub fn setup_schema(&self) -> Result<(), ClientError> {
-            self.connect()?.execute_batch(
-                "CREATE TABLE IF NOT EXISTS determa_public_client_requests (
-                operation_id TEXT PRIMARY KEY, binding_name TEXT NOT NULL, endpoint TEXT NOT NULL,
-                request BLOB NOT NULL, request_digest TEXT NOT NULL, response BLOB)",
-            )?;
+            let mut connection = self.open()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(&TABLE.replacen(
+                "CREATE TABLE",
+                "CREATE TABLE IF NOT EXISTS",
+                1,
+            ))?;
+            for (name, definition) in TRIGGERS {
+                let exists: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?",
+                    [name],
+                    |r| r.get(0),
+                )?;
+                if exists == 0 {
+                    transaction.execute_batch(definition)?;
+                }
+            }
+            Self::check_schema(&transaction)?;
+            transaction.commit()?;
             Ok(())
         }
 
@@ -339,6 +390,24 @@ mod client {
         ) -> Result<Value, ClientError> {
             let response = transport(endpoint, request)?;
             checked_response(request, &response)?;
+            if request["operation"] == "receipt" && response["status"] == "committed" {
+                let nested = &response["value"]["result"]["saved_response"];
+                if !nested.is_null() {
+                    let local: Option<(Vec<u8>,String)> = self.connect()?.query_row("SELECT request,request_digest FROM determa_public_client_requests WHERE operation_id=?",[request["arguments"]["queried_operation_id"].as_str().unwrap()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+                    if let Some((bytes, digest)) = local {
+                        let original: Value =
+                            serde_json::from_slice(&bytes).map_err(|e| error(e.to_string()))?;
+                        if request_digest(&original)? != digest
+                            || request["arguments"]["request_digest"] != digest
+                            || request["scope_binding_identity"]
+                                != original["scope_binding_identity"]
+                        {
+                            return Err(error("nested receipt request differs").into());
+                        }
+                        checked_response(&original, nested)?;
+                    }
+                }
+            }
             Ok(response)
         }
 

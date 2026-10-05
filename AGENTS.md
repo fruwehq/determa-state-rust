@@ -15,7 +15,7 @@ Repository metadata prepares the synchronized State `0.3.0` release after the
 The current draft is validated against these exact immutable inputs:
 
 - specification: `86bb88dd21cb1f799eefe5020b6e49dabf6e7225`;
-- conformance: `7f09321fb483a22eb677a4342f8d9537a7a18e82`.
+- conformance: `affe3fe3bcc4d13fa7c5374471568e94af36f0d1`.
 
 The conformance suite is the arbiter of behavior. These exact reviewed public commits are
 the current implementation inputs; tag publication is a later coordinated release operation.
@@ -66,7 +66,7 @@ Never invent a release tag or weaken an exact revision check.
 ```sh
 git submodule update --init
 test "$(git -C conformance-suite rev-parse HEAD)" = \
-  "7f09321fb483a22eb677a4342f8d9537a7a18e82"
+  "affe3fe3bcc4d13fa7c5374471568e94af36f0d1"
 cargo +1.86.0 build --release --locked --all-features
 cargo +1.86.0 test --locked --all-features
 cargo clippy --locked --all-features --all-targets -- -D warnings

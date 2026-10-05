@@ -71,7 +71,7 @@ pub fn create_execution_checkpoint_v1(
         root_instance_id,
         creation_id,
         bindings,
-        supplied_request_digest,
+        (supplied_request_digest, None),
         replay_retention,
     )
     .map(|(checkpoint, _)| checkpoint)
@@ -83,11 +83,30 @@ pub(crate) fn create_with_response(
     root_instance_id: &str,
     creation_id: &str,
     bindings: &Bindings,
-    supplied_request_digest: Option<&str>,
+    binding_evidence: (Option<&str>, Option<&Value>),
     replay_retention: Value,
 ) -> Result<(ExecutionCheckpoint, Value), ArtifactError> {
-    let request_digest =
-        creation_request_digest(bundle, machine_id, root_instance_id, creation_id, bindings)?;
+    let (supplied_request_digest, normalized_bindings) = binding_evidence;
+    let request_digest = if let Some(normalized_bindings) = normalized_bindings {
+        let machine = bundle
+            .machines
+            .get(machine_id)
+            .ok_or_else(|| invalid("missing creation machine"))?;
+        jcs_hash(&json!([
+            "determa-creation-request-digest-1",
+            "1",
+            bundle.fingerprint,
+            bundle.namespace,
+            machine_id,
+            machine.version.to_string(),
+            root_instance_id,
+            creation_id,
+            normalized_bindings
+        ]))
+        .map_err(|e| invalid(e.to_string()))?
+    } else {
+        creation_request_digest(bundle, machine_id, root_instance_id, creation_id, bindings)?
+    };
     if supplied_request_digest.is_some_and(|supplied| supplied != request_digest) {
         return Err(invalid(
             "supplied creation request digest does not match canonical content",
