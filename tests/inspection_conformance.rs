@@ -113,3 +113,57 @@ fn gate_rejects_a_sabotaged_production_outcome() {
     }))
     .is_err());
 }
+
+#[test]
+fn mismatched_component_incarnation_reports_root_definition_fingerprint() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("conformance-suite/conformance/core/121-native-v1-migration-totality");
+    let source = fs::read_to_string(fixture.join("component-source.yaml")).unwrap();
+    let root_bundle = load_bundle(&source).unwrap();
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(root_bundle, true);
+
+    let aggregate = fs::read(fixture.join("components-source-aggregate-v1.json")).unwrap();
+    let restored = restore_aggregate(&aggregate, &resolver).unwrap();
+    let runtimes = restored.value()["runtimes"].as_array().unwrap();
+    let component = runtimes
+        .iter()
+        .find(|runtime| runtime["relation"]["kind"] == "component")
+        .unwrap();
+    let component_id = component["runtime_id"].clone();
+    let component_target = component["target_identity"].clone();
+    let wrong_incarnation = runtimes
+        .iter()
+        .filter(|runtime| runtime["relation"]["kind"] == "component")
+        .find(|runtime| runtime["runtime_id"] != component_id)
+        .unwrap()["identity_origin"]
+        .clone();
+    let root_fingerprint = restored.value()["validated_bundle_fingerprint"].clone();
+    let request = serde_json::json!({
+        "mode":"structural",
+        "aggregate_state_digest":restored.value()["aggregate_state_digest"],
+        "runtime_id":component_id,
+        "runtime_incarnation":wrong_incarnation,
+        "envelope":{
+            "event":"component_work","event_id":"candidate","cause_id":"candidate",
+            "source":{"host":true},"target":component_target,"payload":["map",[]]
+        },
+        "limits":null
+    });
+    let result = inspect_candidate(
+        &restored,
+        &request,
+        &resolver,
+        InspectionCapabilities::default(),
+    )
+    .unwrap();
+    assert_eq!(result["reason"], "target_incarnation_mismatch", "{result}");
+    assert_eq!(result["definition_fingerprint"], root_fingerprint);
+    assert_eq!(
+        result["possible_dispositions"],
+        serde_json::json!(["invalid"])
+    );
+    assert_eq!(result["levels"], serde_json::json!([]));
+    assert_eq!(result["guard_evidence"], serde_json::json!([]));
+    assert_eq!(restored.canonical_bytes().unwrap(), aggregate);
+}

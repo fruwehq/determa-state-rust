@@ -337,7 +337,7 @@ pub fn inspect_candidate(
     if runtime_wire["identity_origin"] != request["runtime_incarnation"] {
         return Ok(outcome(
             request,
-            fingerprint,
+            root_fingerprint,
             &["invalid"],
             Some("target_incarnation_mismatch"),
             &[],

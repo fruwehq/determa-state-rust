@@ -73,6 +73,119 @@ fn published_inspection_api_uses_exact_runtime_and_guard_identity() {
 }
 
 #[test]
+fn inspection_charges_map_entries_beneath_typed_event_record() {
+    let source = r#"
+format: 1
+namespace: test.inspection_map_cost
+events:
+  probe:
+    direction: input
+    payload:
+      blob: { type: string, required: true }
+machines:
+  - machine_id: sample
+    root:
+      type: simple
+      on_events:
+        probe: { guard: 'event.payload.blob == "x"' }
+"#;
+    let bundle = load_bundle(source).unwrap();
+    let aggregate = create(
+        &bundle,
+        "sample",
+        "sample-1",
+        "create-1",
+        &Bindings::default(),
+    )
+    .unwrap();
+    let runtime = &aggregate.value()["runtimes"][0];
+    let request = json!({
+        "mode":"semantic",
+        "aggregate_state_digest":aggregate.value()["aggregate_state_digest"],
+        "runtime_id":runtime["runtime_id"],
+        "runtime_incarnation":runtime["identity_origin"],
+        "envelope":{
+            "event":"probe","event_id":"probe-1","cause_id":"probe-1",
+            "source":{"host":true},"target":runtime["target_identity"],
+            "payload":["map",[["blob",["string","x"]]]]
+        },
+        "limits":{"maximum_guard_evaluations":"1","maximum_evaluation_steps":"21"}
+    });
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let result = inspect_candidate(
+        &aggregate,
+        &request,
+        &resolver,
+        InspectionCapabilities::default(),
+    )
+    .unwrap();
+    assert_eq!(result["code"], "inspection_limit_exceeded", "{result}");
+    assert_eq!(
+        result["source_locator"],
+        "/machines/0/root/on_events/probe/guard"
+    );
+}
+
+#[test]
+fn inspection_preflight_counts_map_entry_nodes() {
+    let entries = (0..350)
+        .map(|index| format!("\"k{index}\":0"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let source = format!(
+        r#"
+format: 1
+namespace: test.inspection_map_nodes
+events:
+  probe: {{ direction: input }}
+machines:
+  - machine_id: sample
+    root:
+      type: simple
+      on_events:
+        probe: {{ guard: 'size({{{entries}}}) == 350' }}
+"#
+    );
+    let bundle = load_bundle(&source).unwrap();
+    let aggregate = create(
+        &bundle,
+        "sample",
+        "sample-1",
+        "create-1",
+        &Bindings::default(),
+    )
+    .unwrap();
+    let runtime = &aggregate.value()["runtimes"][0];
+    let request = json!({
+        "mode":"semantic",
+        "aggregate_state_digest":aggregate.value()["aggregate_state_digest"],
+        "runtime_id":runtime["runtime_id"],
+        "runtime_incarnation":runtime["identity_origin"],
+        "envelope":{
+            "event":"probe","event_id":"probe-1","cause_id":"probe-1",
+            "source":{"host":true},"target":runtime["target_identity"],
+            "payload":["map",[]]
+        },
+        "limits":{"maximum_guard_evaluations":"1","maximum_evaluation_steps":"1000000"}
+    });
+    let mut resolver = InMemoryDefinitionResolver::default();
+    resolver.insert(bundle, true);
+    let result = inspect_candidate(
+        &aggregate,
+        &request,
+        &resolver,
+        InspectionCapabilities::default(),
+    )
+    .unwrap();
+    assert_eq!(result["code"], "inspection_limit_exceeded", "{result}");
+    assert_eq!(
+        result["source_locator"],
+        "/machines/0/root/on_events/probe/guard"
+    );
+}
+
+#[test]
 fn queue_bearing_public_operations_create_admit_step_and_restore() {
     let bundle = load_bundle(MINIMAL).expect("bundle loads");
     let aggregate = create(

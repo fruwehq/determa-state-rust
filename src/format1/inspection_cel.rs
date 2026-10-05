@@ -67,21 +67,36 @@ fn node_count(expression: &IdedExpr) -> usize {
             call.target.as_deref().map_or(0, node_count)
                 + call.args.iter().map(node_count).sum::<usize>()
         }
+        Expr::Comprehension(comprehension) => {
+            node_count(&comprehension.iter_range)
+                + node_count(&comprehension.accu_init)
+                + node_count(&comprehension.loop_cond)
+                + node_count(&comprehension.loop_step)
+                + node_count(&comprehension.result)
+        }
         Expr::List(list) => list.elements.iter().map(node_count).sum(),
         Expr::Map(map) => map
             .entries
             .iter()
-            .map(|entry| match &entry.expr {
-                EntryExpr::MapEntry(entry) => node_count(&entry.key) + node_count(&entry.value),
-                EntryExpr::StructField(entry) => node_count(&entry.value),
+            .map(|entry| {
+                1 + match &entry.expr {
+                    EntryExpr::MapEntry(entry) => node_count(&entry.key) + node_count(&entry.value),
+                    EntryExpr::StructField(entry) => node_count(&entry.value),
+                }
             })
             .sum(),
         Expr::Select(select) => node_count(&select.operand),
-        Expr::Comprehension(_)
-        | Expr::Struct(_)
-        | Expr::Unspecified
-        | Expr::Ident(_)
-        | Expr::Literal(_) => 0,
+        Expr::Struct(structure) => structure
+            .entries
+            .iter()
+            .map(|entry| {
+                1 + match &entry.expr {
+                    EntryExpr::MapEntry(entry) => node_count(&entry.key) + node_count(&entry.value),
+                    EntryExpr::StructField(entry) => node_count(&entry.value),
+                }
+            })
+            .sum(),
+        Expr::Unspecified | Expr::Ident(_) | Expr::Literal(_) => 0,
     }
 }
 
@@ -417,9 +432,6 @@ fn evaluate(
 fn typed_record(expression: &IdedExpr) -> bool {
     match &expression.expr {
         Expr::Ident(name) => name == "event" || name == "owner",
-        Expr::Select(select) => matches!(&select.operand.expr, Expr::Ident(name)
-            if (name == "event" && select.field == "payload")
-                || (name == "owner" && select.field == "variables")),
         _ => false,
     }
 }
