@@ -16,6 +16,9 @@ on:
 jobs:
   crates:
     runs-on: ubuntu-latest
+    # Configure required reviewers and the matching Trusted Publisher binding
+    # before authorizing any release. This declaration alone is not approval proof.
+    environment: crates-io
     permissions:
       contents: read
       id-token: write   # OIDC for crates.io Trusted Publishing
