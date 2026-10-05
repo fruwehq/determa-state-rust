@@ -1,4 +1,4 @@
-//! Native creation and external admission over the authority's SQLite transaction.
+//! Native creation, external admission and production over the authority's SQLite transaction.
 //! No imported checkpoint/journal activation, worker, archive or recovery claim.
 
 use super::{canonical, failure, hash, AuthorityError, GuardedSqliteExecutionStore};
@@ -19,6 +19,14 @@ pub struct NativeEffectRoute {
     pub destination_binding_digest: String,
     pub result_mapping: Value,
     pub idempotency_policy: String,
+}
+
+/// Owner-local production arguments; these fields grant no worker authority.
+pub struct NativeEffectProductionRequest {
+    pub processing_request: checkpoint::ProcessingRequest,
+    pub operation_token: String,
+    pub route_configuration_generation: String,
+    pub guard: checkpoint::MutationGuard,
 }
 
 pub struct SqliteNativeEffectHost<R> {
@@ -101,7 +109,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         let original_request = json!({"operation_kind":"creation","request_digest":request_digest});
         if let Some(saved) = self
             .store
-            .native_effect_creation_replay(root, creation_id, &original_request)
+            .native_effect_replay(root, creation_id, &original_request)
             .map_err(failure)?
         {
             return Ok(saved);
@@ -194,8 +202,19 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         let document = json!({"journal":validated.value(),"responses":responses,"original_requests":{creation_id:original_request}});
         self.store
             .insert_native_effect_checkpoint(&checkpoint, &document, || {
+                let current = self
+                    .resolver
+                    .resolve_definition(&bundle.fingerprint)
+                    .ok_or_else(|| failure("native creation source unavailable at commit"))?;
+                if !current.trusted
+                    || current.bundle.fingerprint != bundle.fingerprint
+                    || current.bundle.normalized != bundle.normalized
+                {
+                    return Err(failure("native creation source changed at commit"));
+                }
+                crate::format1::providers::check_bundle(&current.bundle).map_err(failure)?;
                 crate::format1::effect_journal::validate_route_mapping(
-                    bundle,
+                    &current.bundle,
                     machine_id,
                     &self.route.result_mapping,
                 )
@@ -226,18 +245,17 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         if operation_id.is_empty() {
             return Err(failure("operation identity absent"));
         }
-        let (original_checkpoint, mut document) =
-            self.store.native_effect_snapshot(root).map_err(failure)?;
         let original_request =
             json!({"operation_kind":"admission","root_instance_id":root,"delivery":delivery});
-        if let Some(saved) = document["responses"].get(operation_id) {
-            if document["original_requests"].get(operation_id) != Some(&original_request)
-                || saved["kind"] != "admission"
-            {
-                return Err(failure("operation_id_conflict"));
-            }
-            return Ok(saved.clone());
+        if let Some(saved) = self
+            .store
+            .native_effect_replay(root, operation_id, &original_request)
+            .map_err(failure)?
+        {
+            return Ok(saved);
         }
+        let (original_checkpoint, mut document) =
+            self.store.native_effect_snapshot(root).map_err(failure)?;
         let fingerprint = original_checkpoint
             .bundle_fingerprint()
             .ok_or_else(|| failure("native admission definition absent"))?;
@@ -307,7 +325,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             journal
         ]))?);
         self.store
-            .update_native_effect_admission(
+            .update_native_effect_checkpoint(
                 &original_checkpoint,
                 &prior_document,
                 &candidate,
@@ -326,7 +344,216 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
                     {
                         return Err(failure("native admission definition changed at commit"));
                     }
-                    Ok(())
+                    crate::format1::providers::check_bundle(&current.bundle).map_err(failure)
+                },
+            )
+            .map_err(failure)?;
+        Ok(response)
+    }
+    /// Process the actual selected ready event and pin its real external intents.
+    /// Native destination invocation remains a later separately fenced operation.
+    pub fn produce(
+        &self,
+        root: &str,
+        operation_id: &str,
+        production: &NativeEffectProductionRequest,
+    ) -> Result<Value, AuthorityError> {
+        if operation_id.is_empty() || production.operation_token.is_empty() {
+            return Err(failure("native production identity/token absent"));
+        }
+        let request = &production.processing_request;
+        let original_request = json!({"operation_kind":"produce","root_instance_id":root,
+            "target_runtime_id":request.target_runtime_id,"event_id":request.event_id,
+            "envelope_digest":request.envelope_digest,"acceptance_sequence":request.acceptance_sequence,
+            "queue_sequence":request.queue_sequence,"processing_mode":request.processing_mode,
+            "operation_token":production.operation_token});
+        if let Some(saved) = self
+            .store
+            .native_effect_replay(root, operation_id, &original_request)
+            .map_err(failure)?
+        {
+            return Ok(saved);
+        }
+        let (original_checkpoint, mut document) =
+            self.store.native_effect_snapshot(root).map_err(failure)?;
+        if production.route_configuration_generation != self.route.generation {
+            return Err(failure("scope_generation_conflict"));
+        }
+        let fingerprint = original_checkpoint
+            .bundle_fingerprint()
+            .ok_or_else(|| failure("native producer definition absent"))?;
+        let resolved = self
+            .resolver
+            .resolve_definition(fingerprint)
+            .ok_or_else(|| failure("native producer definition unavailable"))?;
+        if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
+            return Err(failure("native producer definition not trusted"));
+        }
+        let root_runtime = original_checkpoint.value()["root_record"]["aggregate_state"]
+            ["runtimes"]
+            .as_array()
+            .and_then(|runtimes| {
+                runtimes
+                    .iter()
+                    .find(|runtime| runtime["identity_origin"]["kind"] == "root")
+            })
+            .ok_or_else(|| failure("native result root runtime absent"))?;
+        let machine_id = root_runtime["current_definition"]["machine"]["machine_id"]
+            .as_str()
+            .ok_or_else(|| failure("native result root definition absent"))?;
+        crate::format1::effect_journal::validate_route_mapping(
+            &resolved.bundle,
+            machine_id,
+            &self.route.result_mapping,
+        )
+        .map_err(failure)?;
+        self.handler
+            .verify(
+                &self.route.handler_reference,
+                &self.route.destination_binding_digest,
+            )
+            .map_err(failure)?;
+        let (candidate_value, core) = checkpoint::checkpoint_step_v1_with_core(
+            &resolved.bundle,
+            &original_checkpoint,
+            request,
+            Some(&production.guard.expected_revision),
+            Some(&production.guard.expected_checkpoint_digest),
+        )
+        .map_err(failure)?;
+        let core = core.ok_or_else(|| failure("named native producer replay evidence absent"))?;
+        let candidate = checkpoint::restore(&canonical(&candidate_value)?, self.resolver.as_ref())
+            .map_err(failure)?;
+        let receipt = if core["disposition"] == "deferred" {
+            Value::Null
+        } else {
+            candidate.value()["operation_receipts"]
+                .as_array()
+                .and_then(|receipts| {
+                    receipts.iter().find(|receipt| {
+                        receipt["operation_kind"] == "event_terminal"
+                            && receipt["event_id"] == request.event_id
+                            && receipt["committed_revision"] == candidate.revision()
+                    })
+                })
+                .cloned()
+                .ok_or_else(|| failure("actual native producer terminal receipt absent"))?
+        };
+        let response = json!({"kind":"processing","body":{"core_result":core,"receipt":receipt}});
+        let prior_document = document.clone();
+        let target = json!({"root_instance_id":root,"runtime_id":root_runtime["runtime_id"],"runtime_incarnation":root_runtime["identity_origin"]});
+        let old_ids: std::collections::BTreeSet<&str> = original_checkpoint.value()
+            ["pending_outbox_intents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(
+                original_checkpoint.value()["terminal_outbox_records"]
+                    .as_array()
+                    .unwrap(),
+            )
+            .filter_map(|item| item["intent"]["effect_id"].as_str())
+            .chain(
+                original_checkpoint.value()["outbox_effect_tombstones"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|item| item["effect_id"].as_str()),
+            )
+            .collect();
+        let records = document["journal"]["effect_records"]
+            .as_array_mut()
+            .ok_or_else(|| failure("native records absent"))?;
+        for item in candidate.value()["pending_outbox_intents"]
+            .as_array()
+            .unwrap()
+        {
+            let intent = &item["intent"];
+            if old_ids.contains(intent["effect_id"].as_str().unwrap()) {
+                continue;
+            }
+            if intent["correlation_id"] != production.operation_token {
+                return Err(failure("native produced business token mismatch"));
+            }
+            records.push(json!({"effect_id":intent["effect_id"],"operation_token":production.operation_token,
+                "intent_digest":hash(&json!(["determa-outbox-intent-digest-1","1",root,intent]))?,
+                "handler_reference":self.route.handler_reference,"destination_binding_digest":self.route.destination_binding_digest,
+                "route_configuration_generation":self.route.generation,"result_mapping":self.route.result_mapping,
+                "target":target,"idempotency_policy":self.route.idempotency_policy,"attempt_fence":"0","attempt_records":[],
+                "invocation_state":"unclaimed","outcome":null,"result_event_id":null,"admission_receipt":null,"cancellation":null}));
+        }
+        records.sort_by(|left, right| {
+            left["effect_id"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .cmp(right["effect_id"].as_str().unwrap().as_bytes())
+        });
+        document["responses"][operation_id] = response.clone();
+        document["original_requests"][operation_id] = original_request;
+        let journal = &mut document["journal"];
+        let revision = journal["journal_revision"]
+            .as_str()
+            .unwrap()
+            .parse::<num_bigint::BigUint>()
+            .map_err(failure)?;
+        journal["journal_revision"] =
+            json!((revision + num_bigint::BigUint::from(1u8)).to_string());
+        journal["checkpoint_revision"] = json!(candidate.revision());
+        journal["checkpoint_digest"] = json!(candidate.digest());
+        journal["operation_response_references"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"operation_id":operation_id,
+            "response_digest":hash(&json!(["determa-host-operation-response-1",response]))?}));
+        journal["operation_response_references"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by(|left, right| {
+                left["operation_id"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+                    .cmp(right["operation_id"].as_str().unwrap().as_bytes())
+            });
+        journal
+            .as_object_mut()
+            .unwrap()
+            .remove("host_effect_journal_digest");
+        journal["host_effect_journal_digest"] = json!(hash(&json!([
+            "determa-host-effect-journal-digest-1",
+            journal
+        ]))?);
+        self.store
+            .update_native_effect_checkpoint(
+                &original_checkpoint,
+                &prior_document,
+                &candidate,
+                &document,
+                || {
+                    let current = self
+                        .resolver
+                        .resolve_definition(fingerprint)
+                        .ok_or_else(|| failure("native producer source unavailable at commit"))?;
+                    if !current.trusted
+                        || current.bundle.fingerprint != fingerprint
+                        || current.bundle.normalized != resolved.bundle.normalized
+                    {
+                        return Err(failure("native producer source changed at commit"));
+                    }
+                    crate::format1::providers::check_bundle(&current.bundle).map_err(failure)?;
+                    crate::format1::effect_journal::validate_route_mapping(
+                        &current.bundle,
+                        machine_id,
+                        &self.route.result_mapping,
+                    )
+                    .map_err(failure)?;
+                    self.handler
+                        .verify(
+                            &self.route.handler_reference,
+                            &self.route.destination_binding_digest,
+                        )
+                        .map_err(failure)
                 },
             )
             .map_err(failure)?;

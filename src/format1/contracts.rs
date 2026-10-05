@@ -136,6 +136,15 @@ pub(super) fn validate_effect_result_mapping(value: &Value) -> Result<(), super:
     validate_schema("host_effect_journal_v1", value, SCHEMA)
 }
 
+#[cfg(feature = "sqlite")]
+pub(crate) fn validate_native_core_step_result(value: &Value) -> Result<(), super::ArtifactError> {
+    validate_schema(
+        "core_step_result_v1",
+        value,
+        include_str!("../../schema/core-step-result-v1.schema.json"),
+    )
+}
+
 fn validate_embedded_artifacts(
     value: &Value,
     resolver: &(impl DefinitionResolver + ?Sized),

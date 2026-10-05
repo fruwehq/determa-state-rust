@@ -471,7 +471,7 @@ pub(crate) fn checkpoint_step_replay(
     Ok(None)
 }
 
-fn apply_step_result(
+pub(crate) fn apply_step_result(
     checkpoint: &Value,
     causal: &Value,
     core: Value,

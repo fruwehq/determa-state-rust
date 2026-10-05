@@ -51,3 +51,6 @@ pub use v1::{
     validate_migration_descriptor_v1 as validate_migration_descriptor, AdmissionDelivery,
     QueueEnvelope, Version1Error as ArtifactError,
 };
+
+#[cfg(feature = "sqlite")]
+pub(crate) use contracts::validate_native_core_step_result;

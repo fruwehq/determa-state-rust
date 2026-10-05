@@ -1686,3 +1686,772 @@ fn genuine_journal_only_race_refuses_stale_helper_while_checkpoint_guard_still_m
     assert!(document["responses"].get("winner-duplicate").is_some());
     assert!(document["responses"].get("loser-duplicate").is_none());
 }
+#[cfg(feature = "sqlite")]
+fn production_bundle() -> determa_state::format1::Bundle {
+    determa_state::load_bundle(
+        r#"
+format: 1
+namespace: tests.native_effect_production
+events:
+  invoke: { direction: input, payload: {} }
+  native_request: { direction: output, payload: {} }
+  native_succeeded:
+    direction: input
+    payload:
+      provider_reference: { type: string, required: true }
+  native_cancelled: { direction: input, payload: {} }
+machines:
+  - machine_id: workflow
+    version: 1
+    root:
+      type: simple
+      entry:
+        - send:
+            event: native_request
+            to: { external: true }
+            payload: {}
+            correlation_id: '"creation-business-token"'
+      on_events:
+        invoke:
+          action:
+            - send:
+                event: native_request
+                to: { external: true }
+                payload: {}
+                correlation_id: '"production-business-token"'
+            - send:
+                event: native_request
+                to: { external: true }
+                payload: {}
+                correlation_id: '"production-business-token"'
+        native_succeeded: {}
+        native_cancelled: {}
+"#,
+    )
+    .unwrap()
+}
+#[cfg(feature = "sqlite")]
+fn production_delivery(checkpoint: &Value, event_id: &str) -> Value {
+    let mut delivery = external_effect_delivery(checkpoint, event_id);
+    delivery["envelope"]["event"] = json!("invoke");
+    use sha2::{Digest, Sha256};
+    delivery["envelope_digest"] = json!(format!(
+        "sha256:{:x}",
+        Sha256::digest(
+            serde_json_canonicalizer::to_vec(&json!([
+                "determa-inbox-envelope-digest-1",
+                "1",
+                checkpoint["root_instance_id"],
+                "input",
+                delivery["envelope"]
+            ]))
+            .unwrap()
+        )
+    ));
+    delivery
+}
+#[cfg(feature = "sqlite")]
+fn production_request(
+    checkpoint: &Value,
+) -> determa_state::authority::NativeEffectProductionRequest {
+    let runtime = &checkpoint["root_record"]["aggregate_state"]["runtimes"][0];
+    let ready = &runtime["ready_mailbox"][0];
+    determa_state::authority::NativeEffectProductionRequest {
+        processing_request: determa_state::checkpoint::ProcessingRequest {
+            target_runtime_id: runtime["runtime_id"].as_str().unwrap().into(),
+            event_id: ready["envelope"]["event_id"].as_str().unwrap().into(),
+            envelope_digest: ready["envelope_digest"].as_str().unwrap().into(),
+            acceptance_sequence: ready["acceptance_sequence"].as_str().unwrap().into(),
+            queue_sequence: ready["queue_sequence"].as_str().unwrap().into(),
+            processing_mode: "foreground".into(),
+        },
+        operation_token: "production-business-token".into(),
+        route_configuration_generation: "7".into(),
+        guard: effect_guard(checkpoint),
+    }
+}
+#[cfg(feature = "sqlite")]
+#[test]
+fn actual_native_producer_pins_all_real_emissions_and_replays_full_response_before_health_and_cas()
+{
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = production_bundle();
+    let resolver = effect_resolver(&bundle);
+    let host = effect_host(&path, resolver.clone(), &fixture);
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    let creation = host
+        .create(
+            &bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default(),
+        )
+        .unwrap();
+    let (initial, initial_doc, _) = native_snapshot(&path);
+    let delivery = production_delivery(&initial, "invoke-1");
+    host.admit("root", "admit-1", &delivery, &effect_guard(&initial))
+        .unwrap();
+    let (admitted, _, _) = native_snapshot(&path);
+    let mut request = production_request(&admitted);
+    let first = host.produce("root", "produce-1", &request).unwrap();
+    assert_eq!(first["kind"], "processing");
+    assert_eq!(
+        first["body"]["core_result"]["emissions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let (current, document, ledger) = native_snapshot(&path);
+    assert_eq!(
+        current["pending_outbox_intents"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(
+        document["journal"]["effect_records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let old_record = &initial_doc["journal"]["effect_records"][0];
+    assert!(document["journal"]["effect_records"]
+        .as_array()
+        .unwrap()
+        .contains(old_record));
+    assert_eq!(document["responses"]["produce-1"], first);
+    assert_eq!(ledger["scope_generation"], "3");
+    assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+    fixture.destination.healthy.store(false, Ordering::SeqCst);
+    fixture
+        .destination
+        .binding_checks
+        .store(0, Ordering::SeqCst);
+    request.guard = effect_guard(&initial);
+    request.route_configuration_generation = "999".into();
+    assert_eq!(host.produce("root", "produce-1", &request).unwrap(), first);
+    assert_eq!(fixture.destination.binding_checks.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        host.create(
+            &bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default()
+        )
+        .unwrap(),
+        creation
+    );
+    assert_eq!(
+        native_snapshot(&path),
+        (current.clone(), document.clone(), ledger.clone())
+    );
+    request.operation_token = "changed-business-token".into();
+    assert!(host.produce("root", "produce-1", &request).is_err());
+    fixture.destination.healthy.store(true, Ordering::SeqCst);
+    drop(host);
+    let reopened = effect_host(&path, resolver, &fixture);
+    request.operation_token = "production-business-token".into();
+    assert_eq!(
+        reopened.produce("root", "produce-1", &request).unwrap(),
+        first
+    );
+    assert_eq!(native_snapshot(&path), (current, document, ledger));
+}
+#[cfg(feature = "sqlite")]
+#[test]
+fn actual_producer_poststage_health_loss_rolls_back_effects_checkpoint_and_native_receipt() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = production_bundle();
+    let host = effect_host(&path, effect_resolver(&bundle), &fixture);
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let (initial, _, _) = native_snapshot(&path);
+    let delivery = production_delivery(&initial, "invoke-1");
+    host.admit("root", "admit-1", &delivery, &effect_guard(&initial))
+        .unwrap();
+    let snapshot = native_snapshot(&path);
+    let request = production_request(&snapshot.0);
+    fixture
+        .destination
+        .binding_checks
+        .store(0, Ordering::SeqCst);
+    fixture
+        .destination
+        .fail_binding_at
+        .store(2, Ordering::SeqCst);
+    assert!(host.produce("root", "produce-1", &request).is_err());
+    assert_eq!(fixture.destination.binding_checks.load(Ordering::SeqCst), 2);
+    assert_eq!(native_snapshot(&path), snapshot);
+    assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+    fixture
+        .destination
+        .fail_binding_at
+        .store(0, Ordering::SeqCst);
+    fixture.destination.healthy.store(true, Ordering::SeqCst);
+    host.produce("root", "produce-1", &request).unwrap();
+    assert_eq!(native_snapshot(&path).2["scope_generation"], "3");
+}
+#[cfg(feature = "sqlite")]
+#[test]
+fn producer_wrong_token_generation_or_named_terminal_reuse_never_writes_helper_state() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = production_bundle();
+    let host = effect_host(&path, effect_resolver(&bundle), &fixture);
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let (initial, _, _) = native_snapshot(&path);
+    host.admit(
+        "root",
+        "admit-1",
+        &production_delivery(&initial, "invoke-1"),
+        &effect_guard(&initial),
+    )
+    .unwrap();
+    let snapshot = native_snapshot(&path);
+    let mut request = production_request(&snapshot.0);
+    request.route_configuration_generation = "8".into();
+    assert!(host.produce("root", "produce-1", &request).is_err());
+    request.route_configuration_generation = "7".into();
+    request.operation_token = "different-token".into();
+    assert!(host.produce("root", "produce-1", &request).is_err());
+    assert_eq!(native_snapshot(&path), snapshot);
+    request.operation_token = "production-business-token".into();
+    host.produce("root", "produce-1", &request).unwrap();
+    let finished = native_snapshot(&path);
+    assert!(host
+        .produce("root", "another-operation-id", &request)
+        .is_err());
+    assert_eq!(native_snapshot(&path), finished);
+}
+#[cfg(feature = "sqlite")]
+#[test]
+fn native_producer_zero_emissions_and_deferral_retain_complete_actual_responses() {
+    for deferred in [false, true] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let fixture = Fixture::new();
+        let bundle = if deferred {
+            let mut source = production_bundle().normalized.clone();
+            source["machines"][0]["root"]["on_events"]
+                .as_object_mut()
+                .unwrap()
+                .remove("invoke");
+            source["machines"][0]["root"]["deferred_events"] = json!(["invoke"]);
+            determa_state::load_bundle(&serde_json::to_string(&source).unwrap()).unwrap()
+        } else {
+            production_bundle()
+        };
+        let host = effect_host(&path, effect_resolver(&bundle), &fixture);
+        host.setup_schema().unwrap();
+        host.allocate_scope().unwrap();
+        host.create(
+            &bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default(),
+        )
+        .unwrap();
+        let (initial, _, _) = native_snapshot(&path);
+        let delivery = if deferred {
+            production_delivery(&initial, "invoke-1")
+        } else {
+            external_effect_delivery(&initial, "zero-1")
+        };
+        host.admit("root", "admit-1", &delivery, &effect_guard(&initial))
+            .unwrap();
+        let (admitted, _, _) = native_snapshot(&path);
+        let request = production_request(&admitted);
+        let first = host.produce("root", "produce-1", &request).unwrap();
+        let snapshot = native_snapshot(&path);
+        assert_eq!(
+            snapshot.1["journal"]["effect_records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(first["body"]["core_result"]["emissions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            first["body"]["core_result"]["disposition"],
+            if deferred { "deferred" } else { "handled" }
+        );
+        assert_eq!(first["body"]["receipt"].is_null(), deferred);
+        if deferred {
+            assert_eq!(
+                snapshot.0["root_record"]["aggregate_state"]["runtimes"][0]["deferred_mailbox"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        fixture.destination.healthy.store(false, Ordering::SeqCst);
+        assert_eq!(host.produce("root", "produce-1", &request).unwrap(), first);
+        assert_eq!(native_snapshot(&path), snapshot);
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(all(feature = "sqlite", unix))]
+#[test]
+fn native_producer_crash_child() {
+    let Some(cut) = std::env::var_os("DETERMA_NATIVE_PRODUCER_TEST_CUT") else {
+        return;
+    };
+    let path =
+        std::path::PathBuf::from(std::env::var_os("DETERMA_NATIVE_PRODUCER_TEST_PATH").unwrap());
+    let marker =
+        std::path::PathBuf::from(std::env::var_os("DETERMA_NATIVE_PRODUCER_TEST_MARKER").unwrap());
+    let fixture = Fixture::new();
+    let bundle = production_bundle();
+    let host = effect_host(&path, effect_resolver(&bundle), &fixture);
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let (initial, _, _) = native_snapshot(&path);
+    host.admit(
+        "root",
+        "admit-1",
+        &production_delivery(&initial, "invoke-1"),
+        &effect_guard(&initial),
+    )
+    .unwrap();
+    let request = production_request(&native_snapshot(&path).0);
+    if cut == "staged" {
+        fixture
+            .destination
+            .binding_checks
+            .store(0, Ordering::SeqCst);
+        fixture
+            .destination
+            .fail_binding_at
+            .store(2, Ordering::SeqCst);
+        *fixture.destination.staged_marker.lock().unwrap() = Some(marker.clone());
+    } else {
+        assert_eq!(cut, "committed");
+    }
+    let response = host.produce("root", "produce-1", &request).unwrap();
+    publish_admission_cut_marker(&marker, &serde_json::to_vec(&response).unwrap());
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+#[cfg(all(feature = "sqlite", unix))]
+#[test]
+fn real_sigkill_producer_before_and_after_commit_preserves_all_actual_intents_and_first_response() {
+    for cut in ["staged", "committed"] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let marker = directory.path().join("cut-marker");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "native_producer_crash_child", "--nocapture"])
+            .env("DETERMA_NATIVE_PRODUCER_TEST_CUT", cut)
+            .env("DETERMA_NATIVE_PRODUCER_TEST_PATH", &path)
+            .env("DETERMA_NATIVE_PRODUCER_TEST_MARKER", &marker)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let reached = marker.exists();
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        assert!(reached, "actualproducer{cut}cut not reached");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(9));
+        let (checkpoint, document, ledger) = native_snapshot(&path);
+        assert_eq!(
+            checkpoint["revision"],
+            if cut == "committed" { "2" } else { "1" }
+        );
+        assert_eq!(
+            document["journal"]["journal_revision"],
+            checkpoint["revision"]
+        );
+        assert_eq!(
+            ledger["scope_generation"],
+            if cut == "committed" { "3" } else { "2" }
+        );
+        assert_eq!(
+            document["journal"]["effect_records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            if cut == "committed" { 3 } else { 1 }
+        );
+        let fixture = Fixture::new();
+        let bundle = production_bundle();
+        let host = effect_host(&path, effect_resolver(&bundle), &fixture);
+        let creation = host
+            .create(
+                &bundle,
+                "workflow",
+                "root",
+                "create-root",
+                &determa_state::Bindings::default(),
+            )
+            .unwrap();
+        let admitted = host
+            .admit(
+                "root",
+                "admit-1",
+                &production_delivery(&creation["checkpoint"], "invoke-1"),
+                &effect_guard(&creation["checkpoint"]),
+            )
+            .unwrap();
+        let request = production_request(&admitted["body"]["checkpoint"]);
+        let first = host.produce("root", "produce-1", &request).unwrap();
+        if cut == "committed" {
+            assert_eq!(
+                first,
+                serde_json::from_slice::<Value>(&std::fs::read(&marker).unwrap()).unwrap()
+            );
+        }
+        let snapshot = native_snapshot(&path);
+        assert_eq!(snapshot.2["scope_generation"], "3");
+        assert_eq!(
+            snapshot.1["journal"]["effect_records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(host.produce("root", "produce-1", &request).unwrap(), first);
+        assert_eq!(native_snapshot(&path), snapshot);
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[path = "support/runtime_provider.rs"]
+mod effect_runtime_fixture;
+
+#[cfg(feature = "sqlite")]
+struct EffectRuntimeVerifier {
+    valid: AtomicBool,
+    checks: AtomicUsize,
+}
+#[cfg(feature = "sqlite")]
+impl determa_state::format1::providers::RuntimeProviderVerifier for EffectRuntimeVerifier {
+    fn verify(
+        &self,
+        provider: &dyn determa_state::format1::providers::NativeRuntimeProvider,
+        descriptor: &Value,
+        closure: &determa_state::format1::providers::SourceClosure,
+    ) -> determa_state::format1::providers::ProviderResult<BTreeSet<String>> {
+        self.checks.fetch_add(1, Ordering::SeqCst);
+        if !self.valid.load(Ordering::SeqCst) {
+            return Err(determa_state::ArtifactError::new(
+                "runtime_provider_unavailable",
+                "revoked native binding",
+            ));
+        }
+        effect_runtime_fixture::Verifier {
+            trusted: true,
+            weak_compiler: false,
+        }
+        .verify(provider, descriptor, closure)
+    }
+    fn inspection_state(
+        &self,
+        provider: &dyn determa_state::format1::providers::NativeRuntimeProvider,
+    ) -> determa_state::format1::providers::ProviderResult<Vec<u8>> {
+        effect_runtime_fixture::Verifier {
+            trusted: true,
+            weak_compiler: false,
+        }
+        .inspection_state(provider)
+    }
+}
+#[cfg(feature = "sqlite")]
+struct EffectRuntimeResolver {
+    bundle: determa_state::format1::Bundle,
+    path: std::path::PathBuf,
+    verifier: Arc<EffectRuntimeVerifier>,
+    available: AtomicBool,
+    revoke_at_stage: AtomicBool,
+    calls: AtomicUsize,
+    staged: AtomicUsize,
+}
+#[cfg(feature = "sqlite")]
+impl determa_state::DefinitionResolver for EffectRuntimeResolver {
+    fn resolve_definition(
+        &self,
+        fingerprint: &str,
+    ) -> Option<determa_state::format1::ResolvedDefinition> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if !self.available.load(Ordering::SeqCst) || fingerprint != self.bundle.fingerprint {
+            return None;
+        }
+        if self.revoke_at_stage.load(Ordering::SeqCst) {
+            let connection = rusqlite::Connection::open(&self.path).unwrap();
+            connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+            match connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK") {
+                Ok(()) => {}
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if matches!(
+                        error.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) =>
+                {
+                    self.staged.fetch_add(1, Ordering::SeqCst);
+                    self.verifier.valid.store(false, Ordering::SeqCst);
+                }
+                Err(error) => panic!("unexpected native stage probe: {error}"),
+            }
+        }
+        Some(determa_state::format1::ResolvedDefinition {
+            bundle: self.bundle.clone(),
+            trusted: true,
+        })
+    }
+}
+#[cfg(feature = "sqlite")]
+fn runtime_effect_resolver(path: &std::path::Path) -> Arc<EffectRuntimeResolver> {
+    use determa_state::format1::providers::{RuntimeProviderRegistry, SourceClosure};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("conformance-suite/conformance/profiles/runtime-provider/provider-01-exact-source");
+    let safe: Value =
+        serde_yaml::from_str(&std::fs::read_to_string(root.join("machine-safe.yaml")).unwrap())
+            .unwrap();
+    let binding = safe["machines"][0]["root"]["states"]["pending"]["on_events"]["submit"]["guard"]
+        ["provider"]
+        .clone();
+    let closure = SourceClosure {
+        root,
+        paths: vec![
+            "provider/test_provider.py".into(),
+            "provider/test_provider.rs".into(),
+        ],
+        manifest: "provider-closure.json".into(),
+        domain: b"determa-test-runtime-provider-closure-1\0".to_vec(),
+    };
+    let verifier = Arc::new(EffectRuntimeVerifier {
+        valid: AtomicBool::new(true),
+        checks: AtomicUsize::new(0),
+    });
+    let mut registry = RuntimeProviderRegistry::new(verifier.clone());
+    for dependency in binding["dependencies"].as_array().unwrap() {
+        registry
+            .register_dependency(dependency.clone(), closure.clone())
+            .unwrap();
+    }
+    registry
+        .register(
+            json!({"kind":"guard","binding":binding}),
+            Arc::new(effect_runtime_fixture::RuntimeFixture::new(json!({}))),
+            closure,
+        )
+        .unwrap();
+    let mut document = production_bundle().normalized.clone();
+    document["machines"][0]["root"]["on_events"]["native_succeeded"]["guard"] =
+        json!({"provider":binding});
+    let bundle = determa_state::load_bundle_with_providers(
+        &serde_yaml::to_string(&document).unwrap(),
+        registry,
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    Arc::new(EffectRuntimeResolver {
+        bundle,
+        path: path.into(),
+        verifier,
+        available: AtomicBool::new(true),
+        revoke_at_stage: AtomicBool::new(false),
+        calls: AtomicUsize::new(0),
+        staged: AtomicUsize::new(0),
+    })
+}
+#[cfg(feature = "sqlite")]
+fn runtime_effect_host(
+    path: &std::path::Path,
+    resolver: Arc<EffectRuntimeResolver>,
+    fixture: &Fixture,
+) -> determa_state::authority::SqliteNativeEffectHost<EffectRuntimeResolver> {
+    determa_state::authority::SqliteNativeEffectHost::open(
+        path,
+        "scope-one".into(),
+        "owner".into(),
+        "host-one".into(),
+        resolver,
+        effect_route(),
+        fixture.handler(),
+    )
+    .unwrap()
+}
+#[cfg(feature = "sqlite")]
+#[test]
+fn native_runtime_binding_revoked_after_sql_staging_rolls_back_each_effect_operation() {
+    for operation in ["creation", "admission", "production"] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let fixture = Fixture::new();
+        let resolver = runtime_effect_resolver(&path);
+        let host = runtime_effect_host(&path, resolver.clone(), &fixture);
+        host.setup_schema().unwrap();
+        host.allocate_scope().unwrap();
+        if operation != "creation" {
+            host.create(
+                &resolver.bundle,
+                "workflow",
+                "root",
+                "create-root",
+                &determa_state::Bindings::default(),
+            )
+            .unwrap();
+        }
+        let mut delivery = Value::Null;
+        if operation != "creation" {
+            let (checkpoint, _, _) = native_snapshot(&path);
+            delivery = production_delivery(&checkpoint, "invoke-1");
+            if operation == "production" {
+                host.admit("root", "admit-1", &delivery, &effect_guard(&checkpoint))
+                    .unwrap();
+            }
+        }
+        let prior = if operation == "creation" {
+            None
+        } else {
+            Some(native_snapshot(&path))
+        };
+        resolver.revoke_at_stage.store(true, Ordering::SeqCst);
+        let result = match operation {
+            "creation" => host.create(
+                &resolver.bundle,
+                "workflow",
+                "root",
+                "create-root",
+                &determa_state::Bindings::default(),
+            ),
+            "admission" => host.admit(
+                "root",
+                "admit-1",
+                &delivery,
+                &effect_guard(&prior.as_ref().unwrap().0),
+            ),
+            _ => host.produce(
+                "root",
+                "produce-1",
+                &production_request(&prior.as_ref().unwrap().0),
+            ),
+        };
+        assert!(result.is_err(), "revocation must refuse {operation}");
+        assert_eq!(resolver.staged.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+        if let Some(prior) = prior {
+            assert_eq!(native_snapshot(&path), prior);
+        } else {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            for table in [
+                "determa_execution_checkpoints",
+                "determa_authority_effect_journals",
+                "determa_authority_mutations",
+            ] {
+                let count: u64 = connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
+        }
+    }
+}
+#[cfg(feature = "sqlite")]
+#[test]
+fn retained_native_responses_replay_without_resolver_or_revoked_runtime_provider() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let resolver = runtime_effect_resolver(&path);
+    let host = runtime_effect_host(&path, resolver.clone(), &fixture);
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    let creation = host
+        .create(
+            &resolver.bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default(),
+        )
+        .unwrap();
+    let (checkpoint, _, _) = native_snapshot(&path);
+    let delivery = production_delivery(&checkpoint, "invoke-1");
+    let admission = host
+        .admit("root", "admit-1", &delivery, &effect_guard(&checkpoint))
+        .unwrap();
+    let (admitted, _, _) = native_snapshot(&path);
+    let request = production_request(&admitted);
+    let production = host.produce("root", "produce-1", &request).unwrap();
+    let prior = native_snapshot(&path);
+    resolver.available.store(false, Ordering::SeqCst);
+    resolver.verifier.valid.store(false, Ordering::SeqCst);
+    resolver.calls.store(0, Ordering::SeqCst);
+    resolver.verifier.checks.store(0, Ordering::SeqCst);
+    assert_eq!(
+        host.create(
+            &resolver.bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default()
+        )
+        .unwrap(),
+        creation
+    );
+    assert_eq!(
+        host.admit("root", "admit-1", &delivery, &effect_guard(&checkpoint))
+            .unwrap(),
+        admission
+    );
+    assert_eq!(
+        host.produce("root", "produce-1", &request).unwrap(),
+        production
+    );
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(resolver.verifier.checks.load(Ordering::SeqCst), 0);
+    assert_eq!(native_snapshot(&path), prior);
+    assert!(host.produce("root", "new-produce", &request).is_err());
+    assert!(resolver.calls.load(Ordering::SeqCst) > 0);
+}

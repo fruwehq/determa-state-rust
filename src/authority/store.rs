@@ -119,25 +119,34 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
         })
     }
 
-    pub(super) fn native_effect_creation_replay(
+    // Native authority history validates the canonical checkpoint/helper pair and
+    // every retained mutation before this lookup. Replay does not activate an
+    // executable checkpoint or depend on currently available provider objects.
+    pub(super) fn native_effect_replay(
         &self,
         root: &str,
         operation_id: &str,
         original: &Value,
     ) -> Result<Option<Value>, StoreError> {
         self.with_authority_snapshot(|connection, _| {
-            let document: Option<Vec<u8>> = connection.query_row("SELECT document FROM determa_authority_effect_journals WHERE root_instance_id=?",[root],|row|row.get(0)).optional().map_err(error)?;
-            let Some(bytes) = document else {
-                if checkpoint::load_sqlite_record(connection,root)?.is_some() { return Err(error("existing root has no native effect participant")); }
+            let bytes: Option<Vec<u8>> = connection.query_row(
+                "SELECT document FROM determa_authority_effect_journals WHERE root_instance_id=? AND scope_identity=?",
+                rusqlite::params![root, self.scope], |row| row.get(0),
+            ).optional().map_err(error)?;
+            let Some(bytes) = bytes else {
+                if checkpoint::load_sqlite_record(connection, root)?.is_some() {
+                    return Err(error("existing root has no native effect participant"));
+                }
                 return Ok(None);
             };
             let document = strict_json::parse(&bytes).map_err(error)?;
-            let checkpoint = checkpoint::load_sqlite_record(connection,root)?.ok_or_else(||error("native effect checkpoint absent"))?;
-            let checkpoint = checkpoint::restore(&checkpoint.bytes,self.resolver.as_ref()).map_err(error)?;
-            let responses = serde_json::from_value(document["responses"].clone()).map_err(error)?;
-            crate::format1::effect_journal::ValidatedEffectJournal::restore(&canonical(&document["journal"]).map_err(error)?,&checkpoint,&self.scope,&responses,self.resolver.as_ref()).map_err(error)?;
-            if document["original_requests"].get(operation_id) != Some(original) { return Err(error("operation_id_conflict")); }
-            Ok(Some(document["responses"].get(operation_id).cloned().ok_or_else(||error("retained creation response absent"))?))
+            let Some(saved) = document["responses"].get(operation_id) else {
+                return Ok(None);
+            };
+            if document["original_requests"].get(operation_id) != Some(original) {
+                return Err(error("operation_id_conflict"));
+            }
+            Ok(Some(saved.clone()))
         })
     }
 
@@ -233,7 +242,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
         })
     }
 
-    pub(super) fn update_native_effect_admission(
+    pub(super) fn update_native_effect_checkpoint(
         &self,
         original_checkpoint: &checkpoint::ExecutionCheckpoint,
         original_document: &Value,
@@ -241,7 +250,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
         document: &Value,
         precommit: impl FnOnce() -> Result<(), super::AuthorityError>,
     ) -> Result<(), StoreError> {
-        super::validate_native_effect_admission_transition(
+        super::validate_native_effect_transition(
             original_document,
             original_checkpoint.value(),
             document,
@@ -314,7 +323,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> GuardedSqliteExecutionStore<
         ).map_err(error)?;
         if result["status"] != "accepted" {
             return Err(error(format!(
-                "native admission refused: {}",
+                "native effect update refused: {}",
                 result["error_code"]
             )));
         }

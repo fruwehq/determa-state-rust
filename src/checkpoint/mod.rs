@@ -19,7 +19,7 @@ pub(crate) use adapters::sqlite::{
 pub(crate) use store::{validate_policy_insert, validate_policy_replacement};
 
 #[cfg(feature = "sqlite")]
-pub(crate) use v1::{checkpoint_step_v1_with_core, create_with_response};
+pub(crate) use v1::{apply_step_result, checkpoint_step_v1_with_core, create_with_response};
 
 pub use adapter_policy::{
     adapter_registration_policy, adapter_resolution_policy, conditional_adapter_policy,

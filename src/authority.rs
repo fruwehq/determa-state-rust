@@ -7,7 +7,7 @@
 
 mod effects;
 mod store;
-pub use effects::{NativeEffectRoute, SqliteNativeEffectHost};
+pub use effects::{NativeEffectProductionRequest, NativeEffectRoute, SqliteNativeEffectHost};
 pub use store::GuardedSqliteExecutionStore;
 
 use crate::checkpoint::{DurableStoreMode, ExecutionCheckpoint, MutationGuard, StoreRecord};
@@ -725,7 +725,7 @@ fn validate_record(
                     {
                         return Err(failure("native joint history guard mismatch"));
                     }
-                    validate_native_effect_admission_transition(
+                    validate_native_effect_transition(
                         prior_document,
                         prior_checkpoint,
                         &mutation["effect_document"],
@@ -815,7 +815,7 @@ fn checkpoint_count(connection: &Connection) -> Result<Option<u64>, AuthorityErr
 }
 
 // Native genesis remains fresh creation. Subsequent joint mutations are limited
-// to complete admission-only transitions with immutable prior helper history.
+// to complete admission/production transitions with immutable prior helper history.
 fn validate_native_effect_document(
     document: &Value,
     checkpoint: &Value,
@@ -1022,7 +1022,7 @@ fn validate_native_admission_checkpoint_transition(
 // may change. Every previously committed response and caller request is immutable.
 // Admission-only transition: no worker, route, attempt, outcome or result state
 // may change. Every previously committed response and caller request is immutable.
-fn validate_native_effect_admission_transition(
+fn validate_native_effect_transition(
     prior: &Value,
     prior_checkpoint: &Value,
     document: &Value,
@@ -1050,7 +1050,6 @@ fn validate_native_effect_admission_transition(
         || journal["checkpoint_revision"] != checkpoint["revision"]
         || journal["checkpoint_digest"] != checkpoint["execution_checkpoint_digest"]
         || journal["journal_revision"] != (revision + BigUint::from(1u8)).to_string()
-        || journal["effect_records"] != old_journal["effect_records"]
         || journal["host_effect_journal_digest"]
             != hash(&json!(["determa-host-effect-journal-digest-1", unsigned]))?
     {
@@ -1113,6 +1112,7 @@ fn validate_native_effect_admission_transition(
     expected_journal["checkpoint_digest"] = checkpoint["execution_checkpoint_digest"].clone();
     expected_journal["journal_revision"] = journal["journal_revision"].clone();
     expected_journal["operation_response_references"] = json!(references);
+    expected_journal["effect_records"] = journal["effect_records"].clone();
     expected_journal
         .as_object_mut()
         .unwrap()
@@ -1131,6 +1131,19 @@ fn validate_native_effect_admission_transition(
     let request = requests
         .get(id)
         .ok_or_else(|| failure("new native request absent"))?;
+    if request["operation_kind"] == "produce" {
+        return validate_native_effect_production_transition(
+            prior,
+            prior_checkpoint,
+            document,
+            checkpoint,
+            request,
+            body,
+        );
+    }
+    if journal["effect_records"] != old_journal["effect_records"] {
+        return Err(failure("admission changed immutable effect records"));
+    }
     if !closed(request, &["operation_kind", "root_instance_id", "delivery"])
         || request["operation_kind"] != "admission"
         || request["root_instance_id"] != checkpoint["root_instance_id"]
@@ -1177,6 +1190,205 @@ fn validate_native_effect_admission_transition(
         delivery,
         result,
     )?;
+    Ok(())
+}
+
+// Retained native processing consistency, not portable replay admissibility. This
+// reapplies only checkpoint bookkeeping to the already committed full core result;
+// it does not execute author actions or dispatch native destination work on replay.
+fn validate_native_effect_production_transition(
+    prior: &Value,
+    prior_checkpoint: &Value,
+    document: &Value,
+    checkpoint: &Value,
+    request: &Value,
+    response: &Value,
+) -> Result<(), AuthorityError> {
+    if !closed(
+        request,
+        &[
+            "operation_kind",
+            "root_instance_id",
+            "target_runtime_id",
+            "event_id",
+            "envelope_digest",
+            "acceptance_sequence",
+            "queue_sequence",
+            "processing_mode",
+            "operation_token",
+        ],
+    ) || request["root_instance_id"] != prior_checkpoint["root_instance_id"]
+        || request["operation_token"]
+            .as_str()
+            .is_none_or(|token| token.is_empty())
+        || !matches!(
+            request["processing_mode"].as_str(),
+            Some("foreground" | "delayed")
+        )
+        || !closed(response, &["kind", "body"])
+        || response["kind"] != "processing"
+        || !closed(&response["body"], &["core_result", "receipt"])
+    {
+        return Err(failure(
+            "native production original request/response kind mismatch",
+        ));
+    }
+    let causal = prior_checkpoint["root_record"]["aggregate_state"]["runtimes"]
+        .as_array()
+        .and_then(|runtimes| {
+            runtimes
+                .iter()
+                .find(|runtime| runtime["runtime_id"] == request["target_runtime_id"])
+        })
+        .and_then(|runtime| runtime["ready_mailbox"].as_array())
+        .and_then(|queue| queue.first())
+        .ok_or_else(|| failure("native processing causal ready head absent"))?;
+    if causal["envelope"]["event_id"] != request["event_id"]
+        || causal["envelope_digest"] != request["envelope_digest"]
+        || causal["acceptance_sequence"] != request["acceptance_sequence"]
+        || causal["queue_sequence"] != request["queue_sequence"]
+    {
+        return Err(failure(
+            "native processing original causal identity mismatch",
+        ));
+    }
+    let core = &response["body"]["core_result"];
+    crate::format1::validate_native_core_step_result(core).map_err(failure)?;
+    if !matches!(
+        core["disposition"].as_str(),
+        Some("handled" | "unhandled" | "faulted" | "deferred")
+    ) {
+        return Err(failure(
+            "native processing did not produce a mutable core result",
+        ));
+    }
+    let receipt = &response["body"]["receipt"];
+    let ordinals = if core["disposition"] == "deferred" {
+        if !receipt.is_null() {
+            return Err(failure("deferred processing cannot claim terminal receipt"));
+        }
+        Vec::new()
+    } else {
+        let actual = checkpoint["operation_receipts"]
+            .as_array()
+            .and_then(|receipts| {
+                receipts.iter().find(|item| {
+                    item["operation_kind"] == "event_terminal"
+                        && item["event_id"] == request["event_id"]
+                        && item["committed_revision"] == checkpoint["revision"]
+                })
+            })
+            .ok_or_else(|| failure("native processing actual terminal receipt absent"))?;
+        if receipt != actual {
+            return Err(failure("native processing returned a different receipt"));
+        }
+        actual["emission_references"]
+            .as_array()
+            .ok_or_else(|| failure("native emission references absent"))?
+            .iter()
+            .map(|reference| {
+                reference["emission_index"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| failure("native emission ordinal absent"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let expected =
+        crate::checkpoint::apply_step_result(prior_checkpoint, causal, core.clone(), ordinals)
+            .map_err(failure)?;
+    if &expected != checkpoint {
+        return Err(failure(
+            "native processing checkpoint/result consistency mismatch",
+        ));
+    }
+    let old_records = prior["journal"]["effect_records"]
+        .as_array()
+        .ok_or_else(|| failure("prior effect records absent"))?;
+    let new_records = document["journal"]["effect_records"]
+        .as_array()
+        .ok_or_else(|| failure("new effect records absent"))?;
+    let by_id: BTreeMap<&str, &Value> = new_records
+        .iter()
+        .map(|record| {
+            record["effect_id"]
+                .as_str()
+                .map(|id| (id, record))
+                .ok_or_else(|| failure("native effect identity absent"))
+        })
+        .collect::<Result<_, _>>()?;
+    if by_id.len() != new_records.len()
+        || old_records.iter().any(|record| {
+            record["effect_id"]
+                .as_str()
+                .and_then(|id| by_id.get(id).copied())
+                != Some(record)
+        })
+    {
+        return Err(failure("production changed immutable prior effect records"));
+    }
+    let old_ids: BTreeSet<&str> = prior_checkpoint["pending_outbox_intents"]
+        .as_array()
+        .ok_or_else(|| failure("old pending intents absent"))?
+        .iter()
+        .chain(
+            prior_checkpoint["terminal_outbox_records"]
+                .as_array()
+                .ok_or_else(|| failure("old terminal intents absent"))?,
+        )
+        .filter_map(|item| item["intent"]["effect_id"].as_str())
+        .chain(
+            prior_checkpoint["outbox_effect_tombstones"]
+                .as_array()
+                .ok_or_else(|| failure("old effect tombstones absent"))?
+                .iter()
+                .filter_map(|item| item["effect_id"].as_str()),
+        )
+        .collect();
+    let fresh: Vec<&Value> = checkpoint["pending_outbox_intents"]
+        .as_array()
+        .ok_or_else(|| failure("new pending intents absent"))?
+        .iter()
+        .filter(|item| {
+            item["intent"]["effect_id"]
+                .as_str()
+                .is_some_and(|id| !old_ids.contains(id))
+        })
+        .collect();
+    if new_records.len() != old_records.len() + fresh.len() {
+        return Err(failure(
+            "production did not pin exactly the actual new outbox intents",
+        ));
+    }
+    for item in fresh {
+        let intent = &item["intent"];
+        let id = intent["effect_id"]
+            .as_str()
+            .ok_or_else(|| failure("new intent identity absent"))?;
+        let record = by_id
+            .get(id)
+            .ok_or_else(|| failure("actual produced intent has no native record"))?;
+        if intent["correlation_id"] != request["operation_token"]
+            || record["operation_token"] != request["operation_token"]
+            || record["intent_digest"]
+                != hash(&json!([
+                    "determa-outbox-intent-digest-1",
+                    "1",
+                    checkpoint["root_instance_id"],
+                    intent
+                ]))?
+            || record["attempt_fence"] != "0"
+            || record["invocation_state"] != "unclaimed"
+            || record["attempt_records"] != json!([])
+            || !record["outcome"].is_null()
+            || !record["result_event_id"].is_null()
+            || !record["admission_receipt"].is_null()
+            || !record["cancellation"].is_null()
+            || item["delivery_state"] != json!({"status":"not_attempted"})
+        {
+            return Err(failure("native produced effect pins/state mismatch"));
+        }
+    }
     Ok(())
 }
 
