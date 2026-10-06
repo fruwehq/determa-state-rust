@@ -1221,6 +1221,16 @@ fn validate_native_effect_transition(
             body,
         );
     }
+    if request["operation_kind"] == "effect_cancel" {
+        return validate_native_effect_cancel_transition(
+            prior,
+            prior_checkpoint,
+            document,
+            checkpoint,
+            request,
+            body,
+        );
+    }
     if request["operation_kind"] == "effect_report" {
         return validate_native_effect_report_transition(
             prior,
@@ -2059,6 +2069,53 @@ fn validate_native_effect_start_transition(
         ));
     }
     Ok(())
+}
+
+fn validate_native_effect_cancel_transition(
+    prior: &Value,
+    prior_checkpoint: &Value,
+    document: &Value,
+    checkpoint: &Value,
+    request: &Value,
+    response: &Value,
+) -> Result<(), AuthorityError> {
+    if checkpoint != prior_checkpoint
+        || !closed(
+            request,
+            &[
+                "operation_kind",
+                "root_instance_id",
+                "authenticated_principal",
+                "request",
+            ],
+        )
+        || request["root_instance_id"] != checkpoint["root_instance_id"]
+        || request["authenticated_principal"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    {
+        return Err(failure("native cancellation transition malformed"));
+    }
+    crate::format1::validate_native_effect_cancellation_request(&request["request"])
+        .map_err(failure)?;
+    let mut expected = prior["journal"]["effect_records"].clone();
+    let record = expected
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|record| record["effect_id"] == request["request"]["effect_id"])
+        .ok_or_else(|| failure("effect_not_outstanding"))?;
+    let expected_response = effects::cancel_native_effect(
+        record,
+        &request["request"],
+        document["journal"]["journal_revision"].as_str().unwrap(),
+    )?;
+    if response != &expected_response || document["journal"]["effect_records"] != expected {
+        return Err(failure(
+            "native cancellation changed unrelated or immutable evidence",
+        ));
+    }
+    crate::format1::validate_native_effect_cancellation_response(response).map_err(failure)
 }
 
 #[cfg(test)]

@@ -60,3 +60,8 @@ pub(crate) use contracts::validate_native_effect_result_request;
 
 #[cfg(feature = "sqlite")]
 pub(crate) use contracts::validate_native_effect_result_response;
+
+#[cfg(feature = "sqlite")]
+pub(crate) use contracts::{
+    validate_native_effect_cancellation_request, validate_native_effect_cancellation_response,
+};

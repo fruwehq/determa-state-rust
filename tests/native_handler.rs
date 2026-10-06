@@ -2610,6 +2610,7 @@ fn retained_native_responses_replay_without_resolver_or_revoked_runtime_provider
 #[cfg(feature = "sqlite")]
 struct EffectWorkerAuthority {
     report_right: AtomicBool,
+    cancel_right: AtomicBool,
     dispatch_right: AtomicBool,
     fail_after_start: AtomicUsize,
     after_start_auth: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
@@ -2701,18 +2702,24 @@ impl determa_state::authority::NativeEffectWorkerAuthority for EffectWorkerAutho
         Ok(determa_state::authority::NativeAuthorityInvocation {
             authenticated_principal: self.principal.lock().unwrap().clone(),
             authorized_scopes: BTreeSet::from(["scope-one".into()]),
-            operation_rights: if self.report_right.load(Ordering::SeqCst) {
-                if self.dispatch_right.load(Ordering::SeqCst) {
-                    BTreeSet::from([
-                        "claim_effect".into(),
-                        "submit_effect_result".into(),
-                        "dispatch_effect".into(),
-                    ])
+            operation_rights: {
+                let mut rights: BTreeSet<String> = if self.report_right.load(Ordering::SeqCst) {
+                    if self.dispatch_right.load(Ordering::SeqCst) {
+                        BTreeSet::from([
+                            "claim_effect".into(),
+                            "submit_effect_result".into(),
+                            "dispatch_effect".into(),
+                        ])
+                    } else {
+                        BTreeSet::from(["claim_effect".into(), "submit_effect_result".into()])
+                    }
                 } else {
-                    BTreeSet::from(["claim_effect".into(), "submit_effect_result".into()])
+                    BTreeSet::from(["claim_effect".into()])
+                };
+                if self.cancel_right.load(Ordering::SeqCst) {
+                    rights.insert("cancel_effect".into());
                 }
-            } else {
-                BTreeSet::from(["claim_effect".into()])
+                rights
             },
         })
     }
@@ -2740,6 +2747,7 @@ impl determa_state::authority::NativeEffectWorkerAuthority for EffectWorkerAutho
 fn effect_worker_authority(path: &std::path::Path) -> Arc<EffectWorkerAuthority> {
     Arc::new(EffectWorkerAuthority {
         report_right: AtomicBool::new(true),
+        cancel_right: AtomicBool::new(true),
         dispatch_right: AtomicBool::new(true),
         fail_after_start: AtomicUsize::new(0),
         after_start_auth: Mutex::new(None),
@@ -5816,5 +5824,462 @@ impl determa_state::authority::NativeEffectWorkerAuthority for CallbackOnlyWorke
     }
     fn lease_duration_ns(&self) -> Result<i64, String> {
         self.0.lease_duration_ns()
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn cancellation_request(document: &Value, operation: &str) -> Value {
+    json!({"operation_id":operation,"effect_id":document["journal"]["effect_records"][0]["effect_id"],
+        "reason":"owner-requested-stop", "payload":["map", []]})
+}
+#[cfg(feature = "sqlite")]
+#[test]
+fn native_preclaim_cancellation_records_then_admits_without_call_and_replays_exactly() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let authority = effect_worker_authority(&path);
+    let host = effect_host(&path, effect_resolver(&bundle), &fixture)
+        .with_worker_authority(authority.clone());
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let initial = native_snapshot(&path);
+    let request = cancellation_request(&initial.1, "cancel-1");
+    let first = host
+        .record_cancellation("root", &request, b"private-native-credential")
+        .unwrap();
+    assert_eq!(first["status"], "committed");
+    assert_eq!(first["cancellation"]["state"], "prevented_start");
+    assert_eq!(first["outcome"]["attempt_fence"], "0");
+    let recorded = native_snapshot(&path);
+    assert_eq!(recorded.0, initial.0);
+    assert_eq!(
+        recorded.1["journal"]["effect_records"][0]["invocation_state"],
+        "outcome_recorded"
+    );
+    assert_eq!(
+        recorded.1["journal"]["effect_records"][0]["attempt_records"],
+        json!([])
+    );
+    assert_eq!(recorded.1["invocation_starts"], json!({}));
+    assert_eq!(recorded.1["responses"]["cancel-1"], first);
+    let claim = determa_state::authority::NativeEffectClaimRequest {
+        effect_id: request["effect_id"].as_str().unwrap().into(),
+    };
+    assert!(host
+        .claim("root", "late-claim", &claim, b"private-native-credential")
+        .is_err());
+    assert_eq!(native_snapshot(&path), recorded);
+    assert_eq!(
+        host.cancel_effect("root", &request, b"private-native-credential")
+            .unwrap(),
+        first
+    );
+    assert_eq!(native_snapshot(&path), recorded);
+    host.admit_recorded_result(
+        "root",
+        "owner-recovery-admission",
+        claim.effect_id.as_str(),
+        &effect_guard(&recorded.0),
+    )
+    .unwrap();
+    let admitted = native_snapshot(&path);
+    assert_ne!(admitted.0, initial.0);
+    assert_eq!(
+        admitted.1["journal"]["effect_records"][0]["invocation_state"],
+        "result_admitted"
+    );
+    assert_eq!(
+        admitted.1["journal"]["effect_records"][0]["outcome"],
+        first["outcome"]
+    );
+    fixture.verifier.source_valid.store(false, Ordering::SeqCst);
+    authority.fail_clock.store(true, Ordering::SeqCst);
+    assert_eq!(
+        host.cancel_effect("root", &request, b"private-native-credential")
+            .unwrap(),
+        first
+    );
+    assert_eq!(native_snapshot(&path), admitted);
+    assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+    let mut changed = request.clone();
+    changed["reason"] = json!("changed reason");
+    assert!(host
+        .cancel_effect("root", &changed, b"private-native-credential")
+        .is_err());
+    assert_eq!(native_snapshot(&path), admitted);
+}
+#[cfg(feature = "sqlite")]
+#[test]
+fn native_cancellation_preserves_possible_acceptance_and_the_winning_outcome() {
+    for terminal in [false, true] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let fixture = Fixture::new();
+        fixture.destination.map_result.store(true, Ordering::SeqCst);
+        let bundle = effect_bundle();
+        let authority = effect_worker_authority(&path);
+        let host =
+            effect_host(&path, effect_resolver(&bundle), &fixture).with_worker_authority(authority);
+        host.setup_schema().unwrap();
+        host.allocate_scope().unwrap();
+        host.create(
+            &bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default(),
+        )
+        .unwrap();
+        let initial = native_snapshot(&path);
+        let claim = determa_state::authority::NativeEffectClaimRequest {
+            effect_id: initial.1["journal"]["effect_records"][0]["effect_id"]
+                .as_str()
+                .unwrap()
+                .into(),
+        };
+        host.claim("root", "claim-1", &claim, b"private-native-credential")
+            .unwrap();
+        let candidate = host
+            .dispatch_candidate(
+                "root",
+                &claim.effect_id,
+                b"private-native-credential",
+                b"secret",
+            )
+            .unwrap();
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 1);
+        if terminal {
+            host.record_result("root", "report-1", &candidate, b"private-native-credential")
+                .unwrap();
+        }
+        let before = native_snapshot(&path);
+        let mut invalid = cancellation_request(&before.1, "cancel-invalid");
+        invalid["payload"] = json!(["map", [["undeclared", ["string", "value"]]]]);
+        assert!(host
+            .cancel_effect("root", &invalid, b"private-native-credential")
+            .is_err());
+        assert_eq!(native_snapshot(&path), before);
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 1);
+        let request = cancellation_request(&before.1, "cancel-1");
+        let response = host
+            .cancel_effect("root", &request, b"private-native-credential")
+            .unwrap();
+        let after = native_snapshot(&path);
+        assert_eq!(after.0, before.0);
+        assert_eq!(after.1["invocation_starts"], before.1["invocation_starts"]);
+        assert_eq!(
+            after.1["journal"]["effect_records"][0]["outcome"],
+            before.1["journal"]["effect_records"][0]["outcome"]
+        );
+        assert_eq!(
+            response["cancellation"]["state"],
+            if terminal {
+                "too_late"
+            } else {
+                "reconciliation_required"
+            }
+        );
+        if terminal {
+            assert_eq!(
+                response["outcome"],
+                before.1["journal"]["effect_records"][0]["outcome"]
+            );
+        } else {
+            assert!(response["outcome"].is_null());
+            assert!(response["result_event_id"].is_null());
+        }
+        assert_eq!(
+            host.cancel_effect("root", &request, b"private-native-credential")
+                .unwrap(),
+            response
+        );
+        assert_eq!(native_snapshot(&path), after);
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn native_cancellation_refusals_preserve_all_native_bytes_before_any_sdk_call() {
+    for fault in [
+        "missing_mapping",
+        "invalid_payload",
+        "unauthorized",
+        "final_auth",
+        "extra_field",
+    ] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let fixture = Fixture::new();
+        let bundle = effect_bundle();
+        let authority = effect_worker_authority(&path);
+        let mut route = effect_route();
+        if fault == "missing_mapping" {
+            route
+                .result_mapping
+                .as_array_mut()
+                .unwrap()
+                .retain(|mapping| mapping["outcome_kind"] != "cancelled");
+        }
+        let host = determa_state::authority::SqliteNativeEffectHost::open(
+            &path,
+            "scope-one".into(),
+            "owner".into(),
+            "host-one".into(),
+            effect_resolver(&bundle),
+            route,
+            fixture.handler(),
+        )
+        .unwrap()
+        .with_worker_authority(authority.clone());
+        host.setup_schema().unwrap();
+        host.allocate_scope().unwrap();
+        host.create(
+            &bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default(),
+        )
+        .unwrap();
+        let before = native_snapshot(&path);
+        let mut request = cancellation_request(&before.1, "cancel-1");
+        if fault == "invalid_payload" {
+            request["payload"] = json!(["map", [["undeclared", ["string", "value"]]]]);
+        }
+        if fault == "extra_field" {
+            request["principal"] = json!("worker-one");
+        }
+        if fault == "unauthorized" {
+            authority.cancel_right.store(false, Ordering::SeqCst);
+        }
+        if fault == "final_auth" {
+            authority.revoke_at_stage.store(true, Ordering::SeqCst);
+        }
+        assert!(
+            host.cancel_effect("root", &request, b"private-native-credential")
+                .is_err(),
+            "{fault}"
+        );
+        assert_eq!(native_snapshot(&path), before, "{fault}");
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn native_fresh_cancellation_composes_admission_once_without_provider_call() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let authority = effect_worker_authority(&path);
+    let host =
+        effect_host(&path, effect_resolver(&bundle), &fixture).with_worker_authority(authority);
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let initial = native_snapshot(&path);
+    let request = cancellation_request(&initial.1, "cancel-fresh");
+    let reply = host
+        .cancel_effect("root", &request, b"private-native-credential")
+        .unwrap();
+    let admitted = native_snapshot(&path);
+    assert_eq!(reply["cancellation"]["state"], "prevented_start");
+    assert_ne!(admitted.0, initial.0);
+    assert_eq!(
+        admitted.1["journal"]["effect_records"][0]["invocation_state"],
+        "result_admitted"
+    );
+    assert_eq!(admitted.1["responses"]["cancel-fresh"], reply);
+    assert_eq!(
+        host.cancel_effect("root", &request, b"private-native-credential")
+            .unwrap(),
+        reply
+    );
+    assert_eq!(native_snapshot(&path), admitted);
+    assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn native_equal_cancellation_race_returns_retained_reply_without_admission() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let authority = effect_worker_authority(&path);
+    let host = effect_host(&path, effect_resolver(&bundle), &fixture)
+        .with_worker_authority(authority.clone());
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let initial = native_snapshot(&path);
+    let request = cancellation_request(&initial.1, "cancel-racing");
+    let (signal, receiver) = std::sync::mpsc::channel();
+    let resolver = Arc::new(PausedAdmissionResolver {
+        bundle: bundle.clone(),
+        signal: Mutex::new(Some(signal)),
+        released: Mutex::new(false),
+        wake: std::sync::Condvar::new(),
+    });
+    let loser = determa_state::authority::SqliteNativeEffectHost::open(
+        &path,
+        "scope-one".into(),
+        "owner".into(),
+        "host-one".into(),
+        resolver.clone(),
+        effect_route(),
+        fixture.handler(),
+    )
+    .unwrap()
+    .with_worker_authority(authority);
+    let losing_request = request.clone();
+    let thread = std::thread::spawn(move || {
+        loser.cancel_effect("root", &losing_request, b"private-native-credential")
+    });
+    let pinned = receiver.recv_timeout(std::time::Duration::from_secs(20));
+    if pinned.is_err() {
+        *resolver.released.lock().unwrap() = true;
+        resolver.wake.notify_all();
+        let _ = thread.join();
+        panic!("losing cancellation did not capture native snapshot");
+    }
+    let winning = host.record_cancellation("root", &request, b"private-native-credential");
+    let committed = native_snapshot(&path);
+    *resolver.released.lock().unwrap() = true;
+    resolver.wake.notify_all();
+    let lost = thread.join().unwrap();
+    let reply = winning.unwrap();
+    assert_eq!(lost.unwrap(), reply);
+    assert_eq!(native_snapshot(&path), committed);
+    assert_eq!(committed.0, initial.0);
+    assert_eq!(
+        committed.1["journal"]["effect_records"][0]["invocation_state"],
+        "outcome_recorded"
+    );
+    assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "sqlite")]
+struct CancellationSourceRevokingAuthority {
+    inner: Arc<EffectWorkerAuthority>,
+    verifier: Arc<Verifier>,
+    path: std::path::PathBuf,
+    armed: AtomicBool,
+    enabled: AtomicBool,
+    change_destination: bool,
+}
+#[cfg(feature = "sqlite")]
+impl determa_state::authority::NativeEffectWorkerAuthority for CancellationSourceRevokingAuthority {
+    fn authenticate(
+        &self,
+        c: &[u8],
+    ) -> Result<determa_state::authority::NativeAuthorityInvocation, String> {
+        let result = self.inner.authenticate(c)?;
+        let conn = rusqlite::Connection::open(&self.path).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        match conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                if self.enabled.load(Ordering::SeqCst) {
+                    if self.change_destination {
+                        *self.verifier.destination.binding.lock().unwrap() = hash('c');
+                    } else {
+                        self.verifier.source_valid.store(false, Ordering::SeqCst);
+                    }
+                    self.armed.store(true, Ordering::SeqCst);
+                }
+            }
+            Ok(()) => {}
+            x => panic!("unexpected lock probe: {:?}", x),
+        }
+        Ok(result)
+    }
+    fn lease_duration_ns(&self) -> Result<i64, String> {
+        self.inner.lease_duration_ns()
+    }
+    fn trusted_now(&self) -> Result<i64, String> {
+        self.inner.trusted_now()
+    }
+    fn commit_clock(&self) -> Option<determa_state::authority::NativeCommitClock> {
+        self.inner.commit_clock()
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn native_cancellation_rechecks_source_after_valid_final_authentication() {
+    for change_destination in [false, true] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let fixture = Fixture::new();
+        let bundle = effect_bundle();
+        let authority = Arc::new(CancellationSourceRevokingAuthority {
+            inner: effect_worker_authority(&path),
+            verifier: fixture.verifier.clone(),
+            path: path.clone(),
+            armed: AtomicBool::new(false),
+            enabled: AtomicBool::new(false),
+            change_destination,
+        });
+        let host = effect_host(&path, effect_resolver(&bundle), &fixture)
+            .with_worker_authority(authority.clone());
+        host.setup_schema().unwrap();
+        host.allocate_scope().unwrap();
+        host.create(
+            &bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default(),
+        )
+        .unwrap();
+        let before = native_snapshot(&path);
+        let request = cancellation_request(&before.1, "cancel-source");
+        authority.enabled.store(true, Ordering::SeqCst);
+        assert!(
+            host.record_cancellation("root", &request, b"private-native-credential")
+                .is_err(),
+            "cancellation committed after valid final authentication revoked source"
+        );
+        assert!(authority.armed.load(Ordering::SeqCst));
+        assert_eq!(native_snapshot(&path), before);
+        authority.enabled.store(false, Ordering::SeqCst);
+        fixture.verifier.source_valid.store(true, Ordering::SeqCst);
+        *fixture.destination.binding.lock().unwrap() = hash('b');
+        let reply = host
+            .record_cancellation("root", &request, b"private-native-credential")
+            .unwrap();
+        assert_eq!(reply["cancellation"]["state"], "prevented_start");
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
     }
 }

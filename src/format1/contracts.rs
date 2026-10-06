@@ -220,6 +220,31 @@ pub(crate) fn validate_native_effect_result_response(
     )
 }
 
+#[cfg(feature = "sqlite")]
+pub(crate) fn validate_native_effect_cancellation_request(
+    value: &Value,
+) -> Result<(), super::ArtifactError> {
+    validate_schema(
+        "effect_cancellation_request_v1",
+        value,
+        include_str!("../../schema/effect-cancellation-request-v1.schema.json"),
+    )?;
+    // Reuse the canonical portable-map boundary, not a native JSON payload.
+    validate_native_effect_result_request(&serde_json::json!({"effect_id":value["effect_id"],
+        "operation_token":"native-payload-validation", "attempt_fence":"1",
+        "outcome_kind":"cancelled", "payload":value["payload"]}))
+}
+#[cfg(feature = "sqlite")]
+pub(crate) fn validate_native_effect_cancellation_response(
+    value: &Value,
+) -> Result<(), super::ArtifactError> {
+    validate_schema(
+        "effect_cancellation_response_v1",
+        value,
+        include_str!("../../schema/effect-cancellation-response-v1.schema.json"),
+    )
+}
+
 fn contract_schema(kind: &str) -> Option<&'static str> {
     match kind {
         "host_effect_journal_v1" => Some(include_str!(

@@ -1146,6 +1146,254 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             .map_err(failure)?;
         Ok(response)
     }
+    /// Durably record cancellation under the same native scope/journal boundary.
+    /// A preclaim cancelled outcome is admitted by the separate owner recovery
+    /// operation; a possible invocation is retained as reconciliation-required.
+    /// This foreground operation never invokes an external provider.
+    pub fn record_cancellation(
+        &self,
+        root: &str,
+        request: &Value,
+        credential: &[u8],
+    ) -> Result<Value, AuthorityError> {
+        self.record_cancellation_fresh(root, request, credential)
+            .map(|(response, _)| response)
+    }
+
+    fn record_cancellation_fresh(
+        &self,
+        root: &str,
+        request: &Value,
+        credential: &[u8],
+    ) -> Result<(Value, bool), AuthorityError> {
+        crate::format1::validate_native_effect_cancellation_request(request).map_err(failure)?;
+        let operation_id = request["operation_id"].as_str().unwrap();
+        let authority = self
+            .worker_authority
+            .as_ref()
+            .ok_or_else(|| failure("native cancellation authority absent"))?;
+        let caller = authority.authenticate(credential).map_err(failure)?;
+        if caller.authenticated_principal.is_empty()
+            || !caller.authorized_scopes.contains(&self.scope)
+            || !caller.operation_rights.contains("cancel_effect")
+        {
+            return Err(failure("unauthorized_scope"));
+        }
+        let original = json!({"operation_kind":"effect_cancel", "root_instance_id":root,
+            "authenticated_principal":caller.authenticated_principal,"request":request});
+        if let Some(saved) = self
+            .store
+            .native_effect_replay(root, operation_id, &original)
+            .map_err(failure)?
+        {
+            return Ok((saved, false));
+        }
+        let result = (|| {
+            let (checkpoint, mut document) =
+                self.store.native_effect_snapshot(root).map_err(failure)?;
+            let prior = document.clone();
+            let record = document["journal"]["effect_records"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|record| record["effect_id"] == request["effect_id"])
+                .ok_or_else(|| failure("effect_not_outstanding"))?;
+            let pinned_record = record.clone();
+            let fingerprint = pinned_record["target"]["runtime_incarnation"]["definition"]
+                ["validated_bundle_fingerprint"]
+                .as_str()
+                .ok_or_else(|| failure("pinned cancellation source absent"))?;
+            let resolved = self
+                .resolver
+                .resolve_definition(fingerprint)
+                .ok_or_else(|| failure("pinned cancellation source unavailable"))?;
+            if !resolved.trusted || resolved.bundle.fingerprint != fingerprint {
+                return Err(failure("pinned cancellation source untrusted"));
+            }
+            // Validate the declared cancelled payload even when a possible call or
+            // winning terminal outcome prevents cancellation from replacing it.
+            let mut cancellation_candidate = pinned_record.clone();
+            cancellation_candidate["outcome"] = Value::Null;
+            cancellation_candidate["invocation_state"] = json!("unclaimed");
+            cancellation_candidate["attempt_fence"] = json!("0");
+            cancel_native_effect(&mut cancellation_candidate, request, "0")?;
+            crate::format1::effect_journal::native_result_delivery(
+                &cancellation_candidate,
+                root,
+                &crate::format1::effect_journal::native_definition_evidence(&resolved.bundle),
+            )
+            .map_err(failure)?;
+            let next_revision = prior["journal"]["journal_revision"]
+                .as_str()
+                .unwrap()
+                .parse::<num_bigint::BigUint>()
+                .map_err(failure)?
+                + num_bigint::BigUint::from(1u8);
+            let response = cancel_native_effect(record, request, &next_revision.to_string())?;
+            if response["cancellation"]["state"] == "prevented_start" {
+                native_invocable_intent(
+                    checkpoint.value(),
+                    request["effect_id"].as_str().unwrap(),
+                )?;
+                // Derive and validate exact declared payload/token/event before any write.
+                crate::format1::effect_journal::native_result_delivery(
+                    record,
+                    root,
+                    &crate::format1::effect_journal::native_definition_evidence(&resolved.bundle),
+                )
+                .map_err(failure)?;
+            }
+            crate::format1::validate_native_effect_cancellation_response(&response)
+                .map_err(failure)?;
+            retain_native_effect_response(&mut document, operation_id, &original, &response)?;
+            let fresh = self
+                .store
+                .update_native_effect_checkpoint_with_final_guard(
+                    &checkpoint,
+                    &prior,
+                    &checkpoint,
+                    &document,
+                    || {
+                        let current = self
+                            .resolver
+                            .resolve_definition(fingerprint)
+                            .ok_or_else(|| failure("cancellation source unavailable at commit"))?;
+                        if !current.trusted
+                            || current.bundle.fingerprint != fingerprint
+                            || current.bundle.normalized != resolved.bundle.normalized
+                        {
+                            return Err(failure("cancellation source changed at commit"));
+                        }
+                        crate::format1::providers::check_bundle(&current.bundle)
+                            .map_err(failure)?;
+                        self.handler
+                            .verify(
+                                &pinned_record["handler_reference"],
+                                pinned_record["destination_binding_digest"]
+                                    .as_str()
+                                    .unwrap(),
+                            )
+                            .map_err(failure)
+                    },
+                    || {
+                        let current = authority.authenticate(credential).map_err(failure)?;
+                        if current.authenticated_principal != caller.authenticated_principal
+                            || !current.authorized_scopes.contains(&self.scope)
+                            || !current.operation_rights.contains("cancel_effect")
+                        {
+                            return Err(failure("unauthorized_scope"));
+                        }
+                        // Final authentication may revoke source or handler
+                        // configuration. Consume their current native checks
+                        // after authentication and before actual commit.
+                        let current =
+                            self.resolver
+                                .resolve_definition(fingerprint)
+                                .ok_or_else(|| {
+                                    failure("cancellation source unavailable at final guard")
+                                })?;
+                        if !current.trusted
+                            || current.bundle.fingerprint != fingerprint
+                            || current.bundle.normalized != resolved.bundle.normalized
+                        {
+                            return Err(failure("cancellation source changed at final guard"));
+                        }
+                        crate::format1::providers::check_bundle(&current.bundle)
+                            .map_err(failure)?;
+                        self.handler
+                            .verify(
+                                &pinned_record["handler_reference"],
+                                pinned_record["destination_binding_digest"]
+                                    .as_str()
+                                    .unwrap(),
+                            )
+                            .map_err(failure)?;
+                        Ok(())
+                    },
+                )
+                .map_err(failure)?;
+            if fresh {
+                Ok((response, true))
+            } else {
+                // A racing equal authority commit is disclosure, never fresh work.
+                let saved = self
+                    .store
+                    .native_effect_replay(root, operation_id, &original)
+                    .map_err(failure)?
+                    .ok_or_else(|| failure("retained cancellation response absent"))?;
+                Ok((saved, false))
+            }
+        })();
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                // Another writer may have committed after the first replay
+                // lookup or snapshot. Reconcile only exact retained identity.
+                match self
+                    .store
+                    .native_effect_replay(root, operation_id, &original)
+                    .map_err(failure)?
+                {
+                    Some(saved) => Ok((saved, false)),
+                    None => Err(error),
+                }
+            }
+        }
+    }
+
+    /// Foreground cancellation composition: durable cancellation first, then
+    /// independently guarded admission of the prevented-start cancelled event.
+    /// If admission fails, cancellation remains durable for owner recovery.
+    pub fn cancel_effect(
+        &self,
+        root: &str,
+        request: &Value,
+        credential: &[u8],
+    ) -> Result<Value, AuthorityError> {
+        let (response, fresh) = self.record_cancellation_fresh(root, request, credential)?;
+        // A previously disclosed cancellation reply never resumes admission.
+        // Missing admission is a separate, explicit owner recovery operation.
+        if !fresh || response["cancellation"]["state"] != "prevented_start" {
+            return Ok(response);
+        }
+        let effect = request["effect_id"].as_str().unwrap();
+        let admission_id = hash(&json!([
+            "determa-native-cancellation-admission-1",
+            self.scope,
+            root,
+            request["operation_id"]
+        ]))?;
+        let original = json!({"operation_kind":"effect_result_admission", "root_instance_id":root, "effect_id":effect});
+        if self
+            .store
+            .native_effect_replay(root, &admission_id, &original)
+            .map_err(failure)?
+            .is_some()
+        {
+            return Ok(response);
+        }
+        let (checkpoint, document) = self.store.native_effect_snapshot(root).map_err(failure)?;
+        let record = document["journal"]["effect_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["effect_id"] == effect)
+            .ok_or_else(|| failure("effect_not_outstanding"))?;
+        if matches!(
+            record["invocation_state"].as_str(),
+            Some("result_admitted" | "closed")
+        ) {
+            return Ok(response);
+        }
+        self.admit_recorded_result(
+            root,
+            &admission_id,
+            effect,
+            &checkpoint::MutationGuard::new(checkpoint.revision(), checkpoint.digest()),
+        )?;
+        Ok(response)
+    }
+
     /// Host-local dispatch of one issued claim. A durable start marker is committed
     /// before external I/O; historical starts never authorize a second call.
     /// Native writer exclusion spans the consuming check and entire provider call.
@@ -1729,4 +1977,54 @@ pub(super) fn native_committed_result_response(
         "attempt_report":null,"outcome":record["outcome"],"result_event_id":record["result_event_id"],
         "admission_receipt":record["admission_receipt"],"checkpoint_revision":checkpoint["revision"],
         "journal_revision":journal["journal_revision"],"error_code":null})
+}
+
+/// Pure transition derivation; native source/schema/authentication checks are
+/// separate and cannot be inferred from imported response or journal bytes.
+pub(super) fn cancel_native_effect(
+    record: &mut Value,
+    request: &Value,
+    next_revision: &str,
+) -> Result<Value, AuthorityError> {
+    crate::format1::validate_native_effect_cancellation_request(request).map_err(failure)?;
+    if record["effect_id"] != request["effect_id"] {
+        return Err(failure("effect_not_outstanding"));
+    }
+    let state;
+    if !record["outcome"].is_null() {
+        // Preserve the winning outcome and any preclaim prevented-start evidence.
+        state = "too_late";
+    } else if record["invocation_state"] == "unclaimed" && record["attempt_fence"] == "0" {
+        let mapping = record["result_mapping"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mapping| mapping["outcome_kind"] == "cancelled")
+            .ok_or_else(|| failure("cancelled result mapping absent"))?;
+        let event_id = hash(&json!([
+            "determa-effect-result-event-1",
+            record["effect_id"],
+            mapping["result_slot"]
+        ]))?;
+        record["outcome"] = json!({"kind":"cancelled", "payload":request["payload"],"attempt_fence":"0",
+            "digest":hash(&json!(["determa-effect-outcome-1",record["effect_id"],record["operation_token"],"cancelled",request["payload"],"0"]))?});
+        record["result_event_id"] = json!(event_id);
+        record["invocation_state"] = json!("outcome_recorded");
+        state = "prevented_start";
+    } else {
+        state = "reconciliation_required";
+    }
+    let cancellation =
+        json!({"operation_id":request["operation_id"],"reason":request["reason"],"state":state});
+    if state != "too_late" {
+        record["cancellation"] = cancellation.clone();
+    }
+    let terminal = state != "reconciliation_required";
+    Ok(
+        json!({"status":if terminal {"committed"} else {"reconciliation_required"},
+        "operation_id":request["operation_id"], "effect_id":record["effect_id"], "cancellation":cancellation,
+        "outcome":if terminal {record["outcome"].clone()} else {Value::Null},
+        "result_event_id":if terminal {record["result_event_id"].clone()} else {Value::Null},
+        "journal_revision":next_revision,"error_code":null}),
+    )
 }
