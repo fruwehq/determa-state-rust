@@ -9,11 +9,50 @@ use determa_state::checkpoint::{
     MutationGuard, OutboxRetentionMode, ReceiptRetentionMode, SqliteExecutionStore, StoreRecord,
 };
 use determa_state::{load_bundle, Bindings, InMemoryDefinitionResolver};
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+// Fault tests inspect actual stored bytes and inject corruption directly. The
+// ordinary adapter must not grant these operations on a native-owned database.
+fn read_fault_fixture_checkpoint(file: &std::path::Path, root: &str) -> Option<StoreRecord> {
+    rusqlite::Connection::open(file)
+        .unwrap()
+        .query_row(
+            "SELECT revision, checkpoint_digest, checkpoint_bytes
+             FROM determa_execution_checkpoints WHERE root_instance_id=?",
+            [root],
+            |row| {
+                Ok(StoreRecord {
+                    root_instance_id: root.to_owned(),
+                    revision: row.get(0)?,
+                    execution_checkpoint_digest: row.get(1)?,
+                    bytes: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .unwrap()
+}
+
+fn inject_fault_fixture_checkpoint(file: &std::path::Path, record: &StoreRecord) {
+    rusqlite::Connection::open(file)
+        .unwrap()
+        .execute(
+            "INSERT INTO determa_execution_checkpoints
+         (root_instance_id,revision,checkpoint_digest,checkpoint_bytes) VALUES (?,?,?,?)",
+            rusqlite::params![
+                record.root_instance_id,
+                record.revision,
+                record.execution_checkpoint_digest,
+                record.bytes
+            ],
+        )
+        .unwrap();
+}
 
 #[test]
 fn production_checkpoint_host_uses_guarded_store_and_survives_restart() {
@@ -143,10 +182,14 @@ fn production_checkpoint_host_uses_guarded_store_and_survives_restart() {
     .unwrap();
     let untracked_record = StoreRecord::from_checkpoint(&untracked).unwrap();
     let raw = SqliteExecutionStore::open(&file, mode).unwrap();
-    assert_eq!(
-        raw.insert_if_absent(untracked_record.clone()).unwrap(),
-        checkpoint::StoreWriteResult::Committed
-    );
+    assert!(raw
+        .insert_if_absent(untracked_record.clone())
+        .unwrap_err()
+        .to_string()
+        .contains("scope_fence_unproven"));
+    assert!(restarted.load("root").is_ok());
+    assert!(read_fault_fixture_checkpoint(&file, "untracked-root").is_none());
+    inject_fault_fixture_checkpoint(&file, &untracked_record);
     assert!(restarted.load("root").is_err());
     drop(raw);
 
@@ -162,10 +205,21 @@ fn production_checkpoint_host_uses_guarded_store_and_survives_restart() {
     .unwrap();
     fresh.initialize_schema().unwrap();
     let imported = SqliteExecutionStore::open(&fresh_file, mode).unwrap();
-    imported.insert_if_absent(untracked_record.clone()).unwrap();
+    assert!(imported
+        .insert_if_absent(untracked_record.clone())
+        .unwrap_err()
+        .to_string()
+        .contains("scope_fence_unproven"));
+    assert!(read_fault_fixture_checkpoint(&fresh_file, "untracked-root").is_none());
+    inject_fault_fixture_checkpoint(&fresh_file, &untracked_record);
     assert!(fresh.allocate_scope().is_err());
+    assert!(imported
+        .load("untracked-root")
+        .unwrap_err()
+        .to_string()
+        .contains("scope_fence_unproven"));
     assert_eq!(
-        imported.load("untracked-root").unwrap(),
+        read_fault_fixture_checkpoint(&fresh_file, "untracked-root"),
         Some(untracked_record)
     );
     let bootstrap = rusqlite::Connection::open(&fresh_file).unwrap();
@@ -259,7 +313,15 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
         )
         .unwrap();
     assert_eq!(accepted["status"], "accepted");
-    assert_eq!(store.load("root").unwrap(), Some(native.clone()));
+    assert!(store
+        .load("root")
+        .unwrap_err()
+        .to_string()
+        .contains("scope_fence_unproven"));
+    assert_eq!(
+        read_fault_fixture_checkpoint(&file, "root"),
+        Some(native.clone())
+    );
     assert_eq!(
         authority
             .commit_checkpoint(
@@ -324,7 +386,10 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
             .unwrap()["error_code"],
         "host_capability_mismatch"
     );
-    assert_eq!(store.load("root").unwrap(), Some(native.clone()));
+    assert_eq!(
+        read_fault_fixture_checkpoint(&file, "root"),
+        Some(native.clone())
+    );
     connection
         .execute_batch("DROP TRIGGER injected_native_failure;")
         .unwrap();
@@ -338,7 +403,10 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
             Some(&guard)
         )
         .is_err());
-    assert_eq!(store.load("root").unwrap(), Some(native.clone()));
+    assert_eq!(
+        read_fault_fixture_checkpoint(&file, "root"),
+        Some(native.clone())
+    );
     connection
         .execute_batch("DROP TRIGGER unexpected_checkpoint_writer;")
         .unwrap();
@@ -356,7 +424,10 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
             Some(&wrong_guard)
         )
         .is_err());
-    assert_eq!(store.load("root").unwrap(), Some(native.clone()));
+    assert_eq!(
+        read_fault_fixture_checkpoint(&file, "root"),
+        Some(native.clone())
+    );
     assert_eq!(
         perform(
             &authority,
@@ -376,7 +447,10 @@ fn actual_checkpoint_cas_and_authority_receipt_share_one_native_commit() {
         )
         .unwrap();
     assert_eq!(updated["scope_generation"], "2");
-    assert_eq!(store.load("root").unwrap(), Some(replacement.clone()));
+    assert_eq!(
+        read_fault_fixture_checkpoint(&file, "root"),
+        Some(replacement.clone())
+    );
     assert_eq!(
         perform(
             &authority,
