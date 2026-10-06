@@ -140,6 +140,13 @@ impl ExtensionFactory for Factory {
         Ok(self.0.clone())
     }
 }
+#[cfg(feature = "sqlite")]
+struct RetryClockFault {
+    authority_path: std::path::PathBuf,
+    now: Arc<std::sync::atomic::AtomicI64>,
+    unavailable: Arc<AtomicBool>,
+    kind: usize,
+}
 struct Verifier {
     factory: Arc<dyn ExtensionFactory>,
     provider: Arc<dyn ExtensionProvider>,
@@ -147,6 +154,8 @@ struct Verifier {
     destination: Arc<Destination>,
     source_valid: AtomicBool,
     proof_enabled: AtomicBool,
+    #[cfg(feature = "sqlite")]
+    retry_clock_fault: Mutex<Option<RetryClockFault>>,
     #[cfg(feature = "sqlite")]
     retry_store: Mutex<Option<std::path::PathBuf>>,
     #[cfg(feature = "sqlite")]
@@ -197,6 +206,27 @@ impl HostVerifier for Verifier {
                     .is_err()
                 {
                     return false;
+                }
+            }
+            if let Some(fault) = self.retry_clock_fault.lock().unwrap().as_ref() {
+                let connection = rusqlite::Connection::open(&fault.authority_path).unwrap();
+                connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+                match connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
+                    Err(rusqlite::Error::SqliteFailure(error, _))
+                        if matches!(
+                            error.code,
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        ) =>
+                    {
+                        match fault.kind {
+                            1 => fault.now.store(20, Ordering::SeqCst),
+                            2 => fault.now.store(9, Ordering::SeqCst),
+                            3 => fault.unavailable.store(true, Ordering::SeqCst),
+                            _ => unreachable!(),
+                        }
+                    }
+                    Ok(()) => {}
+                    unexpected => panic!("unexpected native clock probe: {unexpected:?}"),
                 }
             }
             let Some(path) = self.retry_store.lock().unwrap().clone() else {
@@ -290,6 +320,8 @@ impl Fixture {
             destination: destination.clone(),
             source_valid: AtomicBool::new(true),
             proof_enabled: AtomicBool::new(true),
+            #[cfg(feature = "sqlite")]
+            retry_clock_fault: Mutex::new(None),
             #[cfg(feature = "sqlite")]
             retry_store: Mutex::new(None),
             #[cfg(feature = "sqlite")]
@@ -2584,10 +2616,10 @@ struct EffectWorkerAuthority {
     time_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     lease_duration: std::sync::atomic::AtomicI64,
     path: std::path::PathBuf,
-    now: std::sync::atomic::AtomicI64,
+    now: Arc<std::sync::atomic::AtomicI64>,
     authorized: AtomicBool,
     principal: Mutex<String>,
-    fail_clock: AtomicBool,
+    fail_clock: Arc<AtomicBool>,
     revoke_at_stage: AtomicBool,
     expire_at_stage: AtomicBool,
     staged: AtomicUsize,
@@ -2687,6 +2719,12 @@ impl determa_state::authority::NativeEffectWorkerAuthority for EffectWorkerAutho
     fn lease_duration_ns(&self) -> Result<i64, String> {
         Ok(self.lease_duration.load(Ordering::SeqCst))
     }
+    fn commit_clock(&self) -> Option<determa_state::authority::NativeCommitClock> {
+        Some(determa_state::authority::NativeCommitClock::controlled(
+            self.now.clone(),
+            self.fail_clock.clone(),
+        ))
+    }
     fn trusted_now(&self) -> Result<i64, String> {
         let probe = { self.time_probe.lock().unwrap().take() };
         if let Some(probe) = probe {
@@ -2708,10 +2746,10 @@ fn effect_worker_authority(path: &std::path::Path) -> Arc<EffectWorkerAuthority>
         time_probe: Mutex::new(None),
         lease_duration: std::sync::atomic::AtomicI64::new(10),
         path: path.into(),
-        now: std::sync::atomic::AtomicI64::new(10),
+        now: Arc::new(std::sync::atomic::AtomicI64::new(10)),
         authorized: AtomicBool::new(true),
         principal: Mutex::new("worker-one".into()),
-        fail_clock: AtomicBool::new(false),
+        fail_clock: Arc::new(AtomicBool::new(false)),
         revoke_at_stage: AtomicBool::new(false),
         expire_at_stage: AtomicBool::new(false),
         staged: AtomicUsize::new(0),
@@ -5487,6 +5525,48 @@ fn native_retry_requires_destination_verification_before_and_after_staging() {
         .is_err());
     assert_eq!(native_snapshot(&path), leased);
     fixture.verifier.proof_enabled.store(true, Ordering::SeqCst);
+    let host = host.with_worker_authority(Arc::new(CallbackOnlyWorkerAuthority(authority.clone())));
+    let checks = fixture.verifier.retry_checks.load(Ordering::SeqCst);
+    let error = host
+        .record_result_with_retry_evidence(
+            "root",
+            "report-1",
+            &report,
+            b"private-native-credential",
+            Some(&proof),
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("sealed native commit clock absent"));
+    assert_eq!(fixture.verifier.retry_checks.load(Ordering::SeqCst), checks);
+    assert_eq!(native_snapshot(&path), leased);
+    let host = host.with_worker_authority(authority.clone());
+    for kind in [1, 2, 3] {
+        *fixture.verifier.retry_clock_fault.lock().unwrap() = Some(RetryClockFault {
+            authority_path: path.clone(),
+            now: authority.now.clone(),
+            unavailable: authority.fail_clock.clone(),
+            kind,
+        });
+        assert!(host
+            .record_result_with_retry_evidence(
+                "root",
+                "report-1",
+                &report,
+                b"private-native-credential",
+                Some(&proof)
+            )
+            .is_err());
+        assert_eq!(native_snapshot(&path), leased);
+        assert!(
+            authority.now.load(Ordering::SeqCst) != 10
+                || authority.fail_clock.load(Ordering::SeqCst)
+        );
+        authority.now.store(10, Ordering::SeqCst);
+        authority.fail_clock.store(false, Ordering::SeqCst);
+        *fixture.verifier.retry_clock_fault.lock().unwrap() = None;
+    }
     let revoker = Arc::new(RetryProofRevokingAuthority {
         inner: authority.clone(),
         verifier: fixture.verifier.clone(),
@@ -5567,6 +5647,48 @@ fn native_retry_requires_destination_verification_before_and_after_staging() {
         .is_err());
     assert_eq!(native_snapshot(&path), retryable);
     fixture.verifier.proof_enabled.store(true, Ordering::SeqCst);
+    let host = host.with_worker_authority(Arc::new(CallbackOnlyWorkerAuthority(authority.clone())));
+    let checks = fixture.verifier.retry_checks.load(Ordering::SeqCst);
+    let error = host
+        .claim_with_retry_evidence(
+            "root",
+            "claim-2",
+            &request,
+            b"private-native-credential",
+            Some(&proof),
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("sealed native commit clock absent"));
+    assert_eq!(fixture.verifier.retry_checks.load(Ordering::SeqCst), checks);
+    assert_eq!(native_snapshot(&path), retryable);
+    let host = host.with_worker_authority(authority.clone());
+    for kind in [1, 2, 3] {
+        *fixture.verifier.retry_clock_fault.lock().unwrap() = Some(RetryClockFault {
+            authority_path: path.clone(),
+            now: authority.now.clone(),
+            unavailable: authority.fail_clock.clone(),
+            kind,
+        });
+        assert!(host
+            .claim_with_retry_evidence(
+                "root",
+                "claim-2",
+                &request,
+                b"private-native-credential",
+                Some(&proof)
+            )
+            .is_err());
+        assert_eq!(native_snapshot(&path), retryable);
+        assert!(
+            authority.now.load(Ordering::SeqCst) != 10
+                || authority.fail_clock.load(Ordering::SeqCst)
+        );
+        authority.now.store(10, Ordering::SeqCst);
+        authority.fail_clock.store(false, Ordering::SeqCst);
+        *fixture.verifier.retry_clock_fault.lock().unwrap() = None;
+    }
     let revoker = Arc::new(RetryProofRevokingAuthority {
         inner: authority.clone(),
         verifier: fixture.verifier.clone(),
@@ -5673,5 +5795,26 @@ impl determa_state::authority::NativeEffectWorkerAuthority for RetryProofRevokin
     }
     fn trusted_now(&self) -> Result<i64, String> {
         self.inner.trusted_now()
+    }
+    fn commit_clock(&self) -> Option<determa_state::authority::NativeCommitClock> {
+        self.inner.commit_clock()
+    }
+}
+
+#[cfg(feature = "sqlite")]
+struct CallbackOnlyWorkerAuthority(Arc<EffectWorkerAuthority>);
+#[cfg(feature = "sqlite")]
+impl determa_state::authority::NativeEffectWorkerAuthority for CallbackOnlyWorkerAuthority {
+    fn authenticate(
+        &self,
+        credential: &[u8],
+    ) -> Result<determa_state::authority::NativeAuthorityInvocation, String> {
+        self.0.authenticate(credential)
+    }
+    fn trusted_now(&self) -> Result<i64, String> {
+        self.0.trusted_now()
+    }
+    fn lease_duration_ns(&self) -> Result<i64, String> {
+        self.0.lease_duration_ns()
     }
 }

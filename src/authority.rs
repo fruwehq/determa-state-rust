@@ -5,6 +5,8 @@
 //! inventories, worker fences, relocation and verified registration remain unfinished.
 //! No completed authority profile or capability claim is advertised.
 
+mod clock;
+pub use clock::NativeCommitClock;
 mod effects;
 mod store;
 pub use effects::{

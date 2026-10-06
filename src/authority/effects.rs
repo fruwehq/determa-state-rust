@@ -36,6 +36,13 @@ pub struct NativeEffectProductionRequest {
 pub trait NativeEffectWorkerAuthority: Send + Sync {
     fn authenticate(&self, credential: &[u8]) -> Result<super::NativeAuthorityInvocation, String>;
     fn trusted_now(&self) -> Result<i64, String>;
+    /// Trusted installation supplies a sealed reader for fresh retries. Start
+    /// and final lease reads use this same source; no callback follows proof.
+    /// A generic timestamp callback alone cannot authorize a retry.
+    fn commit_clock(&self) -> Option<super::NativeCommitClock> {
+        None
+    }
+
     /// Positive bounded host lease duration in nanoseconds; never worker input.
     fn lease_duration_ns(&self) -> Result<i64, String>;
 }
@@ -839,9 +846,15 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         if duration <= 0 {
             return Err(failure("invalid native lease policy"));
         }
-        let expiry = authority
-            .trusted_now()
-            .map_err(failure)?
+        let clock_guard = authority
+            .commit_clock()
+            .map(|clock| clock.read_ns().map(|start| (clock, start)).map_err(failure))
+            .transpose()?;
+        let start = match &clock_guard {
+            Some((_, start)) => *start,
+            None => authority.trusted_now().map_err(failure)?,
+        };
+        let expiry = start
             .checked_add(duration)
             .ok_or_else(|| failure("native lease time overflow"))?;
         let (checkpoint, mut document) =
@@ -873,6 +886,9 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         }
         let pinned_record = record.clone();
         let retry = if record["attempt_fence"] != "0" {
+            if clock_guard.is_none() {
+                return Err(failure("sealed native commit clock absent"));
+            }
             let proof = retry_evidence.ok_or_else(|| failure("native retry evidence absent"))?;
             self.verify_retry_evidence(root, record, proof)?;
             Some(proof.clone())
@@ -946,11 +962,17 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
                     if authority.trusted_now().map_err(failure)? >= expiry {
                         return Err(failure("stale_attempt_fence"));
                     }
-                    // Authentication and clock callbacks can invalidate the
-                    // destination capability. Consume fresh native proof only
-                    // after both callbacks, immediately before commit.
+                    // Callback authentication/time checks precede native proof.
                     if let Some(proof) = &retry {
                         self.verify_retry_evidence(root, &pinned_record, proof)?;
+                    }
+                    // Sealed implementation-owned read after potentially blocking
+                    // native verification; no arbitrary callback follows it.
+                    if let Some((clock, start)) = &clock_guard {
+                        let now = clock.read_ns().map_err(failure)?;
+                        if now < *start || now >= expiry {
+                            return Err(failure("stale_attempt_fence"));
+                        }
                     }
                     Ok(())
                 },
@@ -1026,10 +1048,21 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             return Err(failure("unauthorized_scope"));
         }
         let expiry = canonical_native_time(&claim["expires_at"])?;
-        if authority.trusted_now().map_err(failure)? >= expiry {
+        let clock_guard = authority
+            .commit_clock()
+            .map(|clock| clock.read_ns().map(|start| (clock, start)).map_err(failure))
+            .transpose()?;
+        let start = match &clock_guard {
+            Some((_, start)) => *start,
+            None => authority.trusted_now().map_err(failure)?,
+        };
+        if start >= expiry {
             return Err(failure("stale_attempt_fence"));
         }
         let retry = if report["outcome_kind"] == "retryable_failure" {
+            if clock_guard.is_none() {
+                return Err(failure("sealed native commit clock absent"));
+            }
             let proof = retry_evidence.ok_or_else(|| failure("native retry evidence absent"))?;
             self.verify_retry_evidence(root, selected, proof)?;
             Some(proof.clone())
@@ -1098,11 +1131,14 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
                     if authority.trusted_now().map_err(failure)? >= expiry {
                         return Err(failure("stale_attempt_fence"));
                     }
-                    // Authentication and clock callbacks can invalidate the
-                    // destination capability. Consume fresh native proof only
-                    // after both callbacks, immediately before commit.
                     if let Some(proof) = &retry {
                         self.verify_retry_evidence(root, &pinned_record, proof)?;
+                    }
+                    if let Some((clock, start)) = &clock_guard {
+                        let now = clock.read_ns().map_err(failure)?;
+                        if now < *start || now >= expiry {
+                            return Err(failure("stale_attempt_fence"));
+                        }
                     }
                     Ok(())
                 },
