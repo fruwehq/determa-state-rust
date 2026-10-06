@@ -15,6 +15,26 @@ pub struct SqliteExecutionStore {
     mode: DurableStoreMode,
 }
 
+// The base adapter cannot prove native authority or a joint effect journal.
+// Check permanent native schema ownership inside each consuming transaction,
+// before caller/core code runs. Partial and case-varied markers fail closed.
+fn refuse_native_owned_database(connection: &Connection) -> Result<(), StoreError> {
+    let owned: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name COLLATE NOCASE IN
+             ('determa_scope_authority','determa_scope_allocations',
+              'determa_authority_mutations','determa_authority_boundary',
+              'determa_authority_effect_journals'))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if owned {
+        return Err(StoreError::new("scope_fence_unproven"));
+    }
+    Ok(())
+}
+
 impl SqliteExecutionStore {
     pub fn open(path: impl AsRef<Path>, mode: DurableStoreMode) -> Result<Self, StoreError> {
         if !path.as_ref().is_absolute() {
@@ -55,6 +75,7 @@ impl SqliteExecutionStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
+        refuse_native_owned_database(&transaction)?;
         let result = operation(&transaction)?;
         transaction.commit().map_err(sql_error)?;
         Ok(result)
@@ -68,6 +89,7 @@ impl SqliteExecutionStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
+        refuse_native_owned_database(&transaction)?;
         let (result, commit) = operation(&transaction)?;
         if commit {
             transaction.commit().map_err(sql_error)?;
@@ -177,8 +199,14 @@ impl SqliteExecutionStore {
         &self,
         root_instance_id: &str,
     ) -> Result<Value, StoreError> {
-        let connection = self.connection()?;
-        durable_snapshot(&connection, root_instance_id)
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(sql_error)?;
+        refuse_native_owned_database(&transaction)?;
+        let snapshot = durable_snapshot(&transaction, root_instance_id)?;
+        transaction.commit().map_err(sql_error)?;
+        Ok(snapshot)
     }
 }
 
@@ -301,25 +329,14 @@ impl ExecutionStore for SqliteExecutionStore {
     }
 
     fn load(&self, root_instance_id: &str) -> Result<Option<StoreRecord>, StoreError> {
-        self.connection()?
-            .query_row(
-                "
-                SELECT revision, checkpoint_digest, checkpoint_bytes
-                FROM determa_execution_checkpoints
-                WHERE root_instance_id = ?1
-                ",
-                [root_instance_id],
-                |row| {
-                    Ok(StoreRecord {
-                        root_instance_id: root_instance_id.to_string(),
-                        revision: row.get(0)?,
-                        execution_checkpoint_digest: row.get(1)?,
-                        bytes: row.get(2)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(sql_error)
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(sql_error)?;
+        refuse_native_owned_database(&transaction)?;
+        let record = load_record(&transaction, root_instance_id)?;
+        transaction.commit().map_err(sql_error)?;
+        Ok(record)
     }
 
     fn insert_if_absent(&self, record: StoreRecord) -> Result<StoreWriteResult, StoreError> {
@@ -328,6 +345,7 @@ impl ExecutionStore for SqliteExecutionStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
+        refuse_native_owned_database(&transaction)?;
         let changed = transaction
             .execute(
                 "
@@ -384,6 +402,7 @@ impl ExecutionStore for SqliteExecutionStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
+        refuse_native_owned_database(&transaction)?;
         let current = load_record(&transaction, root_instance_id)?;
         let Some(current) = current else {
             transaction.commit().map_err(sql_error)?;
@@ -773,6 +792,54 @@ fn sql_error(error: rusqlite::Error) -> StoreError {
 #[cfg(test)]
 mod native_configuration_tests {
     use super::*;
+
+    #[test]
+    fn partial_native_markers_refuse_before_transaction_callbacks() {
+        for marker in [
+            "determa_scope_authority",
+            "DETERMA_SCOPE_AUTHORITY",
+            "Determa_Scope_Allocations",
+            "determa_authority_mutations",
+            "DETERMA_AUTHORITY_BOUNDARY",
+            "Determa_Authority_Effect_Journals",
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "determa-native-marker-{}-{}.sqlite",
+                std::process::id(),
+                marker
+            ));
+            let store = SqliteExecutionStore::open(
+                &path,
+                DurableStoreMode::new(
+                    super::super::super::store::ReceiptRetentionMode::Bounded,
+                    super::super::super::store::OutboxRetentionMode::Bounded,
+                ),
+            )
+            .unwrap();
+            store.initialize_schema().unwrap();
+            store
+                .connection()
+                .unwrap()
+                .execute_batch(&format!("CREATE TABLE {marker} (damaged TEXT)"))
+                .unwrap();
+            let immediate = store.with_immediate_transaction::<()>(|_| {
+                panic!("native-owned database entered ordinary transaction callback")
+            });
+            let controlled = store.with_controlled_transaction::<()>(|_| {
+                panic!("native-owned database entered controlled transaction callback")
+            });
+            for error in [immediate.unwrap_err(), controlled.unwrap_err()] {
+                assert!(error.to_string().contains("scope_fence_unproven"));
+            }
+            assert!(store
+                .load("root")
+                .unwrap_err()
+                .to_string()
+                .contains("scope_fence_unproven"));
+            drop(store);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 
     #[test]
     fn changed_native_connection_settings_remove_sqlite_health() {

@@ -93,7 +93,16 @@ fn failure_after_actual_checkpoint_staging_rolls_back_checkpoint_and_authority()
     assert!(result.is_err());
     assert_eq!(ledger(&authority), before);
     let store = SqliteExecutionStore::open(&path, DurableStoreMode::bounded()).unwrap();
-    assert!(store.load("root").unwrap().is_none());
+    assert!(store
+        .load("root")
+        .unwrap_err()
+        .to_string()
+        .contains("scope_fence_unproven"));
+    assert!(
+        crate::checkpoint::load_sqlite_record(&authority.connection.lock().unwrap(), "root")
+            .unwrap()
+            .is_none()
+    );
     let result = authority
         .commit_checkpoint(&request, &caller, DurableStoreMode::bounded(), &value, None)
         .unwrap();
@@ -199,14 +208,29 @@ fn sigkill_after_staging_and_after_commit_preserves_atomic_fate_and_retained_rep
         if cut == "staged" {
             assert_eq!(before["scope_generation"], "0");
             assert!(before["receipts"].as_array().unwrap().is_empty());
-            assert!(store.load("root").unwrap().is_none());
+            assert!(crate::checkpoint::load_sqlite_record(
+                &restarted.connection.lock().unwrap(),
+                "root"
+            )
+            .unwrap()
+            .is_none());
         } else {
             assert_eq!(before["scope_generation"], "1");
             assert_eq!(
-                store.load("root").unwrap().unwrap(),
+                crate::checkpoint::load_sqlite_record(
+                    &restarted.connection.lock().unwrap(),
+                    "root"
+                )
+                .unwrap()
+                .unwrap(),
                 StoreRecord::from_checkpoint(&value).unwrap()
             );
         }
+        assert!(store
+            .load("root")
+            .unwrap_err()
+            .to_string()
+            .contains("scope_fence_unproven"));
         let result = restarted
             .commit_checkpoint(&request, &caller, DurableStoreMode::bounded(), &value, None)
             .unwrap();
@@ -232,7 +256,11 @@ fn sigkill_after_staging_and_after_commit_preserves_atomic_fate_and_retained_rep
         )
         .unwrap();
         resolver.insert(bundle, true);
-        checkpoint::restore(&store.load("root").unwrap().unwrap().bytes, &resolver).unwrap();
+        let retained =
+            crate::checkpoint::load_sqlite_record(&restarted.connection.lock().unwrap(), "root")
+                .unwrap()
+                .unwrap();
+        checkpoint::restore(&retained.bytes, &resolver).unwrap();
         drop(store);
         drop(restarted);
         std::fs::remove_file(marker).unwrap();

@@ -796,6 +796,43 @@ fn ordinary_checkpoint_writer_cannot_tear_a_native_effect_pair() {
         .unwrap_err();
     assert!(error.to_string().contains("joint native commit"));
     assert_eq!(native_snapshot(&path), before);
+    // The unconfigured base adapter must not bypass native ownership either.
+    let base = determa_state::checkpoint::SqliteExecutionStore::open(
+        &path,
+        determa_state::checkpoint::DurableStoreMode::new(
+            determa_state::checkpoint::ReceiptRetentionMode::Permanent,
+            determa_state::checkpoint::OutboxRetentionMode::Strict,
+        ),
+    )
+    .unwrap();
+    let error = base
+        .compare_and_swap(
+            "root",
+            checkpoint.revision(),
+            checkpoint.digest(),
+            determa_state::checkpoint::StoreRecord::from_checkpoint(&candidate).unwrap(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("scope_fence_unproven"));
+    assert_eq!(native_snapshot(&path), before);
+    assert!(base
+        .load("root")
+        .unwrap_err()
+        .to_string()
+        .contains("scope_fence_unproven"));
+    assert!(base
+        .insert_if_absent(
+            determa_state::checkpoint::StoreRecord::from_checkpoint(&checkpoint).unwrap(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("scope_fence_unproven"));
+    assert!(base
+        .export_durable_host_snapshot("root")
+        .unwrap_err()
+        .to_string()
+        .contains("scope_fence_unproven"));
+    assert_eq!(native_snapshot(&path), before);
 }
 
 #[cfg(feature = "sqlite")]
