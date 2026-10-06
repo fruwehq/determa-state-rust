@@ -1999,17 +1999,38 @@ mod admission_transition_tests {
         Value,
         crate::format1::InMemoryDefinitionResolver,
     ) {
-        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "conformance-suite/conformance/profiles/committed-native-effects/effect-01-result",
-        );
-        let bundle =
-            crate::load_bundle(&std::fs::read_to_string(directory.join("machine.yaml")).unwrap())
-                .unwrap();
+        // Keep shipped library tests independent of checkout-only vector files.
+        let bundle = crate::load_bundle(
+            r#"
+format: 1
+namespace: tests.native_admission_invariant
+events:
+  native_request: {direction: output, payload: {}}
+  native_cancelled: {direction: input, payload: {}}
+machines:
+  - machine_id: workflow
+    root:
+      type: simple
+      entry:
+        - send:
+            event: native_request
+            to: {external: true}
+            correlation_id: "'invariant-operation'"
+      on_events:
+        native_cancelled: {}
+"#,
+        )
+        .unwrap();
         let mut resolver = crate::format1::InMemoryDefinitionResolver::default();
         resolver.insert(bundle.clone(), true);
-        let prior = crate::checkpoint::restore(
-            &std::fs::read(directory.join("pending-checkpoint.json")).unwrap(),
-            &resolver,
+        let prior = crate::checkpoint::create(
+            &bundle,
+            "workflow",
+            "invariant-root",
+            "invariant-create",
+            &crate::format1::Bindings::default(),
+            None,
+            json!({"mode":"permanent","permanent_replay_eligible":true,"pruned_through_receipt_sequence":null,"policy_identifier":null}),
         )
         .unwrap();
         let runtime = &prior.value()["root_record"]["aggregate_state"]["runtimes"][0];
