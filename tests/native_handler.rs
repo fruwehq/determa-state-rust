@@ -147,12 +147,21 @@ struct RetryClockFault {
     unavailable: Arc<AtomicBool>,
     kind: usize,
 }
+#[cfg(feature = "sqlite")]
+struct ReportSourceClockFault {
+    path: std::path::PathBuf,
+    now: Arc<std::sync::atomic::AtomicI64>,
+    staged_checks: AtomicUsize,
+    armed: Arc<AtomicBool>,
+}
 struct Verifier {
     factory: Arc<dyn ExtensionFactory>,
     provider: Arc<dyn ExtensionProvider>,
     native: Arc<dyn NativeHandler>,
     destination: Arc<Destination>,
     source_valid: AtomicBool,
+    #[cfg(feature = "sqlite")]
+    report_source_clock_fault: Mutex<Option<ReportSourceClockFault>>,
     proof_enabled: AtomicBool,
     #[cfg(feature = "sqlite")]
     retry_clock_fault: Mutex<Option<RetryClockFault>>,
@@ -175,6 +184,26 @@ impl HostVerifier for Verifier {
         factory: &Arc<dyn ExtensionFactory>,
         provider: &Arc<dyn ExtensionProvider>,
     ) -> bool {
+        #[cfg(feature = "sqlite")]
+        if let Some(fault) = self.report_source_clock_fault.lock().unwrap().as_ref() {
+            let connection = rusqlite::Connection::open(&fault.path).unwrap();
+            connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+            match connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if matches!(
+                        error.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) =>
+                {
+                    if fault.armed.load(Ordering::SeqCst) {
+                        fault.staged_checks.fetch_add(1, Ordering::SeqCst);
+                        fault.now.store(20, Ordering::SeqCst);
+                    }
+                }
+                Ok(()) => {}
+                other => panic!("unexpected report clock probe: {other:?}"),
+            }
+        }
         self.verify_factory(actual, factory) && Arc::ptr_eq(provider, &self.provider)
     }
     fn prove_claims(
@@ -319,6 +348,8 @@ impl Fixture {
             native,
             destination: destination.clone(),
             source_valid: AtomicBool::new(true),
+            #[cfg(feature = "sqlite")]
+            report_source_clock_fault: Mutex::new(None),
             proof_enabled: AtomicBool::new(true),
             #[cfg(feature = "sqlite")]
             retry_clock_fault: Mutex::new(None),
@@ -6354,6 +6385,131 @@ fn native_result_report_rechecks_source_after_valid_final_authentication() {
             "succeeded"
         );
         assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(feature = "sqlite")]
+struct ReportSourceClockAuthority {
+    inner: Arc<EffectWorkerAuthority>,
+    armed: Arc<AtomicBool>,
+    sealed: bool,
+}
+#[cfg(feature = "sqlite")]
+impl determa_state::authority::NativeEffectWorkerAuthority for ReportSourceClockAuthority {
+    fn authenticate(
+        &self,
+        credential: &[u8],
+    ) -> Result<determa_state::authority::NativeAuthorityInvocation, String> {
+        self.inner.authenticate(credential)
+    }
+    fn trusted_now(&self) -> Result<i64, String> {
+        let now = self.inner.trusted_now()?;
+        let connection = rusqlite::Connection::open(&self.inner.path).unwrap();
+        connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+        match connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                self.armed.store(true, Ordering::SeqCst);
+            }
+            Ok(()) => {}
+            other => panic!("unexpected final time probe: {other:?}"),
+        }
+        Ok(now)
+    }
+    fn lease_duration_ns(&self) -> Result<i64, String> {
+        self.inner.lease_duration_ns()
+    }
+    fn commit_clock(&self) -> Option<determa_state::authority::NativeCommitClock> {
+        if self.sealed {
+            self.inner.commit_clock()
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn every_fresh_native_report_requires_sealed_time_after_final_source_checks() {
+    for outcome in ["succeeded", "ambiguous"] {
+        for sealed in [false, true] {
+            let directory = EffectTestDirectory::new();
+            let path = directory.path().join("authority.sqlite");
+            let fixture = Fixture::new();
+            let bundle = effect_bundle();
+            let authority = effect_worker_authority(&path);
+            let host = effect_host(&path, effect_resolver(&bundle), &fixture)
+                .with_worker_authority(authority.clone());
+            host.setup_schema().unwrap();
+            host.allocate_scope().unwrap();
+            host.create(
+                &bundle,
+                "workflow",
+                "root",
+                "create-root",
+                &determa_state::Bindings::default(),
+            )
+            .unwrap();
+            let initial = native_snapshot(&path);
+            host.claim(
+                "root",
+                "claim-clock",
+                &determa_state::authority::NativeEffectClaimRequest {
+                    effect_id: initial.1["journal"]["effect_records"][0]["effect_id"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                },
+                b"private-native-credential",
+            )
+            .unwrap();
+            let before = native_snapshot(&path);
+            let request = native_result_request(&before.1, outcome);
+            let armed = Arc::new(AtomicBool::new(false));
+            *fixture.verifier.report_source_clock_fault.lock().unwrap() =
+                Some(ReportSourceClockFault {
+                    path: path.clone(),
+                    now: authority.now.clone(),
+                    staged_checks: AtomicUsize::new(0),
+                    armed: armed.clone(),
+                });
+            let host = host.with_worker_authority(Arc::new(ReportSourceClockAuthority {
+                inner: authority.clone(),
+                armed,
+                sealed,
+            }));
+            assert!(
+                host.record_result(
+                    "root",
+                    "report-clock",
+                    &request,
+                    b"private-native-credential"
+                )
+                .is_err(),
+                "fresh {outcome} report committed across final source clock expiry"
+            );
+            assert_eq!(native_snapshot(&path), before);
+            let checks = fixture
+                .verifier
+                .report_source_clock_fault
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .staged_checks
+                .load(Ordering::SeqCst);
+            if sealed {
+                assert!(checks >= 1);
+                assert_eq!(authority.now.load(Ordering::SeqCst), 20);
+            } else {
+                assert_eq!(checks, 0);
+            }
+            assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+        }
     }
 }
 
