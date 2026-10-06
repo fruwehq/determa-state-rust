@@ -6283,3 +6283,192 @@ fn native_cancellation_rechecks_source_after_valid_final_authentication() {
         assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
     }
 }
+#[cfg(all(feature = "sqlite", unix))]
+#[test]
+fn native_cancellation_crash_child() {
+    let Some(cut) = std::env::var_os("DETERMA_NATIVE_CANCELLATION_TEST_CUT") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(
+        std::env::var_os("DETERMA_NATIVE_CANCELLATION_TEST_PATH").unwrap(),
+    );
+    let marker = std::path::PathBuf::from(
+        std::env::var_os("DETERMA_NATIVE_CANCELLATION_TEST_MARKER").unwrap(),
+    );
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let staged = cut == "cancel_staged" || cut == "admission_staged";
+    let resolver = Arc::new(AdmissionStageResolver {
+        bundle: bundle.clone(),
+        path: path.clone(),
+        armed: AtomicBool::new(false),
+        stage_checks: AtomicUsize::new(0),
+        marker: staged.then(|| marker.clone()),
+    });
+    let host = admission_stage_host(&path, resolver.clone(), &fixture)
+        .with_worker_authority(effect_worker_authority(&path));
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let initial = native_snapshot(&path);
+    publish_admission_cut_marker(
+        &marker.with_extension("baseline"),
+        &serde_json::to_vec(&initial).unwrap(),
+    );
+    let request = cancellation_request(&initial.1, "cancel-crash");
+    if cut == "cancel_staged" {
+        resolver.armed.store(true, Ordering::SeqCst);
+    }
+    let reply = host
+        .record_cancellation("root", &request, b"private-native-credential")
+        .unwrap();
+    assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+    publish_admission_cut_marker(
+        &marker.with_extension("cancellation"),
+        &serde_json::to_vec(&reply).unwrap(),
+    );
+    if cut == "cancel_committed" {
+        publish_admission_cut_marker(&marker, &serde_json::to_vec(&reply).unwrap());
+    } else {
+        assert!(cut == "admission_staged" || cut == "admission_committed");
+        let recorded = native_snapshot(&path);
+        publish_admission_cut_marker(
+            &marker.with_extension("baseline"),
+            &serde_json::to_vec(&recorded).unwrap(),
+        );
+        if cut == "admission_staged" {
+            resolver.armed.store(true, Ordering::SeqCst);
+        }
+        let admitted = host
+            .admit_recorded_result(
+                "root",
+                "cancel-crash-admission",
+                request["effect_id"].as_str().unwrap(),
+                &effect_guard(&recorded.0),
+            )
+            .unwrap();
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+        publish_admission_cut_marker(&marker, &serde_json::to_vec(&admitted).unwrap());
+    }
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+#[cfg(all(feature = "sqlite", unix))]
+#[test]
+fn real_sigkill_cancellation_and_separate_admission_preserve_exact_native_fate() {
+    for cut in [
+        "cancel_staged",
+        "cancel_committed",
+        "admission_staged",
+        "admission_committed",
+    ] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let marker = directory.path().join("cut-marker");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "native_cancellation_crash_child", "--nocapture"])
+            .env("DETERMA_NATIVE_CANCELLATION_TEST_CUT", cut)
+            .env("DETERMA_NATIVE_CANCELLATION_TEST_PATH", &path)
+            .env("DETERMA_NATIVE_CANCELLATION_TEST_MARKER", &marker)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let reached = marker.exists();
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        assert!(reached, "cancellation {cut} cut was not reached");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(9));
+        let prior = native_snapshot(&path);
+        if cut.ends_with("staged") {
+            let baseline: (Value, Value, Value) =
+                serde_json::from_slice(&std::fs::read(marker.with_extension("baseline")).unwrap())
+                    .unwrap();
+            assert_eq!(prior, baseline, "{cut} did not fully roll back");
+        }
+        let fixture = Fixture::new();
+        let bundle = effect_bundle();
+        let host = effect_host(&path, effect_resolver(&bundle), &fixture)
+            .with_worker_authority(effect_worker_authority(&path));
+        let request = cancellation_request(&prior.1, "cancel-crash");
+        let reply = host
+            .record_cancellation("root", &request, b"private-native-credential")
+            .unwrap();
+        let recorded = native_snapshot(&path);
+        if cut != "cancel_staged" {
+            let saved: Value = serde_json::from_slice(
+                &std::fs::read(marker.with_extension("cancellation")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(reply, saved);
+            assert_eq!(recorded, prior);
+        }
+        assert_eq!(
+            host.cancel_effect("root", &request, b"private-native-credential")
+                .unwrap(),
+            reply
+        );
+        assert_eq!(native_snapshot(&path), recorded);
+        let admitted = host
+            .admit_recorded_result(
+                "root",
+                "cancel-crash-admission",
+                request["effect_id"].as_str().unwrap(),
+                &effect_guard(&recorded.0),
+            )
+            .unwrap();
+        if cut == "admission_committed" {
+            let saved: Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+            assert_eq!(admitted, saved);
+            assert_eq!(native_snapshot(&path), recorded);
+        }
+        let after = native_snapshot(&path);
+        assert_eq!(
+            after.1["journal"]["effect_records"][0]["invocation_state"],
+            "result_admitted"
+        );
+        assert_eq!(
+            after.1["journal"]["effect_records"][0]["outcome"],
+            reply["outcome"]
+        );
+        assert_eq!(
+            after.1["journal"]["effect_records"][0]["attempt_records"],
+            json!([])
+        );
+        assert_eq!(after.1["invocation_starts"], json!({}));
+        assert_eq!(
+            after.0["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            host.admit_recorded_result(
+                "root",
+                "cancel-crash-admission",
+                request["effect_id"].as_str().unwrap(),
+                &effect_guard(&recorded.0)
+            )
+            .unwrap(),
+            admitted
+        );
+        assert_eq!(native_snapshot(&path), after);
+    }
+}

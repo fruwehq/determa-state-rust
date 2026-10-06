@@ -1990,10 +1990,9 @@ pub(super) fn cancel_native_effect(
     if record["effect_id"] != request["effect_id"] {
         return Err(failure("effect_not_outstanding"));
     }
-    let state;
-    if !record["outcome"].is_null() {
+    let state = if !record["outcome"].is_null() {
         // Preserve the winning outcome and any preclaim prevented-start evidence.
-        state = "too_late";
+        "too_late"
     } else if record["invocation_state"] == "unclaimed" && record["attempt_fence"] == "0" {
         let mapping = record["result_mapping"]
             .as_array()
@@ -2010,10 +2009,10 @@ pub(super) fn cancel_native_effect(
             "digest":hash(&json!(["determa-effect-outcome-1",record["effect_id"],record["operation_token"],"cancelled",request["payload"],"0"]))?});
         record["result_event_id"] = json!(event_id);
         record["invocation_state"] = json!("outcome_recorded");
-        state = "prevented_start";
+        "prevented_start"
     } else {
-        state = "reconciliation_required";
-    }
+        "reconciliation_required"
+    };
     let cancellation =
         json!({"operation_id":request["operation_id"],"reason":request["reason"],"state":state});
     if state != "too_late" {
