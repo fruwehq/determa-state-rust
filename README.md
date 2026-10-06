@@ -9,7 +9,7 @@ aggregate artifacts, and durable checkpoint coverage. The implementation is vali
 these exact normative inputs:
 
 - specification commit `77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0`;
-- conformance commit `c6949440f5b9fd6e06ea5571f4e01681dd59ee04`.
+- conformance commit `dc84ed81ea36a5f2140181a97660477a14347ccc`.
 
 Correctness is defined by the language-agnostic conformance suite. The Rust integration
 tests run all 75 mailbox-neutral runtime traces through the shared private RTC kernel,
@@ -95,7 +95,7 @@ cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 The submodule must resolve to
-`c6949440f5b9fd6e06ea5571f4e01681dd59ee04`. CI also checks that all bundled schemas
+`dc84ed81ea36a5f2140181a97660477a14347ccc`. CI also checks that all bundled schemas
 are identical to the schemas at specification commit
 `77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0`. These exact reviewed public commits are
 the current implementation inputs; tag publication is a later coordinated release operation.

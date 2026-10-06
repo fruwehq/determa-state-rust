@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/host-effect-claim-v1.schema.json",
+  "title": "Determa State version 1 host effect claim",
+  "$ref": "#/$defs/claim",
+  "$defs": {
+    "claim": {
+      "type": "object",
+      "required": [
+        "scope_identity",
+        "root_instance_id",
+        "work_kind",
+        "work_identity",
+        "operation_token",
+        "scope_authority_epoch",
+        "attempt_fence",
+        "worker_principal",
+        "expires_at",
+        "state"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "scope_identity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "root_instance_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "work_kind": {
+          "const": "effect"
+        },
+        "work_identity": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "operation_token": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope_authority_epoch": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "attempt_fence": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "worker_principal": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expires_at": {
+          "type": "string",
+          "pattern": "^(0|-?[1-9][0-9]*)$",
+          "description": "Canonical signed Unix-epoch nanoseconds; enforce signed 64-bit bounds semantically."
+        },
+        "state": {
+          "enum": [
+            "active",
+            "revoked",
+            "expired"
+          ]
+        }
+      }
+    }
+  }
+}

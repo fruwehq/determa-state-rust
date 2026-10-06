@@ -2282,7 +2282,7 @@ fn envelopes_wire_equivalent(left: &Envelope, right: &Envelope) -> bool {
             == super::native::TypedValue::from_value(&Value::Map(right.payload.clone()))
 }
 
-fn normalize_payload(
+pub(crate) fn normalize_payload(
     declaration: &EventDeclaration,
     supplied: &BTreeMap<String, Value>,
 ) -> Result<BTreeMap<String, Value>, ()> {

@@ -18,6 +18,8 @@ exclude = [
     "tests/inspection_conformance.rs",
     "tests/source_compilation.rs",
     "tests/runtime_provider_conformance.rs",
+    "tests/native_handler.rs",
+    "tests/effect_journal.rs",
     "tests/support/runtime_provider.rs",
     "tests/support/runtime_provider_host.rs",
     "tests/support/inspection_provider.rs",
@@ -53,6 +55,7 @@ name = "determa-state-rust"
 path = "src/bin/determa_state_rust.rs"
 
 [dependencies]
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_json_canonicalizer = "0.3"

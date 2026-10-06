@@ -245,6 +245,7 @@ dependencies = [
 name = "determa-state"
 version = "0.3.0"
 dependencies = [
+ "base64",
  "cel-parser",
  "fs2",
  "jsonschema",

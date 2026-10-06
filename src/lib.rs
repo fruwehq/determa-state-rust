@@ -7,6 +7,8 @@
 //! aggregate persistence and definition migration are exposed as pure format-1
 //! operations.
 
+#[cfg(feature = "sqlite")]
+pub mod authority;
 pub mod checkpoint;
 pub mod cli;
 pub mod extensions;
@@ -18,7 +20,7 @@ pub mod value;
 pub const FORMAT_1_SPECIFICATION_COMMIT: &str = "77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0";
 
 /// Exact core conformance revision exercised by this crate.
-pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "c6949440f5b9fd6e06ea5571f4e01681dd59ee04";
+pub const FORMAT_1_CONFORMANCE_COMMIT: &str = "dc84ed81ea36a5f2140181a97660477a14347ccc";
 
 #[cfg(determa_repository_conformance)]
 pub use format1::observed_inspection_guards;

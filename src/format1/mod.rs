@@ -2,6 +2,7 @@ mod cel;
 mod compile;
 mod contracts;
 mod counter;
+pub mod effect_journal;
 mod inspection;
 mod inspection_cel;
 pub(crate) mod migration;
@@ -49,4 +50,18 @@ pub use v1::{
     restore_aggregate_v1 as restore_aggregate, step_v1 as step,
     validate_migration_descriptor_v1 as validate_migration_descriptor, AdmissionDelivery,
     QueueEnvelope, Version1Error as ArtifactError,
+};
+
+#[cfg(feature = "sqlite")]
+pub(crate) use contracts::validate_native_core_step_result;
+
+#[cfg(feature = "sqlite")]
+pub(crate) use contracts::validate_native_effect_result_request;
+
+#[cfg(feature = "sqlite")]
+pub(crate) use contracts::validate_native_effect_result_response;
+
+#[cfg(feature = "sqlite")]
+pub(crate) use contracts::{
+    validate_native_effect_cancellation_request, validate_native_effect_cancellation_response,
 };
