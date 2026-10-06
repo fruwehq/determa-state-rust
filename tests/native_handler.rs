@@ -6283,6 +6283,80 @@ fn native_cancellation_rechecks_source_after_valid_final_authentication() {
         assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
     }
 }
+#[cfg(feature = "sqlite")]
+#[test]
+fn native_result_report_rechecks_source_after_valid_final_authentication() {
+    for change_destination in [false, true] {
+        let directory = EffectTestDirectory::new();
+        let path = directory.path().join("authority.sqlite");
+        let fixture = Fixture::new();
+        let bundle = effect_bundle();
+        let authority = Arc::new(CancellationSourceRevokingAuthority {
+            inner: effect_worker_authority(&path),
+            verifier: fixture.verifier.clone(),
+            path: path.clone(),
+            armed: AtomicBool::new(false),
+            enabled: AtomicBool::new(false),
+            change_destination,
+        });
+        let host = effect_host(&path, effect_resolver(&bundle), &fixture)
+            .with_worker_authority(authority.clone());
+        host.setup_schema().unwrap();
+        host.allocate_scope().unwrap();
+        host.create(
+            &bundle,
+            "workflow",
+            "root",
+            "create-root",
+            &determa_state::Bindings::default(),
+        )
+        .unwrap();
+        let initial = native_snapshot(&path);
+        host.claim(
+            "root",
+            "claim-source",
+            &determa_state::authority::NativeEffectClaimRequest {
+                effect_id: initial.1["journal"]["effect_records"][0]["effect_id"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+            },
+            b"private-native-credential",
+        )
+        .unwrap();
+        let before = native_snapshot(&path);
+        let request = native_result_request(&before.1, "succeeded");
+        authority.enabled.store(true, Ordering::SeqCst);
+        assert!(
+            host.record_result(
+                "root",
+                "report-source",
+                &request,
+                b"private-native-credential"
+            )
+            .is_err(),
+            "result committed after valid final authentication revoked source"
+        );
+        assert!(authority.armed.load(Ordering::SeqCst));
+        assert_eq!(native_snapshot(&path), before);
+        authority.enabled.store(false, Ordering::SeqCst);
+        fixture.verifier.source_valid.store(true, Ordering::SeqCst);
+        *fixture.destination.binding.lock().unwrap() = hash('b');
+        host.record_result(
+            "root",
+            "report-source",
+            &request,
+            b"private-native-credential",
+        )
+        .unwrap();
+        assert_eq!(
+            native_snapshot(&path).1["journal"]["effect_records"][0]["outcome"]["kind"],
+            "succeeded"
+        );
+        assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
 #[cfg(all(feature = "sqlite", unix))]
 #[test]
 fn native_cancellation_crash_child() {

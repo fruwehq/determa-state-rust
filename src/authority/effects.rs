@@ -1131,6 +1131,23 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
                     if authority.trusted_now().map_err(failure)? >= expiry {
                         return Err(failure("stale_attempt_fence"));
                     }
+                    // Authentication and legacy clock callbacks may change
+                    // the loaded source or destination. Consume current source
+                    // checks after those callbacks, before proof and sealed time.
+                    let current = self
+                        .resolver
+                        .resolve_definition(fingerprint)
+                        .ok_or_else(|| failure("native definition unavailable at final guard"))?;
+                    if !current.trusted
+                        || current.bundle.fingerprint != fingerprint
+                        || current.bundle.normalized != resolved.bundle.normalized
+                    {
+                        return Err(failure("native definition changed at final guard"));
+                    }
+                    crate::format1::providers::check_bundle(&current.bundle).map_err(failure)?;
+                    self.handler
+                        .verify(&pinned_reference, &pinned_destination)
+                        .map_err(failure)?;
                     if let Some(proof) = &retry {
                         self.verify_retry_evidence(root, &pinned_record, proof)?;
                     }
