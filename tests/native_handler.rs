@@ -147,6 +147,12 @@ struct Verifier {
     destination: Arc<Destination>,
     source_valid: AtomicBool,
     proof_enabled: AtomicBool,
+    #[cfg(feature = "sqlite")]
+    retry_store: Mutex<Option<std::path::PathBuf>>,
+    #[cfg(feature = "sqlite")]
+    retry_checks: AtomicUsize,
+    #[cfg(feature = "sqlite")]
+    refuse_staged_retry: Mutex<Option<std::path::PathBuf>>,
 }
 impl HostVerifier for Verifier {
     fn verify_factory(&self, actual: &Value, factory: &Arc<dyn ExtensionFactory>) -> bool {
@@ -179,6 +185,63 @@ impl HostVerifier for Verifier {
         instance: &ExtensionInstance,
         evidence: &NativeDeduplicationEvidence<'_>,
     ) -> bool {
+        #[cfg(feature = "sqlite")]
+        if evidence.evidence["kind"] == "destination_deduplication" {
+            use base64::Engine;
+            self.retry_checks.fetch_add(1, Ordering::SeqCst);
+            if let Some(path) = self.refuse_staged_retry.lock().unwrap().as_ref() {
+                let authority = rusqlite::Connection::open(path).unwrap();
+                authority.busy_timeout(std::time::Duration::ZERO).unwrap();
+                if authority
+                    .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            let Some(path) = self.retry_store.lock().unwrap().clone() else {
+                return false;
+            };
+            let connection = rusqlite::Connection::open(path).unwrap();
+            let stored: Result<(Vec<u8>, i64), _> = connection.query_row(
+                "SELECT receipt, calls FROM receipts WHERE scope=?1 AND effect=?2",
+                rusqlite::params![evidence.scope_identity, evidence.effect_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            );
+            let Ok((receipt, calls)) = stored else {
+                return false;
+            };
+            let pins: Value = serde_json::from_slice(&receipt).unwrap();
+            let proof = evidence.evidence;
+            let fields = [
+                "scope_identity",
+                "root_instance_id",
+                "effect_id",
+                "operation_token",
+                "handler_reference",
+                "destination_binding_digest",
+            ];
+            return self.proof_enabled.load(Ordering::SeqCst)
+                && configuration["destination_binding_digest"]
+                    == evidence.destination_binding_digest
+                && instance
+                    .downcast_ref::<Arc<dyn NativeHandler>>()
+                    .is_some_and(|native| Arc::ptr_eq(native, &self.native))
+                && calls >= 2
+                && fields.iter().all(|key| pins[*key] == proof[*key])
+                && [
+                    "first_attempt_receipt_bytes_base64",
+                    "repeat_attempt_receipt_bytes_base64",
+                ]
+                .iter()
+                .all(|key| {
+                    proof[*key].as_str().is_some_and(|text| {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(text)
+                            .is_ok_and(|bytes| bytes == receipt)
+                    })
+                });
+        }
         self.proof_enabled.load(Ordering::SeqCst)
             && configuration["destination_binding_digest"] == evidence.destination_binding_digest
             && instance
@@ -227,6 +290,12 @@ impl Fixture {
             destination: destination.clone(),
             source_valid: AtomicBool::new(true),
             proof_enabled: AtomicBool::new(true),
+            #[cfg(feature = "sqlite")]
+            retry_store: Mutex::new(None),
+            #[cfg(feature = "sqlite")]
+            retry_checks: AtomicUsize::new(0),
+            #[cfg(feature = "sqlite")]
+            refuse_staged_retry: Mutex::new(None),
         });
         let registry = Arc::new(ExtensionRegistry::with_verifier(verifier.clone()));
         registry.register(descriptor(), factory.clone()).unwrap();
@@ -5255,4 +5324,275 @@ fn real_sigkill_native_confirmation_preserves_delivery_and_invocation_fate() {
         }
         assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
     }
+}
+
+#[cfg(feature = "sqlite")]
+fn retained_destination_retry_proof(
+    directory: &EffectTestDirectory,
+    fixture: &Fixture,
+    document: &Value,
+) -> Value {
+    use base64::Engine;
+    let record = &document["journal"]["effect_records"][0];
+    let pins = json!({"scope_identity":"scope-one", "root_instance_id":"root",
+        "effect_id":record["effect_id"], "operation_token":record["operation_token"],
+        "handler_reference":record["handler_reference"],
+        "destination_binding_digest":record["destination_binding_digest"]});
+    let receipt = serde_json_canonicalizer::to_vec(&pins).unwrap();
+    let path = directory.path().join("independent-destination.sqlite");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+        CREATE TABLE IF NOT EXISTS receipts(scope TEXT, effect TEXT, receipt BLOB, calls INTEGER,
+        PRIMARY KEY(scope,effect));",
+        )
+        .unwrap();
+    let mut observed = Vec::new();
+    for _ in 0..2 {
+        connection
+            .execute(
+                "INSERT INTO receipts VALUES (?1,?2,?3,1)
+            ON CONFLICT(scope,effect) DO UPDATE SET calls=calls+1",
+                rusqlite::params![
+                    pins["scope_identity"].as_str().unwrap(),
+                    pins["effect_id"].as_str().unwrap(),
+                    &receipt
+                ],
+            )
+            .unwrap();
+        observed.push(
+            connection
+                .query_row(
+                    "SELECT receipt FROM receipts WHERE scope=?1 AND effect=?2",
+                    rusqlite::params![
+                        pins["scope_identity"].as_str().unwrap(),
+                        pins["effect_id"].as_str().unwrap()
+                    ],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .unwrap(),
+        );
+    }
+    *fixture.verifier.retry_store.lock().unwrap() = Some(path);
+    let mut proof = pins;
+    proof["kind"] = json!("destination_deduplication");
+    proof["attempt_fence"] = record["attempt_fence"].clone();
+    proof["first_attempt_receipt_bytes_base64"] =
+        json!(base64::engine::general_purpose::STANDARD.encode(&observed[0]));
+    proof["repeat_attempt_receipt_bytes_base64"] =
+        json!(base64::engine::general_purpose::STANDARD.encode(&observed[1]));
+    proof
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn native_retry_requires_destination_verification_before_and_after_staging() {
+    let directory = EffectTestDirectory::new();
+    let path = directory.path().join("authority.sqlite");
+    let fixture = Fixture::new();
+    let bundle = effect_bundle();
+    let resolver = effect_resolver(&bundle);
+    let authority = effect_worker_authority(&path);
+    let mut route = effect_route();
+    route.idempotency_policy = "destination_deduplicates".into();
+    let host = determa_state::authority::SqliteNativeEffectHost::open(
+        &path,
+        "scope-one".into(),
+        "owner".into(),
+        "host-one".into(),
+        resolver,
+        route,
+        fixture.handler(),
+    )
+    .unwrap()
+    .with_worker_authority(authority.clone());
+    host.setup_schema().unwrap();
+    host.allocate_scope().unwrap();
+    host.create(
+        &bundle,
+        "workflow",
+        "root",
+        "create-root",
+        &determa_state::Bindings::default(),
+    )
+    .unwrap();
+    let original = native_snapshot(&path);
+    let request = determa_state::authority::NativeEffectClaimRequest {
+        effect_id: original.1["journal"]["effect_records"][0]["effect_id"]
+            .as_str()
+            .unwrap()
+            .into(),
+    };
+    host.claim("root", "claim-1", &request, b"private-native-credential")
+        .unwrap();
+    let leased = native_snapshot(&path);
+    let report = native_result_request(&leased.1, "retryable_failure");
+    let proof = retained_destination_retry_proof(&directory, &fixture, &leased.1);
+    assert!(host
+        .record_result("root", "report-1", &report, b"private-native-credential")
+        .is_err());
+    assert_eq!(native_snapshot(&path), leased);
+    let mut invalid = Vec::new();
+    for key in [
+        "scope_identity",
+        "root_instance_id",
+        "effect_id",
+        "operation_token",
+        "attempt_fence",
+        "handler_reference",
+        "destination_binding_digest",
+    ] {
+        let mut changed = proof.clone();
+        changed[key] = json!("wrong-original-invocation");
+        invalid.push(changed);
+    }
+    invalid.push(json!(true));
+    let mut fabricated = proof.clone();
+    fabricated["first_attempt_receipt_bytes_base64"] = json!("ZmFicmljYXRlZA==");
+    fabricated["repeat_attempt_receipt_bytes_base64"] = json!("ZmFicmljYXRlZA==");
+    invalid.push(fabricated);
+    for key in [
+        "first_attempt_receipt_bytes_base64",
+        "repeat_attempt_receipt_bytes_base64",
+    ] {
+        let mut changed = proof.clone();
+        changed[key] = json!(true);
+        invalid.push(changed);
+    }
+    for bad in &invalid {
+        assert!(host
+            .record_result_with_retry_evidence(
+                "root",
+                "report-1",
+                &report,
+                b"private-native-credential",
+                Some(bad)
+            )
+            .is_err());
+        assert_eq!(native_snapshot(&path), leased);
+    }
+    fixture
+        .verifier
+        .proof_enabled
+        .store(false, Ordering::SeqCst);
+    assert!(host
+        .record_result_with_retry_evidence(
+            "root",
+            "report-1",
+            &report,
+            b"private-native-credential",
+            Some(&proof)
+        )
+        .is_err());
+    assert_eq!(native_snapshot(&path), leased);
+    fixture.verifier.proof_enabled.store(true, Ordering::SeqCst);
+    *fixture.verifier.refuse_staged_retry.lock().unwrap() = Some(path.clone());
+    assert!(host
+        .record_result_with_retry_evidence(
+            "root",
+            "report-1",
+            &report,
+            b"private-native-credential",
+            Some(&proof)
+        )
+        .is_err());
+    assert_eq!(native_snapshot(&path), leased);
+    *fixture.verifier.refuse_staged_retry.lock().unwrap() = None;
+    fixture.verifier.retry_checks.store(0, Ordering::SeqCst);
+    let reply = host
+        .record_result_with_retry_evidence(
+            "root",
+            "report-1",
+            &report,
+            b"private-native-credential",
+            Some(&proof),
+        )
+        .unwrap();
+    assert_eq!(fixture.verifier.retry_checks.load(Ordering::SeqCst), 2);
+    let retryable = native_snapshot(&path);
+    assert_eq!(retryable.0, original.0);
+    assert_eq!(
+        retryable.1["journal"]["effect_records"][0]["invocation_state"],
+        "unclaimed"
+    );
+    assert!(host
+        .claim("root", "claim-2", &request, b"private-native-credential")
+        .is_err());
+    assert_eq!(native_snapshot(&path), retryable);
+    for bad in &invalid {
+        assert!(host
+            .claim_with_retry_evidence(
+                "root",
+                "claim-2",
+                &request,
+                b"private-native-credential",
+                Some(bad)
+            )
+            .is_err());
+        assert_eq!(native_snapshot(&path), retryable);
+    }
+    fixture
+        .verifier
+        .proof_enabled
+        .store(false, Ordering::SeqCst);
+    assert!(host
+        .claim_with_retry_evidence(
+            "root",
+            "claim-2",
+            &request,
+            b"private-native-credential",
+            Some(&proof)
+        )
+        .is_err());
+    assert_eq!(native_snapshot(&path), retryable);
+    fixture.verifier.proof_enabled.store(true, Ordering::SeqCst);
+    *fixture.verifier.refuse_staged_retry.lock().unwrap() = Some(path.clone());
+    assert!(host
+        .claim_with_retry_evidence(
+            "root",
+            "claim-2",
+            &request,
+            b"private-native-credential",
+            Some(&proof)
+        )
+        .is_err());
+    assert_eq!(native_snapshot(&path), retryable);
+    *fixture.verifier.refuse_staged_retry.lock().unwrap() = None;
+    fixture.verifier.retry_checks.store(0, Ordering::SeqCst);
+    let second = host
+        .claim_with_retry_evidence(
+            "root",
+            "claim-2",
+            &request,
+            b"private-native-credential",
+            Some(&proof),
+        )
+        .unwrap();
+    assert_eq!(fixture.verifier.retry_checks.load(Ordering::SeqCst), 2);
+    let claimed = native_snapshot(&path);
+    assert_eq!(claimed.0, original.0);
+    assert_eq!(
+        claimed.1["journal"]["effect_records"][0]["attempt_fence"],
+        "2"
+    );
+    assert_eq!(claimed.1["retry_decisions"].as_object().unwrap().len(), 2);
+    fixture
+        .verifier
+        .proof_enabled
+        .store(false, Ordering::SeqCst);
+    fixture.verifier.source_valid.store(false, Ordering::SeqCst);
+    authority.fail_clock.store(true, Ordering::SeqCst);
+    assert_eq!(
+        host.record_result("root", "report-1", &report, b"private-native-credential")
+            .unwrap(),
+        reply
+    );
+    assert_eq!(
+        host.claim("root", "claim-2", &request, b"private-native-credential")
+            .unwrap(),
+        second
+    );
+    assert_eq!(native_snapshot(&path), claimed);
+    assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
 }

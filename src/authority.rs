@@ -853,12 +853,16 @@ fn validate_native_effect_document(
             "responses",
             "original_requests",
             "invocation_starts",
+            "retry_decisions",
         ],
     ) {
         return Err(failure("native effect document shape mismatch"));
     }
     if document["invocation_starts"] != json!({}) {
         return Err(failure("fresh native creation contains invocation starts"));
+    }
+    if document["retry_decisions"] != json!({}) {
+        return Err(failure("fresh creation contains retry decisions"));
     }
     let journal = &document["journal"];
     if !closed(
@@ -1072,6 +1076,7 @@ fn validate_native_effect_transition(
             "responses",
             "original_requests",
             "invocation_starts",
+            "retry_decisions",
         ],
     ) {
         return Err(failure("native effect document shape mismatch"));
@@ -1183,6 +1188,7 @@ fn validate_native_effect_transition(
     let request = requests
         .get(id)
         .ok_or_else(|| failure("new native request absent"))?;
+    validate_native_retry_decision(prior, document, id, request)?;
     if request["operation_kind"] == "effect_adapter_confirmation" {
         return validate_native_effect_confirmation_transition(
             prior,
@@ -1580,6 +1586,60 @@ fn apply_checkpoint(
 
 #[cfg(all(test, unix))]
 mod crash_tests;
+fn validate_native_retry_decision(
+    prior: &Value,
+    document: &Value,
+    operation_id: &str,
+    request: &Value,
+) -> Result<(), AuthorityError> {
+    let old = prior["retry_decisions"]
+        .as_object()
+        .ok_or_else(|| failure("prior retry inventory absent"))?;
+    let mut expected = old.clone();
+    let (decision, effect) = match request["operation_kind"].as_str() {
+        Some("effect_claim") => ("claim", &request["effect_id"]),
+        Some("effect_report") if request["report"]["outcome_kind"] == "retryable_failure" => {
+            ("report", &request["report"]["effect_id"])
+        }
+        _ => {
+            if document["retry_decisions"] != prior["retry_decisions"] {
+                return Err(failure("unrelated transition changed retry evidence"));
+            }
+            return Ok(());
+        }
+    };
+    let record = prior["journal"]["effect_records"]
+        .as_array()
+        .and_then(|items| items.iter().find(|record| &record["effect_id"] == effect))
+        .ok_or_else(|| failure("retry work absent"))?;
+    if decision == "claim" && record["attempt_fence"] == "0" {
+        if document["retry_decisions"] != prior["retry_decisions"] {
+            return Err(failure("initial claim contains retry evidence"));
+        }
+        return Ok(());
+    }
+    let entry = document["retry_decisions"]
+        .get(operation_id)
+        .ok_or_else(|| failure("native retry decision absent"))?;
+    if !closed(entry, &["decision", "evidence"])
+        || entry["decision"] != decision
+        || old.contains_key(operation_id)
+    {
+        return Err(failure("native retry decision identity mismatch"));
+    }
+    effects::validate_native_retry_evidence(
+        &prior["journal"]["scope_identity"],
+        &prior["journal"]["root_instance_id"],
+        record,
+        &entry["evidence"],
+    )?;
+    expected.insert(operation_id.to_owned(), entry.clone());
+    if document["retry_decisions"] != Value::Object(expected) {
+        return Err(failure("native retry changed retained decisions"));
+    }
+    Ok(())
+}
+
 fn validate_native_effect_claim_transition(
     prior: &Value,
     prior_checkpoint: &Value,
@@ -1641,12 +1701,10 @@ fn validate_native_effect_claim_transition(
         .iter_mut()
         .find(|record| record["effect_id"] == request["effect_id"])
         .ok_or_else(|| failure("effect_not_outstanding"))?;
-    if record["invocation_state"] != "unclaimed"
-        || record["attempt_fence"] != "0"
-        || !record["attempt_records"]
-            .as_array()
-            .is_some_and(Vec::is_empty)
-        || !record["outcome"].is_null()
+    if !matches!(
+        record["invocation_state"].as_str(),
+        Some("unclaimed" | "ambiguous")
+    ) || !record["outcome"].is_null()
         || !record["cancellation"].is_null()
         || claim["operation_token"] != record["operation_token"]
         || effects::native_invocable_intent(checkpoint, request["effect_id"].as_str().unwrap_or(""))
@@ -1654,9 +1712,17 @@ fn validate_native_effect_claim_transition(
     {
         return Err(failure("effect_not_outstanding"));
     }
-    record["attempt_fence"] = json!("1");
+    let next_fence = record["attempt_fence"]
+        .as_str()
+        .ok_or_else(|| failure("fence absent"))?
+        .parse::<BigUint>()
+        .map_err(failure)?
+        + BigUint::from(1u8);
+    record["attempt_fence"] = json!(next_fence.to_string());
     record["invocation_state"] = json!("leased");
-    if claim["attempt_fence"] != "1" || document["journal"]["effect_records"] != expected {
+    if claim["attempt_fence"] != record["attempt_fence"]
+        || document["journal"]["effect_records"] != expected
+    {
         return Err(failure("native effect claim changed unrelated evidence"));
     }
     Ok(())
@@ -1700,7 +1766,11 @@ fn validate_native_effect_report_transition(
     if claim["worker_principal"] != request["worker_principal"] {
         return Err(failure("unauthorized_scope"));
     }
-    effects::record_native_effect_report(record, report)?;
+    effects::record_native_effect_report(
+        record,
+        report,
+        report["outcome_kind"] == "retryable_failure",
+    )?;
     let expected_body = json!({"kind":"effect_report","body":{
         "attempt_report":record["attempt_records"].as_array().unwrap().last().unwrap(),
         "outcome":record["outcome"],"result_event_id":record["result_event_id"]}});

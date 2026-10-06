@@ -4,9 +4,10 @@
 
 use super::{canonical, failure, hash, AuthorityError, GuardedSqliteExecutionStore};
 use crate::checkpoint::{self, DurableStoreMode, ExecutionStore};
-use crate::extensions::VerifiedNativeHandler;
+use crate::extensions::{NativeDeduplicationEvidence, VerifiedNativeHandler};
 use crate::format1::effect_journal::ValidatedEffectJournal;
 use crate::format1::{Bindings, Bundle, DefinitionResolver};
+use base64::Engine;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -85,6 +86,52 @@ pub(super) fn canonical_native_time(value: &Value) -> Result<i64, AuthorityError
     Ok(parsed)
 }
 
+/// Pure binding/codec check. Only the installed destination verifier can turn
+/// this context into permission for a fresh retry decision.
+pub(super) fn validate_native_retry_evidence(
+    scope: &Value,
+    root: &Value,
+    record: &Value,
+    proof: &Value,
+) -> Result<(), AuthorityError> {
+    let context = json!({"kind":"destination_deduplication", "scope_identity":scope,
+        "root_instance_id":root,"effect_id":record["effect_id"],
+        "operation_token":record["operation_token"],"attempt_fence":record["attempt_fence"],
+        "handler_reference":record["handler_reference"],
+        "destination_binding_digest":record["destination_binding_digest"]});
+    let fields = proof
+        .as_object()
+        .ok_or_else(|| failure("native retry evidence absent"))?;
+    if fields.len() != 10
+        || record["idempotency_policy"] != "destination_deduplicates"
+        || context
+            .as_object()
+            .unwrap()
+            .iter()
+            .any(|(key, value)| fields.get(key) != Some(value))
+    {
+        return Err(failure(
+            "native retry evidence differs from original invocation",
+        ));
+    }
+    let first = proof["first_attempt_receipt_bytes_base64"]
+        .as_str()
+        .ok_or_else(|| failure("native receipt bytes absent"))?;
+    let repeat = proof["repeat_attempt_receipt_bytes_base64"]
+        .as_str()
+        .ok_or_else(|| failure("native repeat receipt bytes absent"))?;
+    let first = base64::engine::general_purpose::STANDARD
+        .decode(first)
+        .map_err(failure)?;
+    let repeat = base64::engine::general_purpose::STANDARD
+        .decode(repeat)
+        .map_err(failure)?;
+    if first.is_empty() || first != repeat {
+        return Err(failure("native retry receipt bytes differ or are empty"));
+    }
+    Ok(())
+}
+
 pub struct SqliteNativeEffectHost<R> {
     store: GuardedSqliteExecutionStore<R>,
     resolver: Arc<R>,
@@ -95,6 +142,29 @@ pub struct SqliteNativeEffectHost<R> {
 }
 
 impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
+    fn verify_retry_evidence(
+        &self,
+        root: &str,
+        record: &Value,
+        proof: &Value,
+    ) -> Result<(), AuthorityError> {
+        validate_native_retry_evidence(&json!(self.scope), &json!(root), record, proof)?;
+        self.handler
+            .verify_deduplication_evidence(
+                &record["handler_reference"],
+                &NativeDeduplicationEvidence {
+                    scope_identity: &self.scope,
+                    effect_id: record["effect_id"]
+                        .as_str()
+                        .ok_or_else(|| failure("effect identity absent"))?,
+                    destination_binding_digest: record["destination_binding_digest"]
+                        .as_str()
+                        .ok_or_else(|| failure("destination absent"))?,
+                    evidence: proof,
+                },
+            )
+            .map_err(failure)
+    }
     pub fn open(
         path: impl AsRef<Path>,
         scope: String,
@@ -266,7 +336,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             self.resolver.as_ref(),
         )
         .map_err(failure)?;
-        let document = json!({"journal":validated.value(),"responses":responses,"original_requests":{creation_id:original_request},"invocation_starts":{}});
+        let document = json!({"journal":validated.value(),"responses":responses,"original_requests":{creation_id:original_request},"invocation_starts":{},"retry_decisions":{}});
         self.store
             .insert_native_effect_checkpoint(&checkpoint, &document, || {
                 let current = self
@@ -718,8 +788,8 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         Ok(response)
     }
 
-    /// First claim only: retries, expiry recovery and reconciliation are separate
-    /// operations and cannot be inferred from an absent result or provider claim.
+    /// Claims without new retry evidence can issue only an initial attempt.
+    /// An absent result or provider claim cannot authorize a later attempt.
     /// A retained active-shaped reply is historical evidence, never renewed rights.
     pub fn claim(
         &self,
@@ -727,6 +797,19 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         operation_id: &str,
         request: &NativeEffectClaimRequest,
         credential: &[u8],
+    ) -> Result<Value, AuthorityError> {
+        self.claim_with_retry_evidence(root, operation_id, request, credential, None)
+    }
+
+    /// Fresh later attempts require independently authenticated destination
+    /// evidence; saved receipt replay never renews worker rights.
+    pub fn claim_with_retry_evidence(
+        &self,
+        root: &str,
+        operation_id: &str,
+        request: &NativeEffectClaimRequest,
+        credential: &[u8],
+        retry_evidence: Option<&Value>,
     ) -> Result<Value, AuthorityError> {
         if operation_id.is_empty() {
             return Err(failure("native claim identity absent"));
@@ -780,23 +863,45 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             .iter_mut()
             .find(|record| record["effect_id"] == request.effect_id)
             .ok_or_else(|| failure("effect_not_outstanding"))?;
-        if record["invocation_state"] != "unclaimed" || record["attempt_fence"] != "0" {
+        if !matches!(
+            record["invocation_state"].as_str(),
+            Some("unclaimed" | "ambiguous")
+        ) || !record["outcome"].is_null()
+            || !record["cancellation"].is_null()
+        {
             return Err(failure("effect_not_outstanding"));
         }
-        if record["handler_reference"] != self.route.handler_reference
-            || record["destination_binding_digest"] != self.route.destination_binding_digest
-            || record["route_configuration_generation"] != self.route.generation
-            || record["result_mapping"] != self.route.result_mapping
-        {
-            return Err(failure("scope_generation_conflict"));
+        let pinned_record = record.clone();
+        let retry = if record["attempt_fence"] != "0" {
+            let proof = retry_evidence.ok_or_else(|| failure("native retry evidence absent"))?;
+            self.verify_retry_evidence(root, record, proof)?;
+            Some(proof.clone())
+        } else {
+            if retry_evidence.is_some() {
+                return Err(failure("initial claim contains retry evidence"));
+            }
+            None
+        };
+        let next_fence = record["attempt_fence"]
+            .as_str()
+            .ok_or_else(|| failure("fence absent"))?
+            .parse::<num_bigint::BigUint>()
+            .map_err(failure)?
+            + num_bigint::BigUint::from(1u8);
+        if native_invocable_intent(checkpoint.value(), &request.effect_id).is_err() {
+            return Err(failure("committed invocation absent"));
         }
         let claim = json!({"scope_identity":self.scope,"root_instance_id":root,"work_kind":"effect",
             "work_identity":request.effect_id,"operation_token":record["operation_token"],
-            "scope_authority_epoch":"0","attempt_fence":"1","worker_principal":caller.authenticated_principal,
+            "scope_authority_epoch":"0","attempt_fence":next_fence.to_string(),"worker_principal":caller.authenticated_principal,
             "expires_at":expiry.to_string(),"state":"active"});
-        record["attempt_fence"] = json!("1");
+        record["attempt_fence"] = json!(next_fence.to_string());
         record["invocation_state"] = json!("leased");
         let response = json!({"kind":"effect_claim","body":{"claim":claim}});
+        if let Some(proof) = &retry {
+            document["retry_decisions"][operation_id] =
+                json!({"decision":"claim","evidence":proof});
+        }
         retain_native_effect_response(&mut document, operation_id, &original, &response)?;
         self.store
             .update_native_effect_checkpoint_with_final_guard(
@@ -822,10 +927,16 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
                         .map_err(failure)?;
                     self.handler
                         .verify(
-                            &self.route.handler_reference,
-                            &self.route.destination_binding_digest,
+                            &pinned_record["handler_reference"],
+                            pinned_record["destination_binding_digest"]
+                                .as_str()
+                                .ok_or_else(|| failure("destination absent"))?,
                         )
-                        .map_err(failure)
+                        .map_err(failure)?;
+                    if let Some(proof) = &retry {
+                        self.verify_retry_evidence(root, &pinned_record, proof)?;
+                    }
+                    Ok(())
                 },
                 || {
                     let current = authority.authenticate(credential).map_err(failure)?;
@@ -852,6 +963,19 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         operation_id: &str,
         report: &Value,
         credential: &[u8],
+    ) -> Result<Value, AuthorityError> {
+        self.record_result_with_retry_evidence(root, operation_id, report, credential, None)
+    }
+
+    /// Portable worker reports carry no native proof or retry permission.
+    /// The native host consumes this separate proof before and after staging.
+    pub fn record_result_with_retry_evidence(
+        &self,
+        root: &str,
+        operation_id: &str,
+        report: &Value,
+        credential: &[u8],
+        retry_evidence: Option<&Value>,
     ) -> Result<Value, AuthorityError> {
         if operation_id.is_empty() {
             return Err(failure("native report identity absent"));
@@ -887,6 +1011,7 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             .find(|record| record["effect_id"] == report["effect_id"])
             .ok_or_else(|| failure("effect_not_outstanding"))?;
         let claim = current_native_effect_claim(&document, selected)?.clone();
+        let pinned_record = selected.clone();
         let pinned_reference = selected["handler_reference"].clone();
         let pinned_destination = selected["destination_binding_digest"]
             .as_str()
@@ -901,6 +1026,16 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
         if authority.trusted_now().map_err(failure)? >= expiry {
             return Err(failure("stale_attempt_fence"));
         }
+        let retry = if report["outcome_kind"] == "retryable_failure" {
+            let proof = retry_evidence.ok_or_else(|| failure("native retry evidence absent"))?;
+            self.verify_retry_evidence(root, selected, proof)?;
+            Some(proof.clone())
+        } else {
+            if retry_evidence.is_some() {
+                return Err(failure("unrelated report contains retry evidence"));
+            }
+            None
+        };
         let fingerprint = checkpoint
             .bundle_fingerprint()
             .ok_or_else(|| failure("native definition absent"))?;
@@ -917,10 +1052,14 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
             .iter_mut()
             .find(|record| record["effect_id"] == report["effect_id"])
             .unwrap();
-        record_native_effect_report(record, report)?;
+        record_native_effect_report(record, report, retry.is_some())?;
         let response = json!({"kind":"effect_report","body":{
             "attempt_report":record["attempt_records"].as_array().unwrap().last().unwrap(),
             "outcome":record["outcome"],"result_event_id":record["result_event_id"]}});
+        if let Some(proof) = &retry {
+            document["retry_decisions"][operation_id] =
+                json!({"decision":"report","evidence":proof});
+        }
         retain_native_effect_response(&mut document, operation_id, &original, &response)?;
         self.store
             .update_native_effect_checkpoint_with_final_guard(
@@ -942,7 +1081,11 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
                     crate::format1::providers::check_bundle(&current.bundle).map_err(failure)?;
                     self.handler
                         .verify(&pinned_reference, &pinned_destination)
-                        .map_err(failure)
+                        .map_err(failure)?;
+                    if let Some(proof) = &retry {
+                        self.verify_retry_evidence(root, &pinned_record, proof)?;
+                    }
+                    Ok(())
                 },
                 || {
                     let current = authority.authenticate(credential).map_err(failure)?;
@@ -1457,7 +1600,7 @@ pub(super) fn expire_native_effect_claim(
     }
     let report = json!({"effect_id":effect_id,"operation_token":record["operation_token"],
         "attempt_fence":record["attempt_fence"],"outcome_kind":"ambiguous","payload":["map",[]]});
-    record_native_effect_report(record, &report)?;
+    record_native_effect_report(record, &report, false)?;
     let mut expired = claim.clone();
     expired["state"] = json!("expired");
     Ok(
@@ -1470,6 +1613,7 @@ pub(super) fn expire_native_effect_claim(
 pub(super) fn record_native_effect_report(
     record: &mut Value,
     request: &Value,
+    retry_proven: bool,
 ) -> Result<(), AuthorityError> {
     if record["invocation_state"] != "leased"
         || record["attempt_fence"] != request["attempt_fence"]
@@ -1481,11 +1625,13 @@ pub(super) fn record_native_effect_report(
     let kind = request["outcome_kind"]
         .as_str()
         .ok_or_else(|| failure("native report kind absent"))?;
-    if kind == "retryable_failure" {
+    if kind == "retryable_failure" && !retry_proven {
         // A worker's assertion is not independent no-call or deduplication proof.
         return Err(failure("native safe retry evidence absent"));
     }
-    let reason = if kind == "ambiguous" {
+    let reason = if kind == "retryable_failure" {
+        json!("destination_deduplication_proven")
+    } else if kind == "ambiguous" {
         json!("provider_acceptance_unknown")
     } else {
         Value::Null
@@ -1507,7 +1653,9 @@ pub(super) fn record_native_effect_report(
         .as_array_mut()
         .unwrap()
         .push(report);
-    if kind == "ambiguous" {
+    if kind == "retryable_failure" {
+        record["invocation_state"] = json!("unclaimed");
+    } else if kind == "ambiguous" {
         record["invocation_state"] = json!("ambiguous");
     } else {
         let mapping = record["result_mapping"]
