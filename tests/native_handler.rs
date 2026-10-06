@@ -5487,6 +5487,26 @@ fn native_retry_requires_destination_verification_before_and_after_staging() {
         .is_err());
     assert_eq!(native_snapshot(&path), leased);
     fixture.verifier.proof_enabled.store(true, Ordering::SeqCst);
+    let revoker = Arc::new(RetryProofRevokingAuthority {
+        inner: authority.clone(),
+        verifier: fixture.verifier.clone(),
+        path: path.clone(),
+        armed: AtomicBool::new(false),
+    });
+    let host = host.with_worker_authority(revoker.clone());
+    assert!(host
+        .record_result_with_retry_evidence(
+            "root",
+            "report-1",
+            &report,
+            b"private-native-credential",
+            Some(&proof)
+        )
+        .is_err());
+    assert!(revoker.armed.load(Ordering::SeqCst));
+    assert_eq!(native_snapshot(&path), leased);
+    fixture.verifier.proof_enabled.store(true, Ordering::SeqCst);
+    let host = host.with_worker_authority(authority.clone());
     *fixture.verifier.refuse_staged_retry.lock().unwrap() = Some(path.clone());
     assert!(host
         .record_result_with_retry_evidence(
@@ -5547,6 +5567,26 @@ fn native_retry_requires_destination_verification_before_and_after_staging() {
         .is_err());
     assert_eq!(native_snapshot(&path), retryable);
     fixture.verifier.proof_enabled.store(true, Ordering::SeqCst);
+    let revoker = Arc::new(RetryProofRevokingAuthority {
+        inner: authority.clone(),
+        verifier: fixture.verifier.clone(),
+        path: path.clone(),
+        armed: AtomicBool::new(false),
+    });
+    let host = host.with_worker_authority(revoker.clone());
+    assert!(host
+        .claim_with_retry_evidence(
+            "root",
+            "claim-2",
+            &request,
+            b"private-native-credential",
+            Some(&proof)
+        )
+        .is_err());
+    assert!(revoker.armed.load(Ordering::SeqCst));
+    assert_eq!(native_snapshot(&path), retryable);
+    fixture.verifier.proof_enabled.store(true, Ordering::SeqCst);
+    let host = host.with_worker_authority(authority.clone());
     *fixture.verifier.refuse_staged_retry.lock().unwrap() = Some(path.clone());
     assert!(host
         .claim_with_retry_evidence(
@@ -5595,4 +5635,43 @@ fn native_retry_requires_destination_verification_before_and_after_staging() {
     );
     assert_eq!(native_snapshot(&path), claimed);
     assert_eq!(fixture.destination.calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "sqlite")]
+struct RetryProofRevokingAuthority {
+    inner: Arc<EffectWorkerAuthority>,
+    verifier: Arc<Verifier>,
+    path: std::path::PathBuf,
+    armed: AtomicBool,
+}
+#[cfg(feature = "sqlite")]
+impl determa_state::authority::NativeEffectWorkerAuthority for RetryProofRevokingAuthority {
+    fn authenticate(
+        &self,
+        c: &[u8],
+    ) -> Result<determa_state::authority::NativeAuthorityInvocation, String> {
+        let result = self.inner.authenticate(c)?;
+        let conn = rusqlite::Connection::open(&self.path).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        match conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                self.verifier.proof_enabled.store(false, Ordering::SeqCst);
+                self.armed.store(true, Ordering::SeqCst);
+            }
+            Ok(()) => {}
+            x => panic!("unexpected lock probe: {:?}", x),
+        }
+        Ok(result)
+    }
+    fn lease_duration_ns(&self) -> Result<i64, String> {
+        self.inner.lease_duration_ns()
+    }
+    fn trusted_now(&self) -> Result<i64, String> {
+        self.inner.trusted_now()
+    }
 }

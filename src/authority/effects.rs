@@ -933,9 +933,6 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
                                 .ok_or_else(|| failure("destination absent"))?,
                         )
                         .map_err(failure)?;
-                    if let Some(proof) = &retry {
-                        self.verify_retry_evidence(root, &pinned_record, proof)?;
-                    }
                     Ok(())
                 },
                 || {
@@ -948,6 +945,12 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
                     }
                     if authority.trusted_now().map_err(failure)? >= expiry {
                         return Err(failure("stale_attempt_fence"));
+                    }
+                    // Authentication and clock callbacks can invalidate the
+                    // destination capability. Consume fresh native proof only
+                    // after both callbacks, immediately before commit.
+                    if let Some(proof) = &retry {
+                        self.verify_retry_evidence(root, &pinned_record, proof)?;
                     }
                     Ok(())
                 },
@@ -1082,9 +1085,6 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
                     self.handler
                         .verify(&pinned_reference, &pinned_destination)
                         .map_err(failure)?;
-                    if let Some(proof) = &retry {
-                        self.verify_retry_evidence(root, &pinned_record, proof)?;
-                    }
                     Ok(())
                 },
                 || {
@@ -1097,6 +1097,12 @@ impl<R: DefinitionResolver + Send + Sync + 'static> SqliteNativeEffectHost<R> {
                     }
                     if authority.trusted_now().map_err(failure)? >= expiry {
                         return Err(failure("stale_attempt_fence"));
+                    }
+                    // Authentication and clock callbacks can invalidate the
+                    // destination capability. Consume fresh native proof only
+                    // after both callbacks, immediately before commit.
+                    if let Some(proof) = &retry {
+                        self.verify_retry_evidence(root, &pinned_record, proof)?;
                     }
                     Ok(())
                 },
